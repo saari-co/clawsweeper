@@ -2775,6 +2775,18 @@ function parseRootCauseCluster(
   };
 }
 
+function parseRootCauseClusterOrDefault(
+  value: unknown,
+  path: string,
+  item?: RootCauseNormalizationItem,
+): RootCauseClusterAssessment {
+  try {
+    return parseRootCauseCluster(value, path, item);
+  } catch {
+    return defaultRootCauseCluster();
+  }
+}
+
 function parseAgentsPolicyStatus(value: unknown, path: string): AgentsPolicyStatus {
   const record = requireRecord(value, path);
   rejectUnexpectedKeys(record, AGENTS_POLICY_STATUS_SCHEMA_KEYS, path);
@@ -2875,7 +2887,7 @@ export function parseDecision(value: unknown, item?: DecisionNormalizationItem):
       AUTO_IMPLEMENTATION_CANDIDATES,
       "decision.autoImplementationCandidate",
     ),
-    rootCauseCluster: parseRootCauseCluster(
+    rootCauseCluster: parseRootCauseClusterOrDefault(
       record.rootCauseCluster,
       "decision.rootCauseCluster",
       item,

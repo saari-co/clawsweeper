@@ -16648,6 +16648,13 @@ test("decision parser enforces required schema-shaped evidence", () => {
 
 test("decision parser validates typed root-cause clusters", () => {
   const canonicalRef = "https://github.com/openclaw/openclaw/pull/456";
+  const independentRootCauseCluster = {
+    confidence: "low",
+    canonicalRef: null,
+    currentItemRelationship: "independent",
+    summary: "No evidence-backed root-cause cluster was established.",
+    members: [],
+  };
   const rootCauseCluster = {
     confidence: "high",
     canonicalRef,
@@ -16667,156 +16674,98 @@ test("decision parser validates typed root-cause clusters", () => {
   );
   assert.deepEqual(parsed.rootCauseCluster, rootCauseCluster);
 
-  assert.throws(
-    () =>
+  const invalidRootCauseClusters = [
+    {
+      ...rootCauseCluster,
+      members: [...rootCauseCluster.members, ...rootCauseCluster.members],
+    },
+    {
+      ...rootCauseCluster,
+      canonicalRef: "https://github.com/other/repo/pull/456",
+      members: [
+        {
+          ...rootCauseCluster.members[0],
+          ref: "https://github.com/other/repo/pull/456",
+        },
+      ],
+    },
+    {
+      ...rootCauseCluster,
+      members: [
+        ...rootCauseCluster.members,
+        {
+          ref: "https://github.com/openclaw/openclaw/issues/789",
+          relationship: "canonical",
+          reason: "A conflicting second canonical item.",
+        },
+      ],
+    },
+    {
+      ...rootCauseCluster,
+      members: [
+        {
+          ...rootCauseCluster.members[0],
+          ref: "https://github.com/openclaw/openclaw/pull/789",
+        },
+      ],
+    },
+    {
+      ...rootCauseCluster,
+      canonicalRef: "https://github.com/openclaw/openclaw/issues/456",
+      members: [
+        {
+          ...rootCauseCluster.members[0],
+          ref: "https://github.com/openclaw/openclaw/issues/456",
+        },
+      ],
+    },
+    {
+      ...rootCauseCluster,
+      members: [
+        {
+          ref: "https://github.com/openclaw/openclaw/issues/123",
+          relationship: "canonical",
+          reason: "Incorrectly repeats the current item.",
+        },
+      ],
+      canonicalRef: "https://github.com/openclaw/openclaw/issues/123",
+      currentItemRelationship: "duplicate",
+    },
+    {
+      ...rootCauseCluster,
+      members: [
+        {
+          ref: "https://github.com/OpenClaw/OpenClaw/issues/123",
+          relationship: "canonical",
+          reason: "Incorrectly repeats the current item with different casing.",
+        },
+      ],
+      canonicalRef: "https://github.com/OpenClaw/OpenClaw/issues/123",
+      currentItemRelationship: "duplicate",
+    },
+    {
+      ...rootCauseCluster,
+      members: [
+        rootCauseCluster.members[0],
+        {
+          ...rootCauseCluster.members[0],
+          ref: "https://github.com/OpenClaw/OpenClaw/pull/456",
+        },
+      ],
+    },
+  ];
+
+  for (const invalidRootCauseCluster of invalidRootCauseClusters) {
+    assert.deepEqual(
       parseDecision(
         closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [...rootCauseCluster.members, ...rootCauseCluster.members],
-          },
+          rootCauseCluster: invalidRootCauseCluster,
         }),
         item(),
-      ),
-    /duplicate refs/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            canonicalRef: "https://github.com/other/repo/pull/456",
-            members: [
-              {
-                ...rootCauseCluster.members[0],
-                ref: "https://github.com/other/repo/pull/456",
-              },
-            ],
-          },
-        }),
-        item(),
-      ),
-    /must stay within openclaw\/openclaw/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [
-              ...rootCauseCluster.members,
-              {
-                ref: "https://github.com/openclaw/openclaw/issues/789",
-                relationship: "canonical",
-                reason: "A conflicting second canonical item.",
-              },
-            ],
-          },
-        }),
-        item(),
-      ),
-    /at most one canonical member/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [
-              {
-                ...rootCauseCluster.members[0],
-                ref: "https://github.com/openclaw/openclaw/pull/789",
-              },
-            ],
-          },
-        }),
-        item(),
-      ),
-    /canonicalRef must identify exactly one canonical member/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            canonicalRef: "https://github.com/openclaw/openclaw/issues/456",
-            members: [
-              {
-                ...rootCauseCluster.members[0],
-                ref: "https://github.com/openclaw/openclaw/issues/456",
-              },
-            ],
-          },
-        }),
-        item(),
-      ),
-    /fixed_by_candidate requires a canonical PR/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [
-              {
-                ref: "https://github.com/openclaw/openclaw/issues/123",
-                relationship: "canonical",
-                reason: "Incorrectly repeats the current item.",
-              },
-            ],
-            canonicalRef: "https://github.com/openclaw/openclaw/issues/123",
-            currentItemRelationship: "duplicate",
-          },
-        }),
-        item(),
-      ),
-    /must not repeat the current item/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [
-              {
-                ref: "https://github.com/OpenClaw/OpenClaw/issues/123",
-                relationship: "canonical",
-                reason: "Incorrectly repeats the current item with different casing.",
-              },
-            ],
-            canonicalRef: "https://github.com/OpenClaw/OpenClaw/issues/123",
-            currentItemRelationship: "duplicate",
-          },
-        }),
-        item(),
-      ),
-    /must not repeat the current item/,
-  );
-  assert.throws(
-    () =>
-      parseDecision(
-        closeDecision({
-          rootCauseCluster: {
-            ...rootCauseCluster,
-            members: [
-              rootCauseCluster.members[0],
-              {
-                ...rootCauseCluster.members[0],
-                ref: "https://github.com/OpenClaw/OpenClaw/pull/456",
-              },
-            ],
-          },
-        }),
-        item(),
-      ),
-    /duplicate refs/,
-  );
+      ).rootCauseCluster,
+      independentRootCauseCluster,
+    );
+  }
 });
 
 test("root-cause report parsing defaults legacy and malformed reports safely", () => {
