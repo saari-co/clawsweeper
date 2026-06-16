@@ -16648,6 +16648,8 @@ test("decision parser enforces required schema-shaped evidence", () => {
 
 test("decision parser validates typed root-cause clusters", () => {
   const canonicalRef = "https://github.com/openclaw/openclaw/pull/456";
+  const canonicalIssueRef = "https://github.com/openclaw/openclaw/issues/456";
+  const candidatePullRef = "https://github.com/openclaw/openclaw/pull/789";
   const independentRootCauseCluster = {
     confidence: "low",
     canonicalRef: null,
@@ -16673,6 +16675,46 @@ test("decision parser validates typed root-cause clusters", () => {
     item({ repo: "openclaw/openclaw", number: 123, kind: "issue" }),
   );
   assert.deepEqual(parsed.rootCauseCluster, rootCauseCluster);
+
+  const prCandidateForCanonicalIssue = {
+    confidence: "high",
+    canonicalRef: canonicalIssueRef,
+    currentItemRelationship: "fixed_by_candidate",
+    summary: "This PR is the candidate fix for the canonical issue.",
+    members: [
+      {
+        ref: canonicalIssueRef,
+        relationship: "canonical",
+        reason: "The issue tracks the underlying user-visible bug.",
+      },
+    ],
+  };
+  assert.deepEqual(
+    parseDecision(
+      closeDecision({ rootCauseCluster: prCandidateForCanonicalIssue }),
+      item({ kind: "pull_request" }),
+    ).rootCauseCluster,
+    prCandidateForCanonicalIssue,
+  );
+
+  const canonicalIssueWithCandidateMember = {
+    confidence: "high",
+    canonicalRef: "https://github.com/openclaw/openclaw/issues/123",
+    currentItemRelationship: "canonical",
+    summary: "The issue is canonical and has an open candidate fix PR.",
+    members: [
+      {
+        ref: candidatePullRef,
+        relationship: "fixed_by_candidate",
+        reason: "The PR carries the candidate fix for this canonical issue.",
+      },
+    ],
+  };
+  assert.deepEqual(
+    parseDecision(closeDecision({ rootCauseCluster: canonicalIssueWithCandidateMember }), item())
+      .rootCauseCluster,
+    canonicalIssueWithCandidateMember,
+  );
 
   const invalidRootCauseClusters = [
     {
@@ -16711,11 +16753,21 @@ test("decision parser validates typed root-cause clusters", () => {
     },
     {
       ...rootCauseCluster,
-      canonicalRef: "https://github.com/openclaw/openclaw/issues/456",
+      canonicalRef: canonicalIssueRef,
       members: [
         {
           ...rootCauseCluster.members[0],
-          ref: "https://github.com/openclaw/openclaw/issues/456",
+          ref: canonicalIssueRef,
+        },
+      ],
+    },
+    {
+      ...canonicalIssueWithCandidateMember,
+      members: [
+        {
+          ref: "https://github.com/openclaw/openclaw/issues/789",
+          relationship: "fixed_by_candidate",
+          reason: "Issue-to-issue candidate-fix labels are not meaningful.",
         },
       ],
     },
