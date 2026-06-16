@@ -2,6 +2,19 @@
   "schema_version": 2,
   "repositories": [
     {
+      "target_repo": "saariuslystoned/spark-dgx",
+      "display_name": "SPARK DGX",
+      "checkout_dir": "spark-dgx",
+      "prompt_note": "Use the spark-dgx source tree and current main branch. This is a SPARK swarm operations repo (shell lanes, LiteLLM gate IaC, markdown roadmaps). Review conservatively for correctness, secret hygiene, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
       "target_repo": "openclaw/clawhub",
       "display_name": "ClawHub",
       "checkout_dir": "clawhub",
