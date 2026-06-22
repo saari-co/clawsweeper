@@ -1,0 +1,46 @@
+# saari-co ClawSweeper dashboard — deploy to YOUR Cloudflare account.
+# Kept separate from upstream wrangler.toml so `git pull` from openclaw stays clean.
+#
+# Deploy:
+#   cd ~/Developer/clawsweeper
+#   npx wrangler@4 login                                    # one-time, your CF account
+#   npx wrangler@4 secret put GITHUB_TOKEN --config dashboard/wrangler.saari.toml
+#   npx wrangler@4 deploy            --config dashboard/wrangler.saari.toml
+#
+# GITHUB_TOKEN = a fine-grained, READ-ONLY PAT scoped to the 5 saari-co repos
+# (Contents: read, Issues: read, Pull requests: read, Metadata: read). Do NOT
+# put the ClawSweeper App private key here — it must never leave spark-2.
+#
+# clawsweeper.ztoned.com must be a zone on the SAME Cloudflare account
+# (custom_domain routes require the zone to be in this account).
+
+name = "clawsweeper-ztoned"
+main = "worker.ts"
+account_id = "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"
+compatibility_date = "2026-05-11"
+workers_dev = true
+
+# SQLite-backed Durable Object — available on the Workers FREE plan.
+[[durable_objects.bindings]]
+name = "STATUS_STORE"
+class_name = "StatusStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StatusStore"]
+
+[[routes]]
+pattern = "clawsweeper.ztoned.com"
+custom_domain = true
+
+[vars]
+CLAWSWEEPER_REPO = "saari-co/clawsweeper"
+# All three target lists = your 5 swarm repos (triage + pr-proof read these).
+TARGET_REPOS = "saari-co/spark-dgx,saari-co/x-api,saari-co/pixel-fold,saari-co/StellarAI,saari-co/aicommerce"
+TRIAGE_TARGET_REPOS = "saari-co/spark-dgx,saari-co/x-api,saari-co/pixel-fold,saari-co/StellarAI,saari-co/aicommerce"
+PR_PROOF_TARGET_REPOS = "saari-co/spark-dgx,saari-co/x-api,saari-co/pixel-fold,saari-co/StellarAI,saari-co/aicommerce"
+WORKER_BUDGET = "128"
+CACHE_TTL_SECONDS = "20"
+# `/` pipeline view reads GitHub Actions runs for TARGET_REPOS; triage/pr-proof
+# views read clawsweeper:* labels via Search. Set to "0" to drop the pipeline view.
+INCLUDE_CI_STATUS = "1"
