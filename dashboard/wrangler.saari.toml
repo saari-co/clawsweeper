@@ -8,17 +8,18 @@
 #   npx wrangler@4 deploy            --config dashboard/wrangler.saari.toml
 #
 # GITHUB_TOKEN = a fine-grained, READ-ONLY PAT scoped to the 5 saari-co repos
-# (Contents: read, Issues: read, Pull requests: read, Metadata: read). Do NOT
-# put the ClawSweeper App private key here — it must never leave spark-2.
+# (Actions: read, Contents: read, Issues: read, Pull requests: read, Metadata:
+# read). Do NOT put the ClawSweeper App private key here — it must never leave
+# spark-2.
 #
 # clawsweeper.ztoned.com must be a zone on the SAME Cloudflare account
 # (custom_domain routes require the zone to be in this account).
 
 name = "clawsweeper-ztoned"
 main = "worker.ts"
-account_id = "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"
+account_id = "cddb32366789cab1bdf4c25584dc1920"
 compatibility_date = "2026-05-11"
-workers_dev = true
+workers_dev = false
 
 # SQLite-backed Durable Object — available on the Workers FREE plan.
 [[durable_objects.bindings]]

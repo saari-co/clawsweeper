@@ -14,13 +14,14 @@ Run everything from the clawsweeper fork root: `cd ~/Developer/clawsweeper`.
   routes require the zone to live in the same account.
 - A fine-grained, **read-only** GitHub PAT scoped to the 5 saari-co repos
   (`spark-dgx, x-api, pixel-fold, StellarAI, aicommerce`), permissions:
-  **Contents: Read, Issues: Read, Pull requests: Read, Metadata: Read**.
+  **Actions: Read, Contents: Read, Issues: Read, Pull requests: Read,
+  Metadata: Read**.
   ⚠️ Do **not** use the ClawSweeper App private key here — it stays on spark-2.
 
-## 1. Set your Cloudflare account id
-Edit `dashboard/wrangler.saari.toml` → replace
-`account_id = "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"` with your account id
-(Cloudflare dashboard → right sidebar, or `npx wrangler whoami` after login).
+## 1. Confirm the Cloudflare account id
+`dashboard/wrangler.saari.toml` is prefilled for Bobby's
+Growfunkybeans/ztoned Cloudflare account. If this fork is moved to a different
+account, replace `account_id` with that account id before deploying.
 
 ## 2. Auth → secret → deploy
 ```bash
@@ -30,6 +31,8 @@ npx wrangler@4 deploy            --config dashboard/wrangler.saari.toml
 ```
 - First deploy provisions the SQLite Durable Object (`StatusStore`) — **free Workers plan**, no paid tier needed.
 - The `custom_domain` route `clawsweeper.ztoned.com` is created on deploy; Cloudflare adds the DNS record + cert automatically because the zone is yours.
+- `workers_dev = false`, so the private dashboard is not also exposed on a
+  public `*.workers.dev` hostname.
 - Smoke locally first if you want: `npx wrangler@4 dev --config dashboard/wrangler.saari.toml` → http://127.0.0.1:8787/triage
 
 ## 3. Lock it down (private repos — don't leave it public)
