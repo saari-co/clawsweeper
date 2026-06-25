@@ -5209,10 +5209,28 @@ function isCreatedWithinDays(
   return Number.isFinite(createdAt) && now - createdAt < days * DAY_MS;
 }
 
+// Re-review cadence for a pull request that is past its hot window (created more
+// than HOT_REVIEW_DAYS ago) and has had no activity since its last review. This
+// defaults to the daily cadence. Operators who run the review brain on a metered
+// or subscription budget can extend it (never shorten it) via
+// CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS so that an open pull request which
+// has not changed since its last review is not re-reviewed -- and re-paid for --
+// every day only to reproduce an identical verdict. Unset or invalid keeps the
+// current daily cadence; the hourly "activity since review" and daily hot-window
+// branches in reviewCadenceMs are unaffected, so changed and brand-new pull
+// requests are still reviewed promptly.
+function stalePullRequestReviewCadenceMs(): number {
+  const configuredDays = Number(process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS);
+  if (!Number.isFinite(configuredDays) || configuredDays <= DAILY_REVIEW_DAYS) {
+    return DAILY_REVIEW_DAYS * DAY_MS;
+  }
+  return configuredDays * DAY_MS;
+}
+
 function reviewCadenceMs(item: Item, review: ExistingReview | null, now = Date.now()): number {
   if (hasActivitySinceReview(item, review)) return HOURLY_REVIEW_MS;
   if (isCreatedWithinDays(item, HOT_REVIEW_DAYS, now)) return DAILY_REVIEW_DAYS * DAY_MS;
-  if (item.kind === "pull_request") return DAILY_REVIEW_DAYS * DAY_MS;
+  if (item.kind === "pull_request") return stalePullRequestReviewCadenceMs();
   const createdAt = Date.parse(item.createdAt);
   if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) {
     return DAILY_REVIEW_DAYS * DAY_MS;

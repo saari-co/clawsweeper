@@ -103,6 +103,47 @@ test("hot new items review daily unless target-side activity requires hourly cad
   );
 });
 
+test("CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS extends the daily cadence for inactive stale PRs", () => {
+  const now = Date.parse("2026-04-30T12:00:00Z");
+  const review = (reviewedAt) => ({
+    path: "items/123.md",
+    markdown: "",
+    reviewedAt,
+    itemUpdatedAt: "2026-03-01T00:00:00Z",
+    decision: "keep_open",
+    reviewStatus: "complete",
+    reviewPolicy: "current",
+  });
+  // A pull request well past its 7-day hot window with no activity since review.
+  const stalePr = item({
+    kind: "pull_request",
+    createdAt: "2026-03-01T00:00:00Z",
+    updatedAt: "2026-03-01T00:00:00Z",
+  });
+
+  const original = process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS;
+  try {
+    // Default (unset): the stale PR comes due again one day after its last review.
+    delete process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS;
+    assert.equal(shouldReviewItem(stalePr, review("2026-04-29T10:00:00Z"), now, "current"), true);
+
+    // Extended to weekly: a review from ~1 day ago is no longer due...
+    process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS = "7";
+    assert.equal(shouldReviewItem(stalePr, review("2026-04-29T10:00:00Z"), now, "current"), false);
+    // ...but one older than the configured window still comes due.
+    assert.equal(shouldReviewItem(stalePr, review("2026-04-22T10:00:00Z"), now, "current"), true);
+
+    // Invalid or sub-daily values fall back to the default daily cadence.
+    process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS = "not-a-number";
+    assert.equal(shouldReviewItem(stalePr, review("2026-04-29T10:00:00Z"), now, "current"), true);
+    process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS = "0";
+    assert.equal(shouldReviewItem(stalePr, review("2026-04-29T10:00:00Z"), now, "current"), true);
+  } finally {
+    if (original === undefined) delete process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS;
+    else process.env.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS = original;
+  }
+});
+
 test("scheduler ignores ClawSweeper-owned updated_at churn after review", () => {
   const reviewedAt = "2026-04-30T12:52:57Z";
   const review = {

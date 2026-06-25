@@ -313,10 +313,20 @@ Review cadence:
 
 - items with target-side activity since the last real review: hourly
 - items created in the last 7 days without new target-side activity: daily
-- pull requests outside the hot window: daily
+- pull requests outside the hot window: daily (configurable, see below)
 - issues created in the last 30 days: daily
 - older inactive issues: weekly
 - review policy hash changes: due immediately
+
+`CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS` (optional) extends only the third
+bucket — a pull request past its hot window with no activity since its last
+review. It defaults to the daily cadence above; set it to a larger number of
+days (for example `7` for weekly) to stop re-reviewing, and re-paying for,
+pull requests that have not changed since their last review. This is useful when
+the review brain runs on a metered or subscription budget. Values that are unset,
+non-numeric, or at or below the daily cadence keep the default daily behavior,
+and the hourly activity and daily hot-window buckets are never affected, so
+changed and brand-new pull requests are still reviewed promptly.
 
 The activity check ignores ClawSweeper-owned GitHub mutations that are already
 recorded in durable report frontmatter. `review_comment_synced_at` covers public
