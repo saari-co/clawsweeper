@@ -1092,6 +1092,7 @@ jobs:
           MAX_PAGES: ${{ steps.mode.outputs.max_pages }}
           MIN_ACTIVE_SHARDS: ${{ steps.mode.outputs.min_active_shards }}
           MIN_BACKFILL_REVIEW_AGE_MINUTES: ${{ steps.mode.outputs.min_backfill_review_age_minutes }}
+          CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS: ${{ vars.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS || '' }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           GH_TOKEN: ${{ steps.target-read-token.outputs.token || github.token }}
         run: |
@@ -2035,6 +2036,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS: ${{ vars.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS || '' }}
         run: |
           set -euo pipefail
           git pull --rebase --autostash

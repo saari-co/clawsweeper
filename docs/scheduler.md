@@ -328,6 +328,12 @@ non-numeric, or at or below the daily cadence keep the default daily behavior,
 and the hourly activity and daily hot-window buckets are never affected, so
 changed and brand-new pull requests are still reviewed promptly.
 
+Set it as a repository variable (`vars.CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS`);
+`.github/workflows/sweep.yml` passes it into both the scheduled planner step and
+the dashboard `audit --update-dashboard` step, so scheduled GitHub runs honor it
+and the dashboard's "current within cadence" counts stay consistent with what the
+planner schedules. Self-hosted/CLI runs read it from the process environment.
+
 The activity check ignores ClawSweeper-owned GitHub mutations that are already
 recorded in durable report frontmatter. `review_comment_synced_at` covers public
 review comment writes, and `labels_synced_at` covers ClawSweeper label-only

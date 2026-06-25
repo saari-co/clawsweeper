@@ -19025,7 +19025,10 @@ function cadenceBucketForReview(
     return { bucket: "hourlyHotItems", cadenceMs: DAILY_REVIEW_DAYS * DAY_MS };
   }
   if (kind === "pull_request") {
-    return { bucket: "dailyPullRequests", cadenceMs: DAILY_REVIEW_DAYS * DAY_MS };
+    // Mirror reviewCadenceMs: a stale (non-hot) pull request honors the optional
+    // CLAWSWEEPER_STALE_PULL_REQUEST_REVIEW_DAYS extension, so the dashboard's
+    // "current within cadence" math matches what the planner actually schedules.
+    return { bucket: "dailyPullRequests", cadenceMs: stalePullRequestReviewCadenceMs() };
   }
 
   if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) {
