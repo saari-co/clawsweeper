@@ -28,6 +28,45 @@
       "changed_gate": null
     },
     {
+      "target_repo": "saari-co/smokyworker_setup",
+      "display_name": "SmokyWorker Setup",
+      "checkout_dir": "smokyworker_setup",
+      "prompt_note": "Use the smokyworker_setup source tree and current default branch. This is a SmokySwarm worker bootstrap and setup repo. Review conservatively for bootstrap safety, host routing, secret hygiene, idempotence, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/SwarmDash",
+      "display_name": "SwarmDash",
+      "checkout_dir": "SwarmDash",
+      "prompt_note": "Use the SwarmDash source tree and current default branch. This is the SmokySwarm dashboard and operator visibility repo. Review conservatively for fleet-state correctness, UI/API contract drift, secret hygiene, and deploy safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/SwarmLease",
+      "display_name": "SwarmLease",
+      "checkout_dir": "SwarmLease",
+      "prompt_note": "Use the SwarmLease source tree and current default branch. This is the SmokySwarm lease and resource facade repo. Review conservatively for lease ownership, resource lifecycle safety, idempotence, secret hygiene, and API contract drift. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
       "target_repo": "saari-co/pixel-fold",
       "display_name": "Pixel Fold",
       "checkout_dir": "pixel-fold",
