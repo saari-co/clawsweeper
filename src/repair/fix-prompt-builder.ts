@@ -40,7 +40,7 @@ export function buildFixPrompt({
     "- run local git status/diff/log/rebase/merge commands needed to reconcile this branch with current origin/main;",
     "- when git conflicts exist, resolve every conflict marker and leave the checkout in a normal non-rebasing state;",
     "- use one repair loop: rebase to latest main, inspect review comments and failing checks, make the narrowest fix, run validation, and repeat until the branch is merge-ready or a concrete external blocker is proven;",
-    "- preserve contributor credit in changelog/docs when the fix is user-facing;",
+    "- preserve contributor credit in the PR body or commit history; edit a changelog only when the artifact explicitly requires it and repository policy permits it;",
     "- address review-bot concerns named in the artifact;",
     "- resolve actionable human review comments, bot comments, and requested changes named in the artifact;",
     "- fix relevant failing CI/check output named in the artifact; do not leave known changed-surface CI failures for a later pass;",
@@ -258,8 +258,16 @@ function renderValidationLoopGuidance({
 function renderChangelogRule(fixArtifact: LooseRecord) {
   const policyRule =
     "- target repository release-note policy wins over fix artifact credit notes: for openclaw/openclaw, do not edit CHANGELOG.md during normal repair work; preserve user-facing release-note context and contributor/source PR attribution in PR body/history/source links or commit messages instead; never add forbidden `Thanks @codex`, `Thanks @openclaw`, or `Thanks @steipete` changelog attribution;";
+  if (fixArtifact.repair_strategy === "repair_contributor_branch") {
+    return [
+      "- repair_contributor_branch never edits CHANGELOG.md or other release-owned changelog files, even if changelog_required is true;",
+      "- preserve release-note context and contributor credit in the existing PR body or commit history instead;",
+      policyRule,
+    ].join("\n");
+  }
   if (fixArtifact.changelog_required !== true) {
     return [
+      "- changelog_required is false: do not edit CHANGELOG.md or other release-owned changelog files;",
       "- if you discover the target repository requires release-note context for this user-facing repair, preserve it in the PR body or commit message before returning;",
       policyRule,
     ].join("\n");
@@ -276,10 +284,23 @@ function renderRebaseResult(rebaseResult: LooseRecord) {
   const baseRef = String(rebaseResult.base_ref ?? "origin/main");
   const baseSha = String(rebaseResult.base_sha ?? "unknown");
   const detail = compactText(String(rebaseResult.detail ?? "").trim(), 800);
+  const unmergedPaths = Array.isArray(rebaseResult.unmerged_paths)
+    ? rebaseResult.unmerged_paths.map((entry: unknown) => String(entry)).filter(Boolean)
+    : [];
   return [
     `Deterministic pre-edit rebase: ${status} onto ${baseRef} (${baseSha}).`,
     status === "conflicts"
-      ? "Resolve the active rebase conflicts, continue or finish the rebase, and leave the checkout in a normal non-rebasing state before returning."
+      ? [
+          "Conflict-first mode:",
+          "- resolve only the active rebase conflicts before doing any feature repair;",
+          "- inspect `git status --short` and the conflicted files listed below;",
+          "- remove all conflict markers and stage the resolved files;",
+          "- run `git rebase --continue` until the checkout is no longer rebasing;",
+          "- do not broaden the patch while conflicts remain.",
+        ].join("\n")
+      : "",
+    status === "conflicts" && unmergedPaths.length > 0
+      ? `Unmerged conflict paths: ${unmergedPaths.join(", ")}`
       : "",
     detail ? `Rebase output: ${detail}` : "",
   ]

@@ -43,6 +43,19 @@ GitHub deploys use `.github/workflows/dashboard.yml`. Configure either
 Workers Scripts edit permission before enabling the workflow as the production
 deploy path. The deploy workflow injects the `CLAWSWEEPER_STATUS_INGEST_TOKEN`
 GitHub secret into a temporary Wrangler config as the Worker `INGEST_TOKEN`.
+Its smoke test also verifies the durable exact-review queue binding, not only
+the dashboard response.
+
+When a change updates both the Worker and a GitHub Actions workflow that calls
+a new Worker route, deploy the reviewed Worker branch first and wait for the
+dashboard workflow to pass. Then merge the workflow change. This avoids a
+window where Actions sends events to a route that production has not deployed:
+
+```bash
+gh workflow run dashboard.yml --repo openclaw/clawsweeper --ref <reviewed-branch>
+gh api "repos/openclaw/clawsweeper/actions/workflows/dashboard.yml/runs?per_page=1" \
+  --jq '.workflow_runs[0] | {id, status, conclusion, html_url}'
+```
 
 ## Access Model
 
@@ -112,13 +125,26 @@ is absent or a cache event lands in another Cloudflare colo.
 - recent automerge command-to-merge timing samples
 - explicit workflow status events posted to the ingest API when KV ingest is
   enabled
+- problem-focused pruning alerts from latest sweep status files when apply runs
+  report blocked or degraded progress, with reason tooltips and maintainer
+  workflow commands for safe follow-up
+- lane-level apply health in status JSON so closure processing and durable
+  review-comment sync are reported separately even when they share the same
+  applicator
+- skip next-action buckets in apply health JSON so stale reviews, missing close
+  proof, protected labels, stable skips, invalid reports, and open closing PRs
+  are discoverable without reading individual item records
+- scheduled close-cycle telemetry in apply-health JSON, including current
+  apply-ready candidate count and an estimated number of cursor windows to
+  revisit the close queue; scheduled cadence time is explanatory only because
+  successful windows can dispatch immediate continuations
 
 The Worker fetches job details only for the bounded active-run set, limits that
 GitHub fanout to 12 concurrent requests, and caches each run's jobs for 60
 seconds. It separately samples 20 recent completed worker runs with ten-way
 fanout and caches error/recovery telemetry for 120 seconds. This bounds
-telemetry pressure without reducing the 128-worker fleet budget. Worker details
-paginate up to 300 jobs per workflow run so 128-shard runs remain fully visible,
+telemetry pressure without exceeding the 128-worker fleet budget. Worker details
+paginate up to 300 jobs per workflow run so 89-shard runs remain fully visible,
 then finish before optional pipeline CI and historical
 enrichment begin, so those secondary lookups do not compete with active worker
 telemetry. If GitHub job telemetry is unavailable, the API and UI retain the
@@ -143,9 +169,11 @@ Do not move these into the dashboard:
 - maintainer authorization
 - PR branch writes
 - labels/comments/closes/merges
-- worker budget enforcement
 - final merge safety gates
 
-Cloudflare can later become the queue/dedupe/dispatch control plane, but phase
-one must stay an observer so the existing GitHub Actions safety model remains
+The dashboard Worker owns durable exact-review admission only: it deduplicates
+webhook deliveries, coalesces each repository/item pair, and leases at most
+20 Actions executors, with up to 16 active leases per target repository. It does
+not decide review outcomes or perform target repository mutations. GitHub Actions
+remains the executor and the existing review/apply safety model remains
 unchanged.
