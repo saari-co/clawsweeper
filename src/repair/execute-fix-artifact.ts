@@ -114,7 +114,17 @@ import {
   type TargetValidationOptions,
 } from "./target-validation.js";
 import { uniqueStrings } from "./validation-command-utils.js";
+import {
+  changedFilesFromNameOnlyZ,
+  enforceRepairContract,
+  repairContract,
+} from "./repair-contract.js";
+import {
+  rebaseConflictEditDecision,
+  unresolvedRebaseConflictReason,
+} from "./rebase-conflict-policy.js";
 import { validateActivePrAreaCapacity } from "./execute-fix-area-capacity.js";
+import { issueImplementationTerminalOutcome } from "./issue-implementation-outcome.js";
 import {
   repairPauseLabel,
   validateAutonomousFixScope,
@@ -135,6 +145,7 @@ import {
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
 const NON_EXECUTABLE_REPAIR_STRATEGIES = new Set(["already_fixed_on_main", "needs_human"]);
 const DEFAULT_BASE_BRANCH = "main";
+const DEFAULT_REPAIR_PUSH_SETTLE_SECONDS = 90;
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -666,18 +677,26 @@ try {
       });
       throw error;
     }
+    const unresolvedRebaseConflicts = unresolvedRebaseConflictReason(error);
     outcome = {
-      action: "execute_fix",
+      action: unresolvedRebaseConflicts ? "needs_human" : "execute_fix",
       status: "blocked",
       repair_strategy: fixArtifact.repair_strategy,
       reason: error.message,
-      ...(isRetryableCodexFailure(error) ? { requeue_required: true } : {}),
+      ...(unresolvedRebaseConflicts
+        ? { needs_human: [unresolvedRebaseConflicts] }
+        : isRetryableCodexFailure(error)
+          ? { requeue_required: true }
+          : {}),
     };
   }
 }
 
-report.status = outcome.status;
+report.status = outcome.action === "needs_human" ? "needs_human" : outcome.status;
 if (outcome.reason && !report.reason) report.reason = outcome.reason;
+if (Array.isArray(outcome.needs_human) && outcome.needs_human.length > 0) {
+  report.needs_human = uniqueStrings([...(report.needs_human ?? []), ...outcome.needs_human]);
+}
 report.actions.push(outcome);
 writeReport(report, resultPath);
 if (outcome.requeue_required === true) process.exitCode = 1;
@@ -969,6 +988,14 @@ function pushRepairBranchAndUpdateStatus({
   if (!sameRepoBranch) {
     assertRepairBranchWritable({ targetDir, pull, rewritten: branchUpdate.rewritten });
   }
+  const settleSeconds = repairPushSettleSeconds();
+  if (settleSeconds > 0) {
+    logProgress("settling repair before branch push", {
+      source_pr: sourcePr.url,
+      seconds: settleSeconds,
+    });
+    sleepMs(settleSeconds * 1000);
+  }
   const livePull = fetchPullRequest(result.repo, sourcePr.number);
   const livePauseBlock = liveRepairPauseBlock({
     pull: livePull,
@@ -978,6 +1005,15 @@ function pushRepairBranchAndUpdateStatus({
     branchUpdate,
   });
   if (livePauseBlock) return livePauseBlock;
+  const liveHeadBlock = repairPushSettleBlock({
+    initialPull: pull,
+    livePull,
+    number: sourcePr.number,
+    target: sourcePr.url,
+    commit: prep.commit,
+    branchUpdate,
+  });
+  if (liveHeadBlock) return liveHeadBlock;
   const pushArgs = repairBranchPushArgs({ pull, rewritten: branchUpdate.rewritten });
   try {
     runGitNetwork(pushArgs, targetDir);
@@ -1057,6 +1093,47 @@ function pushRepairBranchAndUpdateStatus({
     status_comment_updated: statusCommentUpdated,
     merge_preflight: prep.merge_preflight,
     review_threads: threadResolution,
+  };
+}
+
+function repairPushSettleSeconds() {
+  const configured = Number(
+    process.env.CLAWSWEEPER_BRANCH_PUSH_SETTLE_SECONDS ?? DEFAULT_REPAIR_PUSH_SETTLE_SECONDS,
+  );
+  if (!Number.isFinite(configured)) return DEFAULT_REPAIR_PUSH_SETTLE_SECONDS;
+  return Math.min(120, Math.max(0, Math.floor(configured)));
+}
+
+function repairPushSettleBlock({
+  initialPull,
+  livePull,
+  number,
+  target,
+  commit,
+  branchUpdate,
+}: LooseRecord) {
+  const liveState = String(livePull?.state ?? "").toLowerCase();
+  if (liveState !== "open") {
+    return {
+      action: "repair_contributor_branch",
+      status: "blocked",
+      target,
+      commit,
+      branch_rewritten: branchUpdate?.rewritten ?? null,
+      reason: `source PR #${number} is ${liveState || "no longer open"} after the repair settle window; refusing to push`,
+    };
+  }
+  const initialHead = String(initialPull?.head?.sha ?? "");
+  const liveHead = String(livePull?.head?.sha ?? "");
+  if (!initialHead || !liveHead || initialHead === liveHead) return null;
+  return {
+    action: "repair_contributor_branch",
+    status: "blocked",
+    target,
+    commit,
+    branch_rewritten: branchUpdate?.rewritten ?? null,
+    reason: `source PR #${number} changed during the repair settle window; requeue against the latest head`,
+    requeue_required: true,
   };
 }
 
@@ -1924,6 +2001,8 @@ function editValidatePrepareMerge({
   let producedChanges = allowExistingChanges;
   let previousSummary = "";
   const checkpointCommits: JsonValue[] = [];
+  const hasRepairContract = repairContract(fixArtifact) !== null;
+  const pushIntermediateCheckpoint = hasRepairContract ? null : pushCheckpoint;
   if (
     !producedChanges &&
     canTreatRebaseAsCompleteRepair({
@@ -1982,7 +2061,10 @@ function editValidatePrepareMerge({
         repositoryContext,
         reconcileWithBase,
         sourceHead,
-        rebaseResult,
+        rebaseResult:
+          rebaseResult?.status === "conflicts"
+            ? { ...rebaseResult, unmerged_paths: unmergedPaths(targetDir) }
+            : rebaseResult,
         maxEditAttempts,
         validationCommands: validationPreflight.resolved_commands ?? [],
         isAutomergeRepair: isAutomergeRepairJob(),
@@ -2029,37 +2111,49 @@ function editValidatePrepareMerge({
           stderrPath: path.join(workRoot, `${mode}-codex-${attempt}.stderr.log`),
         },
       );
-      if ((codexResult.error as JsonValue)?.code === "ETIMEDOUT") {
-        throw new Error(`Codex fix worker timed out after ${workerTimeoutMs}ms`);
-      }
-      if (codexResult.error) {
-        const errorDetail = codexFailureDetail(
-          codexResult,
-          codexResult.error.message || String(codexResult.error),
-        );
-        if (attempt < maxEditAttempts && isRetryableCodexErrorMessage(errorDetail)) {
-          previousSummary = compactText(errorDetail, 360);
-          const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
-          logProgress("retrying Codex edit pass after transient transport error", {
-            mode,
+      const timedOut = (codexResult.error as JsonValue)?.code === "ETIMEDOUT";
+      const errorDetail = timedOut
+        ? `Codex fix worker timed out after ${workerTimeoutMs}ms`
+        : codexResult.error
+          ? codexFailureDetail(codexResult, codexResult.error.message || String(codexResult.error))
+          : codexResult.status !== 0
+            ? codexFailureDetail(codexResult, "Codex fix worker failed")
+            : "";
+      const remainingConflicts =
+        rebaseResult?.status === "conflicts" ? unmergedPaths(targetDir) : [];
+      // Worker failures keep their transport/terminal classification. Only a completed
+      // edit pass that leaves conflicts consumes the bounded conflict-repair budget.
+      const conflictDecision = errorDetail
+        ? { action: "proceed" as const }
+        : rebaseConflictEditDecision({
+            rebaseStatus: rebaseResult?.status,
+            unmergedPaths: remainingConflicts,
             attempt,
-            max_attempts: maxEditAttempts,
-            retry_delay_ms: retryDelayMs,
+            maxEditAttempts,
           });
-          updateAutomergeProgressStatus({
-            id: `codex-edit-${mode}-${attempt}`,
-            label: `Codex edit ${attempt}`,
-            status: "retrying",
-            details: "transient Codex transport error",
-            headSha: currentHead(targetDir),
-          });
-          sleepMs(retryDelayMs);
-          continue;
-        }
-        throw new Error(codexFailureMessage("Codex fix worker failed", errorDetail));
+      if (conflictDecision.action !== "proceed") {
+        previousSummary =
+          readTextIfExists(summaryPath).trim() ||
+          compactText(errorDetail, 360) ||
+          `Rebase conflicts remain unresolved after edit attempt ${attempt}: ${remainingConflicts.join(", ")}`;
+        logProgress("rebase conflicts remain after Codex edit pass", {
+          mode,
+          attempt,
+          max_attempts: maxEditAttempts,
+          unresolved: remainingConflicts,
+        });
+        updateAutomergeProgressStatus({
+          id: `codex-edit-${mode}-${attempt}`,
+          label: `Codex edit ${attempt}`,
+          status: conflictDecision.action === "retry" ? "retrying" : "blocked",
+          details: `unresolved rebase conflicts: ${remainingConflicts.join(", ")}`,
+          headSha: currentHead(targetDir),
+        });
+        if (conflictDecision.action === "retry") continue;
+        throw new Error(conflictDecision.reason);
       }
-      if (codexResult.status !== 0) {
-        const errorDetail = codexFailureDetail(codexResult, "Codex fix worker failed");
+      if (timedOut) throw new Error(errorDetail);
+      if (codexResult.error || codexResult.status !== 0) {
         if (attempt < maxEditAttempts && isRetryableCodexErrorMessage(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
@@ -2110,7 +2204,6 @@ function editValidatePrepareMerge({
 
   const completedRebase = completeRebaseIfResolved({ targetDir });
   if (completedRebase.status === "continued") {
-    producedChanges = true;
     logProgress("completed resolved rebase", {
       previous_head: completedRebase.previous_head,
       current_head: completedRebase.current_head,
@@ -2124,7 +2217,7 @@ function editValidatePrepareMerge({
   });
   if (firstCheckpoint) {
     checkpointCommits.push(firstCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
 
   let codexReview = null;
@@ -2155,7 +2248,7 @@ function editValidatePrepareMerge({
         });
         if (checkpoint) {
           checkpointCommits.push(checkpoint);
-          pushCheckpoint?.();
+          pushIntermediateCheckpoint?.();
         }
       },
     });
@@ -2186,7 +2279,7 @@ function editValidatePrepareMerge({
     });
     if (checkpoint) {
       checkpointCommits.push(checkpoint);
-      pushCheckpoint?.();
+      pushIntermediateCheckpoint?.();
     }
     if (attempt === maxFinalBaseSyncAttempts) {
       codexReview.final_base_sync = {
@@ -2206,7 +2299,7 @@ function editValidatePrepareMerge({
   });
   if (finalCheckpoint) {
     checkpointCommits.push(finalCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
   const historyCompaction =
     mode === "replacement"
@@ -2218,7 +2311,8 @@ function editValidatePrepareMerge({
           checkpointCommits,
         })
       : null;
-  if (historyCompaction?.status === "compacted") {
+  enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch });
+  if (hasRepairContract || historyCompaction?.status === "compacted") {
     pushCheckpoint?.();
   }
   const commit = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
@@ -3281,6 +3375,15 @@ function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRe
   return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
 }
 
+function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch }: LooseRecord) {
+  if (!repairContract(fixArtifact)) return;
+  const baseRef = `origin/${baseBranch}`;
+  const changedFiles = changedFilesFromNameOnlyZ(
+    run("git", ["diff", "--name-only", "-z", `${baseRef}..HEAD`], { cwd: targetDir }),
+  );
+  enforceRepairContract({ fixArtifact, changedFiles });
+}
+
 function pushRecoverableBranch({ targetDir, branch }: LooseRecord) {
   assertIssueImplementationNotPaused();
   const remoteSha = remoteBranchSha({ targetDir, branch });
@@ -3456,25 +3559,6 @@ function issueImplementationPrAction(report: LooseRecord) {
     if (action?.action !== "open_fix_pr") return false;
     return typeof action?.pr_url === "string" && action.pr_url.trim();
   });
-}
-
-function issueImplementationTerminalOutcome(report: LooseRecord) {
-  const actionOutcome = [...(report.actions ?? [])].reverse().find((action: JsonValue) => {
-    const status = String(action?.status ?? "").toLowerCase();
-    if (!["blocked", "skipped", "failed"].includes(status)) return false;
-    return ["execute_fix", "open_fix_pr", "repair_contributor_branch"].includes(
-      String(action?.action ?? ""),
-    );
-  });
-  if (actionOutcome) return actionOutcome;
-
-  const status = String(report.status ?? "").toLowerCase();
-  if (!["blocked", "skipped", "failed"].includes(status)) return null;
-  return {
-    action: "issue_implementation",
-    status,
-    reason: report.reason,
-  };
 }
 
 function issueImplementationTargetIssueNumber() {

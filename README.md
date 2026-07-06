@@ -9,6 +9,8 @@ turns narrow trusted findings into guarded repair or automerge work.
 The current production targets are `openclaw/openclaw`, `openclaw/clawhub`, and
 self-review for `openclaw/clawsweeper`.
 
+Project vision and boundaries: [`VISION.md`](VISION.md)
+
 The OpenClaw-hosted ClawSweeper instance is not a public review service and does
 not provide free reviews for third-party repositories. If you want ClawSweeper
 for your own project, fork this repository, deploy it in your own organization,
@@ -72,7 +74,8 @@ For open issues with complete, current kept-open reviews, ClawSweeper also
 projects selected structured review conclusions into advisory GitHub labels for
 maintainer filtering and project views. These labels expose states such as
 current-main reproduction, source reproduction, linked open PRs, queueable
-fixes, missing info, and product/security review needs. They are advisory only
+fixes, verified small bugs suitable for `good first issue`, missing info, and
+product/security review needs. They are advisory only
 and do not trigger repair, merge, or close behavior. Label-only syncs record
 `labels_synced_at` in the durable report so GitHub `updated_at` changes caused
 by ClawSweeper-owned label writes do not look like fresh target-side activity to
@@ -86,6 +89,15 @@ paired issue/PR state, snapshot drift, and repository profile rules before
 commenting or closing anything. Closed or already-closed reports move to
 `records/<repo-slug>/closed/<number>.md`; reopened archived items move back to
 `items/` as stale work.
+
+Apply and artifact replay also maintain Codex-authored decision packet JSON at
+`records/<repo-slug>/decision-packets/<number>.json` for reports that need a
+maintainer ruling. Codex supplies the exact question, rationale, options,
+recommendation, and likely owner as structured review output. Deterministic
+code validates that intent, persists it, refreshes item state, and removes stale
+packets; labels and report prose do not reconstruct the decision. Pass
+`--decision-packets-dir` to write those packet files somewhere other than the
+profile's default records directory.
 
 Generated state lives on the `state` branch of `openclaw/clawsweeper-state`:
 durable `records/`, `jobs/`, `results/`, audit output, workflow status JSON,
@@ -102,6 +114,13 @@ Maintainer commands can opt PRs into `autofix` or `automerge`, dispatch a fresh
 exact-head review, and run a bounded Codex review/fix loop. Codex handles the
 code repair and local validation loop; deterministic executor steps own every
 GitHub mutation, branch push, label update, and final merge gate.
+
+Operators can create repair-only jobs for one author's blocked pull requests in
+one repository with `pnpm repair:pr-intake -- --repo owner/name --author login`,
+or across all configured public repositories with
+`pnpm repair:pr-intake -- --author login --all-open`. Author-wide discovery
+skips private, unsupported, and unverifiable repositories without persisting
+their names. Generated jobs cannot close or merge their source pull requests.
 
 Automerge waits for exact-head review, required checks, mergeability, and policy
 gates. If repair was needed, the mutable status comment records each review,
@@ -148,6 +167,10 @@ ClawSweeper may propose a close only when the item is clearly one of these:
 - better suited for ClawHub skill/plugin work than core
 - duplicate or superseded by a canonical issue/PR
 - low-signal pull request whose branch is mostly unrelated or unmergeable churn
+- external low-rated pull request whose requested real-behavior proof never
+  arrived and whose branch has been idle for 14+ days
+- external pull request abandoned for 30+ days as a draft, waiting on its
+  author, or failing checks on its live head
 - concrete but not actionable in this source repo
 - incoherent enough that no action can be taken
 - stale issue older than 60 days with too little data to verify
@@ -258,9 +281,13 @@ Other contributor commands are ignored without a reply. Scheduled comment routin
 `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1`; workflow dispatch with `execute=true`
 can be used for one-off live routing.
 For fast intake, the ClawSweeper GitHub App webhook can post the same queued
-status comment and dispatch exact `clawsweeper_comment` or `clawsweeper_item`
-runs from eligible public `openclaw/*` and `steipete/*` repositories. The
-target-side dispatcher remains the fallback when the webhook is unavailable.
+status comment and enqueue exact `clawsweeper_comment` or `clawsweeper_item`
+work from eligible public `openclaw/*` and `steipete/*` repositories. Exact
+item work is coalesced and leased by the dashboard Worker before it dispatches
+an executor, so webhook bursts do not create capacity-waiting Actions runners.
+The target-side dispatcher remains a scheduled-intake fallback until it adopts
+the queue lease contract. Legacy target dispatches are bridged into that queue
+before any Codex executor starts.
 
 ## Dashboard
 
@@ -375,9 +402,12 @@ still valid.
 Apply wakes every 15 minutes, no-ops when there are no unchanged
 high-confidence close proposals, and narrows scheduled runs to the currently
 eligible proposal list so idle runs do not scan unrelated keep-open records.
-It defaults to all item kinds, no age floor, a 2-second close delay, and 50
-fresh closes per checkpoint. If it reaches the requested limit, it queues
-another apply run with the same settings.
+It defaults to all item kinds, no age floor, a 2-second close delay, and 20
+fresh closes per checkpoint, with a hard cap of 20 to keep each GitHub App
+token within its lifetime. After a checkpoint closes at least one item, it
+queues another apply run with a fresh token; a saturated scan that closes
+nothing stops and waits for the next scheduled tick instead of self-dispatching
+indefinitely.
 
 Exact event runs skip the bulk planner, shard matrix, artifact upload, and
 separate publish job. They still use the same review and apply code paths, but
@@ -421,6 +451,14 @@ appropriate repair job.
   review and merge.
 - `automerge` merges only after review verdict, checks, mergeability,
   security, maintainer stop/approve state, and repository policy gates pass.
+- Repair workers coalesce pending runs for the same durable job while allowing
+  an active execute run to finish its gate cleanup. Stale-head retries use a
+  dedicated run-scoped lane so they can start during that temporary gate
+  window. Before a contributor branch push, ClawSweeper waits 90 seconds by
+  default, fetches the live PR head again, and requeues instead of pushing when
+  that head changed. It also refuses to push when the PR closed during the
+  wait. Override the window with `CLAWSWEEPER_BRANCH_PUSH_SETTLE_SECONDS`
+  (bounded to 0-120 seconds) when a manual backfill is already settled.
 - An OpenClaw organization member can comment `@clawsweeper implement issue`;
   ClawSweeper refuses when an open PR already mentions the issue, a generated
   branch PR is already open, the issue is paused, or security blockers remain.
@@ -429,6 +467,8 @@ appropriate repair job.
   implementation remains limited to public sibling repositories;
   `openclaw/openclaw` uses its separately gated strict-bug and vision-fit lanes,
   and `openclaw/clawhub` remains excluded.
+- Issue intake and dispatch use `ubuntu-latest` by default, independently of the
+  Blacksmith runner selected for Codex planning and repair execution.
 
 Repair internals are documented in
 [`docs/repair/README.md`](docs/repair/README.md), and the automerge state
@@ -540,6 +580,86 @@ pnpm run audit -- --target-repo openclaw/openclaw --max-pages 250 --sample-limit
 pnpm run reconcile -- --target-repo openclaw/openclaw --dry-run
 ```
 
+Advisory exact local issue/PR review:
+
+For Codex users, the repo-local skill `$local-clawsweeper-review` wraps this
+workflow with setup checks, target checkout hygiene, and artifact readout. Skill
+usage is documented in
+[`docs/local-clawsweeper-skill.md`](docs/local-clawsweeper-skill.md).
+
+```bash
+codex login --device-auth -c 'service_tier="fast"'
+pnpm run codex:local:check
+pnpm run review -- --local-only --target-repo owner/name --item-number 123
+```
+
+`review` is the single issue/PR review command. `--local-only` makes it an
+advisory local run: it skips the review-start placeholder comment, defaults the
+Codex service tier to `fast` for local CLI compatibility, preserves local Codex
+auth, and leaves generated output under the selected artifact directory. With a
+single `--item-number` and no `--target-dir`, it creates a managed PR checkout
+under `artifacts/local-review-<number>/target`. To use an already-cloned
+checkout, or to review an issue, pass `--target-dir <path>`:
+
+```bash
+pnpm run review -- --local-only \
+  --target-repo owner/name \
+  --item-number 123 \
+  --target-dir ../target-checkout
+```
+
+Pre-submission committed-range review uses the same full proof-aware review
+without requiring an open GitHub item. From the clean checkout containing the
+branch to review:
+
+```bash
+pnpm run review -- --local-range \
+  --target-repo openclaw/clawsweeper \
+  --base origin/main
+```
+
+Without `--target-dir`, `--local-range` reviews the checkout where the command
+was invoked. Pass `--target-dir <path>` when invoking ClawSweeper from a
+different checkout. The range is `merge-base(<base>, HEAD)..HEAD`, includes
+committed work only, and refuses a dirty working tree. `--body-file` can supply
+the proposed PR body and `--additional-policy` can layer an extra local policy.
+
+This mode withholds GitHub token variables, points `gh` at an empty config
+directory inside the run artifacts, disables Codex web search, skips host-side
+URL/media preprocessing, and makes no GitHub reads or writes. It is not
+air-gapped: the Codex model invocation still uses its configured network
+service. Reports use a unique
+`.git/clawsweeper/reviews/local-range-<time>-<pid>/` directory so the default
+run leaves the checkout clean. `--artifact-dir` overrides that location.
+
+Read the report at `artifacts/local-review-<number>/<number>.md`. Key fields are
+`review_status`, `main_sha`, `pull_head_sha`, `decision`, `confidence`, and
+`Review Findings`. Do not run `apply-artifacts` or `apply-decisions` unless you
+intentionally want to move reports into durable state or sync GitHub comments.
+Add `--verbose` when you need the underlying `[review]` diagnostic logs.
+
+If you prefer API-key auth, keep the key out of the repository and shell
+history. For POSIX shells:
+
+```sh
+printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key -c 'service_tier="fast"'
+unset OPENAI_API_KEY
+```
+
+For PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY = Read-Host "OpenAI API key"
+$env:OPENAI_API_KEY | codex login --with-api-key -c 'service_tier="fast"'
+Remove-Item Env:OPENAI_API_KEY
+```
+
+`--local-only` preserves local Codex auth environment variables only for that
+advisory local run. Normal production review workers still strip Codex, OpenAI,
+and GitHub write credentials before invoking the model. Set `CODEX_BIN` to an
+absolute executable path if the desired Codex CLI is not the first spawnable
+binary on `PATH`.
+
 Apply unchanged proposals later:
 
 ```bash
@@ -590,13 +710,14 @@ default, subject to the selected repository profile; pass `target_repo`,
 `apply_kind=issue`, or `apply_kind=pull_request` to narrow a manual run.
 
 Scheduled runs cover the configured product profiles. `openclaw/openclaw` runs
-normal backfill every 5 minutes with up to 64 review shards when the system is
+normal backfill every 5 minutes with up to 89 review shards when the system is
 quiet; `openclaw/clawhub` runs on offset review/apply/audit crons so its reports
 live under `records/openclaw-clawhub/` without colliding with default repo
 records. `openclaw/clawsweeper` has a scheduled read-only audit row and is
 available for manual and event self-review smoke tests. Broad hot-intake sweeps
-cap scheduled fan-out at 44 one-item shards per run when quiet; exact event
-reviews still use one shard. Normal review, hot intake, and commit review are
+cap scheduled fan-out at 44 one-item shards per run when quiet; manual normal
+backfill can use up to 89 shards, while exact event reviews still use one shard.
+Normal review, hot intake, and commit review are
 background lanes, so they shrink automatically while repair or exact-item work
 is active. Throughput defaults live in
 [docs/limits.md](docs/limits.md) and `config/automation-limits.json`.
@@ -606,16 +727,16 @@ is active. Throughput defaults live in
 ClawSweeper has one main capacity knob:
 `config/automation-limits.json` -> `workers.max`. The current value is `128`.
 Lane limits are derived from that number: normal review defaults to 89 shards
-for manual/backstop runs, scheduled normal review gets up to 64 after reserves,
-hot intake up to 44 shards, commit review 6 commits per page, and existing
-repair/issue implementation lanes use 40% of `workers.max`, currently 51 live
+for manual/backstop and scheduled runs, hot intake up to 44 shards, commit
+review 6 commits per page, and existing repair/issue implementation lanes use
+40% of `workers.max`, currently 51 live
 workers. Imported gitcrawl cluster repair allows 2 live workers by default.
 Exact-item review, repair, and issue implementation are priority work; normal
 review, hot intake, and commit review are background work and automatically
-yield when priority work is active. Exact-item runs also wait for deterministic
-live Actions admission before Codex starts, with at most four concurrent exact
-reviews and no state-repository lease. Other lanes retain the existing global
-128-worker scheduling model.
+yield when priority work is active. Exact-item runs use a durable Worker queue
+that coalesces item deliveries, leases at most 20 concurrent reviews, and admits
+up to 16 active exact reviews per target repository. Other lanes retain the
+checked-in 128-worker scheduling model.
 Use `workers.max` first when turning total Codex usage up or down; use
 `lanes.repair.cluster_max_live_runs` to tune the imported legacy cluster-repair
 lane separately, and individual environment overrides only for temporary

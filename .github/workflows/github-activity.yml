@@ -58,7 +58,7 @@ env:
 
 concurrency:
   group: >-
-    github-activity-${{ github.event.client_payload.activity.repo || github.event.repository.full_name || github.repository }}-${{ github.event_name == 'workflow_run' && 'workflow-run' || 'activity' }}
+    github-activity-${{ github.event.client_payload.activity.repo || github.event.client_payload.target_repo || github.event.repository.full_name || github.repository }}-${{ github.event_name == 'workflow_run' && 'workflow-run' || format('{0}-{1}-{2}-{3}', github.event.client_payload.event_name || github.event.client_payload.activity.type || github.event_name, github.event.client_payload.action || github.event.client_payload.activity.action || github.event.action || 'activity', github.event.client_payload.comment_id || github.event.client_payload.review_comment_id || github.event.client_payload.activity.comment.id || github.event.comment.id || github.event.client_payload.activity.review.id || github.event.review.id || github.event.client_payload.activity.workflow_run.id || github.event.workflow_run.id || github.event.client_payload.activity.pull_request.number || github.event.pull_request.number || github.event.client_payload.activity.issue.number || github.event.issue.number || github.event.client_payload.activity.subject.number || github.event.client_payload.number || github.run_id, github.event.client_payload.activity.label.name || github.event.label.name || github.event.client_payload.activity.assignee.login || github.event.assignee.login || github.event.client_payload.activity.pull_request.head.sha || github.event.pull_request.head.sha || github.event.client_payload.activity.delivery_id || github.event.client_payload.delivery_id || github.event.client_payload.activity.idempotency_key || github.event.client_payload.idempotency_key || github.run_attempt) }}
   cancel-in-progress: true
 
 jobs:
@@ -69,7 +69,7 @@ jobs:
         !(github.event_name == 'repository_dispatch' && github.event.client_payload.activity.type == 'pull_request_target' && github.event.client_payload.activity.action == 'synchronize') &&
         !(github.event_name == 'workflow_run' && contains(fromJSON('["success","neutral","skipped"]'), github.event.workflow_run.conclusion))
       }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check core API budget
@@ -91,54 +91,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Dispatch spam comment intake candidates
-        if: steps.core-budget.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          payload_path="$RUNNER_TEMP/spam-comment-intake-dispatch.json"
-          node <<'NODE' > "$payload_path"
-          const fs = require("fs");
-          const eventName = process.env.GITHUB_EVENT_NAME || "";
-          const root = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
-          const clientPayload = root.client_payload || {};
-          const activity = clientPayload.activity || clientPayload || {};
-          const type = activity.type || clientPayload.event_name || (eventName === "repository_dispatch" ? "" : eventName);
-          const action = activity.action || clientPayload.action || root.action || "";
-          if (!["issue_comment", "pull_request_review_comment"].includes(type)) process.exit(0);
-          if (!["created", "edited"].includes(action)) process.exit(0);
-          const repo =
-            activity.target_repo ||
-            activity.repo ||
-            (activity.repository && activity.repository.full_name) ||
-            (typeof activity.repository === "string" && activity.repository) ||
-            clientPayload.target_repo ||
-            clientPayload.repo ||
-            (clientPayload.repository && clientPayload.repository.full_name) ||
-            (typeof clientPayload.repository === "string" && clientPayload.repository) ||
-            (root.repository && root.repository.full_name) ||
-            process.env.GITHUB_REPOSITORY;
-          process.stdout.write(JSON.stringify({
-            event_type: "clawsweeper_spam_comment_intake",
-            client_payload: {
-              target_repo: repo,
-              event_name: type,
-              action,
-              activity: { ...activity, type, action, repo },
-            },
-          }));
-          NODE
-          if [ ! -s "$payload_path" ]; then
-            echo "No spam comment intake candidate for this activity."
-            exit 0
-          fi
-          gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
-            --method POST \
-            --input "$payload_path"
-
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.core-budget.outputs.skip != 'true'
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -157,12 +110,12 @@ jobs:
           set -euo pipefail
           corepack enable
           for attempt in 1 2 3; do
-            if corepack prepare "pnpm@10.33.2" --activate; then
+            if corepack prepare "pnpm@11.10.0" --activate; then
               exit 0
             fi
             sleep "$((attempt * 10))"
           done
-          corepack prepare "pnpm@10.33.2" --activate
+          corepack prepare "pnpm@11.10.0" --activate
 
       - name: Resolve pnpm store
         id: pnpm-store
@@ -170,13 +123,13 @@ jobs:
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         if: steps.core-budget.outputs.skip != 'true'
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
-          key: ${{ runner.os }}-pnpm-10.33.2-${{ hashFiles('pnpm-lock.yaml') }}
+          key: ${{ runner.os }}-pnpm-11.10.0-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
-            ${{ runner.os }}-pnpm-10.33.2-
+            ${{ runner.os }}-pnpm-11.10.0-
             ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
@@ -194,6 +147,14 @@ jobs:
             sleep "$((attempt * 10))"
           done
           pnpm run build:repair
+
+      - name: Dispatch spam scan candidate
+        if: steps.core-budget.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:spam-comment-intake -- --write-report
 
       - name: Feed activity to OpenClaw
         if: steps.core-budget.outputs.skip != 'true'

@@ -5,7 +5,11 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-import { completeRebaseIfResolved, rebaseOntoBase } from "../../dist/repair/git-repo-utils.js";
+import {
+  completeRebaseIfResolved,
+  rebaseOntoBase,
+  unmergedPaths,
+} from "../../dist/repair/git-repo-utils.js";
 
 test("rebaseOntoBase rebases a repair branch onto latest origin main", () => {
   const { work } = fixtureRepo();
@@ -46,6 +50,7 @@ test("rebaseOntoBase leaves conflicts for Codex repair instead of aborting", () 
   const result = rebaseOntoBase({ targetDir: work, baseBranch: "main" });
 
   assert.equal(result.status, "conflicts");
+  assert.deepEqual(unmergedPaths(work), ["shared.txt"]);
   assert.match(fs.readFileSync(path.join(work, "shared.txt"), "utf8"), /<<<<<<< HEAD/);
 });
 
@@ -81,6 +86,8 @@ function fixtureRepo() {
   run("git", ["init", "--bare", "--initial-branch=main", remote]);
   fs.mkdirSync(work);
   run("git", ["init", "--initial-branch=main"], { cwd: work });
+  run("git", ["config", "core.autocrlf", "false"], { cwd: work });
+  run("git", ["config", "core.eol", "lf"], { cwd: work });
   run("git", ["config", "user.name", "ClawSweeper Test"], { cwd: work });
   run("git", ["config", "user.email", "clawsweeper-test@example.com"], { cwd: work });
   run("git", ["remote", "add", "origin", remote], { cwd: work });

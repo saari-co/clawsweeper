@@ -54,7 +54,24 @@ test("fix prompt still asks Codex to preserve discovered release-note context", 
     likely_files: ["extensions/discord/src/message.ts"],
   });
 
-  assert.match(prompt, /if you discover the target repository requires release-note context/);
+  assert.match(prompt, /repair_contributor_branch never edits CHANGELOG\.md/);
+  assert.match(prompt, /preserve release-note context/);
+  assert.match(prompt, /preserve contributor credit in the PR body or commit history/);
+});
+
+test("contributor branch repairs never edit release-owned changelogs", () => {
+  const prompt = promptFor({
+    repair_strategy: "repair_contributor_branch",
+    pr_title: "feat(slides): add native tables",
+    summary: "Repair a generated contributor branch.",
+    source_prs: ["https://github.com/openclaw/gogcli/pull/834"],
+    changelog_required: true,
+    likely_files: ["CHANGELOG.md", "internal/cmd/slides_table.go"],
+  });
+
+  assert.match(prompt, /repair_contributor_branch never edits CHANGELOG\.md/);
+  assert.match(prompt, /even if changelog_required is true/);
+  assert.match(prompt, /existing PR body or commit history instead/);
 });
 
 test("fix prompt makes Codex own the validation loop", () => {
@@ -127,6 +144,7 @@ test("fix prompt includes rebase and previous no-diff recovery details", () => {
       base_ref: "origin/main",
       base_sha: "def456",
       detail: "CONFLICT (content): CHANGELOG.md",
+      unmerged_paths: ["src/index.ts", "CHANGELOG.md"],
     },
     maxEditAttempts: 5,
   });
@@ -136,7 +154,9 @@ test("fix prompt includes rebase and previous no-diff recovery details", () => {
   assert.match(prompt, /Existing repair branch detected/);
   assert.match(prompt, /Source head before edit: abc123/);
   assert.match(prompt, /Deterministic pre-edit rebase: conflicts onto origin\/main \(def456\)/);
-  assert.match(prompt, /Resolve the active rebase conflicts/);
+  assert.match(prompt, /Conflict-first mode/);
+  assert.match(prompt, /resolve only the active rebase conflicts/);
+  assert.match(prompt, /Unmerged conflict paths: src\/index\.ts, CHANGELOG\.md/);
   assert.match(prompt, /Rebase output: CONFLICT \(content\): CHANGELOG\.md/);
   assert.match(prompt, /Previous attempt produced no target repo diff/);
   assert.match(prompt, /Previous no-diff summary: Analyzed without editing files/);

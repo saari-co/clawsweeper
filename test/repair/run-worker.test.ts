@@ -7,6 +7,31 @@ import test from "node:test";
 
 const repoRoot = process.cwd();
 
+test("repair output schema keeps every strict object property required", () => {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "schema/repair/codex-result.schema.json"), "utf8"),
+  );
+
+  const visit = (value: unknown, location: string): void => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const node = value as Record<string, unknown>;
+    if (node.type === "object" && node.additionalProperties === false) {
+      const properties = Object.keys((node.properties ?? {}) as Record<string, unknown>).sort();
+      const required = Array.isArray(node.required) ? node.required.map(String).sort() : [];
+      assert.deepEqual(required, properties, `${location} must require every declared property`);
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (Array.isArray(child)) {
+        child.forEach((entry, index) => visit(entry, `${location}.${key}[${index}]`));
+      } else {
+        visit(child, `${location}.${key}`);
+      }
+    }
+  };
+
+  visit(schema, "schema");
+});
+
 test("run-worker starts Codex in the target checkout when one is available", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-run-worker-"));
   const fakeBin = path.join(tmp, "bin");
@@ -98,6 +123,7 @@ test("run-worker starts Codex in the target checkout when one is available", () 
         FAKE_CODEX_ARGS_FILE: argsFile,
         CLAWSWEEPER_INTERNAL_MODEL: "secret-model-for-test",
         CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB: "1",
+        CLAWSWEEPER_CODEX_PLANNER_SANDBOX: "danger-full-access",
         CLAWSWEEPER_STEERABLE_CODEX: "0",
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
       },
@@ -107,6 +133,7 @@ test("run-worker starts Codex in the target checkout when one is available", () 
     assert.equal(fs.readFileSync(cwdFile, "utf8"), fs.realpathSync(targetCheckout));
     const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
     assert.equal(args[args.indexOf("--cd") + 1], targetCheckout);
+    assert.equal(args[args.indexOf("--sandbox") + 1], "danger-full-access");
     assert.equal(args.includes("--model"), false);
     assert.equal(args.includes("secret-model-for-test"), false);
     const runDirs = fs.globSync(path.join(repoRoot, `.clawsweeper-repair/runs/${jobName}-plan-*`));

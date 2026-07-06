@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
@@ -8,6 +9,7 @@ import {
   assertLiveWorkerCapacity,
   parseArgs,
   parseJob,
+  repairRunNameForJob,
   repoRoot,
   validateJob,
   waitForLiveWorkerCapacity,
@@ -53,6 +55,8 @@ import {
   isIssueImplementationCommandAllowed,
   issueImplementationClusterId,
   issueImplementationJobPath,
+  isReadyHumanReviewPause,
+  maintainerModeCommandCanResumePausedMode,
   maintainerAutomergeOptInApprovesNeedsHuman as maintainerAutomergeOptInApprovesNeedsHumanReason,
   latestRepairLoopResumeTime,
   parseRoutedCommentCommand,
@@ -75,12 +79,17 @@ import {
   sharedAutomergeStatusMarkerPrefix,
   staleClosedItemCommandReason,
   shouldClearMaintainerCommandReaction,
+  trustedCloseBlockReason,
   usesSharedAutomergeStatus,
 } from "./comment-router-core.js";
 import { mergeAutomergeTimelineSection } from "./automerge-status-timeline.js";
 import {
   SUPERSEDED_RE_REVIEW_REASON,
   appendLedger,
+  dispatchClaimDecision,
+  dispatchClaimLookupKeys,
+  dispatchReceiptKeyMaterial,
+  hasSuccessfulDispatchExecutionJob,
   issueNumberFromUrl,
   isAllowedMutationActor,
   isGitHubAppIntegrationAuthError,
@@ -145,6 +154,11 @@ const {
 const startedAtMs = Date.now();
 const timings: LooseRecord[] = [];
 const ledger = readLedger(ledgerPath());
+const priorDispatchClaims = new Map<string, LooseRecord>();
+for (const entry of ledger.commands ?? []) {
+  if (entry.status !== "claimed") continue;
+  for (const key of dispatchClaimLookupKeys(entry)) priorDispatchClaims.set(key, entry);
+}
 const TARGET_LOOKUP_RETRY_ATTEMPTS = 3;
 const processedCommentVersions = forceReprocess
   ? new Set()
@@ -156,7 +170,7 @@ const processedCommentVersions = forceReprocess
     );
 const retryPendingCommentVersions = new Set(
   (ledger.commands ?? [])
-    .filter((entry: JsonValue) => entry.status === "waiting")
+    .filter((entry: JsonValue) => entry.status === "waiting" || entry.status === "claimed")
     .map(commentVersionKey)
     .filter(Boolean),
 );
@@ -232,21 +246,36 @@ for (const comment of comments) {
     freeform_prompt: parsed.freeform_prompt ?? null,
     visual_lens: parsed.visual_lens ?? null,
     expected_head_sha: parsed.expected_head_sha ?? null,
+    close_reason: parsed.close_reason ?? null,
+    close_confidence: parsed.close_confidence ?? null,
+    close_action_taken: parsed.close_action_taken ?? null,
+    reviewed_at: parsed.reviewed_at ?? null,
+    expected_item_updated_at: parsed.expected_item_updated_at ?? null,
+    expected_source_revision: parsed.expected_source_revision ?? null,
     finding_id: parsed.finding_id ?? null,
     status: "pending",
     actions: [],
   };
   rawCommands.push(command);
 }
-for (const command of listRepairLoopSweepCommands(rawCommands)) {
-  rawCommands.push(command);
-}
 const supersededReReviewVersions = supersededReReviewCommentVersions(rawCommands);
 
-await measureAsync("prehydrate_command_lookups", () => prehydrateCommandLookups(rawCommands));
-const commands = measure("classify_commands", () =>
+await measureAsync("prehydrate_comment_commands", () => prehydrateCommandLookups(rawCommands));
+const classifiedCommentCommands = measure("classify_comment_commands", () =>
   rawCommands.map((command) => classifyCommand(command)),
 );
+for (const command of listRepairLoopSweepCommands(classifiedCommentCommands)) {
+  rawCommands.push(command);
+}
+
+const sweepCommands = rawCommands.slice(classifiedCommentCommands.length);
+await measureAsync("prehydrate_repair_loop_sweeps", () => prehydrateCommandLookups(sweepCommands));
+const commands = [
+  ...classifiedCommentCommands,
+  ...measure("classify_repair_loop_sweeps", () =>
+    sweepCommands.map((command) => classifyCommand(command)),
+  ),
+];
 
 const actionable = commands.filter((command: JsonValue) => command.status === "ready");
 const report: LooseRecord = {
@@ -277,8 +306,6 @@ const report: LooseRecord = {
 if (execute) {
   await measureAsync("execute_commands", async () => {
     assertMutationActorIsClawsweeperBot();
-    for (const command of commands) convergePrecreatedCommandAckComments(command);
-    for (const command of commands) acknowledgeSkippedMaintainerCommand(command);
     const capacityRequests = workerCapacityRequests(actionable);
     if (capacityRequests.length > 0) {
       const capacities = capacityRequests.map((request) =>
@@ -287,6 +314,12 @@ if (execute) {
       report.live_worker_capacity_before_dispatch =
         capacities.length === 1 ? capacities[0] : capacities;
     }
+    report.ledger_claimed = measure("claim_dispatch_commands", () =>
+      claimDispatchCommands(actionable),
+    );
+    if (report.ledger_claimed) writeLedger(ledgerPath(), ledger);
+    for (const command of commands) convergePrecreatedCommandAckComments(command);
+    for (const command of commands) acknowledgeSkippedMaintainerCommand(command);
     for (const command of actionable) executeCommand(command);
   });
   report.ledger_changed = measure("append_ledger", () => appendLedger(ledger, commands));
@@ -316,6 +349,217 @@ async function measureAsync<T>(name: string, fn: () => Promise<T>): Promise<T> {
   } finally {
     timings.push({ name, ms: Date.now() - start });
   }
+}
+
+function claimDispatchCommands(commands: LooseRecord[]) {
+  const processedAt = new Date().toISOString();
+  const claims = commands
+    .filter(commandNeedsDurableDispatchClaim)
+    .filter((command) => !priorDispatchClaim(command))
+    .map((command) => dispatchClaimEntry(command, processedAt));
+  return appendLedger(ledger, claims);
+}
+
+function dispatchClaimEntry(command: LooseRecord, processedAt: string) {
+  command.processed_at = processedAt;
+  return {
+    ...command,
+    processed_at: processedAt,
+    status: "claimed",
+    actions: Array.isArray(command.actions)
+      ? command.actions.map((action: JsonValue) =>
+          actionNeedsDurableDispatchClaim(action) ? { ...action, status: "claimed" } : action,
+        )
+      : command.actions,
+  };
+}
+
+function refreshDispatchClaim(command: LooseRecord) {
+  const claim = dispatchClaimEntry(command, new Date().toISOString());
+  appendLedger(ledger, [claim]);
+  writeLedger(ledgerPath(), ledger);
+  for (const key of dispatchClaimLookupKeys(claim)) priorDispatchClaims.set(key, claim);
+}
+
+function commandNeedsDurableDispatchClaim(command: LooseRecord) {
+  return (
+    String(command.status ?? "") === "ready" &&
+    (commandHasAction(command, "dispatch_clawsweeper") ||
+      commandHasAction(command, "dispatch_repair") ||
+      commandHasAction(command, "dispatch_assist"))
+  );
+}
+
+function actionNeedsDurableDispatchClaim(action: JsonValue) {
+  return ["dispatch_clawsweeper", "dispatch_repair", "dispatch_assist"].includes(
+    String(action?.action ?? ""),
+  );
+}
+
+function priorDispatchClaim(command: LooseRecord) {
+  for (const key of dispatchClaimLookupKeys(command)) {
+    const claim = priorDispatchClaims.get(key);
+    if (claim) return claim;
+  }
+  return null;
+}
+
+function dispatchReceiptKey(command: LooseRecord) {
+  return `router-${createHash("sha256")
+    .update(dispatchReceiptKeyMaterial(command, priorDispatchClaim(command)))
+    .digest("hex")
+    .slice(0, 16)}`;
+}
+
+function claimedDispatchState({
+  command,
+  repo,
+  workflowName,
+  expectedTitle,
+}: {
+  command: LooseRecord;
+  repo: string;
+  workflowName: string;
+  expectedTitle: string;
+}) {
+  const claim = priorDispatchClaim(command);
+  if (!claim) return null;
+  const runs: LooseRecord[] = [];
+  try {
+    for (let page = 1; page <= 3; page += 1) {
+      const response = ghJson<LooseRecord>(
+        [
+          "api",
+          "--method",
+          "GET",
+          `repos/${repo}/actions/workflows/${encodeURIComponent(workflowName)}/runs?per_page=100&page=${page}`,
+        ],
+        { env: dispatchTokenEnv() },
+      );
+      const pageRuns = Array.isArray(response.workflow_runs) ? response.workflow_runs : [];
+      runs.push(...pageRuns);
+      if (pageRuns.length < 100) break;
+    }
+  } catch (error) {
+    return {
+      status: "claimed",
+      dispatch_key: dispatchReceiptKey(command),
+      reason: `waiting to verify the previous dispatch claim: ${compactText(ghErrorText(error), 300)}`,
+    };
+  }
+  let verifiedRuns: LooseRecord[];
+  try {
+    verifiedRuns = verifyDispatchExecutionRuns({
+      claim,
+      runs,
+      repo,
+      workflowName,
+      expectedTitle,
+    });
+  } catch (error) {
+    return {
+      status: "claimed",
+      dispatch_key: dispatchReceiptKey(command),
+      reason: `waiting to verify the previous dispatch execution: ${compactText(ghErrorText(error), 300)}`,
+    };
+  }
+  const decision = dispatchClaimDecision({
+    claim,
+    runs: verifiedRuns,
+    expectedTitle,
+    graceMs: dispatchClaimGraceMs(),
+  });
+  if (decision.action === "dispatch") {
+    refreshDispatchClaim(command);
+    return null;
+  }
+  if (decision.action === "wait") {
+    return {
+      status: "claimed",
+      dispatch_key: dispatchReceiptKey(command),
+      reason: "waiting for the previous dispatch to become visible before retrying",
+    };
+  }
+  const run = decision.run ?? {};
+  return {
+    status: "recovered",
+    dispatch_key: dispatchReceiptKey(command),
+    recovered: true,
+    run_id: run.id ?? run.databaseId ?? null,
+    run_url: run.html_url ?? run.url ?? null,
+    event: run.event ?? null,
+  };
+}
+
+function verifyDispatchExecutionRuns({
+  claim,
+  runs,
+  repo,
+  workflowName,
+  expectedTitle,
+}: {
+  claim: LooseRecord;
+  runs: LooseRecord[];
+  repo: string;
+  workflowName: string;
+  expectedTitle: string;
+}) {
+  const requiredJobName =
+    workflowName === "assist.yml"
+      ? "assist"
+      : workflowName === "repair-cluster-worker.yml"
+        ? "Plan and review cluster"
+        : null;
+  if (!requiredJobName) return runs;
+  const claimedAtMs = Date.parse(String(claim.processed_at ?? ""));
+  return runs.map((run) => {
+    const createdAtMs = Date.parse(String(run.created_at ?? run.createdAt ?? ""));
+    if (
+      String(run.display_title ?? run.displayTitle ?? "") !== expectedTitle ||
+      String(run.conclusion ?? "").toLowerCase() !== "success" ||
+      !Number.isFinite(claimedAtMs) ||
+      !Number.isFinite(createdAtMs) ||
+      createdAtMs < claimedAtMs - 5_000
+    ) {
+      return run;
+    }
+    const runId = Number(run.id ?? run.databaseId ?? 0);
+    if (!Number.isInteger(runId) || runId <= 0) {
+      return { ...run, dispatch_execution_verified: false };
+    }
+    const response = ghJson<LooseRecord>(
+      ["api", "--method", "GET", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`],
+      { env: dispatchTokenEnv() },
+    );
+    const jobs = Array.isArray(response.jobs) ? response.jobs : [];
+    return {
+      ...run,
+      dispatch_execution_verified: hasSuccessfulDispatchExecutionJob(jobs, requiredJobName),
+    };
+  });
+}
+
+function dispatchClaimGraceMs() {
+  const configured = Number(process.env.CLAWSWEEPER_DISPATCH_CLAIM_GRACE_MS ?? 300_000);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 300_000;
+}
+
+function dispatchedActionStatus(dispatch: LooseRecord) {
+  const { status: dispatchStatus, ...receipt } = dispatch;
+  if (dispatchStatus === "claimed") return { ...receipt, status: "claimed" };
+  return {
+    ...receipt,
+    status: "executed",
+    ...(dispatchStatus === "recovered"
+      ? { recovered: true, receipt_verified_at: new Date().toISOString() }
+      : { dispatched_at: new Date().toISOString() }),
+  };
+}
+
+function keepCommandClaimed(command: LooseRecord) {
+  command.status = "claimed";
+  const claimedAt = priorDispatchClaim(command)?.processed_at;
+  if (claimedAt) command.processed_at = claimedAt;
 }
 
 function assertMutationActorIsClawsweeperBot() {
@@ -638,6 +882,10 @@ function classifyCommand(command: LooseRecord): JsonValue {
           command.issue_number,
           command.intent,
         ),
+        allowNewMaintainerModeCommand: maintainerModeCommandCanResumePausedMode({
+          command: next,
+          entries: repairLoopControlEntries(),
+        }),
         forceReprocess,
       })
     ) {
@@ -836,6 +1084,56 @@ function classifyAutoclose(command: LooseRecord, issue: LooseRecord, pull: Loose
       reason: "autoclose requires an open issue or PR",
       actions: [{ action: "comment", status: execute ? "pending" : "planned" }],
     };
+  }
+  if (command.trusted_bot && pull) {
+    const closeReason = String(command.close_reason ?? "");
+    const comments = cachedIssueComments(command.issue_number);
+    const needsCloseSignalContext =
+      closeReason === "unconfirmed_product_direction" ||
+      closeReason === "low_signal_unmergeable_pr";
+    const pullApi = needsCloseSignalContext ? fetchPullRequestApi(command.issue_number) : {};
+    const reviews = needsCloseSignalContext
+      ? ghPaged<JsonValue>(`repos/${targetRepo}/pulls/${command.issue_number}/reviews?per_page=100`)
+      : [];
+    const reviewComments =
+      closeReason === "unconfirmed_product_direction"
+        ? ghPaged<JsonValue>(
+            `repos/${targetRepo}/pulls/${command.issue_number}/comments?per_page=100`,
+          )
+        : [];
+    const trustedCloseBlock = trustedCloseBlockReason({
+      repo: command.repo,
+      kind: "pull_request",
+      labels: targetLabelsFromPull(pull),
+      closeReason: command.close_reason,
+      closeConfidence: command.close_confidence,
+      closeActionTaken: command.close_action_taken,
+      createdAt: issue.created_at,
+      expectedHeadSha: command.expected_head_sha,
+      currentHeadSha: pull.headRefOid,
+      expectedItemUpdatedAt: command.expected_item_updated_at,
+      currentItemUpdatedAt: issue.updated_at,
+      expectedSourceRevision: command.expected_source_revision,
+      currentSourceRevision: issueSourceRevisionSha256(issue, comments),
+      authorAssociation: issue.author_association,
+      reviewedAt: command.reviewed_at ?? command.expected_item_updated_at,
+      assignees: issue.assignees,
+      requestedReviewers: pullApi.requested_reviewers,
+      requestedTeams: pullApi.requested_teams,
+      comments,
+      reviews,
+      reviewComments,
+      sourceCommentId: command.comment_id,
+      trustedAuthors: trustedBots,
+    });
+    if (trustedCloseBlock) {
+      return {
+        ...command,
+        autoclose_reason: reason,
+        status: "skipped",
+        reason: trustedCloseBlock,
+      };
+    }
   }
   const targets = discoverAutocloseTargets({ command, issue, pull });
   if (targets.length === 0) {
@@ -1339,7 +1637,9 @@ function repairLoopControlEntries() {
 }
 
 function isRepairLoopControlIntent(command: LooseRecord) {
-  return ["stop", "autofix", "automerge"].includes(String(command?.intent ?? ""));
+  return ["stop", "autofix", "automerge", "clawsweeper_needs_human"].includes(
+    String(command?.intent ?? ""),
+  );
 }
 
 function executeCommand(command: LooseRecord) {
@@ -1392,6 +1692,20 @@ function executeCommand(command: LooseRecord) {
       }
       const repair = dispatchRepair(command);
       dispatched = REPAIR_INTENTS.has(command.intent) ? repair : { repair };
+      if (repair.status === "claimed") {
+        command.actions = command.actions.map((action: JsonValue) =>
+          action.action === "dispatch_repair"
+            ? {
+                ...action,
+                job_path: command.target.job_path,
+                mode: command.target.mode,
+                ...dispatchRepairActionStatus(repair),
+              }
+            : action,
+        );
+        keepCommandClaimed(command);
+        return;
+      }
       const labelsToRemove = command.actions
         .filter((action: JsonValue) => action.action === "remove_label")
         .map((action: JsonValue) => String(action.label ?? ""))
@@ -1480,13 +1794,15 @@ function executeCommand(command: LooseRecord) {
         if (action.action === "dispatch_clawsweeper") {
           return {
             ...action,
-            status: "executed",
-            dispatched_at: new Date().toISOString(),
-            ...clawsweeper,
+            ...dispatchedActionStatus(clawsweeper),
           };
         }
         return action;
       });
+      if (clawsweeper.status === "claimed") {
+        keepCommandClaimed(command);
+        return;
+      }
     }
     if (
       (command.intent === "freeform_assist" || command.intent === "visualize") &&
@@ -1499,13 +1815,15 @@ function executeCommand(command: LooseRecord) {
         if (action.action === "dispatch_assist") {
           return {
             ...action,
-            status: "executed",
-            dispatched_at: new Date().toISOString(),
-            ...clawsweeper,
+            ...dispatchedActionStatus(clawsweeper),
           };
         }
         return action;
       });
+      if (clawsweeper.status === "claimed") {
+        keepCommandClaimed(command);
+        return;
+      }
     }
     if (command.intent === "re_review" && command.issue_number && shouldDispatchClawSweeper) {
       const clawsweeper = dispatchClawSweeperReview(command);
@@ -1514,13 +1832,15 @@ function executeCommand(command: LooseRecord) {
         if (action.action === "dispatch_clawsweeper") {
           return {
             ...action,
-            status: "executed",
-            dispatched_at: new Date().toISOString(),
-            ...clawsweeper,
+            ...dispatchedActionStatus(clawsweeper),
           };
         }
         return action;
       });
+      if (clawsweeper.status === "claimed") {
+        keepCommandClaimed(command);
+        return;
+      }
     }
     if (
       AUTOCLOSE_INTENTS.has(command.intent) &&
@@ -1619,6 +1939,10 @@ function executeCommand(command: LooseRecord) {
             mode: command.target.mode,
             ...dispatchRepairActionStatus(repair),
           });
+          if (repair.status === "claimed") {
+            keepCommandClaimed(command);
+            return;
+          }
         }
       }
     }
@@ -1677,7 +2001,11 @@ function executeCommand(command: LooseRecord) {
           }
         : action,
     );
-    command.status = commandHasWaitingRepairDispatch(command) ? "waiting" : "executed";
+    command.status = commandHasClaimedDispatch(command)
+      ? "claimed"
+      : commandHasWaitingRepairDispatch(command)
+        ? "waiting"
+        : "executed";
   } finally {
     clearTerminalMaintainerCommandReaction(command);
   }
@@ -2036,7 +2364,17 @@ function repairJobModeForCommand(command: LooseRecord) {
   return "automerge";
 }
 
-function dispatchClawSweeperReview(command: LooseRecord) {
+function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
+  let dispatchKey = dispatchReceiptKey(command);
+  const expectedTitle = `Review event item ${command.repo}#${command.issue_number} [${dispatchKey}]`;
+  const claimed = claimedDispatchState({
+    command,
+    repo: reviewRepo,
+    workflowName: reviewWorkflow,
+    expectedTitle,
+  });
+  if (claimed) return { ...claimed, workflow: reviewWorkflow, repo: reviewRepo };
+  dispatchKey = dispatchReceiptKey(command);
   const reviewBudget =
     command.target?.kind === "pull_request"
       ? adaptiveReviewBudgetForPullRequest(command.target)
@@ -2061,6 +2399,7 @@ function dispatchClawSweeperReview(command: LooseRecord) {
       ...(command.target_branch ? { target_branch: String(command.target_branch) } : {}),
       item_number: String(command.issue_number),
       item_kind: command.target?.kind ?? "",
+      dispatch_key: dispatchKey,
       additional_prompt: freeformReviewPrompt(command),
       ...(reviewBudget
         ? {
@@ -2092,7 +2431,7 @@ function dispatchClawSweeperReview(command: LooseRecord) {
         ...(command.target_branch ? [`target_branch=${String(command.target_branch)}`, "-f"] : []),
         `item_number=${command.issue_number}`,
         "-f",
-        `item_numbers=${command.issue_number}`,
+        `item_numbers=${dispatchKey}`,
         "-f",
         `additional_prompt=${freeformReviewPrompt(command)}`,
         "-f",
@@ -2115,6 +2454,7 @@ function dispatchClawSweeperReview(command: LooseRecord) {
       event: "workflow_dispatch",
       repo: reviewRepo,
       item_number: command.issue_number,
+      dispatch_key: dispatchKey,
       fallback_reason: stripAnsi(result.stderr || result.stdout).trim(),
     };
   }
@@ -2123,11 +2463,28 @@ function dispatchClawSweeperReview(command: LooseRecord) {
     event: "repository_dispatch",
     repo: reviewRepo,
     item_number: command.issue_number,
+    dispatch_key: dispatchKey,
   };
 }
 
-function dispatchClawSweeperAssist(command: LooseRecord) {
-  const payload = JSON.stringify(buildClawSweeperAssistDispatchPayload(command));
+function dispatchClawSweeperAssist(command: LooseRecord): LooseRecord {
+  let dispatchKey = dispatchReceiptKey(command);
+  const workflowName = "assist.yml";
+  const expectedTitle = `Assist ${command.repo}#${command.issue_number} [${dispatchKey}]`;
+  const claimed = claimedDispatchState({
+    command,
+    repo: reviewRepo,
+    workflowName,
+    expectedTitle,
+  });
+  if (claimed) return { ...claimed, workflow: workflowName, repo: reviewRepo };
+  dispatchKey = dispatchReceiptKey(command);
+  const baseDispatchPayload = buildClawSweeperAssistDispatchPayload(command);
+  const dispatchPayload = {
+    ...baseDispatchPayload,
+    client_payload: { ...baseDispatchPayload.client_payload, dispatch_key: dispatchKey },
+  };
+  const payload = JSON.stringify(dispatchPayload);
   const result = ghSpawn(
     ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", "-"],
     {
@@ -2143,10 +2500,11 @@ function dispatchClawSweeperAssist(command: LooseRecord) {
     );
   }
   return {
-    workflow: "assist.yml",
+    workflow: workflowName,
     event: "repository_dispatch",
     repo: reviewRepo,
     item_number: command.issue_number,
+    dispatch_key: dispatchKey,
   };
 }
 
@@ -2182,6 +2540,31 @@ function freeformReviewPrompt(command: LooseRecord): string {
 }
 
 function dispatchRepair(command: LooseRecord) {
+  let dispatchKey = dispatchReceiptKey(command);
+  const expectedTitle = repairRunNameForJob(
+    command.target.job_path,
+    automergeRunNamePrefix,
+    dispatchKey,
+  );
+  const claimed = claimedDispatchState({
+    command,
+    repo: repairRepo,
+    workflowName: workflow,
+    expectedTitle,
+  });
+  if (claimed) {
+    return {
+      ...claimed,
+      workflow,
+      repair_repo: repairRepo,
+      job_path: command.target.job_path,
+      mode: command.target.mode,
+      runner,
+      execution_runner: executionRunner,
+      model,
+    };
+  }
+  dispatchKey = dispatchReceiptKey(command);
   const activeRun = activeRepairRunForCommand(command);
   if (activeRun) {
     return {
@@ -2208,6 +2591,8 @@ function dispatchRepair(command: LooseRecord) {
       repairRepo,
       "-f",
       `job=${command.target.job_path}`,
+      "-f",
+      `dispatch_key=${dispatchKey}`,
       "-f",
       `mode=${command.target.mode}`,
       "-f",
@@ -2238,6 +2623,13 @@ function dispatchRepair(command: LooseRecord) {
 }
 
 function dispatchRepairActionStatus(repair: LooseRecord) {
+  if (repair.status === "claimed") {
+    return {
+      status: "claimed",
+      reason: repair.reason,
+      ...(repair.dispatch_key ? { dispatch_key: repair.dispatch_key } : {}),
+    };
+  }
   if (repair.status === "already_running") {
     return {
       status: "active",
@@ -2250,9 +2642,19 @@ function dispatchRepairActionStatus(repair: LooseRecord) {
   }
   return {
     status: "executed",
-    dispatched_at: new Date().toISOString(),
+    ...(repair.status === "recovered"
+      ? { recovered: true, receipt_verified_at: new Date().toISOString() }
+      : { dispatched_at: new Date().toISOString() }),
+    ...(repair.dispatch_key ? { dispatch_key: repair.dispatch_key } : {}),
     ...(repair.run_url ? { run_url: repair.run_url } : {}),
+    ...(repair.run_id ? { run_id: repair.run_id } : {}),
   };
+}
+
+function commandHasClaimedDispatch(command: LooseRecord) {
+  return command.actions?.some(
+    (action: JsonValue) => actionNeedsDurableDispatchClaim(action) && action.status === "claimed",
+  );
 }
 
 function commandHasWaitingRepairDispatch(command: LooseRecord) {
@@ -2306,6 +2708,13 @@ function executeAutoclose(command: LooseRecord) {
         results.push({ ...liveTarget, status: "skipped", reason: "already closed" });
         continue;
       }
+      if (command.trusted_bot) {
+        const trustedCloseBlock = liveTrustedCloseBlockReason(command, liveTarget);
+        if (trustedCloseBlock) {
+          results.push({ ...liveTarget, status: "skipped", reason: trustedCloseBlock });
+          continue;
+        }
+      }
       if (Number(liveTarget.number) !== currentNumber) {
         postIssueComment(
           command.repo,
@@ -2350,6 +2759,72 @@ function discoverAutocloseTargets({ command, issue, pull }: LooseRecord): JsonVa
   return targets;
 }
 
+function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseRecord): string | null {
+  if (liveTarget.kind === "pull_request") {
+    const issue = fetchIssue(liveTarget.number);
+    const pull = fetchPullRequestView(liveTarget.number);
+    const comments = cachedIssueComments(liveTarget.number);
+    const closeReason = String(command.close_reason ?? "");
+    const needsCloseSignalContext =
+      closeReason === "unconfirmed_product_direction" ||
+      closeReason === "low_signal_unmergeable_pr";
+    const pullApi = needsCloseSignalContext ? fetchPullRequestApi(liveTarget.number) : {};
+    const reviews = needsCloseSignalContext
+      ? ghPaged<JsonValue>(`repos/${targetRepo}/pulls/${liveTarget.number}/reviews?per_page=100`)
+      : [];
+    const reviewComments =
+      closeReason === "unconfirmed_product_direction"
+        ? ghPaged<JsonValue>(`repos/${targetRepo}/pulls/${liveTarget.number}/comments?per_page=100`)
+        : [];
+    return trustedCloseBlockReason({
+      repo: command.repo,
+      kind: "pull_request",
+      labels: targetLabelsFromPull(pull),
+      closeReason: command.close_reason,
+      closeConfidence: command.close_confidence,
+      closeActionTaken: command.close_action_taken,
+      createdAt: issue.created_at,
+      expectedHeadSha: command.expected_head_sha,
+      currentHeadSha: pull.headRefOid,
+      expectedItemUpdatedAt: command.expected_item_updated_at,
+      currentItemUpdatedAt: issue.updated_at,
+      expectedSourceRevision: command.expected_source_revision,
+      currentSourceRevision: issueSourceRevisionSha256(issue, comments),
+      authorAssociation: issue.author_association,
+      reviewedAt: command.reviewed_at ?? command.expected_item_updated_at,
+      assignees: issue.assignees,
+      requestedReviewers: pullApi.requested_reviewers,
+      requestedTeams: pullApi.requested_teams,
+      comments,
+      reviews,
+      reviewComments,
+      sourceCommentId: command.comment_id,
+      trustedAuthors: trustedBots,
+    });
+  }
+  const issue = fetchIssue(liveTarget.number);
+  const comments = cachedIssueComments(liveTarget.number);
+  return trustedCloseBlockReason({
+    repo: command.repo,
+    kind: "issue",
+    labels: issue.labels,
+    closeReason: command.close_reason,
+    closeConfidence: command.close_confidence,
+    closeActionTaken: command.close_action_taken,
+    expectedHeadSha: null,
+    currentHeadSha: null,
+    expectedItemUpdatedAt: command.expected_item_updated_at,
+    currentItemUpdatedAt: issue.updated_at,
+    expectedSourceRevision: command.expected_source_revision,
+    currentSourceRevision: issueSourceRevisionSha256(issue, comments),
+    authorAssociation: issue.author_association,
+    reviewedAt: command.reviewed_at ?? command.expected_item_updated_at,
+    comments,
+    sourceCommentId: command.comment_id,
+    trustedAuthors: trustedBots,
+  });
+}
+
 function collectAutocloseCandidateNumbers({ command }: LooseRecord): number[] {
   const numbers = new Set<number>();
   const add = (value: JsonValue) => {
@@ -2384,6 +2859,10 @@ function issueTargetFromIssue(issue: LooseRecord) {
       issue.html_url ??
       `https://github.com/${targetRepo}/${issue.pull_request ? "pull" : "issues"}/${number}`,
   };
+}
+
+function targetLabelsFromPull(pull: LooseRecord): JsonValue[] {
+  return (pull.labels ?? []).map((item: JsonValue) => item?.name ?? item);
 }
 
 function autocloseReason(command: LooseRecord) {
@@ -2906,6 +3385,12 @@ function listRepairLoopReviewComments() {
 
 function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
   if (itemNumbers.size > 0 || commentIds.size > 0) return [];
+  const paused = new Set(
+    existingCommands
+      .filter(isReadyHumanReviewPause)
+      .map((command) => Number(command.issue_number))
+      .filter((number) => Number.isInteger(number) && number > 0),
+  );
   const seen = new Set(
     existingCommands
       .filter((command) => ["autofix", "automerge"].includes(String(command.intent ?? "")))
@@ -2918,7 +3403,7 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
   ] as const) {
     for (const number of listOpenIssueNumbersWithLabel(label)) {
       const key = `${intent}:${number}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key) || paused.has(number)) continue;
       seen.add(key);
       commands.push({
         idempotency_key: `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`,
@@ -3054,6 +3539,18 @@ function fetchPullRequestView(number: JsonValue) {
         "title",
         "url",
       ].join(","),
+    ],
+    { attempts: TARGET_LOOKUP_RETRY_ATTEMPTS },
+  );
+}
+
+function fetchPullRequestApi(number: JsonValue) {
+  return ghJson(
+    [
+      "api",
+      `repos/${targetRepo}/pulls/${number}`,
+      "--jq",
+      "{requested_reviewers:[.requested_reviewers[]? | {login:.login}],requested_teams:[.requested_teams[]? | {slug:.slug}]}",
     ],
     { attempts: TARGET_LOOKUP_RETRY_ATTEMPTS },
   );

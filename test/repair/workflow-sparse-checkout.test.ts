@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import path from "node:path";
 import test from "node:test";
 
-const REPAIR_PROOF_RUNTIME_PATHS = [
+import { readText } from "../helpers.ts";
+
+const REPAIR_RUNTIME_PATHS = [
   "prompts/pr-close-coverage-proof.md",
   "schema/clawsweeper-pr-close-coverage-proof.schema.json",
   "src/clawsweeper-text.ts",
@@ -11,6 +12,7 @@ const REPAIR_PROOF_RUNTIME_PATHS = [
   "src/codex-output-capture.ts",
   "src/codex-process-worker.ts",
   "src/codex-process.ts",
+  "src/codex-spawn.ts",
   "src/codex-transient.ts",
   "src/pr-close-coverage-proof.ts",
 ] as const;
@@ -21,13 +23,13 @@ const SPARSE_REPAIR_BUILD_WORKFLOWS = [
   ".github/workflows/spam-scanner.yml",
 ] as const;
 
-test("sparse repair build workflows include PR close proof runtime files", () => {
+test("sparse repair build workflows include runtime dependencies", () => {
   for (const workflowPath of SPARSE_REPAIR_BUILD_WORKFLOWS) {
-    const workflow = fs.readFileSync(path.join(process.cwd(), workflowPath), "utf8");
+    const workflow = readText(workflowPath);
     assert.match(workflow, /build-script: build:repair/);
 
     const entries = sparseCheckoutEntries(workflow);
-    for (const requiredPath of REPAIR_PROOF_RUNTIME_PATHS) {
+    for (const requiredPath of REPAIR_RUNTIME_PATHS) {
       assert.ok(entries.has(requiredPath), `${workflowPath} missing ${requiredPath}`);
     }
   }
@@ -42,10 +44,7 @@ test("repair build emits the bounded Codex process worker", () => {
 });
 
 test("repair comment router workflow preserves repository dispatch target branch", () => {
-  const workflow = fs.readFileSync(
-    path.join(process.cwd(), ".github/workflows/repair-comment-router.yml"),
-    "utf8",
-  );
+  const workflow = readText(".github/workflows/repair-comment-router.yml");
 
   assert.match(workflow, /target_branch:\n\s+description:/);
   assert.match(
@@ -63,7 +62,7 @@ test("repair comment router workflow preserves repository dispatch target branch
 });
 
 test("sweep workflow preserves workflow dispatch target branch", () => {
-  const workflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/sweep.yml"), "utf8");
+  const workflow = readText(".github/workflows/sweep.yml");
   const dispatchTargetBranchResolver =
     /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
   const continuationTargetBranch =

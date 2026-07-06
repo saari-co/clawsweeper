@@ -11,6 +11,7 @@ import {
   type InventoryConfig,
   type ListedRepository,
 } from "../../dist/repair/target-fanout.js";
+import { mockGhBinEnv } from "../helpers.ts";
 
 const config: InventoryConfig = {
   owners: ["openclaw", "steipete"],
@@ -80,7 +81,7 @@ process.exit(2);
       env: {
         ...process.env,
         GITHUB_ACTIONS: "true",
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         GH_TOKEN: "workflow-token",
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
@@ -146,7 +147,7 @@ process.exit(2);
       env: {
         ...process.env,
         GITHUB_ACTIONS: "true",
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
         CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: "__public__",
@@ -165,6 +166,19 @@ process.exit(2);
     calls.filter((call) => call.args[0] === "repo").map((call) => call.ghToken),
     ["inventory-openclaw", "dispatch-token"],
   );
+});
+
+test("target fanout falls back to public inventory env outside Actions", () => {
+  const source = readFileSync("src/repair/target-fanout.ts", "utf8");
+  const helperStart = source.indexOf("function inventoryEnv(");
+  const helperEnd = source.indexOf("function publicInventoryEnv(", helperStart);
+
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+  assert.match(helper, /if \(process\.env\.GITHUB_ACTIONS === "true"\) return null;/);
+  assert.match(helper, /return publicInventoryEnv\(\);/);
+  assert.doesNotMatch(helper, /GH_TOKEN: ""/);
 });
 
 test("target fanout selection advances cursor with wraparound", () => {
@@ -229,7 +243,7 @@ process.exit(2);
       encoding: "utf8",
       env: {
         ...process.env,
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         GH_TOKEN: "workflow-token",
         CLAWSWEEPER_DISPATCH_TOKEN: "dispatch-token",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
@@ -308,7 +322,7 @@ process.exit(2);
       encoding: "utf8",
       env: {
         ...process.env,
-        GH_BIN: ghPath,
+        ...mockGhBinEnv(ghPath),
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
       },
     },
