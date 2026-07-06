@@ -104,6 +104,19 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/clawsweeper",
+      "display_name": "ClawSweeper",
+      "checkout_dir": "clawsweeper",
+      "prompt_note": "Use the clawsweeper source tree and current default branch. This is the ClawSweeper review-automation engine itself (TypeScript/tsgo plan+review pipeline, repair workers, dashboard, and the target-repository config). Review conservatively for correctness, secret hygiene, and safety, and note that changes here can affect the very pipeline reviewing this PR. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [],
