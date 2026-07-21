@@ -8,18 +8,11 @@
       "community_url": "https://clawhub.ai/",
       "prompt_note": "Use the ClawHub source tree and current main branch. Review every issue and PR with the same evidence standard. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "bun",
-      "validation_commands": [
-        "bun run check"
-      ],
+      "validation_commands": ["bun run check"],
       "changed_gate": null
     },
     {
@@ -28,13 +21,8 @@
       "checkout_dir": "clawsweeper",
       "prompt_note": "Use the ClawSweeper source tree and current main branch. Review bot automation, workflow, and documentation changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -49,13 +37,8 @@
       "checkout_dir": "fs-safe",
       "prompt_note": "Use the fs-safe source tree and current main branch. Review filesystem-safety, path-handling, and package changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -216,25 +199,108 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/blocks",
+      "display_name": "Dinkus Blocks",
+      "checkout_dir": "dinkuskit-blocks",
+      "prompt_note": "Use the Dinkus Blocks source tree and current default branch. This is a public EmDash section-block package with Astro renderers. Review conservatively for typed public-contract drift, rendering and link safety, fixture fidelity, secret/customer-data hygiene, and package boundaries. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/template-store",
+      "display_name": "Dinkus Store Template",
+      "checkout_dir": "dinkuskit-template-store",
+      "prompt_note": "Use the Dinkus Store Template source tree and current default branch. This is a public EmDash/Astro starter for stores. Review conservatively for generic reusable defaults, safe checkout and content boundaries, absence of production/customer configuration, secret hygiene, and reproducible setup. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/template-services",
+      "display_name": "Dinkus Services Template",
+      "checkout_dir": "dinkuskit-template-services",
+      "prompt_note": "Use the Dinkus Services Template source tree and current default branch. This is a public EmDash/Astro starter for service businesses. Review conservatively for generic reusable defaults, form/contact safety, absence of production/customer configuration, secret hygiene, and reproducible setup. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/template-marketing",
+      "display_name": "Dinkus Marketing Template",
+      "checkout_dir": "dinkuskit-template-marketing",
+      "prompt_note": "Use the Dinkus Marketing Template source tree and current default branch. This is a public EmDash/Astro marketing-site starter. Review conservatively for generic reusable defaults, content/render fallback safety, absence of production/customer configuration, secret hygiene, and reproducible setup. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/inventory",
+      "display_name": "Dinkus Inventory",
+      "checkout_dir": "dinkuskit-inventory",
+      "prompt_note": "Use the Dinkus Inventory source tree and current default branch. This is the public advanced inventory-provider extension for AICommerce on EmDash. Review conservatively for single-writer pool authority, atomic reservation and movement receipts, reconciliation/idempotency, SDK contract compatibility, secret/customer-data hygiene, and migration safety. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/coupons",
+      "display_name": "Dinkus Coupons",
+      "checkout_dir": "dinkuskit-coupons",
+      "prompt_note": "Use the Dinkus Coupons source tree and current default branch. This is the public advanced promotion extension for AICommerce on EmDash. Review conservatively for server-authoritative money and eligibility, deterministic promotion ordering/allocation, redemption idempotency, SDK contract compatibility, secret/customer-data hygiene, and migration safety. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "dinkuskit/bundles",
+      "display_name": "Dinkus Bundles",
+      "checkout_dir": "dinkuskit-bundles",
+      "prompt_note": "Use the Dinkus Bundles source tree and current default branch. This is the public Mix-and-Match product extension for AICommerce on EmDash. Review conservatively for parent/child line-graph identity, server-side configuration and pricing, child-SKU inventory, tax/refund/fulfillment allocations, SDK contract compatibility, secret/customer-data hygiene, and migration safety. Do not auto-close issues or pull requests; this Spark command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [
     {
       "owner": "openclaw",
-      "deny_repositories": [
-        "openclaw/clawsweeper-state",
-        "openclaw/.github"
-      ],
+      "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
       "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
       "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic OpenClaw onboarding profile, so keep review conservative: issues and pull requests may be auto-closed only when the exact change is certainly already implemented on the default branch; pull requests may also be age-gated mostly implemented there.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -265,14 +331,8 @@
     }
   },
   "target_inventory": {
-    "owners": [
-      "openclaw",
-      "steipete"
-    ],
-    "deny_repositories": [
-      "openclaw/clawsweeper-state",
-      "openclaw/.github"
-    ],
+    "owners": ["openclaw", "steipete"],
+    "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
     "include_private": false,
     "include_archived": false,
     "include_forks": false,
