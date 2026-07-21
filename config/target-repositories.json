@@ -160,6 +160,19 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyworks",
+      "display_name": "Smoky Works",
+      "checkout_dir": "smokyworks",
+      "prompt_note": "Use the smokyworks source tree and current main branch. This is the Smoky Works product site (EmDash CMS-first, Astro + Cloudflare Workers, dinkus Portable Text block renderers). Review conservatively for correctness, content-render fallback safety (missing or unpublished content must 404, never render a blank or shadow page), secret hygiene, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [
