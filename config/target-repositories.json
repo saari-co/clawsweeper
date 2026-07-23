@@ -216,6 +216,21 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyproductco",
+      "display_name": "Smoky Product Company",
+      "checkout_dir": "smokyproductco",
+      "prompt_note": "Use the smokyproductco source tree and current main branch. This is the public Smoky Product Company site (EmDash CMS-first, Astro + Cloudflare Workers, and reusable Dinkus project-record rendering). Review conservatively for correctness, content and visual-proof integrity, accessibility, secret hygiene, and deploy safety. Treat pnpm test:acceptance as the canonical repository validation. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [
+        "pnpm test:acceptance"
+      ],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [

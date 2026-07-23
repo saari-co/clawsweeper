@@ -28,6 +28,18 @@ test("repositoryProfileFor supports fs-safe event reviews", () => {
   ]);
 });
 
+test("repositoryProfileFor supports Smoky Product Company as review-only", () => {
+  const profile = repositoryProfileFor("saari-co/smokyproductco");
+
+  assert.equal(profile.targetRepo, "saari-co/smokyproductco");
+  assert.equal(profile.slug, "saari-co-smokyproductco");
+  assert.equal(profile.displayName, "Smoky Product Company");
+  assert.equal(profile.checkoutDir, "smokyproductco");
+  assert.match(profile.promptNote, /pnpm test:acceptance/);
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("generic OpenClaw fallback supports conservative event-only onboarding", () => {
   const profile = repositoryProfileFor("OpenClaw/example-tool");
 
