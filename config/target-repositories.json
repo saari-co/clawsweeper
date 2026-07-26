@@ -127,6 +127,19 @@
       "changed_gate": null
     },
     {
+      "target_repo": "saari-co/swarmpocket",
+      "display_name": "SwarmPocket",
+      "checkout_dir": "swarmpocket",
+      "prompt_note": "Use the SwarmPocket source tree and current default branch. This is the SmokySwarm native Android client and Go Herdr gateway for WireGuard-only mobile access to live swarm sessions. Review conservatively for WireGuard-only binding, clean-room Herdr socket/API use, verify-then-send write safety, Android credential storage, TLS/certificate handling, secret hygiene, and device/operator safety. Treat web/ as a disposable daemon smoke surface, not the product client. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
       "target_repo": "saari-co/pixel-fold",
       "display_name": "Pixel Fold",
       "checkout_dir": "pixel-fold",
