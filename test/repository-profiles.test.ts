@@ -40,6 +40,19 @@ test("repositoryProfileFor supports Smoky Product Company as review-only", () =>
   assert.deepEqual(profile.applyCloseRules.pull_request, []);
 });
 
+test("repositoryProfileFor supports SwarmPocket as review-only", () => {
+  const profile = repositoryProfileFor("saari-co/swarmpocket");
+
+  assert.equal(profile.targetRepo, "saari-co/swarmpocket");
+  assert.equal(profile.slug, "saari-co-swarmpocket");
+  assert.equal(profile.displayName, "SwarmPocket");
+  assert.equal(profile.checkoutDir, "swarmpocket");
+  assert.match(profile.promptNote, /WireGuard-only/);
+  assert.match(profile.promptNote, /verify-then-send/);
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("generic OpenClaw fallback supports conservative event-only onboarding", () => {
   const profile = repositoryProfileFor("OpenClaw/example-tool");
 
