@@ -153,6 +153,19 @@
       "changed_gate": null
     },
     {
+      "target_repo": "saari-co/RepoGlance",
+      "display_name": "RepoGlance",
+      "checkout_dir": "RepoGlance",
+      "prompt_note": "Use the RepoGlance source tree and current main branch. This is a public, read-only, Pixel-native Android GitHub glance and issue navigator. Review conservatively for truth-labelled UNKNOWN and LAST_GOOD state, first-class rate-limit behavior, immutable model boundaries, untrusted GitHub display-text sanitization, safe deep links, Android build correctness, secret hygiene, and preservation of the no-GitHub-mutation v0.x contract. Do not auto-close issues or pull requests; this exact-PR onboarding lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": ["./gradlew testDebugUnitTest assembleDebug"],
+      "changed_gate": null
+    },
+    {
       "target_repo": "saari-co/StellarAI",
       "display_name": "StellarAI",
       "checkout_dir": "StellarAI",
