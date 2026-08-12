@@ -53,6 +53,20 @@ test("repositoryProfileFor supports SwarmPocket as review-only", () => {
   assert.deepEqual(profile.applyCloseRules.pull_request, []);
 });
 
+test("repositoryProfileFor supports RepoGlance as review-only", () => {
+  const profile = repositoryProfileFor("saari-co/RepoGlance");
+
+  assert.equal(profile.targetRepo, "saari-co/repoglance");
+  assert.equal(profile.slug, "saari-co-repoglance");
+  assert.equal(profile.displayName, "RepoGlance");
+  assert.equal(profile.checkoutDir, "RepoGlance");
+  assert.match(profile.promptNote, /read-only/);
+  assert.match(profile.promptNote, /UNKNOWN and LAST_GOOD/);
+  assert.match(profile.promptNote, /no-GitHub-mutation/);
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("generic OpenClaw fallback supports conservative event-only onboarding", () => {
   const profile = repositoryProfileFor("OpenClaw/example-tool");
 
