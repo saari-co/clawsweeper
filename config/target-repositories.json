@@ -101,6 +101,19 @@
       "changed_gate": null
     },
     {
+      "target_repo": "saari-co/SwarmBar",
+      "display_name": "SwarmBar",
+      "checkout_dir": "SwarmBar",
+      "prompt_note": "Use the SwarmBar source tree and current main branch. This is the read-only native macOS menu-bar companion for SmokySwarm. Review conservatively for canonical x-api truth-model parity, honest exact/partial/unknown and fresh/stale presentation, Operator Link state safety, fixed doorway delegation, SwiftUI/macOS behavior, secret hygiene, and preservation of x-api authority over identity, endpoint state, recovery, and gateway truth. Do not auto-close issues or pull requests; this exact-PR command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
       "target_repo": "saari-co/SwarmDash",
       "display_name": "SwarmDash",
       "checkout_dir": "SwarmDash",

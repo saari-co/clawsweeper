@@ -53,6 +53,20 @@ test("repositoryProfileFor supports SwarmPocket as review-only", () => {
   assert.deepEqual(profile.applyCloseRules.pull_request, []);
 });
 
+test("repositoryProfileFor supports SwarmBar as review-only", () => {
+  const profile = repositoryProfileFor("saari-co/SwarmBar");
+
+  assert.equal(profile.targetRepo, "saari-co/swarmbar");
+  assert.equal(profile.slug, "saari-co-swarmbar");
+  assert.equal(profile.displayName, "SwarmBar");
+  assert.equal(profile.checkoutDir, "SwarmBar");
+  assert.match(profile.promptNote, /read-only native macOS menu-bar companion/);
+  assert.match(profile.promptNote, /x-api truth-model parity/);
+  assert.match(profile.promptNote, /Operator Link state safety/);
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("repositoryProfileFor supports RepoGlance as review-only", () => {
   const profile = repositoryProfileFor("saari-co/RepoGlance");
 
