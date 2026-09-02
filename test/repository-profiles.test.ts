@@ -101,6 +101,54 @@ test("repositoryProfileFor supports fs-safe event reviews", () => {
   ]);
 });
 
+test("saari-co profiles remain explicit, review-only targets after upstream migration", () => {
+  const profiles = [
+    ["saari-co/spark-dgx", "SPARK DGX", "spark-dgx"],
+    ["saari-co/x-api", "X API", "x-api"],
+    ["saari-co/smokyworker_setup", "SmokyWorker Setup", "smokyworker_setup"],
+    ["saari-co/SwarmBar", "SwarmBar", "SwarmBar"],
+    ["saari-co/SwarmDash", "SwarmDash", "SwarmDash"],
+    ["saari-co/SwarmLease", "SwarmLease", "SwarmLease"],
+    ["saari-co/swarmpocket", "SwarmPocket", "swarmpocket"],
+    ["saari-co/pixel-fold", "Pixel Fold", "pixel-fold"],
+    ["saari-co/RepoGlance", "RepoGlance", "RepoGlance"],
+    ["saari-co/StellarAI", "StellarAI", "StellarAI"],
+    ["saari-co/aicommerce", "AI Commerce", "aicommerce"],
+    ["saari-co/clawsweeper", "ClawSweeper", "clawsweeper"],
+    ["saari-co/smokyclub", "SmokyClub", "smokyclub"],
+    ["saari-co/smokytriage", "SmokyTriage", "smokytriage"],
+    ["saari-co/smokyworks", "Smoky Works", "smokyworks"],
+    ["saari-co/smokyproductco", "Smoky Product Company", "smokyproductco"],
+  ] as const;
+
+  for (const [repo, displayName, checkoutDir] of profiles) {
+    const profile = repositoryProfileFor(repo);
+    assert.equal(profile.targetRepo, repo.toLowerCase(), repo);
+    assert.equal(profile.displayName, displayName, repo);
+    assert.equal(profile.checkoutDir, checkoutDir, repo);
+    assert.ok(REPOSITORY_PROFILES.includes(profile), `${repo} must not use an owner fallback`);
+    assert.deepEqual(profile.applyCloseRules, { issue: [], pull_request: [] }, repo);
+    assert.equal(
+      profile.liveTest,
+      undefined,
+      `${repo} must not enable unproven live-test commands`,
+    );
+  }
+});
+
+test("saari-co profiles preserve their target-native validation commands", () => {
+  assert.deepEqual(resolveTargetRepoToolchain("saari-co/RepoGlance"), {
+    packageManager: "pnpm",
+    baseValidationCommands: ["./gradlew testDebugUnitTest assembleDebug"],
+    changedGate: null,
+  });
+  assert.deepEqual(resolveTargetRepoToolchain("saari-co/smokyproductco"), {
+    packageManager: "pnpm",
+    baseValidationCommands: ["pnpm test:acceptance"],
+    changedGate: null,
+  });
+});
+
 test("generic OpenClaw fallback supports conservative event-only onboarding", () => {
   const profile = repositoryProfileFor("OpenClaw/example-tool");
 

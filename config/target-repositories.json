@@ -128,6 +128,214 @@
         "ready_timeout_seconds": 240,
         "max_recording_seconds": 90
       }
+    },
+    {
+      "target_repo": "saari-co/spark-dgx",
+      "display_name": "SPARK DGX",
+      "checkout_dir": "spark-dgx",
+      "prompt_note": "Use the spark-dgx source tree and current main branch. This is a SPARK swarm operations repo (shell lanes, LiteLLM gate IaC, markdown roadmaps). Review conservatively for correctness, secret hygiene, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/x-api",
+      "display_name": "X API",
+      "checkout_dir": "x-api",
+      "prompt_note": "Use the x-api source tree and current default branch. This is a saari-co swarm service repo (Cloudflare Worker / D1 state API and related lanes). Review conservatively for correctness, secret hygiene, and shell/JS safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyworker_setup",
+      "display_name": "SmokyWorker Setup",
+      "checkout_dir": "smokyworker_setup",
+      "prompt_note": "Use the smokyworker_setup source tree and current default branch. This is a SmokySwarm worker bootstrap and setup repo. Review conservatively for bootstrap safety, host routing, secret hygiene, idempotence, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/SwarmBar",
+      "display_name": "SwarmBar",
+      "checkout_dir": "SwarmBar",
+      "prompt_note": "Use the SwarmBar source tree and current main branch. This is the read-only native macOS menu-bar companion for SmokySwarm. Review conservatively for canonical x-api truth-model parity, honest exact/partial/unknown and fresh/stale presentation, Operator Link state safety, fixed doorway delegation, SwiftUI/macOS behavior, secret hygiene, and preservation of x-api authority over identity, endpoint state, recovery, and gateway truth. Do not auto-close issues or pull requests; this exact-PR command lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/SwarmDash",
+      "display_name": "SwarmDash",
+      "checkout_dir": "SwarmDash",
+      "prompt_note": "Use the SwarmDash source tree and current default branch. This is the SmokySwarm dashboard and operator visibility repo. Review conservatively for fleet-state correctness, UI/API contract drift, secret hygiene, and deploy safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/SwarmLease",
+      "display_name": "SwarmLease",
+      "checkout_dir": "SwarmLease",
+      "prompt_note": "Use the SwarmLease source tree and current default branch. This is the SmokySwarm lease and resource facade repo. Review conservatively for lease ownership, resource lifecycle safety, idempotence, secret hygiene, and API contract drift. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/swarmpocket",
+      "display_name": "SwarmPocket",
+      "checkout_dir": "swarmpocket",
+      "prompt_note": "Use the SwarmPocket source tree and current default branch. This is the SmokySwarm native Android client and Go Herdr gateway for WireGuard-only mobile access to live swarm sessions. Review conservatively for WireGuard-only binding, clean-room Herdr socket/API use, verify-then-send write safety, Android credential storage, TLS/certificate handling, secret hygiene, and device/operator safety. Treat web/ as a disposable daemon smoke surface, not the product client. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/pixel-fold",
+      "display_name": "Pixel Fold",
+      "checkout_dir": "pixel-fold",
+      "prompt_note": "Use the pixel-fold source tree and current default branch. This is a saari-co swarm dashboard/device-app repo. Review conservatively for correctness, secret hygiene, and safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/RepoGlance",
+      "display_name": "RepoGlance",
+      "checkout_dir": "RepoGlance",
+      "prompt_note": "Use the RepoGlance source tree and current main branch. This is a public, read-only, Pixel-native Android GitHub glance and issue navigator. Review conservatively for truth-labelled UNKNOWN and LAST_GOOD state, first-class rate-limit behavior, immutable model boundaries, untrusted GitHub display-text sanitization, safe deep links, Android build correctness, secret hygiene, and preservation of the no-GitHub-mutation v0.x contract. Do not auto-close issues or pull requests; this exact-PR onboarding lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": ["./gradlew testDebugUnitTest assembleDebug"],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/StellarAI",
+      "display_name": "StellarAI",
+      "checkout_dir": "StellarAI",
+      "prompt_note": "Use the StellarAI source tree and current default branch. This is a saari-co swarm service repo. Review conservatively for correctness, secret hygiene, and safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/aicommerce",
+      "display_name": "AI Commerce",
+      "checkout_dir": "aicommerce",
+      "prompt_note": "Use the aicommerce source tree and current default branch. This is a saari-co swarm commerce-backend repo (products, payments, orders). Review conservatively for correctness, secret hygiene, money/precision handling, and safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/clawsweeper",
+      "display_name": "ClawSweeper",
+      "checkout_dir": "clawsweeper",
+      "prompt_note": "Use the clawsweeper source tree and current default branch. This is the ClawSweeper review-automation engine itself (TypeScript plan+review pipeline, repair workers, dashboard, and target-repository configuration). Review conservatively for correctness, secret hygiene, and safety, and note that changes here can affect the very pipeline reviewing this PR. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyclub",
+      "display_name": "SmokyClub",
+      "checkout_dir": "smokyclub",
+      "prompt_note": "Use the smokyclub source tree and current default branch. This is a saari-co commerce storefront/club product repo extracted from aicommerce. Review conservatively for correctness, secret hygiene, money/precision handling, staging isolation, and safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokytriage",
+      "display_name": "SmokyTriage",
+      "checkout_dir": "smokytriage",
+      "prompt_note": "Use the smokytriage source tree and current default branch. This is a saari-co customer-service triage product repo (CSv0.1) extracted from pixel-fold. Review conservatively for correctness, secret hygiene, email/SMS handling, regulated storage paths, and safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyworks",
+      "display_name": "Smoky Works",
+      "checkout_dir": "smokyworks",
+      "prompt_note": "Use the smokyworks source tree and current main branch. This is the Smoky Works product site (EmDash CMS-first, Astro + Cloudflare Workers, dinkus Portable Text block renderers). Review conservatively for correctness, content-render fallback safety (missing or unpublished content must 404, never render a blank or shadow page), secret hygiene, and shell-safety. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
+      "target_repo": "saari-co/smokyproductco",
+      "display_name": "Smoky Product Company",
+      "checkout_dir": "smokyproductco",
+      "prompt_note": "Use the smokyproductco source tree and current main branch. This is the public Smoky Product Company site (EmDash CMS-first, Astro + Cloudflare Workers, and reusable Dinkus project-record rendering). Review conservatively for correctness, content and visual-proof integrity, accessibility, secret hygiene, and deploy safety. Treat pnpm test:acceptance as the canonical repository validation. Do not auto-close issues or pull requests; this host-side subscription pilot is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": ["pnpm test:acceptance"],
+      "changed_gate": null
     }
   ],
   "generic_fallbacks": [
