@@ -555,6 +555,12 @@ Repair reviews scan the committed, staged, unstaged, and applicable untracked
 bytes of the validated checkout. Clean text-converted checkouts retain both
 canonical Git and raw working bytes in scan coverage. The host never starts a target-bundled autoreview helper or second reviewer.
 
+Codex checkout inspection uses its `:read-only` sandbox permission profile.
+Hosts where AppArmor blocks Codex's bubblewrap user namespace may set
+`CLAWSWEEPER_CODEX_CHECKOUT_LEGACY_LANDLOCK=1` to retain the same read-only
+attestation through Codex's legacy Landlock backend. The default remains the
+current Codex sandbox backend.
+
 Hosted Codex and OpenClaw setup share the checksum-pinned TruffleHog 3.97.1
 installer in `.github/actions/setup-review-tools/install.sh`. For local review,
 ClawSweeper first uses a trusted host executable outside both checkouts; when it
