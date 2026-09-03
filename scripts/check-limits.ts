@@ -13,6 +13,7 @@ type WorkerConfig = {
     exact_review: {
       max_concurrent: number;
       target_max_concurrent: number;
+      actions_budget: number;
     };
     assist: {
       max: number;
@@ -37,10 +38,6 @@ type AutomationLimits = {
     hot_intake_default: number;
     exact_item_default: number;
     hard_cap: number;
-  };
-  commit_review: {
-    page_size_default: number;
-    page_size_hard_cap: number;
   };
   repair_live_runs: {
     default: number;
@@ -70,8 +67,15 @@ const expectations: { file: string; label: string; pattern: RegExp }[] = [
   },
   {
     file: "dashboard/wrangler.toml",
-    label: "dashboard worker budget",
+    label: "dashboard Codex worker budget",
     pattern: new RegExp(`WORKER_BUDGET = "${config.workers.max}"`),
+  },
+  {
+    file: "dashboard/wrangler.toml",
+    label: "exact review Actions budget",
+    pattern: new RegExp(
+      `EXACT_REVIEW_ACTIONS_BUDGET = "${config.lanes.exact_review.actions_budget}"`,
+    ),
   },
   {
     file: "dashboard/wrangler.toml",
@@ -88,26 +92,16 @@ const expectations: { file: string; label: string; pattern: RegExp }[] = [
     ),
   },
   {
-    file: "dashboard/worker.ts",
-    label: "dashboard worker budget fallback",
-    pattern: new RegExp(`numberFrom\\(env\\.WORKER_BUDGET, ${config.workers.max}\\)`),
+    file: "dashboard/exact-review-queue.ts",
+    label: "exact review Actions budget fallback",
+    pattern: new RegExp(
+      `DEFAULT_EXACT_REVIEW_ACTIONS_BUDGET = ${config.lanes.exact_review.actions_budget}`,
+    ),
   },
   {
     file: "README.md",
     label: "manual plan shard-count example",
     pattern: new RegExp(`--shard-count ${limits.review_shards.normal_default}\\b`),
-  },
-  {
-    file: "docs/commit-dispatcher.md",
-    label: "commit review page size env example",
-    pattern: new RegExp(
-      `CLAWSWEEPER_COMMIT_REVIEW_PAGE_SIZE=${limits.commit_review.page_size_default}\\b`,
-    ),
-  },
-  {
-    file: "docs/commit-sweeper.md",
-    label: "commit review page size default",
-    pattern: new RegExp(`defaults to ${limits.commit_review.page_size_default}\\b`),
   },
   {
     file: "docs/repair/README.md",
@@ -249,10 +243,6 @@ function deriveAutomationLimits(workerConfig: WorkerConfig): AutomationLimits {
       hot_intake_default: percent(max, 35),
       exact_item_default: 1,
       hard_cap: max,
-    },
-    commit_review: {
-      page_size_default: percent(max, 5),
-      page_size_hard_cap: max,
     },
     repair_live_runs: {
       default: percent(max, 40),

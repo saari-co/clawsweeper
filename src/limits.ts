@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { QueuePressureLevel } from "./queue-pressure.js";
 
 export type WorkerConfig = {
   workers: {
@@ -12,6 +13,10 @@ export type WorkerConfig = {
   lanes: {
     exact_review: {
       max_concurrent: number;
+      target_max_concurrent: number;
+    };
+    assist: {
+      max: number;
     };
     repair: {
       cluster_max_live_runs: number;
@@ -22,6 +27,10 @@ export type WorkerConfig = {
 export type AutomationLimits = {
   exact_review: {
     concurrent_max: number;
+    target_concurrent_max: number;
+  };
+  assist: {
+    default: number;
   };
   review_shards: {
     normal_default: number;
@@ -29,10 +38,6 @@ export type AutomationLimits = {
     hot_intake_default: number;
     exact_item_default: number;
     hard_cap: number;
-  };
-  commit_review: {
-    page_size_default: number;
-    page_size_hard_cap: number;
   };
   repair_live_runs: {
     default: number;
@@ -49,12 +54,12 @@ export type AutomationLimits = {
 export type WorkerLane =
   | "normal_review"
   | "hot_intake"
-  | "commit_review"
   | "repair"
   | "automerge_repair"
   | "issue_implementation"
   | "cluster_repair"
-  | "exact_item";
+  | "exact_item"
+  | "assist";
 
 export const WORKER_CONFIG = readWorkerConfig();
 export const AUTOMATION_LIMITS = deriveAutomationLimits(WORKER_CONFIG);
@@ -72,6 +77,14 @@ export function deriveAutomationLimits(config: WorkerConfig): AutomationLimits {
   return {
     exact_review: {
       concurrent_max: Math.min(config.lanes.exact_review.max_concurrent, max),
+      target_concurrent_max: Math.min(
+        config.lanes.exact_review.target_max_concurrent,
+        config.lanes.exact_review.max_concurrent,
+        max,
+      ),
+    },
+    assist: {
+      default: Math.min(config.lanes.assist.max, max),
     },
     review_shards: {
       normal_default: percent(max, 70),
@@ -79,10 +92,6 @@ export function deriveAutomationLimits(config: WorkerConfig): AutomationLimits {
       hot_intake_default: percent(max, 35),
       exact_item_default: 1,
       hard_cap: max,
-    },
-    commit_review: {
-      page_size_default: percent(max, 5),
-      page_size_hard_cap: max,
     },
     repair_live_runs: {
       default: percent(max, 40),
@@ -102,16 +111,19 @@ export function workerLimit(
   {
     activeCritical = 0,
     activeBackground = 0,
+    pressureLevel = "none",
     config = WORKER_CONFIG,
     limits = AUTOMATION_LIMITS,
   }: {
     activeCritical?: number;
     activeBackground?: number;
+    pressureLevel?: QueuePressureLevel;
     config?: WorkerConfig;
     limits?: AutomationLimits;
   } = {},
 ): number {
   if (lane === "exact_item") return limits.review_shards.exact_item_default;
+  if (lane === "assist") return priorityLimit(limits.assist.default, activeCritical);
   if (lane === "repair") return priorityLimit(limits.repair_live_runs.default, activeCritical);
   if (lane === "automerge_repair")
     return priorityLimit(limits.repair_live_runs.automerge_default, activeCritical);
@@ -119,12 +131,6 @@ export function workerLimit(
     return priorityLimit(limits.repair_live_runs.issue_implementation_default, activeCritical);
   if (lane === "cluster_repair")
     return priorityLimit(limits.repair_live_runs.cluster_default, activeCritical);
-  if (lane === "commit_review")
-    return backgroundLimit(
-      limits.commit_review.page_size_default,
-      activeCritical,
-      activeBackground,
-    );
   if (lane === "hot_intake")
     return backgroundLimit(
       limits.review_shards.hot_intake_default,
@@ -148,7 +154,11 @@ export function workerLimit(
     if (rawAvailable <= 0) return 1;
     const withFloor =
       rawAvailable >= config.workers.minimum_background ? rawAvailable : Math.max(1, rawAvailable);
-    return Math.max(1, Math.min(laneMax, withFloor));
+    const normalBudget = Math.max(1, Math.min(laneMax, withFloor));
+    if (pressureLevel === "soft") return Math.ceil(normalBudget * 0.5);
+    if (pressureLevel === "hard" || pressureLevel === "unknown")
+      return Math.max(1, Math.floor(normalBudget * 0.1));
+    return normalBudget;
   }
 }
 
@@ -164,6 +174,14 @@ function validateWorkerConfig(value: unknown): WorkerConfig {
     lanes: {
       exact_review: {
         max_concurrent: positiveInteger(value, "lanes.exact_review.max_concurrent"),
+        target_max_concurrent: optionalPositiveInteger(
+          value,
+          "lanes.exact_review.target_max_concurrent",
+          positiveInteger(value, "lanes.exact_review.max_concurrent"),
+        ),
+      },
+      assist: {
+        max: positiveInteger(value, "lanes.assist.max"),
       },
       repair: {
         cluster_max_live_runs: optionalPositiveInteger(

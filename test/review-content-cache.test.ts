@@ -8,6 +8,42 @@ import {
   reviewReportCanPromoteToCloseForTest,
 } from "../dist/clawsweeper.js";
 import { item } from "./helpers.ts";
+import { hydratePrimaryBody, longProofBody, sourceTools } from "./primary-body-fixture.ts";
+
+for (const kind of ["issue", "pull_request"] as const) {
+  test(`same-length omitted ${kind} body edit changes complete source, snapshot and content identity`, () => {
+    const body = longProofBody();
+    const before = hydratePrimaryBody(body, kind);
+    const after = hydratePrimaryBody(body.slice(0, -1) + "!", kind);
+    assert.equal(before.context.issue.body, after.context.issue.body);
+    assert.deepEqual(
+      before.context.issue.bodyCoverage.excerpts,
+      after.context.issue.bodyCoverage.excerpts,
+    );
+    assert.ok(before.context.issue.bodyCoverage.excerpts.every(({ end }) => end < body.length - 1));
+    assert.equal(
+      before.context.sourceRevision,
+      sourceTools.itemSourceRevisionSha256(before.rawIssue, []),
+    );
+    assert.equal(
+      after.context.sourceRevision,
+      sourceTools.itemSourceRevisionSha256(after.rawIssue, []),
+    );
+    assert.notEqual(before.context.sourceRevision, after.context.sourceRevision);
+    assert.notEqual(
+      before.context.structuralItemStateDigest,
+      after.context.structuralItemStateDigest,
+    );
+    assert.notEqual(
+      sourceTools.itemSnapshotHash(before.target, before.context),
+      sourceTools.itemSnapshotHash(after.target, after.context),
+    );
+    assert.notEqual(
+      itemContentDigestForTest(before.target, before.context),
+      itemContentDigestForTest(after.target, after.context),
+    );
+  });
+}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -96,6 +132,21 @@ test("content digest busts when a diff patch byte changes", () => {
   assert.notEqual(a, b);
 });
 
+test("content digest uses the full commit-message revision", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const compactCommits = [{ author: "contributor", message: "x".repeat(1000) }];
+  const a = itemContentDigestForTest(
+    pull,
+    pullContext({ pullCommits: compactCommits, pullCommitsRevision: "a".repeat(64) }),
+  );
+  const b = itemContentDigestForTest(
+    pull,
+    pullContext({ pullCommits: compactCommits, pullCommitsRevision: "b".repeat(64) }),
+  );
+
+  assert.notEqual(a, b);
+});
+
 test("content digest busts when the PR head sha changes", () => {
   const pull = item({ kind: "pull_request", number: 200 });
   const a = itemContentDigestForTest(pull, pullContext());
@@ -171,6 +222,22 @@ test("content digest busts when the latest release changes", () => {
   assert.notEqual(a, b);
 });
 
+test("content digest distinguishes complete and unknown release state", () => {
+  const issue = item({ kind: "issue", number: 300 });
+  const known = itemContentDigestForTest(issue, issueContext(), {
+    mainSha: "main-sha",
+    releaseStateComplete: true,
+    latestRelease: null,
+  });
+  const unknown = itemContentDigestForTest(issue, issueContext(), {
+    mainSha: "main-sha",
+    releaseStateComplete: false,
+    latestRelease: null,
+  });
+
+  assert.notEqual(known, unknown);
+});
+
 test("issue digest busts when target main changes", () => {
   const issue = item({ kind: "issue", number: 300 });
   const context = issueContext();
@@ -233,6 +300,131 @@ test("content digest ignores PR review comment timestamp churn", () => {
   assert.equal(a, b);
 });
 
+test("content digest busts when bounded PR check state changes", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const passing = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [{ name: "test", status: "completed", conclusion: "success" }],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+  const failing = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [{ name: "test", status: "completed", conclusion: "failure" }],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+
+  assert.notEqual(passing, failing);
+});
+
+test("content digest ignores duplicate compacted PR check runs", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const notify = {
+    name: "notify",
+    status: "completed",
+    conclusion: "success",
+    app: "github-actions",
+  };
+  const once = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [notify],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+  const repeated = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [notify, notify],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+
+  assert.equal(once, repeated);
+});
+
+test("content digest keeps check runs that differ only in name or app", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const check = {
+    name: "smoke",
+    status: "completed",
+    conclusion: "success",
+    app: "github-actions",
+  };
+  const digest = (checkRuns) =>
+    itemContentDigestForTest(
+      pull,
+      pullContext({
+        pullChecks: {
+          complete: true,
+          checkRuns,
+          checkRunsTruncated: false,
+          statuses: [],
+          statusesTruncated: false,
+        },
+      }),
+    );
+
+  const alone = digest([check]);
+  const byName = digest([check, { ...check, name: "smoke (windows)" }]);
+  const byApp = digest([check, { ...check, app: "blacksmith-sh" }]);
+
+  assert.notEqual(alone, byName);
+  assert.notEqual(alone, byApp);
+  assert.notEqual(byName, byApp);
+});
+
+test("content digest busts when one of several repeated check runs newly fails", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const notify = {
+    name: "notify",
+    status: "completed",
+    conclusion: "success",
+    app: "github-actions",
+  };
+  const digest = (checkRuns) =>
+    itemContentDigestForTest(
+      pull,
+      pullContext({
+        pullChecks: {
+          complete: true,
+          checkRuns,
+          checkRunsTruncated: false,
+          statuses: [],
+          statusesTruncated: false,
+        },
+      }),
+    );
+
+  const allPassing = digest([notify, notify, notify]);
+  const oneFailing = digest([notify, notify, { ...notify, conclusion: "failure" }]);
+
+  assert.notEqual(allPassing, oneFailing);
+});
+
 test("review comment revision covers comments outside the bounded prompt window", () => {
   const comments = Array.from({ length: 81 }, (_, index) => ({
     id: index + 1,
@@ -290,6 +482,48 @@ function cacheHit(overrides = {}) {
 
 test("cache hits when content is unchanged, fresh, complete, and policy matches", () => {
   assert.equal(cacheHit(), true);
+});
+
+test("cache hits after an equivalent check run is repeated on an unchanged head", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const notify = {
+    name: "notify",
+    status: "completed",
+    conclusion: "success",
+    app: "github-actions",
+  };
+  const priorDigest = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [notify],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+  const currentDigest = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullChecks: {
+        complete: true,
+        checkRuns: [notify, notify],
+        checkRunsTruncated: false,
+        statuses: [],
+        statusesTruncated: false,
+      },
+    }),
+  );
+
+  assert.equal(
+    cacheHit({
+      review: freshReview({ contentDigest: priorDigest }),
+      contentDigest: currentDigest,
+    }),
+    true,
+  );
 });
 
 test("cache misses when the content digest differs", () => {
@@ -356,6 +590,16 @@ test("verdict without a decision is never cached", () => {
 
 test("cache-carried reports cannot be promoted to close", () => {
   assert.equal(reviewReportCanPromoteToCloseForTest("---\nreview_cache_hit: true\n---\n"), false);
+  assert.equal(
+    reviewReportCanPromoteToCloseForTest(
+      "---\nreview_cache_hit: false\nreview_cache_hit: false\n---\n",
+    ),
+    false,
+  );
+  assert.equal(
+    reviewReportCanPromoteToCloseForTest("---\nreview_cache_hit: invalid\n---\n"),
+    false,
+  );
 });
 
 test("fresh and legacy reports retain existing close promotion behavior", () => {

@@ -6,6 +6,7 @@ dist/
 .artifacts/
 artifacts/
 dashboard/.wrangler/
+.wrangler/
 .clawsweeper-repair/
 .claude/
 tmp/
@@ -14,4 +15,5 @@ repair-apply-report.json
 jobs/
 records/
 results/
+test-results/
 triage-dashboard-dev*.log

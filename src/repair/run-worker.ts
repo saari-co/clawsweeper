@@ -3,15 +3,9 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import {
-  appendCodexOutputCapture,
-  closeCodexOutputCapture,
-  codexOutputTail,
-  openCodexOutputCapture,
-} from "../codex-output-capture.js";
-import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
-import { spawnCodex, terminateCodexProcessTree } from "../codex-spawn.js";
+import { spawn, spawnSync } from "node:child_process";
+import { runAgentProcess } from "../agent-runner.js";
+import { codexAppServerProcessOptionsFromEnv } from "../codex-process.js";
 import { deterministicAutomergeResult } from "./deterministic-automerge-result.js";
 import {
   assertAllowedOwner,
@@ -75,6 +69,11 @@ if (errors.length > 0) {
 
 assertAllowedOwner(job.frontmatter.repo, process.env.CLAWSWEEPER_ALLOWED_OWNER);
 
+if (job.frontmatter.repair_mode === "autofix" && process.env.CLAWSWEEPER_ALLOW_MERGE === "1") {
+  console.error("[repair] autofix-only job cannot inherit merge permission; merge disabled");
+  process.env.CLAWSWEEPER_ALLOW_MERGE = "0";
+}
+
 if ((mode === "execute" || mode === "autonomous") && !dryRun) {
   if (job.frontmatter.mode !== mode) {
     throw new Error(`refusing ${mode}: job frontmatter mode is not ${mode}`);
@@ -86,6 +85,7 @@ if ((mode === "execute" || mode === "autonomous") && !dryRun) {
 
 const runDir = makeRunDir(job, mode);
 const promptPath = path.join(runDir, "prompt.md");
+fs.rmSync(promptPath, { force: true });
 const resultPath = path.join(runDir, "result.json");
 const transcriptPath = path.join(runDir, "codex.jsonl");
 const promptContext: Record<string, string> = {};
@@ -147,9 +147,9 @@ if (!dryRun) {
 
 const prompt = renderPrompt(job, mode, promptContext);
 
-fs.writeFileSync(promptPath, prompt);
-
 if (dryRun) {
+  // Explicit render/export contract; no model attempt or diagnostic copy.
+  fs.writeFileSync(promptPath, prompt, { mode: 0o600, flag: "wx" });
   const dryResult = {
     status: "planned",
     repo: job.frontmatter.repo,
@@ -221,8 +221,7 @@ function runCodex({
   stderrPath,
   timeoutMs,
 }: LooseRecord) {
-  const codexArgs = [
-    "exec",
+  const codexExtraArgs = [
     "--cd",
     codexWorkspaceRoot(),
     ...codexModelArgs(String(model)),
@@ -237,99 +236,67 @@ function runCodex({
     "-",
   ];
 
-  return spawnCodexWithHeartbeat({
-    args: codexArgs,
+  return spawnAgentWithHeartbeat({
+    label: "Codex planning worker",
+    requestedModel: String(model),
+    reasoningEffort: codexReasoningEffort,
+    codexExtraArgs,
     cwd: codexWorkspaceRoot(),
-    input: String(input ?? ""),
+    prompt: String(input ?? ""),
     transcriptPath: codexTranscriptPath,
     stderrPath,
     timeoutMs: Number(timeoutMs),
   });
 }
 
-function spawnCodexWithHeartbeat({
-  args: commandArgs,
+function spawnAgentWithHeartbeat({
+  label,
+  requestedModel,
+  reasoningEffort,
+  codexExtraArgs,
   cwd,
-  input,
+  prompt,
   transcriptPath: codexTranscriptPath,
   stderrPath,
   timeoutMs,
 }: LooseRecord): Promise<LooseRecord> {
-  const appServer = codexAppServerProcessOptionsFromEnv("Codex planning worker");
-  if (appServer) {
+  const heartbeat = startCodexWorkerHeartbeat();
+  try {
+    const appServer = codexAppServerProcessOptionsFromEnv(String(label));
     return Promise.resolve(
-      runCodexProcess({
-        args: commandArgs,
-        cwd,
+      runAgentProcess({
+        scanSource: { kind: "prompt" },
+        diagnosticPromptPath: promptPath,
+        label: String(label),
+        prompt: String(prompt),
+        model: String(requestedModel),
+        reasoningEffort: String(reasoningEffort),
+        codexExtraArgs: codexExtraArgs as string[],
+        cwd: String(cwd),
         env: codexEnv(),
-        input,
-        timeoutMs,
-        stdoutPath: codexTranscriptPath,
-        stderrPath,
-        appServer,
+        timeoutMs: Number(timeoutMs),
+        stdoutPath: String(codexTranscriptPath),
+        stderrPath: String(stderrPath),
+        ...(appServer ? { appServer } : {}),
       }),
     );
+  } finally {
+    heartbeat.kill("SIGTERM");
   }
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    let settled = false;
-    let timeoutError: Error | null = null;
-    const stdout = openCodexOutputCapture(codexTranscriptPath);
-    const stderr = openCodexOutputCapture(stderrPath);
+}
 
-    const childEnv = codexEnv();
-    const child = spawnCodex(commandArgs, { cwd, env: childEnv });
-
-    const heartbeat = setInterval(() => {
-      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-      console.log(
-        `[clawsweeper repair] ${new Date().toISOString()} Codex worker still running (${elapsedSeconds}s elapsed)`,
-      );
-    }, codexHeartbeatMs);
-    const timeout = setTimeout(() => {
-      timeoutError = new Error(`Codex worker timed out after ${timeoutMs}ms`);
-      (timeoutError as LooseRecord).code = "ETIMEDOUT";
-      terminateCodexProcessTree(child, "SIGTERM", 5_000);
-    }, timeoutMs);
-
-    const finish = (result: LooseRecord) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(heartbeat);
-      clearTimeout(timeout);
-      closeCodexOutputCapture(stdout);
-      closeCodexOutputCapture(stderr);
-      resolve(result);
-    };
-
-    const append = (stream: "stdout" | "stderr", chunk: Buffer) => {
-      if (stream === "stdout") {
-        appendCodexOutputCapture(stdout, chunk);
-      } else {
-        appendCodexOutputCapture(stderr, chunk);
-      }
-    };
-
-    child.stdout.on("data", (chunk) => append("stdout", chunk));
-    child.stderr.on("data", (chunk) => append("stderr", chunk));
-    child.on("error", (error) => {
-      finish({
-        status: null,
-        stdout: codexOutputTail(stdout),
-        stderr: codexOutputTail(stderr),
-        error,
-      });
-    });
-    child.on("close", (status, signal) => {
-      finish({
-        status,
-        signal,
-        stdout: codexOutputTail(stdout),
-        stderr: codexOutputTail(stderr),
-        error: timeoutError ?? undefined,
-      });
-    });
-    child.stdin.end(input);
+function startCodexWorkerHeartbeat() {
+  const script = `
+const interval = Math.max(1000, Number(process.env.CLAWSWEEPER_CODEX_HEARTBEAT_MS || 60000));
+const startedAt = Date.now();
+setInterval(() => {
+  const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+  console.log(\`[clawsweeper repair] \${new Date().toISOString()} Codex worker still running (\${elapsedSeconds}s elapsed)\`);
+}, interval);
+`;
+  return spawn(process.execPath, ["-e", script], {
+    env: { ...process.env, CLAWSWEEPER_CODEX_HEARTBEAT_MS: String(codexHeartbeatMs) },
+    stdio: ["ignore", "inherit", "inherit"],
   });
 }
 

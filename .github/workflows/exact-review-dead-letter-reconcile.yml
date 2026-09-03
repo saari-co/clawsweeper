@@ -1,0 +1,181 @@
+name: Automatically reconcile exact-review dead letters
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_targets:
+        description: "Maximum canonical targets to inspect (1-100)"
+        required: false
+        type: string
+        default: "100"
+      max_recoveries:
+        description: "Maximum fresh review recoveries (0-10)"
+        required: false
+        type: string
+        default: "10"
+      execute:
+        description: "Resolve terminal rows and enqueue safe fresh reviews"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: exact-review-dead-letter-operator
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: exact-review-operator
+    env:
+      EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+    steps:
+      - name: Establish reconciliation deadline
+        run: |
+          deadline_ms="$(( $(date +%s) * 1000 + 13 * 60 * 1000 ))"
+          echo "EXACT_REVIEW_RECONCILE_DEADLINE_MS=$deadline_ms" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: main
+          filter: blob:none
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+
+      - name: Restore permanent queued-run zombie state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_dir=.artifacts/exact-review-dlq
+          mkdir -p "$artifact_dir"
+          artifact_id="$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/artifacts" -F per_page=100 \
+            --jq '[.artifacts[] | select(.expired == false) | select(.name | startswith("exact-review-dlq-reconcile-"))] | sort_by(.created_at) | reverse | .[0].id // empty')"
+          if [ -z "$artifact_id" ]; then
+            echo "no prior reconcile artifact; using checked-in zombie seed"
+            exit 0
+          fi
+          archive="$RUNNER_TEMP/exact-review-dlq-prior.zip"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$archive"
+          entry="$(unzip -Z1 "$archive" | awk '/(^|\/)stuck-queued-zombies\.json$/ { print; exit }')"
+          if [ -z "$entry" ]; then
+            echo "prior reconcile artifact has no queued-run zombie state; using checked-in seed"
+            exit 0
+          fi
+          unzip -p "$archive" "$entry" > "$artifact_dir/prior-stuck-queued-zombies.json"
+          echo "restored queued-run zombie state from artifact ${artifact_id}"
+
+      - name: Remediate demonstrably stuck queued runs
+        id: remediate
+        continue-on-error: true
+        env:
+          EXECUTE: ${{ github.event_name == 'schedule' && 'true' || github.event.inputs.execute }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(
+            --repository "$GITHUB_REPOSITORY"
+            --zombie-state .artifacts/exact-review-dlq/prior-stuck-queued-zombies.json
+            --zombie-output .artifacts/exact-review-dlq/stuck-queued-zombies.json
+            --output .artifacts/exact-review-dlq/stuck-queued-runs.json
+          )
+          if [[ "$EXECUTE" == "true" ]]; then
+            args+=(--execute)
+          fi
+          node scripts/stuck-queued-run-remediation.mjs "${args[@]}"
+
+      - name: Verify live recovery guards
+        run: |
+          set -euo pipefail
+          expected_deploy_sha="$(git rev-parse HEAD)"
+          live_deploy_sha="$(curl --fail --silent --show-error "$EXACT_REVIEW_QUEUE_URL/api/health" | jq -er '.deployment_sha')"
+          if [[ "$live_deploy_sha" != "$expected_deploy_sha" ]]; then
+            if ! [[ "$live_deploy_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Live Worker returned an invalid deployment revision; refusing unguarded reconciliation" >&2
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "$live_deploy_sha"
+            expected_guard_blob="$(git rev-parse "${expected_deploy_sha}:dashboard/exact-review-queue.ts")"
+            live_guard_blob="$(git rev-parse "${live_deploy_sha}:dashboard/exact-review-queue.ts")"
+            if [[ "$live_guard_blob" != "$expected_guard_blob" ]]; then
+              echo "Live Worker deployment $live_deploy_sha has incompatible recovery guards; refusing unguarded reconciliation" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Reconcile closed, duplicate, and recoverable dead letters
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}
+          CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          EXACT_REVIEW_TARGET_TOKEN_MODE: github-app
+          GITHUB_TOKEN: ${{ github.token }}
+          MAX_TARGETS: ${{ github.event.inputs.max_targets || '100' }}
+          MAX_RECOVERIES: ${{ github.event.inputs.max_recoveries || '10' }}
+          EXECUTE: ${{ github.event_name == 'schedule' && 'true' || github.event.inputs.execute }}
+        run: |
+          set -euo pipefail
+          args=(
+            --action reconcile
+            --max-targets "$MAX_TARGETS"
+            --max-recoveries "$MAX_RECOVERIES"
+            --output .artifacts/exact-review-dlq/inventory.json
+          )
+          if [[ "$EXECUTE" == "true" ]]; then
+            args+=(--execute)
+          fi
+          node scripts/exact-review-dead-letter-operator.mjs "${args[@]}"
+
+      - name: Reconcile terminal and open parked reviews
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}
+          CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          EXACT_REVIEW_TARGET_TOKEN_MODE: github-app
+          GITHUB_TOKEN: ${{ github.token }}
+          MAX_TARGETS: ${{ github.event.inputs.max_targets || '100' }}
+          EXECUTE: ${{ github.event_name == 'schedule' && 'true' || github.event.inputs.execute }}
+        run: |
+          set -euo pipefail
+          args=(
+            --action reconcile-parked
+            --max-targets "$MAX_TARGETS"
+            --max-recoveries 5
+            --output .artifacts/exact-review-dlq/parked-reviews.json
+          )
+          if [[ "$EXECUTE" == "true" ]]; then
+            args+=(--execute)
+          fi
+          node scripts/exact-review-dead-letter-operator.mjs "${args[@]}"
+
+      - name: Fail if queued-run remediation failed
+        if: ${{ always() && steps.remediate.outcome == 'failure' }}
+        run: |
+          echo "Queued-run remediation failed after dead-letter reconciliation completed" >&2
+          exit 1
+
+      - name: Upload sanitized inventory
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: exact-review-dlq-reconcile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/exact-review-dlq/inventory.json
+            .artifacts/exact-review-dlq/parked-reviews.json
+            .artifacts/exact-review-dlq/stuck-queued-runs.json
+            .artifacts/exact-review-dlq/stuck-queued-zombies.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14

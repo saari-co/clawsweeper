@@ -104,25 +104,59 @@ function stalledPrApplyGhMock(
   options: {
     draft?: boolean;
     headCommittedAt?: string;
+    sourceRunCreatedAts?: string[];
+    sourceRunHeadBranch?: string;
+    sourceRunPullNumber?: number;
     combinedStatusState?: string;
     checkRunConclusion?: string | null;
+    checkRunStartedAt?: string;
+    checkRunCompletedAt?: string;
+    forcePushAt?: string;
+    forcePushCommitId?: string;
     maintainerComment?: boolean;
+    viewerDependentMaintainerComment?: boolean;
+    tokenLogPath?: string;
     proofRequestedAt?: string;
+    mergeable?: boolean | null;
+    mergeableState?: string | null;
   } = {},
 ): string {
   const draft = options.draft === true;
   const headCommittedAt = options.headCommittedAt ?? "2026-05-01T00:00:00Z";
+  const sourceRuns = (options.sourceRunCreatedAts ?? [headCommittedAt]).map((created_at) => ({
+    event: "pull_request",
+    created_at,
+    head_branch: options.sourceRunHeadBranch ?? "branch",
+    head_repository: { full_name: "fork/openclaw", id: 99 },
+    pull_requests:
+      options.sourceRunPullNumber === undefined ? [] : [{ number: options.sourceRunPullNumber }],
+  }));
   const proofRequestedAt = options.proofRequestedAt ?? "2026-05-10T00:00:00Z";
   const combinedStatusState = options.combinedStatusState ?? "failure";
   const checkRunConclusion =
     options.checkRunConclusion === undefined ? "failure" : options.checkRunConclusion;
+  const mergeable = options.mergeable === undefined ? true : options.mergeable;
+  const mergeableState = options.mergeableState === undefined ? "clean" : options.mergeableState;
+  const checkRunStartedAt = options.checkRunStartedAt ?? headCommittedAt;
+  const checkRunCompletedAt = options.checkRunCompletedAt ?? checkRunStartedAt;
+  const forcePushEvent = options.forcePushAt
+    ? `,{
+      event: "head_ref_force_pushed",
+      commit_id: ${JSON.stringify(options.forcePushCommitId ?? "head-sha")},
+      created_at: ${JSON.stringify(options.forcePushAt)}
+    }`
+    : "";
   const maintainerComment = options.maintainerComment
     ? `,{
       id: 9901,
       html_url: "https://github.com/openclaw/openclaw/pull/321#issuecomment-9901",
       created_at: "2026-05-11T00:00:00Z",
       updated_at: "2026-05-11T00:00:00Z",
-      author_association: "MEMBER",
+      author_association: ${
+        options.viewerDependentMaintainerComment
+          ? 'process.env.GH_TOKEN === "target-app-token" ? "MEMBER" : "CONTRIBUTOR"'
+          : '"MEMBER"'
+      },
       user: { login: "maintainer" },
       body: "Taking a look at this branch."
     }`
@@ -131,6 +165,11 @@ function stalledPrApplyGhMock(
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 const path = args[1] || "";
+${
+  options.tokenLogPath
+    ? `require("node:fs").appendFileSync(${JSON.stringify(options.tokenLogPath)}, JSON.stringify({ path, token: process.env.GH_TOKEN, method: args.includes("--method") ? args[args.indexOf("--method") + 1] : null }) + "\\n");`
+    : ""
+}
 if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$)/.test(args[2] || "")) {
   console.log("HTTP/2 200\\n\\n[]");
 } else if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
@@ -148,7 +187,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     event: "labeled",
     label: { name: "triage: needs-real-behavior-proof" },
     created_at: ${JSON.stringify(proofRequestedAt)}
-  }]]));
+  }${forcePushEvent}]]));
 } else if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {
   console.log(JSON.stringify({
     number: 321,
@@ -177,24 +216,33 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     html_url: "https://github.com/openclaw/openclaw/pull/321",
     state: "open",
     draft: ${draft},
+    mergeable: ${JSON.stringify(mergeable)},
+    mergeable_state: ${JSON.stringify(mergeableState)},
+    created_at: "2026-05-01T00:00:00Z",
     changed_files: 1,
     commits: 1,
     review_comments: 0,
     requested_reviewers: [],
     requested_teams: [],
     body: "Fixes a small bug.",
-    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/openclaw", id: 99 } },
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
 } else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/actions\\/runs\\?/.test(path)) {
+  console.log(JSON.stringify({ workflow_runs: ${JSON.stringify(sourceRuns)} }));
 } else if (args[0] === "api" && /\\/commits\\/head-sha\\/status(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify({ state: ${JSON.stringify(combinedStatusState)}, statuses: [] }));
 } else if (args[0] === "api" && /\\/commits\\/head-sha\\/check-runs(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify({
     total_count: ${checkRunConclusion === null ? 0 : 1},
-    check_runs: ${checkRunConclusion === null ? "[]" : `[{ conclusion: ${JSON.stringify(checkRunConclusion)} }]`}
+    check_runs: ${
+      checkRunConclusion === null
+        ? "[]"
+        : `[{ conclusion: ${JSON.stringify(checkRunConclusion)}, started_at: ${JSON.stringify(checkRunStartedAt)}, completed_at: ${JSON.stringify(checkRunCompletedAt)} }]`
+    }
   }));
 } else if (args[0] === "api" && /\\/commits\\/head-sha(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify({
@@ -298,20 +346,112 @@ test("stalled-unproven apply keeps a draft PR open for the abandoned policy", ()
   assert.equal(result.closedExists, false);
 });
 
-test("stalled-unproven apply keeps a PR open when head commits are recent", () => {
+test("stalled-unproven apply keeps a reused old head SHA open after fresh source activity", () => {
+  const recentSourceRunAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
   const result = runStalledPrApply({
     report: stalledUnprovenCloseReport(),
     closeReason: "stalled_unproven_pr",
-    ghOptions: { headCommittedAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString() },
+    ghOptions: {
+      headCommittedAt: "2025-01-01T00:00:00Z",
+      sourceRunCreatedAts: ["2026-05-01T00:00:00Z", recentSourceRunAt],
+    },
   });
   assert.deepEqual(result.entries, [
     {
       number: 321,
       action: "kept_open",
-      reason: "stalled_unproven_pr requires 14 days without new head commit or check activity",
+      reason: "stalled_unproven_pr requires 14 days without source activity on the current head",
     },
   ]);
   assert.equal(result.closedExists, false);
+});
+
+test("stalled-unproven apply keeps a reused old head SHA open after a force push", () => {
+  const recentForcePushAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+  const result = runStalledPrApply({
+    report: stalledUnprovenCloseReport(),
+    closeReason: "stalled_unproven_pr",
+    ghOptions: {
+      headCommittedAt: "2025-01-01T00:00:00Z",
+      sourceRunCreatedAts: ["2026-05-01T00:00:00Z"],
+      forcePushAt: recentForcePushAt,
+    },
+  });
+  assert.deepEqual(result.entries, [
+    {
+      number: 321,
+      action: "kept_open",
+      reason: "stalled_unproven_pr requires 14 days without source activity on the current head",
+    },
+  ]);
+});
+
+test("stalled-unproven apply ignores later check reruns after old source activity", () => {
+  const recentCheckAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const result = runStalledPrApply({
+    report: stalledUnprovenCloseReport(),
+    closeReason: "stalled_unproven_pr",
+    ghOptions: {
+      sourceRunCreatedAts: ["2026-05-01T00:00:00Z"],
+      checkRunStartedAt: recentCheckAt,
+      checkRunCompletedAt: recentCheckAt,
+    },
+  });
+  assert.equal(result.entries.length, 1);
+  assert.equal(result.entries[0]?.action, "closed");
+});
+
+test("stalled-unproven apply keeps a PR open without a source workflow run", () => {
+  const result = runStalledPrApply({
+    report: stalledUnprovenCloseReport(),
+    closeReason: "stalled_unproven_pr",
+    ghOptions: {
+      sourceRunCreatedAts: [],
+    },
+  });
+  assert.deepEqual(result.entries, [
+    {
+      number: 321,
+      action: "kept_open",
+      reason: "stalled_unproven_pr requires 14 days without source activity on the current head",
+    },
+  ]);
+});
+
+test("stalled-unproven apply ignores a source run for another PR sharing the head SHA", () => {
+  const result = runStalledPrApply({
+    report: stalledUnprovenCloseReport(),
+    closeReason: "stalled_unproven_pr",
+    ghOptions: {
+      sourceRunCreatedAts: ["2026-05-01T00:00:00Z"],
+      sourceRunHeadBranch: "other-branch",
+      sourceRunPullNumber: 999,
+    },
+  });
+  assert.deepEqual(result.entries, [
+    {
+      number: 321,
+      action: "kept_open",
+      reason: "stalled_unproven_pr requires 14 days without source activity on the current head",
+    },
+  ]);
+});
+
+test("stalled-unproven apply ignores a same-branch source run from before this PR opened", () => {
+  const result = runStalledPrApply({
+    report: stalledUnprovenCloseReport(),
+    closeReason: "stalled_unproven_pr",
+    ghOptions: {
+      sourceRunCreatedAts: ["2026-04-01T00:00:00Z"],
+    },
+  });
+  assert.deepEqual(result.entries, [
+    {
+      number: 321,
+      action: "kept_open",
+      reason: "stalled_unproven_pr requires 14 days without source activity on the current head",
+    },
+  ]);
 });
 
 test("stalled-unproven apply keeps a PR open when the proof request is too fresh", () => {
@@ -348,6 +488,74 @@ test("stalled-unproven apply keeps a PR open when a maintainer commented", () =>
   assert.equal(result.closedExists, false);
 });
 
+test("public publication reads cannot hide maintainer identity from destructive close guards", () => {
+  const fixtureEnv = {
+    EXACT_EVENT_PUBLICATION: "true",
+    GH_TOKEN: "target-app-token",
+    REPO_TOKEN: "workflow-public-token",
+  };
+  const previous = Object.fromEntries(
+    [...Object.keys(fixtureEnv), "GH_HOST"].map((key) => [key, process.env[key]]),
+  );
+  const logRoot = mkdtempSync(tmpPrefix);
+  const tokenLogPath = join(logRoot, "github-token-calls.jsonl");
+  Object.assign(process.env, fixtureEnv);
+  delete process.env.GH_HOST;
+
+  try {
+    const result = runStalledPrApply({
+      report: stalledUnprovenCloseReport(),
+      closeReason: "stalled_unproven_pr",
+      ghOptions: {
+        maintainerComment: true,
+        viewerDependentMaintainerComment: true,
+        tokenLogPath,
+      },
+    });
+    assert.deepEqual(result.entries, [
+      {
+        number: 321,
+        action: "kept_open",
+        reason: "maintainer issue comment blocks inactivity auto-close",
+      },
+    ]);
+    assert.equal(result.closedExists, false);
+
+    const calls = readFileSync(tokenLogPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { path: string; token: string; method: string | null });
+    assert.ok(
+      calls.some((call) => call.token === "workflow-public-token" && call.method === null),
+      "ordinary publication reads did not use the workflow token",
+    );
+    assert.ok(
+      calls.some(
+        (call) =>
+          /\/issues\/321\/comments(?:\?|$)/.test(call.path) &&
+          call.token === "target-app-token" &&
+          call.method === "GET",
+      ),
+      "destructive engagement guards did not preserve the App-authoritative maintainer identity",
+    );
+    assert.ok(
+      calls.some(
+        (call) =>
+          call.path.endsWith("/issues/321") &&
+          call.token === "target-app-token" &&
+          call.method === "GET",
+      ),
+      "destructive engagement guards did not preserve App-authoritative issue metadata",
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(logRoot, { recursive: true, force: true });
+  }
+});
+
 test("apply dry-run closes an abandoned PR with failing checks", () => {
   const result = runStalledPrApply({
     report: abandonedCloseReport(),
@@ -358,17 +566,18 @@ test("apply dry-run closes an abandoned PR with failing checks", () => {
   assert.match(result.entries[0]?.reason ?? "", /would close as abandoned inactive PR/);
 });
 
-test("abandoned apply keeps a PR open when head commits are recent", () => {
+test("abandoned apply keeps a PR open when source activity is recent", () => {
+  const recentSourceRunAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
   const result = runStalledPrApply({
     report: abandonedCloseReport(),
     closeReason: "abandoned_pr",
-    ghOptions: { headCommittedAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString() },
+    ghOptions: { sourceRunCreatedAts: [recentSourceRunAt] },
   });
   assert.deepEqual(result.entries, [
     {
       number: 321,
       action: "kept_open",
-      reason: "abandoned_pr requires 30 days without new head commit or check activity",
+      reason: "abandoned_pr requires 30 days without source activity on the current head",
     },
   ]);
   assert.equal(result.closedExists, false);
@@ -385,8 +594,37 @@ test("abandoned apply keeps a live healthy PR open", () => {
       number: 321,
       action: "kept_open",
       reason:
-        "live PR is not draft, waiting-on-author, or failing checks; abandonment is not confirmed",
+        "live PR is not draft, waiting-on-author, failing checks, or merge-conflicted; abandonment is not confirmed",
     },
   ]);
+  assert.equal(result.closedExists, false);
+});
+
+test("abandoned apply treats a merge-conflicted head as stalled", () => {
+  const result = runStalledPrApply({
+    report: abandonedCloseReport(),
+    closeReason: "abandoned_pr",
+    ghOptions: {
+      combinedStatusState: "success",
+      checkRunConclusion: "success",
+      mergeable: false,
+      mergeableState: "dirty",
+    },
+  });
+  assert.equal(result.entries[0]?.action, "closed");
+});
+
+test("abandoned apply keeps unknown mergeability open when no other stalled state exists", () => {
+  const result = runStalledPrApply({
+    report: abandonedCloseReport(),
+    closeReason: "abandoned_pr",
+    ghOptions: {
+      combinedStatusState: "success",
+      checkRunConclusion: "success",
+      mergeable: null,
+      mergeableState: "unknown",
+    },
+  });
+  assert.match(result.entries[0]?.reason ?? "", /not draft.*merge-conflicted/);
   assert.equal(result.closedExists, false);
 });

@@ -16,7 +16,7 @@ import {
 } from "./lib.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
-import { AUTOMATION_LIMITS, workerLimit, type WorkerLane } from "./limits.js";
+import { AUTOMATION_LIMITS, workerLimit, type WorkerLane } from "../limits.js";
 import {
   repairJobIntentForFrontmatter,
   repairJobUsesClusterLane,
@@ -154,6 +154,14 @@ function shouldDispatchJob(relative: JsonValue) {
     activeRunsByPrefix: activeRepairRunsByPrefix,
   });
   if (!activeRun) return true;
+  const createdAt = String(activeRun.createdAt ?? "");
+  if (
+    relative.includes("/inbox/issue-") &&
+    process.env.GITHUB_OUTPUT &&
+    Number.isFinite(Date.parse(createdAt))
+  ) {
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `issue_worker_created_at=${createdAt}\n`);
+  }
   console.log(
     `skipping ${relative}: active ${workflow} run already exists (${activeRun.url ?? activeRun.databaseId ?? "unknown run"})`,
   );

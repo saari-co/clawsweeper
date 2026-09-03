@@ -7,19 +7,246 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ## 0.3.1 - Unreleased
 
+### Removed
+
+- Deleted the separate live-proof dispatch/execute/attach workflow and its composite dispatcher; live verification now stays inside the review artifact lifecycle.
+- Deleted the retired append-window compactor end to end: the `state-materializer.yml` workflow (a runner every 20 minutes to drain zero rows), its drain module, and the producer-free `/internal/state/{append,drain,ack,dispose}` Worker endpoints plus the five `state_append_*` Durable Object tables, which are dropped on upgrade.
+- Deleted the commit-review lane (`commit-review.yml`, the hosted commit sweeper CLI commands, classifier/check publishing, and the `repair-commit-finding-intake.yml` intake) after zero successful runs in its final 20 attempts; the offline `pnpm local-review` engine and existing `commit_finding` repair jobs remain.
+- Deleted the crawl-remote production deployment system (`deploy-crawl-remote.yml`, its pinned Wrangler toolchain, and CI integration job) after three runs ever with no success.
+- Deleted the dormant `repair-finalize-open-prs.yml` dispatch workflow (last success April 29); the finalizer report module stays because `repair-publish-results.yml` still writes it after every worker-result publish.
+- Deleted the proof-nudge lane (`proof-nudges.yml`, the `proof-nudges`/`bot-proof` CLI commands, and their eligibility/rendering policy); historical proof-nudge comment markers still count as dated proof requests in the stalled-unproven close policy.
+- Deleted the monthly `state-compaction.yml` history rewrite of `openclaw/clawsweeper-state`, removing one of the last writers ahead of that repository's retirement.
+
+### Changed
+
+- Retain only Cloudflare failure flags in queue transport logs so backend faults can be diagnosed without exposing exception details.
+
+- Hydrate review blobs from cached PR snapshots that store an absent previous filename as `null`, preventing repeat reviews from refusing otherwise available source.
+
+- Preserve Codex keep-open verdicts during publication instead of treating related PR links as independent supersession decisions.
+
+- Let Codex own transport recovery within one review process; the durable queue owns fresh attempts. Batch publication now loads only reviewed item tuples and syncs their comments directly, removing full-repository hydration, source Git pulls, and a second comment-sync dispatch.
+
+- OpenClaw PR reviews now count explicitly named test support as Tests and exclude test-role files from config-surface warnings while preserving contributor-proof and storage gates.
+- Review continuity now carries bounded prior rank-up items and explicit context coverage so intentionally filtered self-comments do not recursively become new merge warnings, while preserving concrete blockers and existing review gates.
+- Proof-review guidance now maps changed source behavior to exercised scenarios and observed results, and historical Live Verification PASS comments clarify their declared scenario and assertion scope.
+- Reviewer input now retains bounded late proof/trace excerpts with explicit body coverage and treats PR patches as reviewer-only media inputs, without increasing the body budget, adding media fetches, or weakening proof requirements; OpenClaw Bay is unaffected.
+- PR reviews now separate introduced changes from main-only drift, verify test-merge parents, and avoid stored-data warnings for ordinary Markdown prose beside source.
+- Review and repair fetches preserve the target branch ref when Git pruning is enabled.
+- Default close-mode apply runs now requeue up to five exact re-reviews for records whose close was blocked by source drift or an unverified-checkout review, so stale backlog records converge to closeable instead of being skipped by every cursor sweep.
+- Live verification now publishes a sanitized, capped dev-server log tail when browser startup fails, and detects a start command that exits before its URL becomes reachable without waiting for the readiness timeout.
+- Live verification now installs a missing target package manager on demand after execution is approved, publishes installer failures as verification results, and guides plans toward stable assertions the run can satisfy.
+- Live verification now runs immediately after review in the same job and exact reviewed checkout; review judgment gates execution, target children receive a denylist-and-heuristic-sanitized environment, package installs suppress lifecycle scripts unless a repository explicitly opts in, and review jobs default to `ubuntu-latest` without requiring Linux namespaces. Existing publication jobs still validate and upload media before publishing the normal record and comment.
+- Live verification comments now keep terminal captures but render browser proof as sanitized per-step outcomes with explicit failure reasons, never document-wide page text or empty assertion sections.
+- Live verification now runs real PR behavior by default, publishes bounded command output and assertion results even without video, and treats recordings as optional presentation.
+- Browser live proofs treat scroll-into-view as best effort so continuously animated targets stay clickable.
+- Live-proof recordings can now be retracted through a trusted manual workflow dispatch without rerunning target code or requiring an artifact, manifest, or matching head SHA.
+- Live-proof recordings now wait for post-action command or page expectations, hold the final state on screen, and attach only when an initially absent expectation proves a semantic change.
+- Live-proof recording retraction now uses a small trusted maintenance workflow that preserves the review plan and verification result while synchronizing the canonical record and public comment.
+- Short live-proof recordings fall back to a single poster frame when the contact-sheet tile cannot emit one.
+- Terminal recorders flush WebM packets immediately and treat a live ffmpeg session as healthy while the muxer buffers.
+- Terminal live-proof recordings tune VP9 for realtime capture and accept the recorder once any payload is written, matching the encoder's bursty muxer output.
+- OpenClaw browser live proofs run against the repository's mock control-UI dev server.
+- Folder reconciliation now defers with a zero-mutation result when the open-state scan hits GitHub rate limiting, so throttled proof/apply/publish runs proceed to their close and publication work instead of failing before `Apply close proposals` can run.
+- Comment-only sync now defers its remaining batch as a runtime-budget-style yield when GitHub rate limits a live read, instead of failing the scheduled run; the next 15-minute cycle resumes the interrupted item, and close-mode apply keeps its loud failure.
+- Close-mode apply now takes the same rate-limit yield as comment sync: a throttled live read mid-scan defers the remaining window to the next cycle instead of failing the run, after production runs kept losing 600-record scan windows to mid-run 403s.
+- Increased the AWS Crabbox root volume from 160 GB to 400 GB so trusted checks can provision with the repository's current dependency and build footprint.
+- GitHub-throttled terminal status updates no longer fail the finalization run; the requeue step already re-arms the acknowledgement for after the rate window.
+
+- GitHub-throttled live-item checks now release the review claim for a delayed retry instead of failing the run and spending failure budget.
+- Event-review artifact publication completes as a superseded no-op when the reviewed branch vanished upstream (force-push or deletion) instead of failing the run.
+- Worker record requests now retry transient blank/invalid 2xx bodies from the edge within the bounded budget instead of failing hydration on the first occurrence.
+- Exact reviews of items that closed after enqueue now complete as superseded no-ops, and GitHub-throttled reservations defer as held retries — neither spends the item's review-failure budget.
+- Trimmed the exact-review feed rate from 600/h to 450/h after the resumed apply and comment-sync lanes pushed the shared GitHub App installation token into rate-limit 403s.
+- Exact reviews whose pull request head moved past the queued authority now complete as superseded no-ops (the newer push owns its own review) instead of failing and burning the item's review-failure budget.
+- Close-coverage proof runs now remove their model scratch files (`N-M.model.json`, `N-M.prompt.md`) from the proof artifact tree, which the apply-lane validator was correctly rejecting and failing every apply run.
+- Repaired legacy exact-review decisions whose empty branch was shifted to the string `0`, resolved invalid queued branches from the target repository default, and requeued temporary branch-resolution failures without spending the eight-attempt review-failure budget.
+- Made scheduled exact reviews immediately ready after fleet admission, automatically retried recoverable parked reviews on a bounded 5/10/20-minute cycle, and exposed backoff/park reason counts in queue status and the dashboard.
+- Aligned normal fanout and planner priority with the dashboard's canonical tuple coverage identities, so legacy backfill reports no longer hide untracked open items behind canonical re-reviews.
+- Sized scheduled candidate batches from live free review capacity, apportioned fleet fanout by untracked backlog while retaining round-robin fairness, and skipped empty repositories before both normal and hot fanout so a dominant backlog can fill idle review slots without starving smaller targets.
+- Isolated review admission, pressure, and backpressure accounting from the publication lane so stale publication work cannot throttle review throughput, made top-level queue health review-specific, and added durable shed counters by reason.
+- Made exact-review reservation races and mid-generation supersession successful no-ops with bounded jittered retries, surfaced provider throttling separately from content/output failures, prioritized never-reviewed open items before oldest-reviewed canonical refreshes, and based dashboard coverage on signed live open-item inventory with explicit expired, untracked, protected, and unmanaged cohorts.
+- Routed scheduled review through the durable exact-review queue, raised each target plan from one to 50 candidates, and added oldest-age funnel telemetry plus a fleet-wide 600-review/hour admission budget with duplicate, backlog, and lease-safe backpressure.
+- Scoped per-target canonical record hydration to the selected repository and skipped unused ledger/assets downloads in workflow lanes, preventing exact-item review publication from collapsing under concurrent full-fleet state setup.
+- Doubled exact-review admission to 128 global and 120 per target with a separate 194-slot Actions budget that preserves verdict publication at full review load, doubled scheduled fleet review fanout and canonical publication batch preparation, prioritized six-day oldest-review coverage before hot-item churn, exposed a six-hour fleet coverage summary, and raised automatic apply to 40 closes with proportional scan/runtime budgets without changing close eligibility.
+- Completed the Cloudflare-canonical state migration: records publish only to the Durable Object, action ledgers and assets publish only to R2, canonical-only workflows no longer check out `clawsweeper-state`, the former materializer only compacts the legacy append window, and the remaining `jobs`/`results`/`notifications`/apply-report Git writers use the Durable Object coordinator without Git lease refs or rebuild recovery.
+- Generated live-proof plans now receive the effective cold-checkout setup contract and guidance to supply missing build or code-generation prerequisites before dependent commands.
+
+### Fixed
+
+- Bound standalone webhook bodies to 2 MiB before signature verification, preserving chunked deliveries and flushing rejection responses before closing oversized requests. Thanks @SebTardif.
+- Preserve committed lifecycle outcomes when later queue completions disagree, preventing terminal-state conflicts from failing completion callbacks and acknowledgement drivers.
+- Retain numeric queue failure source locations inside the Durable Object before remote transport discards the original stack, without logging private error text.
+- Bound shared repair GitHub CLI calls with native process deadlines and honor per-call timeout settings. Thanks @SebTardif.
+- Bound standalone webhook GitHub requests to 15 seconds, including response bodies, so stalled calls return a retryable response. Thanks @SebTardif.
+- Kept leading report metadata authoritative through ordinary and fenced body quotes across review, repair intake, workflow selection, and decision packets; shared structural parsing rejects competing records and duplicate packet keys while preserving legacy promotion guards. Thanks @dwin-gharibi for the original report and proposed fix in [#1137](https://github.com/openclaw/clawsweeper/pull/1137).
+
+- Completed obsolete exact-review publications when apply verifies a strictly newer durable review for the same revision, preserving retry behavior for unproven results. Thanks @vincentkoc. (#1249)
+
+- Required the saved lease's accepted or deduplicated receipt for direct-publication requeues, preventing superseded receipts or mutable current decisions from inventing or dropping follow-up reviews.
+- Preserved owed source-drift reviews when completion callbacks are lost, and distinguished queue-completion failures from review failures. Thanks @yetval. (#1251)
+
+- Stopped retrying unchanged PR revisions after an incomplete-source scan refusal while preserving newer queued revisions. Thanks @sallyom. (#1311)
+- Stopped stored-data and SQLite warnings for colocated test-support files while preserving production persistence, rename, and incomplete-evidence warnings.
+- macOS action-ledger locks use stable process identity, treat unavailable observations as unknown, and fail closed for live legacy owners during the version 2 lock transition.
+- Aligned PR proof comments and status labels with the existing host requirement when a reviewer records proof as not applicable, while preserving recorded assessments and merge gates.
+- Preserved authoritative whole-range Git line counts in local reviews and report rendering, allowing review to complete with unavailable best-effort statistics while requiring complete file enumeration under its prior capture and timeout contract and never showing unknown counts as verified zero totals.
+- Classified the explicitly approved autoreview fixture only by its exact full-URI digest and canonical or vendored source path, enforcing the same digest/path/mode policy at every scanned endpoint for all reviewed fixtures while preserving scanner gates and value-free audits.
+- Stopped treating pane-local runtime state as stored data while retaining warnings for explicit persistence changes and incomplete storage patches.
+- Recover hosted PR reviews that refused `incomplete_source` by fetching reviewed-head history before the bounded base/head fallback, preserving merge-base verification and secret-scanning gates. Thanks @masatohoshino. ([#1308](https://github.com/openclaw/clawsweeper/pull/1308))
+- Corrected retained terminal-proof cleanup for independent process-exit and PTY-close events, preserving the original wrapper failure and draining dead-pane capture only after verified cleanup.
+- Prevented rejected model inputs from surviving in generated prompt artifacts; retained diagnostics now follow admission with owner-only access, and unused prompt copies are no longer written.
+- Provisioned pinned TruffleHog for hosted reviews and enforced complete host-owned input scans before native review or cache reuse, preserving read-only workers, proxy authentication, and redacted fail-closed errors.
+- Removed redundant pnpm setup identity work by reusing the verified post-install identity without changing deadlines or mutation guards.
+- Guided package-version live proofs toward validated machine-readable output and exact resolution checks instead of guessed terminal formatting, while preserving literal expectations and successful-exit requirements.
+- Preserved empty-step live-proof plans through report rendering and inspection, with explicit JSON empty arrays and strict compatibility for existing solitary `- none` reports.
+- Added schema constraints and explicit prompt guidance for single-line live-proof commands and nonblank run steps while preserving strict parsing.
+- Scoped the `openclaw/openclaw` release-note review restriction to its repository profile so ClawSweeper and other targets follow their own policies without granting release-file edit permission.
+- Routed default apply's bounded source-drift refreshes through exact-event queue intake so full-repository hydration cannot fail before admission.
+- Indexed webhook receipt expiry by receipt time to avoid scanning and sorting retained history on each accepted delivery, preserving 30-day retention and transactional cleanup.
+- Bounded apply/proof/comment-sync record retention to selected records and paired dependencies, avoiding unrelated archive loads during ledger finalization without changing close guards.
+- Kept projected GitHub reads out of the durable ETag cache so incompatible response shapes cannot hide requested reviewers from close guards. Thanks @goutamadwant! (#1242)
+- Normalized unexpected exact-review failures at the Worker boundary without weakening Durable Object transaction rollback. Thanks @yetval and @vincentkoc! (#1240)
+- Terminal live verification waits for finite commands to complete within the existing proof budget before judging output, keeps missing assertions unverified, and preserves usable PTY descriptors for detached child processes.
+- Replaced public Worker exception text with endpoint-owned error codes and bounded direct-publication rejection categories, preserving distinct operational fingerprints without exposing submitted values or stack traces.
+- Replaced terminal live proof's authenticated `xvfb-run` wrapper with a TCP-disabled local Xvfb display so readiness probes and recording can connect without X authorization failures.
+- Made terminal live-proof recording wait for Xvfb and ffmpeg readiness and clean finalization, with tmux pane diagnostics on failure.
+- Routed every durable review-record publication lane through one shared, host-authenticated live-proof dispatcher, including queued exact-review batches grouped per target repository.
+- Exact-event reviews now dispatch recommended live proofs with host-repository credentials, while generic and configured OpenClaw and steipete profiles opt into browser or terminal proof as appropriate.
+- Hosted webhook 🦞👀 receipts now dedupe per pull request across `opened` and `ready_for_review`, so back-to-back webhook actions keep one receipt instead of posting near-identical duplicates. (#1084)
+- The target dispatcher no longer double-posts pull request receipt acknowledgements when `opened` and `ready_for_review` fire seconds apart: the ack step now waits and rechecks for any existing marker immediately before posting. (#1083)
+- Restored pull request 🦞👀 receipt comments by granting fast-ack tokens `pull_requests: write`. (#1082)
+- Scoped GitHub App tokens to their named repositories via the documented `repositories` parameter. (#1082)
+- Legacy reports with canonical proof or rating keys outside the apparent leading front-matter block now fail closed, with a read-only workflow to inventory affected canonical records. (#1049)
+- Prevented model-authored report prose and body-shaped front matter from spoofing proof or rating sections, keeping unproven external pull requests in human review instead of routing them into automated repair. (#951)
+
 ### Added
 
+- Enabled browser live proof for ClawSweeper with a self-contained local OpenClaw Bay launcher and seeded lifecycle/workflow demo data.
+- Added an opt-in live-proof lane that records typed browser or terminal plans in a secretless PR-head job, validates and uploads media from a separate trusted job, and attaches only trusted R2 URLs to the durable review comment.
+- Status dashboard facelift: an at-a-glance subsystem health strip in the hero (review handoff, work execution, incidents, apply lane, coverage) and a new Fleet Review Coverage section backed by a public `/api/review-coverage` endpoint that summarizes trailing-7-day review coverage per fleet (coverage %, stale/failed/pending counts) from canonical Durable Object item records.
+- Cut cluster repair intake over to durable state publication: intake appends an authenticated intent (exact job bytes, digest, store identity, selector report) and hydrates with a read-only non-persisted state credential; result publication mints its target-read token for the validated worker target repositories, projects exact changed state paths, and publisher-rerun failures no longer block subsequent self-heal. Thanks @RomneyDa! (#873)
+- Added authenticated Worker blob endpoints (`/internal/state/blobs/*`) that serve the `ledger/v1` and `assets` state trees from R2 with create-only immutable ledger writes, a cursor-resumable `migrate-state-blobs` workflow with digest verification, and an opt-in `CLAWSWEEPER_LEDGER_SOURCE=worker` dual-read in `hydrate-state` (default stays git).
+
+- Durable cluster intake now dispatches through the state materializer with receipt-verified recovery: git ledger/job files stay projection (dispatch requires the HMAC accepted-intent receipt minted at durable acceptance), the dispatch claim is published before the workflow side effect, malformed intake rows dead-letter per row instead of re-failing the drain, and the shell receipt gate matches the observer's successful-planning-job definition. At-least-once workflow creation with exactly-once worker execution intent. Thanks @RomneyDa! (#884)
+- Ranked imported repair clusters for landable bugs using conservative historical dedupe, live-state, security, and quality gates. Thanks @RomneyDa! (#881)
+- The OpenClaw runner ships a built-in Z.AI provider: `CLAWSWEEPER_OPENCLAW_MODEL=zai/glm-5.2` runs GLM-5.2 on the GLM Coding Plan endpoint with only `ZAI_API_KEY` (validated live end to end).
+- The OpenClaw runner ships a built-in Cerebras provider: `CLAWSWEEPER_OPENCLAW_MODEL=cerebras/zai-glm-4.7` needs only `CEREBRAS_API_KEY` (validated live at ~474 tok/s on Cerebras Code Max); provider-key allowlist extended for Cerebras, Z.AI, DeepSeek, and Mistral.
+- Redesigned PR review comments into a scan-first layout: outcome and merge readiness up top, ratings and verification as compact tables, before-merge work as native checklists, evidence folded into details — with hardened fence-aware section parsing and Mermaid sanitization. Thanks @Patrick-Erichsen! (#776)
+- Screenshot-only real-behavior proof (PNG/JPEG/WebP/GIF) is now hydrated through the bounded media path so sandboxed reviewers can assess it instead of marking it insufficient. Thanks @goutamadwant! (#595)
+- The repair owner policy (`CLAWSWEEPER_ALLOWED_OWNER`) accepts a multi-owner list enforced identically at intake and every execution gate; disallowed owners are rejected before a durable job is written. (#809)
+- Added a pluggable `CLAWSWEEPER_RUNNER` agent-process seam with Codex as the unchanged default and isolated OpenClaw CLI execution for provider/model fallbacks.
+
+- Added review-time bulk-filer detection, transparent labeling, duplicate scrutiny, fix-lane suppression, and within-bucket scheduling de-prioritization for high-volume issue authors.
+- Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
+- Added a maintainer-only two-runner workflow that builds a hash-bound
+  crawl-remote release artifact without production credentials, then requires
+  that exact SHA to remain the current main tip on a fresh protected runner
+  using an environment-specific Cloudflare token, a committed lockfile-backed
+  Wrangler toolchain, pre- and post-migration D1 fence proof, a second
+  current-main check immediately before Worker deployment, an explicit
+  dormant-or-active selectors for observation ordering and snapshot
+  provenance, fail-closed single-output Worker packaging, 31-day
+  approval-window artifact retention, exact release-identity and contract
+  polling on workers.dev, and a fail-closed compatibility contract that accepts
+  only the reviewed pending migration suffix. Migrations 0007 and 0008 are
+  mechanically checked as additive, including immutable archive-retirement
+  state and the old-worker publish-candidate bridge, and the still-serving
+  previous Worker's public,
+  D1-backed contract must remain healthy without regressing routes,
+  capabilities, or notes after migration and before Worker deployment. The
+  protected
+  environment must explicitly own the deployment authority and bind the
+  production token fingerprint; mandatory custom-route proof uses Cloudflare
+  Access service-token headers, and failed or stale deployments roll back only
+  the Worker to the exact prior stable version; D1 migrations remain applied.
+  The 40-minute protected job enforces a 35-minute internal mutation deadline,
+  leaves eleven minutes for bounded setup before the D1 cutoff, reserves seven
+  minutes between D1 and Worker cutoffs plus two minutes for late ownership
+  recovery, and reauthorizes both repository main tips again after production
+  proof before accepting success.
+  The former crawl-remote deployment workflow must be deleted, not merely
+  disabled, and all Wrangler reads, mutations, ownership probes, and rollback
+  commands have explicit deadlines. Absolute pre-mutation cutoffs refuse D1 or
+  Worker changes once the protected job can no longer preserve the complete
+  proof and rollback window. A timed-out ownership recovery remains
+  indeterminate even when every observed status still shows the previous
+  Worker, so a delayed Cloudflare mutation is never misreported as absent.
+  Environment variables resolve only
+  inside protected steps, route-proof mode is mandatory, and D1 packaging
+  accepts only the exact reviewed migration sequence and content hashes.
 - Added conservative, add-only `good first issue` labeling for unlocked, small, current-main reproduced bugs with a high-confidence repair prompt and validation steps and no linked-PR, feature, config, product, security, protected-label, or maintainer-opt-out blocker.
 - Added durable maintainer decision packets whose exact question, rationale, options, recommendation, and likely owner come from Codex structured review output while deterministic code only validates and persists the result. Thanks @brokemac79.
 - Added close-candidate quality telemetry to apply status while keeping reporting separate from close eligibility and comment-only sync. Thanks @brokemac79.
 - Added the PR-only `stalled_unproven_pr` close reason: external D/F-rated pull requests whose requested real-behavior proof stayed missing, mock-only, or insufficient can close after 14 idle days, guarded by live checks that the proof request itself was visible for 14 days plus proof-label, draft, head-commit, and human-engagement gates.
 - Added the PR-only `abandoned_pr` close reason: external pull requests idle for 30 days that are still drafts, waiting on their author, or failing checks on the live head can close, while high-quality proven work stays open for repair/adopt paths. See `docs/stalled-pr-close-policies.md`.
+- Added the default-off, issue-only `unsponsored_feature_request` close reason for 90-day-old feature requests awaiting product direction, with live sponsorship, activity, popularity, linked-PR, and security gates.
+- Added the default-off, PR-only `author_pr_budget_exceeded` close reason to gradually trim external authors' oldest lowest-signal PRs after live count, inactivity, proof/rating, protected-label, maintainer-engagement, and per-run-cap checks.
+- Added default-off `stale_version_bug` and `obsolete_fix_pr` close reasons for genuinely obsolete issues and small fix PRs, with fail-closed live age, activity, engagement, security, popularity, and per-path main-branch verification gates.
+- Exposed the oldest pending exact-review item key per lane so operators can identify stuck review and publication work from the public queue status API.
 - Added apply-health telemetry and a quiet-by-default dashboard alert for stalled, cursorless, or fully blocked pruning windows. Thanks @brokemac79.
 - Added author-wide PR repair intake across configured public repositories, with private and unsupported repositories excluded before job generation. Thanks @Jhacarreiro.
 - Added a system, light, and dark theme switcher to the generated documentation site. Thanks @joshka.
 
 ### Changed
 
+- Treat apply runtime-budget exhaustion as a successful resumable yield, preserve the safe next-cycle cursor, and stage immutable action events safely from sparse state checkouts.
+- The `migrate-state-blobs` workflow uploads with bounded concurrency (default 12, input-configurable) instead of strictly sequential per-file round trips, reports a contiguous-prefix resume cursor that stays valid under out-of-order completion, and backs off adaptively on 429/5xx pressure; three prior runs had hit the job timeout before finishing the ledger tree.
+- Bound durable cluster dispatch recovery to a verifiable accepted-intent receipt and strictly validated v2 intake ledgers. Thanks @RomneyDa! (#883)
+- Prioritized durable cluster intake without starving sweep, router, proof, or canonical tuple rows during sustained intake. Thanks @RomneyDa! (#882)
+- Made every item/closed/plan/decision-packet writer publish an atomic canonical Worker tuple first, leaving the git state tree as materializer-only projection; added bounded canonical projection replay for migration convergence.
+- Removed the Claude CLI runtime layer; ClawSweeper is Codex-only.
+- Allowed eight isolated exact-review batches to prepare concurrently while
+  retaining one fenced state-writer mutation boundary.
+- Snapshot exact-review batch clone credentials once before worker fanout so
+  parallel preparation no longer drops members during repeated shared-repo
+  bootstrap reads, and report any remaining member-specific setup failure.
+- Completed tuple-missing stale publication artifacts as superseded in batch
+  mode instead of retrying them forever without a mutation outcome.
+- Isolated each exact-review batch member's records, action ledger, snapshots,
+  and apply reports under its private work root while serializing imports into
+  the shared Git object database, preventing parallel publishers from moving
+  each other's records or losing prepared mutation blobs.
+- Restored the state materializer to GitHub-hosted runners after the dedicated
+  runner label left the sole publication drain queued without an eligible
+  runner.
+- Split exact-item review from Git-backed publication: read-only reviewers now upload hash-bound, 90-day artifacts and enqueue separate durable publication leases before one globally serialized publisher validates, comments, routes, and commits state without rerunning Codex after ordinary publisher failure; handoffs still blocked after 80 days safely fall back to one fresh exact review.
+- Reverted the action-lifecycle expansion from PR #521, restoring the pre-merge ClawSweeper paths while retaining later exact-review throughput fixes and retrying coalesced reconciliations after any partial lookup failure.
+- Raised exact-review capacity from 48/44 global/per-target workers to 64/60, shortened unclaimed dispatch recovery from ten to six minutes, and coalesced terminal-run reconciliation bursts into one bounded aggregate claim scan.
+- Expanded exact-review backlog capacity while making background review yield, released exact-review leases before ledger publication, and aggregated healthy retry scans into one bounded ledger summary.
+- Accepted package-manager argument separators in the action-ledger CLI and
+  allowed proven zero-command router runs to finish without empty publication.
+- Made action-ledger publication include every transactional import binding,
+  added pre-dispatch apply and retry receipts with conservative unknown-outcome
+  recovery, failed active apply items on runtime yield, preserved skipped apply
+  outcomes independently from incidental mutations, separated durable comment
+  writes from metadata reconciliation, propagated ambiguous retry dispatches
+  and final Codex retryability exactly, and ordered every apply mutation attempt
+  and outcome with monotonic causal phases.
+- Dual-write review batches, items, retries, Codex log publications, durable
+  review comments, apply actions, apply batches, and apply reports into the
+  immutable action ledger, including partial, interrupted, timeout, and failed
+  executions.
+- Dual-write comment-router command receipt, classification, durable claim,
+  claim refresh, receipt-aware command-side GitHub mutation attempts and
+  outcomes, dispatch, wait, recovery, completion, skip, and failure transition,
+  status-comment progress, and report-only repair requeues into immutable
+  per-attempt action chains. Each retried request receives its own causal
+  receipt pair while retaining stable business idempotency; forced replays use
+  production-wired durable attempt identities through dispatch claims and worker
+  receipt keys; and bounded requeues dispatch the same original source path
+  bound to their digest and depth before fail-closed immutable publication from
+  the setup-provided action-ledger output root to the state repository. Each
+  command lane binds publication to a canonical, run-scoped finalized-shard
+  manifest and rejects any missing producer path before state import.
+- Short-circuited authenticated duplicate comment deliveries when their exact
+  body version is already terminal in the durable router ledger, while edited,
+  retryable, and state-drifted commands retain the full routing path.
+- Expanded stale-insufficient-info issue handling to materially outdated reports with no current-version confirmation for 60 days, and counted live merge conflicts as an abandoned-PR stalled state.
+- Upgraded Codex review and repair workers to GPT-5.6 Sol with high reasoning, invalidating cached reviews from the prior model policy.
+- Added a fail-closed structural review cache that can reuse unchanged scheduled keep-open verdicts before comments, timelines, diffs, and commits are hydrated, with same-second human edit detection, complete hydrated PR-state binding, per-run savings metrics, and the existing full-content cache retained as a second stage.
+- Added a fail-closed semantic review cache for hydrated pull requests, using TypeScript compiler tokens and structured JSON to ignore ordinary formatting or comment churn while requiring unchanged discussion, reviews, checks, readiness, policy, and target context plus post-lease revalidation.
+- Raised durable exact-review admission from 20 to 28 global leases and from 16 to 24 leases per target while preserving four slots for other repositories.
 - Redesigned the live dashboard and triage pages: an editorial status headline, borderless stat ticker, pipeline stepper, single capacity bar, and dense worker rows replace the boxed card layout, with a warm theme that follows the system light/dark preference, one lobster-coral accent, quiet outline pills, GitHub label colors as neutral dot-pills, and emoji-free metric and section labels.
 - Reused unchanged scheduled keep-open reviews for up to 14 days while forcing fresh reviews after content, policy, target-head, or human-activity changes and before any close promotion. Thanks @yetval.
 - Expanded untargeted close-apply scans from 300 toward a capped 900 records after skip-heavy zero-close windows without changing close or worker limits. Thanks @brokemac79.
@@ -31,12 +258,128 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Codex subprocess containment now actually suppresses target `.pnpmfile.cjs` execution: pnpm 11 only honors `npm_config_*` environment settings, so the previously used `PNPM_CONFIG_IGNORE_PNPMFILE` spelling was inert and a target repository's pnpmfile could run arbitrary code during repair installs.
+- Reconcile observers now start only for review titles they can classify, so queue-backed `Review exact item` and support runs no longer consume runner slots merely to report `skipped`; a new hourly janitor also cancels runs stuck in `queued` for over 24 hours before they decay into uncancellable zombies.
+- Deployment runs waiting for human approval no longer count as runner-queue congestion in operational health: a forgotten approval gate had pinned `oldest_queued_minutes` at eight-plus days and held work-execution status away from healthy; approval-gated runs now report separately (count and oldest age) in the API and the execution alert.
+- Terminal command acknowledgements whose status comment was deleted (or never existed) now complete as a durable `missing_status_comment` skip instead of requeueing the finalization driver forever every ~20 minutes.
+- Apply and comment-sync publications now recover from canonical record tuple 409 conflicts instead of crashing mid-checkpoint: an equivalent concurrent write is absorbed, an unrelated-section race is rebased onto CURRENT with a single deterministic retry, and a same-section race skips just that item while the rest of the run continues.
+- Prevented weekly coverage from endlessly refreshing tracked records while never-reviewed live items remained invisible behind a full candidate batch; normal fanout now refreshes and consumes the signed live inventory, skips empty repositories, and prioritizes repositories with untracked work.
+- Reconciled apply backlogs now publish record tuples in bounded batches, re-verify authority-superseded canonical revisions without weakening source/verdict guards, and always carry an explicit coverage-proof artifact manifest under reduced state hydration.
+- Restored close-backlog throughput by keeping apply jobs off the enormous immutable state-blob hydration path, and isolated operator-dispatched sweeps from background concurrency coalescing.
+
+- Prevented exact-review cancellation storms by sparsely checking out Worker-projected state and keeping completed review-generation leases fenced through final publication.
+- Apply now rechecks close proposals previously blocked by protected labels, PR close-exemption labels, or locked conversations, and resumes the normal conservative close gates when the live blocker is gone instead of stranding the verdict permanently; canonical audit output is uploaded before state publication so a later tuple conflict cannot discard the close-verdict inventory.
+- Worker-mode hydration now cold-hydrates a slug that has no stored snapshot yet (records created canonically after the R2 seeding, e.g. a repository's first review) by replaying its journal from revision 0, bounded at 2000 records, instead of refusing cutover for the entire fleet; over-bound slugs still produce the named `snapshot_not_found` refusal (`cold_hydration_bound_exceeded`) telling the operator to trigger a snapshot, and snapshot cache key preparation excludes cold slugs instead of disabling the cache.
+- Worker-mode hydration now discovers record repo slugs from the authenticated `/internal/state/records/slugs` Worker endpoint (canonical DO store, per-slug revisions) instead of reading the git state checkout's `records/` directory, which the worker-mode sparse checkout never materializes — this ended the permanent `no_record_repo_slugs` cutover refusal; explicit `CLAWSWEEPER_RECORDS_REPO_SLUGS`/`--records-repo-slugs` still wins, git-only (un-backfilled) slugs are warned about, and the snapshot cache key preparation uses the same discovery.
+- Worker record request failures now surface the real status, error code, and a body snippet instead of dying on `Response.clone: Body has already been consumed`, and signed Worker requests retry transient 5xx/network failures (3 attempts, exponential backoff) so Cloudflare 502s no longer kill long export/reconcile runs.
+- Made canonical record replay normalize revision-ordered legacy tuple remnants, continue after per-item validation rejections, and fail once at the end with every rejected item id.
+- Allowed stuck-placeholder recovery to label pull requests by granting its target token pull-request write permission alongside issue write. Thanks @masatohoshino! (#865)
+- Kept root-level apply reports as digest-only action-ledger evidence so ledger-enabled apply runs can finish, publish their compatibility report, and advance their cursor. Thanks @yetval! (#833)
+- Restored repair and spam workflows by keeping the multi-owner repair policy out of the GitHub App token action's single-owner input. Thanks @yetval! (#834)
+- Stopped the review pipeline stranding delivered verdicts: a single drifted state item is quarantined instead of aborting its whole batch, the commit_refs recovery path retries its final state-branch push with exponential backoff like its receipt and lease siblings, the superseded-placeholder sweep runs on every apply pass instead of only right after posting the durable verdict comment, and placeholder recovery spends its per-run budget on the oldest orphans first and labels long-stuck ones. Thanks @yetval! (#816)
+- State publishes rebase onto the live remote head after lease admission, the coordinator ticket poll has a hard deadline with a still-queued heartbeat, and network pushes carry timeouts — ending the materializer's stale-base rejections and silent hangs. (#805)
+- The state materializer is admitted through the publication-batch coordinator lane so the bulk writer no longer starves behind batch lease turns; queued state now drains on schedule. (#806)
+- The `@clawsweeper re-review` acknowledgement describes the durable review comment's real create-or-update behavior. Thanks @anagnorisis2peripeteia! (#587)
+- `normalizeGitHubActor` strips every trailing `[bot]` suffix, so stacked suffixes can no longer survive normalization and collide with a real bot identity. (#808)
+- Validation identity capture and near-exhausted command budgets fail with classified budget errors instead of raw few-millisecond subprocess timeouts on loaded machines. (#817)
+- Coalesced retried exact-review publication deliveries after provenance refresh without breaking same-producer revision handoff. Reported by @snowzlmbot automation.
+- Synchronized review-derived labels on high-activity pull requests when complete hydration proves omitted activity is automation-only, while continuing to fail closed on hidden human activity or incomplete hydration. Thanks @veteranbv.
+- Stopped stale "review started" placeholder comments from accumulating on reviewed items: publishing the durable review comment now sweeps superseded placeholders.
+- Stopped narrow OpenClaw automerge repairs from chasing unrelated full-repository lint and typecheck failures.
+- Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
+- Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
+- Restored exact-review intake by deriving cancellation from `job.status`, avoiding an unsupported status-check function in step environment expressions that made GitHub reject the sweep workflow, and added checksum-pinned workflow-semantic linting to CI.
+- Made comment-router ledger updates retain refreshed claims at the bounded
+  history limit, publish through fsynced atomic replacement, and fail closed on
+  malformed existing state so interrupted forced replays cannot dispatch twice.
+- Completed exact-review events when a fresh low-signal close guard keeps the
+  item open, instead of retrying the same safely rejected close forever.
+- Coalesced self-continuing hot and normal review runs per target so scheduled
+  backstops cannot create permanent parallel continuation chains that overwhelm
+  serialized review publication, while exact-item, apply, and comment-sync
+  lanes remain independent.
+- Gated review artifact application, record publication, exact-review queue
+  completion, apply dispatch, and review/apply continuations on explicit
+  primary success markers so action-ledger setup, import, finalization, upload,
+  or publication failures remain visible but fail open, while real review,
+  sync, proof, and apply failures still block dependent mutations.
+- Bound apply receipts to each actual GitHub request attempt while preserving
+  stable business idempotency across transient retries, recorded review lease
+  creation and cleanup independently, bound retry dispatches to review and
+  decision digests, aggregated every exact-attempt mutation outcome, and made
+  pre-spawn budget exhaustion a definite no-mutation yield. Interruption
+  recovery now terminalizes exact open mutation receipts before their enclosing
+  item and batch summaries with causal, collision-free phases; immutable ledger
+  finalization and publisher failures remain visible without suppressing valid
+  isolated apply dispatch or proof-backed apply work; selected-comment and
+  failed-review retry lanes finalize interrupted receipts before publication;
+  scheduled retry failures remain failed after cleanup; active coverage-proof
+  yields cannot become kept-open terminals; and review mutation, retryability,
+  and cancellation status survive finalization.
+- Recovered exact-review intake from Cloudflare SQLite value-size exhaustion by normalizing delivery receipts and queue items into independently bounded rows, committing dedupe and admission atomically, restoring the seven-day idempotency window, and migrating live queue state through a transaction-coupled, generation-aware, size-bounded rollback bridge that retains the complete active dedupe set and safely reimports rollback-era changes. Thanks @brokemac79.
+- Hardened action-ledger privacy, import identity and causal validation,
+  multi-shard capacity, crash-safe completion publication, portable paths,
+  bounded shard, marker, and spool reads, producer-lock and finalization races,
+  direct shard collection invariants, calendar timestamp parity, single-label
+  email and common service-credential rejection, root-scoped projection drains,
+  bounded optional CrabFleet delivery, eager apply mutation receipts, exact
+  active-item timeout recovery, and item/revision-stable apply and retry
+  idempotency across checkpoint and batch reordering.
+- Bounded every repair git helper subprocess while retaining the shorter configurable network timeout, ordinary nonzero and signal status semantics, platform-aware command launching, and explicit spawn-error reporting. Thanks @hex-AI12.
+- Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.
+- Separated review publication from apply/comment-sync concurrency so long
+  mutation runs no longer block completed reviews from publishing, and retried
+  GitHub CLI commands whose jq process reports truncated JSON.
+- Bound structural, semantic, and content review reuse to the canonical
+  persisted durable-comment body hash under the acquired lease, normalizing
+  surrounding whitespace while preserving label
+  transitions and linked-item render context; versioned security scanner
+  directive hashing, isolated durable-comment refresh failures to the affected
+  item, rejected malformed eligibility records, and skipped unreachable
+  compiler work for local-range reviews.
+- Packaged only planned prior review reports into scheduled shard runtimes and
+  rebound structural cache probes to the explicit latest release state,
+  restoring safe cache reuse without broad generated-state artifacts.
+- Coalesced superseded sweep and planner concurrency entries instead of retaining up to 100 pending runs per group, while keeping durable leased reviews and explicit manual apply or comment-sync runs isolated.
+- Required a live `DIRTY` merge conflict and at least 30 days without contributor comments or head activity before publishing or applying low-signal pull-request close verdicts, honoring longer configured stale thresholds and applying the same fail-closed policy to stale-review promotion and trusted close routing.
+- Retried successful GitHub CLI JSON-lines responses when their output is truncated, preventing transient list-page corruption from aborting close-apply runs.
+- Allowed conflict-free canonical PRs that only need a base update to back duplicate or superseded closures while retaining proof, review, check, draft, and conflict guards.
+- Completed exact-item reviews whose captured record matches a deterministic remain-open guard instead of requeueing them indefinitely, carried tuple-verified terminal closes through cleanup, handed ordinary synced verdicts to an executing target-wide serialized router after authoritative publication, and treated repository-confirmed missing items as cleanup-free terminal results, while preserving latest-revision retries for review drift.
+- Requeued stale exact-event preflights instead of letting a successful no-disposition publisher route an older verdict.
+- Completed locked exact-event intake as a guarded-open result before setup or Codex, preventing review-start comment failures from retrying indefinitely.
+- Requeued exact reviews when locked issues or pull requests are unlocked or close-blocking labels are removed, so a guarded-open or close-exempt completion does not delay the next eligible review until unrelated activity.
+- Bounded broad reconciliation with batched Git I/O and tuple checkpoints that report progress and resume safely under concurrent state writers.
+- Retried tuple-safe broad reconciliation after full push batches lose continuous exact-state races, including candidates that normalize to no changes.
+- Serialized explicit workflow-dispatch planners through a non-dropping target queue and accounted for recovery runs by their requested or live shards, preventing overlapping target planning and false 89-shard reservations without undercounting multi-shard retries.
+- Released workflow-owned review leases after unsuccessful exact reviews, deferred coordination-held retries until lease expiry, and skipped state checkout without fresh artifacts, preventing held-lease loops from wasting exact-review capacity.
+- Bound exact-review execution to immutable queue claims and preserved both Worker/workflow deployment orders through a versioned rolling-upgrade protocol, avoiding stalled leases without disabling ClawSweeper.
+- Isolated maintainer-report Codex generation from GitHub and deployment write credentials by publishing its bounded report artifact on fresh runners.
+- Hardened structural and semantic review reuse against check-state, proof-override, release-lookup, Git tree-mode, and full commit-message drift; omitted AST syntax and tooling controls; diff-marker ambiguity; unsafe runtime staging and symlinked compiler-install parents; unverified, mode-lost, missing, or architecture-mismatched compiler packages; and order-sensitive JSON.
+- Reconciled terminal exact-review runs by requested run instead of sampling the first 32 claimed leases, while preserving attempt and claim-generation guards across larger worker waves.
+- Dequeued already-closed exact-review events before setup and treated items closed during review as terminal no-ops, preventing permanent retry churn from consuming live worker capacity.
+- Kept broad reconciliation draining independent record repairs when one valid tuple has ambiguous legacy contents, while timestamping closed-record sidecar cleanup as an orderable atomic mutation.
+- Kept assist, spam classification, local smoke checks, and transport recovery on GPT-5.6 Sol high reasoning instead of accepting lower-effort fallback results as completed reviews.
+- Published exact-review records, plans, and decision packets as one validated tuple, and made broad sweep publishers preserve the semantically newer tuple and independently merged status health instead of replaying stale review state.
+- Requeued cancelled and failed exact-review leases, kept pre-terminal success provisional, and added signed exact-attempt reconciliation with claim-generation guards that releases only GitHub-confirmed terminal runs while preserving live workers.
+- Kept exact-review work pending with an explicit bounded retry when GitHub Actions cannot confirm that the executor workflow is active, instead of reporting silent repository dispatches to a disabled workflow as occupied capacity.
+- Refreshed generated source paths after each state publish so later checkpoints cannot overwrite concurrent record, cursor, or report updates learned during a push rebase.
+- Preserved bounded command status and prompt context through durable exact-review queue leases so successful re-reviews advance their original acknowledgement instead of remaining queued.
+- Preserved independently updated sweep status and nested apply-health snapshots across concurrent state publication retries with timestamp-safe three-way merging.
+- Prevented completed apply and comment-sync runs from republishing stale hydrated records after their checkpoint commits, preserving concurrent apply bookkeeping while retaining a narrow final-status retry.
+- Persisted apply preselection reconciliation even when stricter policy or an empty candidate queue makes the run a no-op, publishing only changed record tuples, deferring concurrently updated tuples, and cleaning stale plans and decision packets for already-closed items.
+- Prevented overlapping exact-item reviews and stale verdict replay with owned, bounded PR-head and issue-source leases; tuple-bearing reports now enforce apply-time revision and durable-verdict CAS across label, comment, and close mutations, and failed exact reviews no longer publish event results.
+- Prevented comment-only synchronization from replaying duplicate or superseded close verdicts after the linked canonical PR closes without merging.
+- Retried infrastructure-failed issue reviews against their exact source revision through bounded one-shot asynchronous dispatch, requeued source drift once, and preserved retry attempts in separate durable state so ambiguous timeouts cannot overwrite completed reviews.
+- Stopped later CI reruns from resetting PR inactivity clocks by anchoring head activity to the latest source-triggered workflow run associated with that pull request.
+- Prioritized ready close decisions and bounded PR close-coverage proofs before slow policy-gated candidates, kept default 20-item continuations shareable, and retried malformed successful GitHub JSON responses.
+- Kept automatic close-apply checkpoints within their runtime budget by bounding GitHub commands and retry waits while preserving resumable report and cursor output.
+- Kept stale F-rated PR promotions semantically consistent by recording them as low-signal unmergeable closes and replacing contradictory keep-open summaries.
 - Removed exponential backtracking from durable review-marker parsing so adversarial comment bodies cannot stall apply or comment synchronization.
 - Scoped Mantis recommendations to supported proof capture and kept code changes, PR repair, and GitHub mutations in ClawSweeper's deterministic lanes. Thanks @brokemac79.
 - Bounded automatic close-apply checkpoints to ten minutes, persisted exact cursor progress before immediate continuation, and limited close-coverage proofs to the time remaining in the checkpoint.
 - Kept close-limit apply checkpoints from advancing their resumable cursor past an unexecuted close candidate. Thanks @brokemac79.
 - Stopped zero-progress automatic apply runtime yields from queueing immediate continuations, leaving the scheduled apply run as the retry backstop. Thanks @brokemac79.
-- Kept automatic apply windows responsive by running at most one PR close-coverage proof after fast candidates and advancing independent fast/proof cursors only through records actually examined.
+- Kept automatic apply windows responsive by reserving up to two PR close-coverage proofs, capped by the effective close budget, and advancing independent fast/proof cursors only through records actually examined.
 - Prevented malformed `maintainer_decision` records from repeatedly consuming apply queue slots by recording their deterministic apply bookkeeping. Thanks @brokemac79.
 - Preserved ready-for-maintainer labels when a newer durable review matches the current PR head, while still removing readiness from stale-head reviews. Thanks @brokemac79.
 - Surfaced apply-health `needs_attention` state in the dashboard hero and added explicit System, Light, and Dark theme controls. Thanks @brokemac79.

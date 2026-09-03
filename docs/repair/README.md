@@ -2,9 +2,32 @@
 
 # 🐠 ClawSweeper
 
+- Status: active repair entry point and local command reference
+- Owner: ClawSweeper maintainers
+- Source of truth: repair source, workflows, `package.json`, and focused repair
+  tests; [operations](operations.md) is canonical for live procedures
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Update when: repair modes, command entry points, job/result shape, or linked
+  canonical guides change
+
+## Use the right repair document
+
+| Need | Canonical page |
+| --- | --- |
+| Understand repair concepts, modes, artifacts, or local CLI entry points | This page |
+| Run or recover live repair work | [Operations](operations.md) |
+| Change implementation objects, stages, ledgers, or extension points | [Internal feature map](internal-features.md) |
+| Change trusted PR autofix/automerge behavior | [Auto-updating PRs](auto-update-prs.md) |
+| Understand the end-to-end steerable session protocol | [Steerable repair automation](../steerable-repair-automation.md) |
+
+The operations runbook is the single source for live command trust, mutation
+gates, runner selection, token boundaries, routing, recovery, and promotion.
+This entry point keeps the conceptual model and local command catalog. It does
+not grant authority to open an execution or merge gate.
+
 ClawSweeper is a conservative OpenClaw maintainer tool for one-cluster issue and PR cleanup.
 
-It takes a curated GitHub issue/PR cluster, asks a Codex worker to classify the items, and applies only narrow, auditable cleanup actions when the evidence is strong. It shares the same ClawSweeper repo and GitHub App as the commit and backlog sweepers, but runs as a separate repair lane with stricter mutation gates.
+It takes a curated GitHub issue/PR cluster, asks a Codex worker to classify the items, and applies only narrow, auditable cleanup actions when the evidence is strong. It shares the same ClawSweeper repo and GitHub App as the backlog sweeper, but runs as a separate repair lane with stricter mutation gates.
 
 For the canonical repair `job_intent` contract and workflow/TypeScript boundary,
 see [`docs/orchestration.md`](../orchestration.md).
@@ -56,11 +79,22 @@ The default workflow is proposal-first. It does not comment or close unless a jo
 
 ## State Boundaries
 
+Before internal review, the host scans the explicit prompt/schema and complete
+introduced before/after source bytes from the actual validated dirty checkout.
+The index and raw worktree snapshots stay alive through admission, including
+staged bytes that differ from the working file. Drift, scanner failures, and findings stop the run as infrastructure
+refusals; they never enter the review-fix or JSON-repair paths. No target-bundled
+autoreview helper or second reviewer is started. See the
+[safety model](../../README.md#safety-model) for the trusted scanner prerequisite,
+staging/deadline limits, and the distinction from later tool/history scanning.
+
 `jobs/` and `results/` are durable operational state in
 `openclaw/clawsweeper-state`, not generated source in this repo. They may
 contain historical run text and audit evidence. Active code, prompts, workflows,
 docs, schemas, and tests are covered by `pnpm run check:active-surface`, which
 rejects retired project names and old token variables before the full gate runs.
+Review records are canonical in the Cloudflare Worker; action ledgers and assets
+are canonical in R2. See [`../state-storage.md`](../state-storage.md).
 
 ## Dashboard
 
@@ -75,6 +109,10 @@ For the ClawSweeper feedback loop that updates existing generated PRs, see
 [`docs/repair/auto-update-prs.md`](auto-update-prs.md).
 For the exact automerge state machine, wait behavior, and operator replay, see
 [`docs/repair/automerge-flow.md`](automerge-flow.md).
+For the repository-owned local-container, CI, and Crabbox end-to-end validation,
+see [`docs/repair/automerge-e2e.md`](automerge-e2e.md).
+For the separate path that can turn an eligible issue into a generated PR, see
+[`docs/repair/automatic-issue-prs.md`](automatic-issue-prs.md).
 
 That loop is marker-driven. ClawSweeper comments use hidden
 `clawsweeper-verdict:*` markers, and only actionable PR feedback includes
@@ -95,11 +133,9 @@ dispatches repair and another exact-head review. A clean review waits for
 required checks to appear and settle green, then removes the repair-loop label
 and leaves the PR open; generated issue PRs never automerge.
 
-ClawSweeper commit findings have a separate intake lane. A
-`clawsweeper_commit_finding` dispatch fetches the latest markdown commit report,
-writes an audit record under `results/commit-findings/`, and only sends the
-finding into the PR executor when the issue is narrow, non-security, and still
-worth repairing on latest `main`.
+The commit-finding intake lane was retired with the commit-review lane in July
+2026; existing `commit_finding` jobs remain executable through the cluster
+worker.
 
 Each cluster job:
 
@@ -109,8 +145,8 @@ Each cluster job:
 4. Runs Codex with repo-local policy prompts and JSON output schema in a read-only sandbox when a planning pass is needed. Adopted automerge/autofix PR repairs skip this read-only model pass after live hydration and emit a generic fix artifact directly.
 5. Writes structured run artifacts under `.clawsweeper-repair/runs/`.
 6. Reviews the worker artifact with deterministic safety checks.
-7. Executes credited fix artifacts through `scripts/execute-fix-artifact.ts` when the fix gate is open: repair a writable contributor branch first, treating same-repo head branches as writable even when GitHub reports `maintainer_can_modify=false`; otherwise raise a narrow replacement PR, copy source labels, add non-bot source PR authors as replacement co-authors, and close the uneditable source PR after the replacement push succeeds.
-8. Applies guarded close/comment and explicit merge actions through `scripts/apply-result.ts`.
+7. Executes credited fix artifacts through `src/repair/execute-fix-artifact.ts` when the fix gate is open: repair a writable contributor branch first, treating same-repo head branches as writable even when GitHub reports `maintainer_can_modify=false`; otherwise raise a narrow replacement PR, copy source labels, add non-bot source PR authors as replacement co-authors, and close the uneditable source PR after the replacement push succeeds.
+8. Applies guarded close/comment and explicit merge actions through `src/repair/apply-result.ts`.
 9. Publishes a sanitized result ledger back to `openclaw/clawsweeper-state`
    under `results/`, `jobs/openclaw/closed/`, `repair-apply-report.json`, and
    `notifications/`; the external dashboard and Discord notification dedupe
@@ -122,7 +158,16 @@ Merge is deliberately harder than closeout. A merge action must include `merge_p
 
 Replacement fix work uses a recoverable target branch named `clawsweeper/<cluster-id>`. The executor resumes that branch if it already exists and pushes checkpoint commits after agent edits and review-fix edits, adding `Co-authored-by` trailers for non-bot source PR authors when a contributor PR is replaced. It then opens or updates the PR only after validation and internal review/fix handling. If validation or Codex itself still blocks after retries, the run writes a blocked fix report and leaves the checkpoint branch recoverable instead of losing the patch.
 
-Runs for the same job path and mode are queued instead of running concurrently. The workflow uses Node 24, `blacksmith-4vcpu-ubuntu-2404` for cluster planning/review, and `blacksmith-16vcpu-ubuntu-2404` for fix/apply execution. Planning defaults to Codex's `read-only` sandbox. Maintainers may select `planner_sandbox: danger-full-access` only when moving a job to a trusted ephemeral runner whose host cannot start the Linux sandbox; the default and all automated dispatches stay read-only. Fix execution prepares the target checkout with Corepack and the target `pnpm` package manager before validation; the execution job caches Codex, npm, Corepack, and the target pnpm store. Fix validation is pinned to OpenClaw's fast changed-lane posture by default: `pnpm check:changed` plus diff checks are the hard local gate, and target validation commands normalize to `pnpm check:changed` unless `CLAWSWEEPER_TARGET_VALIDATION_MODE=strict` or `CLAWSWEEPER_STRICT_TARGET_VALIDATION=1` is explicitly set. Adopted OpenClaw automerge repairs force strict target validation and add `pnpm lint` plus `pnpm check:test-types`, so maintainer-approved automerge branches keep iterating on common terminal CI failures before push. The deterministic repair artifact also carries failing exact-head check names and links when available, and the prompt treats those failed checks as automerge repair scope even when the failing file is outside the original `likely_files`; Codex must rebase, inspect logs, fix the narrow failure, or prove current `main` is independently blocked. That normalized gate is also passed to Codex in the write prompt; Codex is expected to run it, fix failures it introduced, and report the exact command/result before returning. Unrelated flaky main CI, broad `pnpm check`, full tests, live, docker, and e2e lanes do not block narrow ClawSweeper Repair fixes by default.
+Runs for the same job path are queued instead of running concurrently (the workflow concurrency group is keyed by job path only, not by mode). The workflow uses Node 24, `blacksmith-4vcpu-ubuntu-2404` for cluster planning/review, and `blacksmith-16vcpu-ubuntu-2404` for fix/apply execution. Planning defaults to Codex's `read-only` sandbox. Maintainers may select `planner_sandbox: danger-full-access` only when moving a job to a trusted ephemeral runner whose host cannot start the Linux sandbox; the default and all automated dispatches stay read-only. Fix execution prepares the target checkout with Corepack and the target `pnpm` package manager before validation; the execution job caches Codex, npm, Corepack, and the target pnpm store. Fix validation is pinned to OpenClaw's fast changed-lane posture by default: `pnpm check:changed` plus diff checks are the hard local gate, and target validation commands normalize to `pnpm check:changed` unless `CLAWSWEEPER_TARGET_VALIDATION_MODE=strict` or `CLAWSWEEPER_STRICT_TARGET_VALIDATION=1` is explicitly set. Adopted OpenClaw automerge repairs require that changed-surface command without adding full-repository lint or typecheck gates; exact-head hosted CI remains the authority for broader repository health. The deterministic repair artifact also carries failing exact-head check names and links when available, and the prompt treats those failed checks as automerge repair scope even when the failing file is outside the original `likely_files`; Codex must rebase, inspect logs, fix the narrow failure, or prove current `main` is independently blocked. That normalized gate is also passed to Codex in the write prompt; Codex is expected to run it, fix failures it introduced, and report the exact command/result before returning. Unrelated flaky main CI, broad `pnpm check`, full tests, live, docker, and e2e lanes do not block narrow ClawSweeper Repair fixes by default.
+
+Target dependency metadata may retain npm's positive `min-release-age` and
+package-name `min-release-age-exclude[]` settings. Registry overrides and other
+active package-manager configuration remain rejected; every YAML lockfile
+document is checked against the approved destinations. OpenClaw changed-gate
+validation restores `.cache/vitest`, `node_modules/.cache`, and
+`node_modules/.vite` after success or failure. Neighboring ignored inputs remain
+protected. A pending runtime build also retains its bound output until archive
+smoke completes; cache restoration does not exempt that output from verification.
 
 If Codex itself fails an edit pass with a transient tool-transport error, such
 as a closed stdin session from the Codex tool router, the executor consumes an
@@ -139,108 +184,39 @@ Full worker prompts, Codex transcripts, and raw artifacts stay in GitHub Actions
 - `autonomous`: adds live cluster preflight and fix-artifact generation. It may recommend and drive a canonical fix path; direct mutation still goes through the fix executor and applicator gates.
 - `route_security`: quarantines true security-sensitive refs without poisoning unrelated cluster work.
 - `needs_human`: only product-direction, trust-boundary, canonical-choice, merge-path, or contributor-credit decisions that remain unclear after the hydrated artifact and single-item review/check/decide pass.
-- Automated reviewer feedback must be cleared during autonomous PR work. Greptile, Codex, Asile, CodeRabbit, Copilot, and similar bot comments must be addressed, proven non-actionable, or escalated before any merge or post-merge closeout recommendation.
-- Merge preflight: no PR can merge until `CLAWSWEEPER_ALLOW_MERGE=1`, security issues are cleared, comments are resolved, review findings are addressed, changed-surface validation is clean, and the pushed head passes exact-head ClawSweeper review plus GitHub checks. With the merge gate closed, ClawSweeper Repair labels merge-ready targets for human review instead of merging.
-- Final base sync: before pushing a repaired branch, ClawSweeper fetches latest `origin/main`. If main moved after validation, the worker rebases once more and pushes that synchronized head; conflict resolution still goes back through Codex, but the fresh exact-head ClawSweeper review and GitHub checks gate the final merge instead of repeating local validation indefinitely. Set `CLAWSWEEPER_FINAL_BASE_SYNC_ATTEMPTS` above `1` only for controlled backfills where extra local validation is worth the latency.
-- Repair ladder: make the useful contributor PR mergeable when its branch is writable; same-repo PRs are writable by the GitHub App contents permission even when the raw maintainer-edit flag is false. If a fork push is rejected because the rebase would create or update workflow files without effective workflow permission, publish the already-prepared repair as a base-repo replacement PR instead of rerunning Codex. Otherwise replace draft, stale, unmergeable, uneditable, or unsafe branches with a narrow credited fix PR. When fix PR mode is enabled, "wait or replace" is already answered: replace, preserve credit and labels, then supersede only the source PR that could not be safely updated.
+
+Reviewer-feedback, base-sync, repair-ladder, exact-head, and merge requirements
+are canonical in [Auto-Updating ClawSweeper PRs](auto-update-prs.md). Live gate
+handling and runner/token procedure are canonical in [Operations](operations.md).
 
 ## Maintainer Comment Commands
 
-ClawSweeper can route maintainer comments from target repositories back into the
-cloud repair workflow. It recognizes both command styles:
+ClawSweeper routes trusted review, status, issue implementation, PR repair,
+autofix, automerge, approval, explanation, and stop requests through its
+maintainer comment router. The command matrix, accepted authors and mentions,
+idempotency behavior, execution switch, and recovery procedure are canonical in
+[Operations: Maintainer Comment Routing](operations.md#maintainer-comment-routing).
+The trusted PR state contract and label behavior are canonical in
+[Auto-Updating ClawSweeper PRs](auto-update-prs.md).
 
-```text
-/clawsweeper status
-@openclaw-clawsweeper status
-@clawsweeper status
-```
+Keep these boundaries visible from the entry point:
 
-Accepted mentions are `@clawsweeper`, `@clawsweeper[bot]`,
-`@openclaw-clawsweeper`, or `@openclaw-clawsweeper[bot]`.
-
-Only maintainers can trigger it. The router checks GitHub `author_association`
-and accepts `OWNER`, `MEMBER`, and `COLLABORATOR` by default. Contributor and
-unknown comments are ignored without a reply.
-
-Supported commands:
-
-```text
-/review
-/clawsweeper status
-/clawsweeper re-review
-/clawsweeper re-run
-/clawsweeper implement
-/clawsweeper build
-/clawsweeper fix ci
-/clawsweeper address review
-/clawsweeper rebase
-/clawsweeper autofix
-/clawsweeper automerge
-/clawsweeper auto merge
-/clawsweeper approve
-/clawsweeper explain
-/clawsweeper stop
-@clawsweeper re-review
-@clawsweeper re-run
-@clawsweeper review
-@clawsweeper implement
-@clawsweeper fix
-@clawsweeper build
-@clawsweeper create pr
-@clawsweeper fix issue
-@openclaw-clawsweeper fix ci
-@clawsweeper why did automerge stop here?
-```
-
-`status` and `explain` post a short status reply. `review`, `re-review`, and
-`re-run` dispatch ClawSweeper review again for an open issue or PR. Issue and PR
-authors may use only these read-only review commands on their own open item.
-`fix ci`, `address review`,
-and `rebase` dispatch the normal `repair-cluster-worker.yml` repair path, but only for
-existing ClawSweeper PRs identified by the `clawsweeper/*` branch.
-`implement`, `fix`, `build`, `create pr`, and `fix issue` work only on open issues.
-The router creates or reuses one durable `issue-<repo>-<number>` job and
-dispatches the normal repair worker to verify the issue on latest `main` and
-open or update one narrow implementation PR. This lane never merges or closes
-the issue; broad, underspecified, security-sensitive, or already-fixed issues
-become a blocked repair result instead of a public PR.
-Outside `openclaw/openclaw` and `openclaw/clawhub`, the normal review publisher
-also dispatches this same worker for newly reviewed issues and bounded backfill
-from existing open issue reports when automatic issue implementation is
-enabled. Codex discovers the implementation and validation from the
-repository; deterministic intake still blocks protected/security signals,
-opt-outs, stale issue state, queued issue jobs, and duplicate or linked PRs.
-Generated PRs receive `clawsweeper:autogenerated` plus
-`clawsweeper:autofix`, continue through exact-head review/fix/re-review, and
-remain open for manual merge.
-Freeform maintainer mentions such as `@clawsweeper why did automerge stop here?`
-dispatch a read-only assist review. The answer lands in the next ClawSweeper
-comment; action-looking prose can only become existing structured
-recommendations and still passes the normal deterministic gates.
-`autofix` opts an open PR into the bounded review/fix loop and never merges.
-`automerge` opts an open PR into the bounded review/fix/merge loop, but draft
-PRs stay fix-only until GitHub marks them ready for review. `approve` is
-maintainer-only exact-head approval after a human-review pause; it clears pause
-labels and merges only when the normal automerge readiness checks and merge
-gate pass. A later trusted pass for the exact current head also clears stale
-pause labels before continuing automerge. `stop` labels the item for human review.
-It also removes repair-loop labels, so older automerge/autofix commands and
-trusted pass markers cannot continue the loop after the stop.
-
-The router writes an idempotency marker into each reply and records processed
-comments in `results/comment-router.json`. The scheduled workflow is dry by
-default; set `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1` to let scheduled runs post
-replies and dispatch workers.
-
-Scheduled runs also sweep open PRs with `clawsweeper:autofix` or
-`clawsweeper:automerge` labels. When a labelled PR is stale, failing checks, or
-dirty/behind its base branch, the router can synthesize an internal trusted
-repair-loop command and re-enter the normal repair path without waiting for a
-new GitHub comment. `clawsweeper:human-review` still pauses that path.
+- item authors may request read-only review of their own open item; repair and
+  mutation commands require maintainer trust
+- `autofix` never merges, and `automerge` still requires every exact-head,
+  proof, review, check, mergeability, security, and global merge gate
+- issue implementation never merges or closes the source issue
+- `stop` pauses repair and removes continuation labels
+- freeform questions are read-only and cannot bypass structured command gates
 
 ## Local Run
 
 Requires Node 24.
+
+Validation, rendering, dry-run, and artifact-building commands below are local
+development surfaces. Commands that dispatch workflows, pass `--execute`, open
+gates, alter labels, or publish live state are operator-only; use
+[Operations](operations.md) for their authority, preflight, and recovery steps.
 
 ```bash
 # Validate all job files.
@@ -260,17 +236,33 @@ pnpm run repair:build-fix-artifact -- jobs/openclaw/inbox/autonomous-example.md 
 # legacy ~/.config/gitcrawl/gitcrawl.db; it never fetches GitHub issues itself.
 pnpm run repair:import-gitcrawl-low-signal -- --limit 20 --batch-size 5 --mode autonomous --sort stale
 
-# Stage the next largest active gitcrawl clusters, skipping already-imported,
-# security-sensitive, feature-request, and 75%+ closed clusters by default.
-# Mixed clusters can route security refs while continuing ordinary bug/dedupe work.
+# Stage unprocessed active gitcrawl clusters. The scheduled intake gives their
+# live evidence to the selector model, which chooses one useful cluster or none.
 pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous --suffix autonomous-smoke --allow-instant-close --allow-merge --allow-fix-pr --allow-post-merge-close
 
 # Automatic imported-cluster intake runs through repair-cluster-intake.yml.
 # gitcrawl-store refreshes openclaw/openclaw every 15 minutes; the ClawSweeper
 # intake runs daily, records the processed portable DB SHA in
 # results/cluster-repair-intake/<repo>.json, and skips repeated ticks for the
-# same store snapshot. It imports at most one cluster by default and dispatches
-# through the two-worker cluster_repair lane.
+# same store snapshot. The selector model compares the candidate batch without
+# word lists, scores, or semantic thresholds, and dispatches at most one cluster
+# through the two-worker cluster_repair lane. Clusters with one live candidate
+# and useful closed context remain eligible for model evaluation. Intake appends
+# the selected job, store identity, model rationale and per-cluster decisions,
+# and stable dispatch key directly to the coordinator-guarded operational Git
+# state before dispatch. Decisions persist in a versioned sidecar, leaving the strict v2 dispatch
+# ledger readable by in-flight older workers. Rejected cluster IDs are remembered
+# instead of being offered again on the next snapshot. The intake workflow
+# recovers pending dispatch before selecting new work.
+#
+# Durable intake dispatch guarantee: at-least-once workflow creation with
+# exactly-once worker execution intent. GitHub workflow_dispatch has no atomic
+# run receipt, so the intake owner publishes a durable dispatch claim before
+# dispatching; a crash between claim publication and dispatch (or between
+# dispatch and observing the run) may create another workflow run, and the
+# worker-side dispatch receipt gate skips the duplicate planning pass.
+# Recovery redispatches only ledger entries whose HMAC accepted-intent receipt
+# verifies against the webhook secret.
 
 # Dispatch reviewed jobs. Dispatch derives its default live-worker cap from the
 # job's job_intent and config/automation-limits.json. Existing repair lanes
@@ -363,6 +355,10 @@ git diff --check
 
 ## GitHub Actions Setup
 
+This section is the canonical inventory of repair Actions configuration. It
+does not authorize changing a live variable or secret. Gate-window and token
+procedures remain canonical in [Operations](operations.md).
+
 The workflow needs:
 
 - Codex/OpenAI authentication for model execution
@@ -372,19 +368,21 @@ The workflow needs:
 - `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=1` opt-in for the scheduled
   `repair-cluster-intake.yml` imported-cluster intake. Direct repair import and
   dispatch commands are not blocked by this variable; they keep the existing
-  repair execution gates. Gitcrawl cluster import skips clusters with at least
-  75% closed members by default; pass `--skip-closed-percent` only for an
-  intentional broader import.
-- optional `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` variable for the scheduled
-  imported-cluster intake; default is `1` cluster per daily run.
+  repair execution gates. The selector model compares live cluster evidence and
+  may reject the entire batch.
+- optional `CLAWSWEEPER_CLUSTER_REPAIR_CANDIDATE_BATCH` variable for the scheduled
+  intake; default is `8` candidates, from which the model selects at most one.
+- imported-cluster intake is accepted into the Cloudflare durable window before
+  materialization or dispatch; publication recovery retains the exact selected
+  job and selector decision.
 - merge is separately gated by `CLAWSWEEPER_ALLOW_MERGE`, which defaults to `0`; merge-ready PRs are labeled `clawsweeper:human-review` and `clawsweeper:merge-ready` for a maintainer to merge manually when the global gate is closed
 - required `CLAWSWEEPER_MODEL` GitHub Actions secret containing the actual
   internal model name; workflows, dispatch payloads, comments, and reports use
   only the public `internal` alias
 - Codex CLI and its responses API proxy install from their latest npm tags on
   every worker run
-- repair workers default to high reasoning on the fast service tier, and
-  accidental `xhigh` reasoning overrides are normalized back to `high`
+- repair planning defaults to high reasoning on the fast service tier;
+  automatic issue fix/PR execution uses `gpt-5.6-sol` with `xhigh` reasoning
 - optional `CLAWSWEEPER_MAX_LIVE_WORKERS` variable for dispatch/requeue/self-heal worker fan-out; dispatch defaults are derived from `job_intent`, cluster-lane classification, `workers.max`, and `lanes.repair.cluster_max_live_runs`
 - optional `CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA` variable for replacement PR backpressure; default is `50` open ClawSweeper PRs per touched area, `0` disables the area cap, and common changelog/release-note files are ignored for this check
 - ClawSweeper commit-finding repair PRs are labeled `clawsweeper:commit-finding`
@@ -406,7 +404,10 @@ The workflow needs:
   request fails in time for the executor to write a blocked report and upload
   debug artifacts. `CLAWSWEEPER_GIT_NETWORK_TIMEOUT_MS` and
   `CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS` can override the Git and GitHub CLI
-  portions separately.
+  portions separately. Shared repair GitHub CLI calls use the merged per-call
+  environment for these settings, default to two minutes, and enforce a
+  30-second minimum for environment-configured budgets. An explicit `timeoutMs`
+  call option takes precedence and may select a shorter positive deadline.
 - optional `CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS` and `CLAWSWEEPER_RESOLVE_REVIEW_THREADS` variables for agentic merge-prep review loops; the review attempt default is `4`, with the last failed internal review converted into one final Codex review-fix pass when changed-surface validation can still prove the branch safe to push for exact-head review
 - optional `CLAWSWEEPER_MAX_REPAIRS_PER_PR` and
   `CLAWSWEEPER_MAX_REPAIRS_PER_HEAD` variables for trusted

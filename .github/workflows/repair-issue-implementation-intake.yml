@@ -49,12 +49,6 @@ on:
         required: false
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
-      model:
-        description: "Internal Codex model alias"
-        required: false
-        default: internal
-        type: string
-
 permissions:
   contents: write
   actions: read
@@ -161,10 +155,16 @@ jobs:
 
       - uses: ./.github/actions/setup-state
         with:
+          coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          coordinator-class: cluster_intake
+          records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          records-repo-slugs: ${{ steps.target.outputs.target_slug }}
+          records-item-number: ${{ github.event.inputs.item_number || github.event.client_payload.item_number }}
+          hydrate-state-blobs: "false"
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
           sparse-checkout: |
-            records/${{ steps.target.outputs.target_slug }}
             jobs
             results
 
@@ -172,7 +172,8 @@ jobs:
         id: prepare
         env:
           GH_TOKEN: ${{ steps.target-token.outputs.token }}
-          ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS || 'false' }}
+          CLAWSWEEPER_ISSUE_IMPLEMENTATION_WORKFLOW_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES || 'false' }}
           TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
           ITEM_NUMBER: ${{ github.event.inputs.item_number || github.event.client_payload.item_number }}
           CANDIDATE_KIND: ${{ github.event.inputs.candidate_kind || github.event.client_payload.candidate_kind || 'strict_bug' }}
@@ -202,14 +203,22 @@ jobs:
 
       - name: Commit intake ledger
         if: always()
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
-          pnpm run repair:publish-main -- \
-            --message "chore: record issue implementation intake" \
-            --path jobs \
-            --path results \
-            --max-attempts 12 \
-            --push-attempts 4
+          for attempt in 1 2 3; do
+            if pnpm run repair:publish-main -- \
+              --message "chore: record issue implementation intake" \
+              --path jobs \
+              --path results \
+              --max-attempts 12 \
+              --push-attempts 4; then
+              exit 0
+            fi
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep "$((attempt * 3))"
+          done
 
       - name: Publish automatic implementation queue status
         if: ${{ steps.prepare.outputs.should_repair == 'true' }}
@@ -226,13 +235,15 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Dispatch repair worker
-        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
+        id: dispatch-worker
+        if: ${{ steps.prepare.outputs.should_repair == 'true' || steps.prepare.outputs.existing_job_path != '' }}
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS || '' }}
           RUNNER: ${{ github.event.inputs.runner || github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
           EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
           MODEL: internal
+          JOB_PATH: ${{ steps.prepare.outputs.job_path || steps.prepare.outputs.existing_job_path }}
         run: |
           set -euo pipefail
           cap_args=()
@@ -240,7 +251,7 @@ jobs:
             cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
           fi
           git pull --rebase --autostash
-          pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
+          pnpm run repair:dispatch -- "$JOB_PATH" \
             --mode autonomous \
             --wait-for-capacity \
             "${cap_args[@]}" \
@@ -248,3 +259,28 @@ jobs:
             --execution-runner "$EXECUTION_RUNNER" \
             --model "$MODEL" \
             --ref main
+
+      - name: Record successful repair worker dispatch
+        if: ${{ steps.prepare.outputs.should_repair == 'true' || steps.prepare.outputs.existing_job_path != '' }}
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          AUDIT_PATH: ${{ steps.prepare.outputs.audit_path }}
+          JOB_PATH: ${{ steps.prepare.outputs.job_path || steps.prepare.outputs.existing_job_path }}
+          WORKER_CREATED_AT: ${{ steps.dispatch-worker.outputs.issue_worker_created_at || '' }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:issue-implementation-intake -- mark-dispatched \
+            --audit-path "$AUDIT_PATH" \
+            --job-path "$JOB_PATH" \
+            --worker-created-at "$WORKER_CREATED_AT"
+          for attempt in 1 2 3; do
+            if pnpm run repair:publish-main -- \
+              --message "chore: record issue implementation worker dispatch" \
+              --path "$AUDIT_PATH" \
+              --max-attempts 12 \
+              --push-attempts 4; then
+              exit 0
+            fi
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep "$((attempt * 3))"
+          done

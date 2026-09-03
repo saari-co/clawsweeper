@@ -10,7 +10,10 @@ copies when applying repository policy. Treat `AGENTS.md` as optional
 repository-authored review policy and review guidance for that target, not only
 as setup instructions. Apply concrete target-specific instructions or guidance
 when they do not conflict with this prompt or higher-priority system/developer
-instructions. If `AGENTS.md` is absent, unrelated, or lower-confidence than the
+instructions. For a reviewed diff, read every applicable ancestor `AGENTS.md`
+for each changed path. Nested instructions apply only within their own subtree;
+do not import policy from sibling or consumer directories.
+If `AGENTS.md` is absent, unrelated, or lower-confidence than the
 repository's observed behavior, continue with ClawSweeper's existing repository
 profiles and owner/default fallback behavior. The checkout is current target `main`, not the commit snapshot. Review the commit SHA and base range provided in the prompt
 with commands such as `git show <sha>` and `git diff <base>..<sha>`, then read
@@ -32,6 +35,12 @@ checks, lint checks, CLI smoke checks, dependency lookups, package metadata
 queries, advisory searches, and general web lookups are allowed when they can
 materially raise confidence within the time budget. Prefer focused checks over
 full-suite work unless the commit is small and the full gate is cheap.
+
+The host owns this review and its mandatory scan of the explicit initial payload
+and complete introduced before/after source bytes. Do not start target-bundled
+autoreview helpers or another reviewer, and do not claim those helpers ran.
+Later tool results, automatically loaded project docs, resumed/steered history,
+and universal provider egress are outside this admission scan's scope.
 
 Do not return JSON. Return Markdown only. The Markdown must start with YAML-ish
 front matter, then a human-readable report.

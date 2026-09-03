@@ -1,5 +1,13 @@
 # Steerable Repair Automation
 
+- Status: active end-to-end architecture reference; not a routine runbook
+- Owner: ClawSweeper maintainers
+- Source of truth: repair source/workflows, CrabFleet integration, dashboard
+  telemetry, and controlled behavior proof
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Update when: session lifecycle, steering, runner/auth boundary, capacity,
+  proof, dashboard, or recovery protocol changes
+
 Read this guide to understand how ClawSweeper turns GitHub work into bounded,
 observable, steerable Codex sessions. It covers issue-to-PR work, PR repair,
 GitCrawl cluster intake, GitHub App authentication, durable session resumption,
@@ -27,6 +35,20 @@ The automation is designed around five goals:
 5. GitHub mutations should remain deterministic, authenticated, bounded, and
    reversible when the model, runner, network, or operator disappears.
 
+Prefer the capable agent over custom reasoning machinery. Codex owns code
+judgment, investigation, implementation, and choosing appropriate validation.
+ClawSweeper supplies evidence and enforces the boundaries the agent cannot own:
+authorization, credential isolation, bounded scheduling, durable identity, and
+GitHub mutation gates. Add orchestration only for a concrete boundary or
+operational contract; do not duplicate the agent's reasoning in parsers,
+heuristics, or additional agent loops.
+
+Issue maturity assessment follows this boundary: Codex reads the target's
+checked-out scorecard and taxonomy directly and cites the primary owner and
+existing behavior. ClawSweeper does not generate or prefilter a maturity
+shortlist. Missing or ambiguous maturity evidence means no maturity label;
+the existing M4/M5 and broken-existing-behavior requirements still apply.
+
 The system separates model judgment from mutation authority. Codex reviews and
 edits code. TypeScript and GitHub Actions decide whether work is allowed,
 validate the result, and perform GitHub writes with short-lived GitHub App
@@ -38,7 +60,8 @@ credentials.
 flowchart LR
   A[GitHub issue, PR, comment, or schedule] --> B[ClawSweeper intake]
   G[GitCrawl store snapshot] --> B
-  B --> C[Durable job in clawsweeper-state]
+  B --> C[Coordinator-guarded jobs and results in clawsweeper-state]
+  B --> R[Canonical records and R2 action ledgers]
   C --> D[GitHub Actions repair worker]
   D --> E[Codex app-server thread]
   D --> F[CrabFleet action session]
@@ -62,8 +85,11 @@ Ownership boundaries:
 - **CrabFleet** owns the durable action-session registry, browser terminal
   relay, work-state timeline, terminal archives, and operator steering
   transport.
-- **`openclaw/clawsweeper-state`** owns generated operational state: jobs,
-  reports, results, intake ledgers, notifications, and dashboard source data.
+- **The Cloudflare Worker and R2** own review records, action ledgers, and
+  published assets.
+- **`openclaw/clawsweeper-state`** retains generated operational state: jobs,
+  results, intake ledgers, notifications, apply reports, and dashboard source
+  data.
 - **GitCrawl** groups related GitHub items. ClawSweeper consumes a published
   SQLite snapshot; it does not crawl GitHub during cluster intake.
 
@@ -130,10 +156,10 @@ enable it. The master gate is:
 CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES=1
 ```
 
-Additional candidate gates select the permitted automatic lane:
+With the master gate enabled, high-confidence reproduced bugs and small,
+high-confidence source-proven bugs automatically enter the OpenClaw bug lane.
+Additional controls select other permitted automatic lanes:
 
-- `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS=1` for strict, high-confidence
-  reproduced bugs.
 - `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT=1` for small, clearly aligned work
   backed by `VISION.md` evidence.
 - Eligible configured repositories outside the stricter core profiles may use
@@ -169,9 +195,21 @@ The `repair-cluster-intake.yml` workflow:
    `results/cluster-repair-intake/<repo-slug>.json`.
 5. Skips a store snapshot that was already processed unless a maintainer uses
    the force input.
-6. Imports a bounded number of eligible clusters into durable job markdown.
-7. Publishes the jobs and updated intake ledger.
-8. Dispatches them through the `repair_cluster` lane with capacity waiting.
+6. Gives a bounded batch of hydrated live GitHub evidence to the selector model.
+   The model chooses one narrow, actionable cluster or rejects the batch; quality
+   is not decided by word lists, scores, or semantic thresholds.
+7. Publishes the exact accepted job and intake-ledger paths through the durable
+   state-writer coordinator. Unrelated generated state remains untouched.
+8. Recovers any prior pending dispatch claims before accepting the new store,
+   then publishes a durable dispatch claim for each stable dispatch key.
+9. Starts
+   the `repair_cluster` worker and records the matching planning-job receipt.
+   Workflow creation is at-least-once: `workflow_dispatch` has no atomic run
+   receipt, so a crash inside the dispatch window can create another workflow
+   run. Worker execution is exactly-once by intent: the worker-side dispatch
+   receipt gate skips the duplicate planning pass. Recovery redispatches only
+   ledger entries whose HMAC accepted-intent receipt verifies against the
+   webhook secret; git ledger and job files are never dispatch authority.
 
 Scheduled cluster intake is independently gated:
 
@@ -224,20 +262,22 @@ and one durable Codex thread state.
 
 ### GitCrawl Store Ledger
 
-Cluster intake records the processed store content hash. A delayed schedule or
-duplicate workflow tick against the same exported database does not enqueue the
-same snapshot again.
+Cluster intake records every processed store content hash and accepted cluster
+identity. Import history spans inbox jobs, archived jobs, result records, and
+the intake ledger, so a delayed schedule, a duplicate workflow tick, or a newer
+store containing an already completed cluster cannot enqueue the same work
+again. The durable dispatch receipt independently suppresses transport retries.
 
 ### GitHub Actions Concurrency
 
-`repair-cluster-worker.yml` serializes identical job path and mode pairs:
+`repair-cluster-worker.yml` serializes runs for the same job path:
 
 ```text
-clawsweeper-repair-<job-path>-<mode>
+clawsweeper-repair-<job-path>
 ```
 
 Different jobs may run concurrently. The same logical job is queued instead of
-executed twice at the same time.
+executed twice at the same time, regardless of mode.
 
 ### Mutation Idempotency
 
@@ -605,14 +645,18 @@ terminal grid and focused session URL.
 
 ### Durable State
 
-Generated operational state is stored on the `state` branch of
-`openclaw/clawsweeper-state`, including:
+Generated state has explicit owners:
 
 - `jobs/`: queued and closed job markdown;
-- `records/`: issue, PR, and commit review reports;
 - `results/`: repair, intake, router, and run ledgers;
 - `notifications/`: notification idempotency state;
-- workflow status and dashboard data.
+- apply reports, workflow status, and dashboard data remain on the `state`
+  branch of `openclaw/clawsweeper-state`;
+- `records/` lives in the canonical Cloudflare record store;
+- `ledger/v1/` and `assets/` live in R2.
+
+See [`state-storage.md`](state-storage.md) for hydration and publication
+boundaries.
 
 Raw Codex transcripts and debug files remain GitHub Actions artifacts. The
 committed state keeps sanitized summaries and mutation evidence.
@@ -764,7 +808,6 @@ Issue implementation controls:
 | Name | Purpose |
 | --- | --- |
 | `CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES` | Master automatic issue-to-PR gate; default off. |
-| `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS` | Strict reproduced-bug automatic lane. |
 | `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT` | Small vision-aligned automatic lane. |
 | `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS` | Issue implementation live-worker override. |
 | `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_DISPATCH_PER_SWEEP` | Per-publish dispatch cap. |
@@ -774,7 +817,7 @@ GitCrawl controls:
 | Name | Purpose |
 | --- | --- |
 | `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED` | Enables scheduled GitCrawl cluster intake. |
-| `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` | Maximum clusters imported by one intake run. |
+| `CLAWSWEEPER_CLUSTER_REPAIR_CANDIDATE_BATCH` | Unprocessed clusters compared by the selector model; it selects at most one. |
 | `CLAWSWEEPER_MAX_LIVE_WORKERS` | Optional explicit repair dispatch override. |
 
 Mutation controls:

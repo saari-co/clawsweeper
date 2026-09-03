@@ -10,6 +10,50 @@ export interface ReviewHistoryLedger {
   totalCompletedCycles: number;
 }
 
+export interface ReviewItemCoverage {
+  status: "items" | "empty" | "not_published" | "unrecognized" | "truncated" | "unavailable";
+  recognizedItems: number;
+  retainedItems: number;
+  omittedItems: number;
+  truncatedItems: number;
+  itemLimit: number;
+  textLimit: number;
+}
+
+export function boundedReviewItems(
+  items: string[],
+  status: ReviewItemCoverage["status"],
+  itemLimit: number,
+  textLimit: number,
+): { items: string[]; coverage: ReviewItemCoverage } {
+  const retained = items.slice(0, itemLimit);
+  const truncatedItems = retained.filter((item) => item.length > textLimit).length;
+  const omittedItems = items.length - retained.length;
+  return {
+    items: retained.map((item) => truncateReviewText(item, textLimit)),
+    coverage: {
+      status:
+        status === "unrecognized" ? status : omittedItems || truncatedItems ? "truncated" : status,
+      recognizedItems: items.length,
+      retainedItems: retained.length,
+      omittedItems,
+      truncatedItems,
+      itemLimit,
+      textLimit,
+    },
+  };
+}
+
+function truncateReviewText(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
+}
+
+interface ParsedReviewHistory {
+  ledger: ReviewHistoryLedger;
+  start: number;
+  end: number;
+}
+
 export const MAX_REVIEW_HISTORY_CYCLES = 8;
 const MAX_CYCLE_FINDINGS = 6;
 const MAX_HISTORY_FIELD_CHARS = 160;
@@ -97,7 +141,7 @@ function parseReviewHistoryLine(line: string): ReviewHistoryCycle | null {
   return { reviewedAt: head[1].trim(), sha: head[2], verdict, findings };
 }
 
-function parseReviewHistoryAt(body: string, markerIndex: number): ReviewHistoryLedger | null {
+function parseReviewHistoryAt(body: string, markerIndex: number): ParsedReviewHistory | null {
   const markerEnd = body.indexOf("-->", markerIndex + REVIEW_HISTORY_MARKER_PREFIX.length);
   if (markerEnd < 0) return null;
   const marker = body.slice(markerIndex + 4, markerEnd).trim();
@@ -143,21 +187,103 @@ function parseReviewHistoryAt(body: string, markerIndex: number): ReviewHistoryL
   ].join("\n");
   if (summary.replaceAll("\r\n", "\n") !== expectedSummary) return null;
   return {
-    cycles,
-    totalCompletedCycles: parsedTotal,
+    ledger: {
+      cycles,
+      totalCompletedCycles: parsedTotal,
+    },
+    start: detailsStart,
+    end: detailsEnd + "</details>".length,
   };
 }
 
-export function parseReviewHistory(body: string): ReviewHistoryLedger {
+function latestParsedReviewHistory(body: string): ParsedReviewHistory | null {
   let searchFrom = body.length;
   while (searchFrom > 0) {
     const markerIndex = body.lastIndexOf(REVIEW_HISTORY_MARKER_PREFIX, searchFrom - 1);
     if (markerIndex < 0) break;
-    const ledger = parseReviewHistoryAt(body, markerIndex);
-    if (ledger) return ledger;
+    const parsed = parseReviewHistoryAt(body, markerIndex);
+    if (parsed) return parsed;
     searchFrom = markerIndex;
   }
+  return null;
+}
+
+export function parseReviewHistory(body: string): ReviewHistoryLedger {
+  const parsed = latestParsedReviewHistory(body);
+  if (parsed) return parsed.ledger;
   return { cycles: [], totalCompletedCycles: 0 };
+}
+
+// Reviewer-only diagnostics: the public v1 parser, writer, and digest stay unchanged.
+export function reviewHistoryForReviewer(body: string) {
+  const lines = body.split(/\r?\n/);
+  const fenced = fencedLineStates(lines);
+  const unfenced = lines.map((line, index) => (fenced[index] ? "" : line)).join("\n");
+  const parsed = latestParsedReviewHistory(unfenced);
+  const remainder = parsed
+    ? unfenced.slice(0, parsed.start) + unfenced.slice(parsed.end)
+    : unfenced;
+  const malformed = /<!--\s*clawsweeper-review-history\b|<summary>Review history\b/i.test(
+    remainder,
+  );
+  const ledger = parsed?.ledger ?? { cycles: [], totalCompletedCycles: 0 };
+  const omittedCycles =
+    parsed && !malformed ? ledger.totalCompletedCycles - ledger.cycles.length : null;
+  const cappedFindings = ledger.cycles.some((cycle) => cycle.findings.length >= MAX_CYCLE_FINDINGS);
+  const cappedText = ledger.cycles.some((cycle) =>
+    [cycle.reviewedAt, cycle.sha, cycle.verdict, ...cycle.findings].some(
+      (text) => text.length >= MAX_HISTORY_FIELD_CHARS || text.endsWith("..."),
+    ),
+  );
+  return {
+    ledger: {
+      ...ledger,
+      cycles: ledger.cycles.map((cycle) => ({
+        reviewedAt: truncateReviewText(cycle.reviewedAt, MAX_HISTORY_FIELD_CHARS),
+        sha: truncateReviewText(cycle.sha, MAX_HISTORY_FIELD_CHARS),
+        verdict: truncateReviewText(cycle.verdict, MAX_HISTORY_FIELD_CHARS),
+        findings: cycle.findings
+          .slice(0, MAX_CYCLE_FINDINGS)
+          .map((finding) => truncateReviewText(finding, MAX_HISTORY_FIELD_CHARS)),
+      })),
+    },
+    coverage: {
+      status: malformed
+        ? "malformed"
+        : !parsed
+          ? "absent"
+          : omittedCycles
+            ? "truncated"
+            : "recognized",
+      retainedCycles: ledger.cycles.length,
+      lifetimeCycles: parsed && !malformed ? ledger.totalCompletedCycles : null,
+      omittedCycles,
+      content: "bounded_finding_titles_only",
+      rankUpMoves: "not_retained",
+      risks: "not_retained",
+      findingLimit: MAX_CYCLE_FINDINGS,
+      fieldLimit: MAX_HISTORY_FIELD_CHARS,
+      // v1 never recorded original item/text counts, even when below these caps.
+      itemAndTextCompleteness: "unknown",
+      atFindingCap: cappedFindings,
+      textMayBeTruncated: cappedText,
+    },
+  };
+}
+
+export function normalizeDurableReviewVerdictBody(body: string): string {
+  const normalized = body.replace(/\r\n?/g, "\n");
+  const parsed = latestParsedReviewHistory(normalized);
+  const withoutHistory = parsed
+    ? [normalized.slice(0, parsed.start).trimEnd(), normalized.slice(parsed.end).trimStart()]
+        .filter(Boolean)
+        .join("\n\n")
+    : normalized;
+  return withoutHistory
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
 }
 
 function reviewHistoryCycleKey(cycle: ReviewHistoryCycle): string {
@@ -206,7 +332,7 @@ function reviewMarkerAttribute(body: string, name: string): string | null {
   return null;
 }
 
-function hasReviewStatusMarker(body: string): boolean {
+function hasNonStartedReviewStatusMarker(body: string): boolean {
   let searchFrom = 0;
   while (searchFrom < body.length) {
     const start = body.indexOf("<!--", searchFrom);
@@ -214,12 +340,13 @@ function hasReviewStatusMarker(body: string): boolean {
     const end = body.indexOf("-->", start + 4);
     if (end < 0) return false;
     searchFrom = end + 3;
+    const marker = body
+      .slice(start + 4, end)
+      .trim()
+      .toLowerCase();
     if (
-      body
-        .slice(start + 4, end)
-        .trim()
-        .toLowerCase()
-        .startsWith("clawsweeper-review-status:")
+      marker.startsWith("clawsweeper-review-status:") &&
+      !marker.startsWith("clawsweeper-review-status:started")
     ) {
       return true;
     }
@@ -227,26 +354,95 @@ function hasReviewStatusMarker(body: string): boolean {
   return false;
 }
 
-function reviewFindingLines(lines: readonly string[]): readonly string[] {
-  const detailsStart = lines.findLastIndex((line) => line.trim() === "Full review comments:");
-  if (detailsStart >= 0) {
-    const detailsLines = lines.slice(detailsStart + 1);
-    const end = detailsLines.findIndex((line) =>
-      /^(?:Overall correctness:|<\/details>|<!--)/.test(line.trim()),
-    );
-    return end < 0 ? detailsLines : detailsLines.slice(0, end);
-  }
-  const summaryStart = lines.findIndex((line) => line.trim() === "**Review findings**");
-  if (summaryStart < 0) return [];
-  const summaryLines = lines.slice(summaryStart + 1);
-  const end = summaryLines.findIndex((line) => /^(?:\*\*|<details>|<!--)/.test(line.trim()));
-  return end < 0 ? summaryLines : summaryLines.slice(0, end);
+// Marks each line that is part of a fenced code block (including the delimiters) so
+// fenced model output such as the Mermaid diagram cannot fake section markers.
+function fencedLineStates(lines: readonly string[]): readonly boolean[] {
+  let fence: string | null = null;
+  return lines.map((raw) => {
+    const trimmed = raw.trim();
+    const delimiter = trimmed.match(/^(?:`{3,}|~{3,})/)?.[0];
+    if (delimiter) {
+      if (!fence) {
+        fence = delimiter;
+      } else if (
+        delimiter[0] === fence[0] &&
+        delimiter.length >= fence.length &&
+        trimmed.slice(delimiter.length).trim() === ""
+      ) {
+        fence = null;
+      }
+      return true;
+    }
+    return fence !== null;
+  });
 }
 
-function commentBodyFindings(body: string): string[] {
+// Depth of nested <details> per line (fenced lines keep the surrounding depth) so
+// collapsed agent details cannot be mistaken for top-level sections.
+function detailsDepthStates(
+  lines: readonly string[],
+  fenced: readonly boolean[],
+): readonly number[] {
+  let depth = 0;
+  return lines.map((raw, index) => {
+    const trimmed = raw.trim();
+    if (!fenced[index]) {
+      if (/^<details(?:\s|>)/i.test(trimmed)) depth += 1;
+      else if (/^<\/details>/i.test(trimmed)) depth = Math.max(0, depth - 1);
+    }
+    return depth;
+  });
+}
+
+function reviewFindingLines(lines: readonly string[]): readonly string[] | null {
+  const fenced = fencedLineStates(lines);
+  const detailsDepth = detailsDepthStates(lines, fenced);
+  const collect = (start: number, boundary: RegExp): string[] => {
+    const section: string[] = [];
+    for (let index = start; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      if (fenced[index]) continue;
+      if (boundary.test(line.trim())) break;
+      section.push(line);
+    }
+    return section;
+  };
+  let detailsStart = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!fenced[index] && (lines[index] ?? "").trim() === "Full review comments:") {
+      detailsStart = index;
+      break;
+    }
+  }
+  if (detailsStart >= 0) {
+    // Stop at later headings so subsequent detail subsections are never recorded as
+    // current findings when the Overall correctness delimiter is absent.
+    return collect(detailsStart + 1, /^(?:Overall correctness:|#{1,6}\s|<\/details>|<!--)/);
+  }
+  let summaryStart = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = (lines[index] ?? "").trim();
+    // Stop permanently at the first top-level details boundary: renderer-owned
+    // summary sections precede it, and collapsed model text could contain forged
+    // closing tags that would otherwise re-enter top level.
+    if (!fenced[index] && /^<details(?:\s|>)/i.test(trimmed)) break;
+    if (
+      !fenced[index] &&
+      detailsDepth[index] === 0 &&
+      ["**Review findings**", "## Findings"].includes(trimmed)
+    ) {
+      summaryStart = index;
+      break;
+    }
+  }
+  if (summaryStart < 0) return null;
+  return collect(summaryStart + 1, /^(?:\*\*|#{1,6}\s|<details>|<\/details>|<!--)/);
+}
+
+function parsedFindingTitles(lines: readonly string[]): string[] {
   const detailed: string[] = [];
   const summary: string[] = [];
-  for (const raw of reviewFindingLines(body.split(/\r?\n/))) {
+  for (const raw of lines) {
     const line = raw.trim();
     if (line.startsWith(HISTORY_LINE_PREFIX)) continue;
     const detailedMatch = line.match(DETAILED_FINDING_PATTERN);
@@ -265,11 +461,79 @@ function commentBodyFindings(body: string): string[] {
     }
   }
   const findings = detailed.length ? detailed : summary;
-  return [...new Set(findings)].slice(0, MAX_CYCLE_FINDINGS);
+  return [...new Set(findings)];
+}
+
+export function reviewFindingsForReviewer(body: string) {
+  const lines = reviewFindingLines(body.split(/\r?\n/));
+  const findings = parsedFindingTitles(lines ?? []);
+  const empty = lines?.some((line) => /^(?:- )?none[.!]?$/i.test(line.trim()));
+  const malformed = lines?.some(
+    (line) =>
+      line.startsWith("- ") &&
+      !DETAILED_FINDING_PATTERN.test(line) &&
+      !SUMMARY_FINDING_PATTERN.test(line) &&
+      !/^- none[.!]?$/i.test(line),
+  );
+  return boundedReviewItems(
+    findings,
+    malformed
+      ? "unrecognized"
+      : findings.length
+        ? "items"
+        : empty
+          ? "empty"
+          : lines
+            ? "unrecognized"
+            : "not_published",
+    MAX_CYCLE_FINDINGS,
+    MAX_HISTORY_FIELD_CHARS,
+  );
+}
+
+export function reviewRankUpMovesForReviewer(body: string) {
+  const lines = body.split(/\r?\n/);
+  const fenced = fencedLineStates(lines);
+  const start = lines.findIndex(
+    (line, index) =>
+      !fenced[index] &&
+      /^(?:#{1,6}\s+Rank-up moves|\*\*Rank-up moves\*\*|Rank-up moves:)\s*$/i.test(line),
+  );
+  const items: string[] = [];
+  let unrecognized = false;
+  if (start >= 0) {
+    for (let index = start + 1; index < lines.length; index += 1) {
+      const line = (lines[index] ?? "").trim();
+      if (fenced[index]) {
+        unrecognized = true;
+        continue;
+      }
+      if (/^(?:#{1,6}\s|\*\*[^*]+\*\*\s*$|<\/?details>|<!--)/.test(line)) break;
+      if (
+        !line ||
+        line === "Optional improvements that raise the rating; they are not merge blockers." ||
+        /^(?:- )?none[.!]?$/i.test(line)
+      )
+        continue;
+      const item = line.match(/^-\s+(\S.*)$/)?.[1];
+      if (item) items.push(item);
+      else unrecognized = true;
+    }
+  }
+  return boundedReviewItems(
+    items,
+    start < 0 ? "not_published" : unrecognized ? "unrecognized" : items.length ? "items" : "empty",
+    6,
+    600,
+  );
 }
 
 export function reviewHistoryCycleFromCommentBody(body: string): ReviewHistoryCycle | null {
-  if (!body.trim() || body.includes(REVIEW_START_PLACEHOLDER) || hasReviewStatusMarker(body)) {
+  if (
+    !body.trim() ||
+    body.includes(REVIEW_START_PLACEHOLDER) ||
+    hasNonStartedReviewStatusMarker(body)
+  ) {
     return null;
   }
   const lines = body.split(/\r?\n/);
@@ -288,5 +552,10 @@ export function reviewHistoryCycleFromCommentBody(body: string): ReviewHistoryCy
   const inlineReviewedAt = body.match(/_reviewed ([^_]+?)\.?_/i)?.[1]?.trim();
   const reviewedAt = reviewMarkerAttribute(body, "reviewed_at") ?? inlineReviewedAt ?? "unknown";
   const sha = reviewMarkerAttribute(body, "sha") ?? "unknown";
-  return { reviewedAt, sha, verdict, findings: commentBodyFindings(body) };
+  return {
+    reviewedAt,
+    sha,
+    verdict,
+    findings: parsedFindingTitles(reviewFindingLines(lines) ?? []).slice(0, MAX_CYCLE_FINDINGS),
+  };
 }

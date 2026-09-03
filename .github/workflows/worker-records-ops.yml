@@ -1,0 +1,77 @@
+name: Snapshot canonical Worker records
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Repository whose canonical records should be snapshotted (owner/name).
+        required: true
+        type: string
+
+concurrency:
+  group: worker-records-snapshot-${{ inputs.target_repo }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CLAWSWEEPER_RECORDS_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+
+jobs:
+  snapshot:
+    name: Trigger canonical records snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          filter: blob:none
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Resolve target record slug
+        id: target
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          if ! [[ "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "target_repo must be owner/name" >&2
+            exit 2
+          fi
+          echo "slug=${TARGET_REPO//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger canonical records snapshot
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          TARGET_SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          import { signedPost } from "./scripts/worker-records.ts";
+
+          const result = await signedPost({
+            baseUrl: process.env.CLAWSWEEPER_RECORDS_URL,
+            path: "/internal/state/records/snapshots/trigger",
+            webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET,
+            body: { repoSlug: process.env.TARGET_SLUG },
+          });
+          if (result?.ok !== true || result.snapshot?.repoSlug !== process.env.TARGET_SLUG) {
+            throw new Error("Worker returned an invalid snapshot response");
+          }
+          const summary = {
+            repoSlug: result.snapshot.repoSlug,
+            revisionWatermark: result.snapshot.revisionWatermark,
+            bytes: result.snapshot.bytes,
+            fileCount: result.snapshot.fileCount,
+            createdAt: result.snapshot.createdAt,
+          };
+          console.log(JSON.stringify(summary));
+          appendFileSync(
+            process.env.GITHUB_STEP_SUMMARY,
+            `### Canonical records snapshot\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`,
+          );
+          NODE

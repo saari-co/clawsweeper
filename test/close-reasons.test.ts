@@ -4,10 +4,17 @@ import test from "node:test";
 
 import {
   abandonedPrAgeSkipReason,
+  authorPrBudget,
+  authorPrBudgetAgeSkipReason,
+  authorPrBudgetCloseEnabled,
+  authorPrBudgetMaxClosesPerRun,
   closeReasonApplyAgeSkipReason,
   closeReasonsArg,
   compactReferencingMergedPullRequestForTest,
   formatRecentClosedRows,
+  issueRecentHumanCommentBlockReasonFromComments,
+  obsoleteFixPrAgeSkipReason,
+  obsoleteFixPrCloseEnabled,
   openClosingPullRequestApplyReason,
   referencingMergedPullRequestCandidatesForTest,
   referencingMergedPullRequestsForIssueForTest,
@@ -16,8 +23,14 @@ import {
   sanitizePublicSelfReferences,
   stalledUnprovenPrAgeSkipReason,
   stalledUnprovenProofRequestBlockReason,
+  staleVersionBugAgeSkipReason,
+  staleVersionBugCloseEnabled,
+  staleVersionBugDecisionBlockReason,
   unconfirmedProductDirectionAgeSkipReason,
   unconfirmedProductDirectionCloseEnabled,
+  unsponsoredFeatureAgeSkipReason,
+  unsponsoredFeatureCloseEnabled,
+  unsponsoredFeatureDecisionBlockReason,
   validateCloseDecision,
 } from "../dist/clawsweeper.js";
 import { closeDecision, git, item, tmpPrefix, withMockGh } from "./helpers.ts";
@@ -235,6 +248,266 @@ test("unconfirmed product direction apply policy is default-off and age-gated", 
   );
 });
 
+const unsponsoredMaintainerDecision = {
+  required: true,
+  kind: "product_direction",
+  question: "Should OpenClaw sponsor this feature direction?",
+  rationale: "The request needs an explicit product decision before core work starts.",
+  options: [
+    {
+      title: "Sponsor the direction",
+      body: "Keep the issue open and assign a maintainer owner.",
+      recommended: false,
+    },
+    {
+      title: "Leave unsponsored",
+      body: "Close as not planned unless a maintainer sponsors it later.",
+      recommended: true,
+    },
+  ],
+  likelyOwner: {
+    person: "@alice",
+    reason: "Recent ownership covers this product area.",
+    confidence: "high",
+  },
+};
+
+test("unsponsored feature requests are issue-only feature decisions without security labels", () => {
+  const decision = closeDecision({
+    closeReason: "unsponsored_feature_request",
+    itemCategory: "feature",
+    requiresProductDecision: true,
+    maintainerDecision: unsponsoredMaintainerDecision,
+  });
+
+  assert.equal(unsponsoredFeatureDecisionBlockReason(item(), decision), null);
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item({ kind: "pull_request" }), decision) ?? "",
+    /allowed only for issues/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), { ...decision, itemCategory: "bug" }) ?? "",
+    /feature item category/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), {
+      ...decision,
+      requiresProductDecision: false,
+    }) ?? "",
+    /requires a product decision/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), {
+      ...decision,
+      maintainerDecision: { ...unsponsoredMaintainerDecision, kind: "implementation" },
+    }) ?? "",
+    /product-direction maintainer decision/,
+  );
+  for (const label of ["impact:security", "CLAWSWEEPER:NEEDS-SECURITY-REVIEW"]) {
+    assert.match(
+      unsponsoredFeatureDecisionBlockReason(item({ labels: [label] }), decision) ?? "",
+      /blocks unsponsored feature auto-close/,
+    );
+  }
+  assert.deepEqual(validateCloseDecision(item(), decision), { ok: true });
+  assert.equal(validateCloseDecision(item({ kind: "pull_request" }), decision).ok, false);
+  assert.deepEqual(
+    closeReasonsArg("unsponsored_feature_request"),
+    new Set(["unsponsored_feature_request"]),
+  );
+});
+
+test("unsponsored feature apply policy is default-off and age-gated", () => {
+  assert.equal(unsponsoredFeatureCloseEnabled({}), false);
+  assert.equal(
+    unsponsoredFeatureCloseEnabled({ CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: "true" }),
+    true,
+  );
+  const now = Date.parse("2026-07-11T00:00:00Z");
+  assert.equal(unsponsoredFeatureAgeSkipReason({ createdAt: "2026-04-11T23:59:59Z" }, now), null);
+  assert.equal(
+    unsponsoredFeatureAgeSkipReason({ createdAt: "2026-05-01T00:00:00Z" }, now),
+    "unsponsored_feature_request requires issue older than 90 days",
+  );
+});
+
+test("author PR-budget policy is default-off with bounded tunable defaults", () => {
+  assert.equal(authorPrBudgetCloseEnabled({}), false);
+  assert.equal(
+    authorPrBudgetCloseEnabled({ CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED: "true" }),
+    true,
+  );
+  assert.equal(authorPrBudget({}), 15);
+  assert.equal(authorPrBudget({ CLAWSWEEPER_AUTHOR_PR_BUDGET: "20" }), 20);
+  assert.equal(authorPrBudget({ CLAWSWEEPER_AUTHOR_PR_BUDGET: "invalid" }), 15);
+  assert.equal(authorPrBudgetMaxClosesPerRun({}), 5);
+  assert.equal(
+    authorPrBudgetMaxClosesPerRun({ CLAWSWEEPER_AUTHOR_PR_BUDGET_MAX_CLOSES_PER_RUN: "2" }),
+    2,
+  );
+  const now = Date.parse("2026-07-15T00:00:00Z");
+  assert.equal(authorPrBudgetAgeSkipReason({ createdAt: "2026-07-01T00:00:00Z" }, now), null);
+  assert.equal(
+    authorPrBudgetAgeSkipReason({ createdAt: "2026-07-10T00:00:00Z" }, now),
+    "author_pr_budget_exceeded requires PR older than 7 days",
+  );
+});
+
+test("author_pr_budget_exceeded is PR-only and protects high-quality proven work", () => {
+  const lowSignal = closeDecision({
+    closeReason: "author_pr_budget_exceeded",
+    realBehaviorProof: {
+      status: "missing",
+      summary: "No real proof was supplied.",
+      evidenceKind: "none",
+      needsContributorAction: true,
+    },
+    prRating: {
+      proofTier: "F",
+      patchTier: "D",
+      overallTier: "D",
+      summary: "Low-signal and unproven.",
+      nextSteps: [],
+    },
+  });
+  assert.deepEqual(validateCloseDecision(item({ kind: "pull_request" }), lowSignal), {
+    ok: true,
+  });
+  assert.match(
+    validateCloseDecision(item({ kind: "issue" }), lowSignal).reason ?? "",
+    /not allowed for openclaw\/openclaw issue apply policy/,
+  );
+  assert.match(
+    validateCloseDecision(
+      item({ kind: "pull_request", authorAssociation: "COLLABORATOR" }),
+      lowSignal,
+    ).reason ?? "",
+    /maintainer-authored/,
+  );
+  assert.match(
+    validateCloseDecision(
+      item({ kind: "pull_request" }),
+      closeDecision({
+        ...lowSignal,
+        closeReason: "author_pr_budget_exceeded",
+        realBehaviorProof: {
+          status: "sufficient",
+          summary: "A live run proves the behavior.",
+          evidenceKind: "terminal",
+          needsContributorAction: false,
+        },
+        prRating: {
+          proofTier: "A",
+          patchTier: "A",
+          overallTier: "A",
+          summary: "High-quality proven work.",
+          nextSteps: [],
+        },
+      }),
+    ).reason ?? "",
+    /cannot close a high-quality proven pull request/,
+  );
+  assert.deepEqual(
+    closeReasonsArg("author_pr_budget_exceeded"),
+    new Set(["author_pr_budget_exceeded"]),
+  );
+});
+
+test("stale_version_bug is issue-only, bug-only, and security-safe", () => {
+  const decision = closeDecision({ closeReason: "stale_version_bug", itemCategory: "bug" });
+  assert.deepEqual(validateCloseDecision(item(), decision), { ok: true });
+  assert.match(
+    staleVersionBugDecisionBlockReason(item({ kind: "pull_request" }), decision) ?? "",
+    /allowed only for issues/,
+  );
+  assert.match(
+    staleVersionBugDecisionBlockReason(item(), { ...decision, itemCategory: "feature" }) ?? "",
+    /requires bug item category/,
+  );
+  assert.match(
+    staleVersionBugDecisionBlockReason(item({ labels: ["topic:security-review"] }), decision) ?? "",
+    /blocks stale-version bug auto-close/,
+  );
+  assert.deepEqual(closeReasonsArg("stale_version_bug"), new Set(["stale_version_bug"]));
+});
+
+test("obsolete_fix_pr is PR-only even for high-quality proven work", () => {
+  const decision = closeDecision({
+    closeReason: "obsolete_fix_pr",
+    realBehaviorProof: {
+      status: "sufficient",
+      summary: "The original fix was proven before main replaced the code.",
+      evidenceKind: "terminal",
+      needsContributorAction: false,
+    },
+    prRating: {
+      proofTier: "A",
+      patchTier: "A",
+      overallTier: "A",
+      summary: "High-quality work whose target code is gone.",
+      nextSteps: [],
+    },
+  });
+  assert.deepEqual(validateCloseDecision(item({ kind: "pull_request" }), decision), { ok: true });
+  assert.match(
+    validateCloseDecision(item({ kind: "issue" }), decision).reason ?? "",
+    /not allowed for openclaw\/openclaw issue apply policy/,
+  );
+  assert.match(
+    validateCloseDecision(item({ kind: "pull_request", authorAssociation: "MEMBER" }), decision)
+      .reason ?? "",
+    /maintainer-authored/,
+  );
+  assert.deepEqual(closeReasonsArg("obsolete_fix_pr"), new Set(["obsolete_fix_pr"]));
+});
+
+test("obsolescence apply policies are default-off and age-gated", () => {
+  assert.equal(staleVersionBugCloseEnabled({}), false);
+  assert.equal(
+    staleVersionBugCloseEnabled({ CLAWSWEEPER_STALE_VERSION_BUG_CLOSE_ENABLED: "true" }),
+    true,
+  );
+  assert.equal(obsoleteFixPrCloseEnabled({}), false);
+  assert.equal(
+    obsoleteFixPrCloseEnabled({ CLAWSWEEPER_OBSOLETE_FIX_PR_CLOSE_ENABLED: "true" }),
+    true,
+  );
+  const now = Date.parse("2026-07-16T00:00:00Z");
+  assert.equal(staleVersionBugAgeSkipReason({ createdAt: "2026-01-01T00:00:00Z" }, now), null);
+  assert.equal(
+    staleVersionBugAgeSkipReason({ createdAt: "2026-05-01T00:00:00Z" }, now),
+    "stale_version_bug requires issue older than 120 days",
+  );
+  assert.equal(obsoleteFixPrAgeSkipReason({ createdAt: "2026-01-01T00:00:00Z" }, now), null);
+  assert.equal(
+    obsoleteFixPrAgeSkipReason({ createdAt: "2026-06-01T00:00:00Z" }, now),
+    "obsolete_fix_pr requires PR older than 90 days",
+  );
+});
+
+test("issue inactivity ignores bot-only and old comment history", () => {
+  const now = Date.parse("2026-07-11T00:00:00Z");
+  assert.match(
+    issueRecentHumanCommentBlockReasonFromComments(
+      [{ created_at: "2026-07-01T00:00:00Z", user: { type: "User" } }],
+      60,
+      now,
+    ) ?? "",
+    /non-bot comment within the last 60 days/,
+  );
+  assert.equal(
+    issueRecentHumanCommentBlockReasonFromComments(
+      [
+        { created_at: "2026-07-10T00:00:00Z", user: { type: "Bot" } },
+        { created_at: "2026-01-01T00:00:00Z", user: { type: "User" } },
+      ],
+      60,
+      now,
+    ),
+    null,
+  );
+});
+
 test("implemented-on-main closes require fix provenance", () => {
   const missingFixedSha = validateCloseDecision(
     item(),
@@ -368,6 +641,16 @@ test("implemented-on-main closes require fix provenance", () => {
       summary: "Current main implements the useful part of this older PR.",
       closeComment:
         "Closing this older PR because current main already covers the useful change and the remaining branch diff is obsolete.",
+      fixedPullRequest: {
+        repo: "openclaw/openclaw",
+        number: 900,
+        url: "https://github.com/openclaw/openclaw/pull/900",
+        title: "Current implementation",
+        mergedAt: "2026-04-28T12:00:00Z",
+        sha: "abcdef1234567890",
+        confidence: "high",
+        source: "GitHub linked-issue current closing PR",
+      },
     }),
   );
   assert.equal(mostlyImplementedPr.ok, true);

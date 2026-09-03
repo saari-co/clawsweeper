@@ -1,22 +1,302 @@
 import assert from "node:assert/strict";
+import fs, { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   SUPERSEDED_RE_REVIEW_REASON,
   appendLedger,
+  commentBodySha256,
   dispatchClaimDecision,
   dispatchClaimLookupKeys,
   dispatchReceiptKeyMaterial,
+  exactCommentVersionFastPathDecision,
+  exactCommentVersionMatchesLive,
   hasSuccessfulDispatchExecutionJob,
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
   normalizeGitHubActor,
+  readLedger,
+  routerDispatchReceiptKey,
+  routedCommentSourceDeliveryId,
   selectCommentsForRouting,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
   supersededReReviewCommentVersions,
   summarizeChecks,
+  writeLedger,
 } from "../../dist/repair/comment-router-utils.js";
+import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
+
+test("exact terminal comment versions short-circuit duplicate created deliveries", () => {
+  const body = "@clawsweeper re-review";
+  const ledger = exactVersionLedger({
+    status: "executed",
+    body,
+  });
+
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      authenticated: true,
+      sourceAction: "created",
+      targetRepo: "openclaw/openclaw",
+      commentId: 456,
+      commentUpdatedAt: "2026-07-12T20:00:00Z",
+      commentBodyDigest: commentBodySha256(body),
+      forceReprocess: false,
+      ledger,
+      verificationLedgers: [structuredClone(ledger), structuredClone(ledger)],
+    }),
+    {
+      suppress: true,
+      reason: "exact_terminal_comment_version",
+      commentVersionKey: "456:2026-07-12T20:00:00Z",
+      status: "executed",
+    },
+  );
+});
+
+test("edited comments and changed body bytes always use the full router path", () => {
+  const ledger = exactVersionLedger({
+    status: "executed",
+    body: "@clawsweeper re-review",
+  });
+
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      authenticated: true,
+      sourceAction: "edited",
+      targetRepo: "openclaw/openclaw",
+      commentId: 456,
+      commentUpdatedAt: "2026-07-12T20:01:00Z",
+      commentBodyDigest: commentBodySha256("@clawsweeper re-review with new context"),
+      forceReprocess: false,
+      ledger,
+      verificationLedgers: [structuredClone(ledger), structuredClone(ledger)],
+    }),
+    { suppress: false, reason: "edited_or_unknown_action" },
+  );
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      authenticated: true,
+      sourceAction: "created",
+      targetRepo: "openclaw/openclaw",
+      commentId: 456,
+      commentUpdatedAt: "2026-07-12T20:00:00Z",
+      commentBodyDigest: commentBodySha256("@clawsweeper re-review with changed bytes"),
+      forceReprocess: false,
+      ledger,
+      verificationLedgers: [structuredClone(ledger), structuredClone(ledger)],
+    }),
+    { suppress: false, reason: "body_digest_mismatch" },
+  );
+});
+
+test("terminal cleanup requires the same live comment version", () => {
+  const body = "@clawsweeper re-review";
+  const command = {
+    comment_id: "456",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    comment_body_sha256: commentBodySha256(body),
+  };
+
+  assert.equal(
+    exactCommentVersionMatchesLive(command, {
+      id: 456,
+      updated_at: "2026-07-12T20:00:00Z",
+      body,
+    }),
+    true,
+  );
+  assert.equal(
+    exactCommentVersionMatchesLive(command, {
+      id: 456,
+      updated_at: "2026-07-12T20:01:00Z",
+      body: `${body} now`,
+    }),
+    false,
+  );
+});
+
+test("command delivery identity follows only its authenticated exact comment version", () => {
+  const body = "@clawsweeper re-review";
+  const comment = {
+    id: 456,
+    updated_at: "2026-07-12T20:00:00Z",
+    body,
+  };
+  const event = {
+    authenticated: true,
+    commentId: 456,
+    commentUpdatedAt: comment.updated_at,
+    commentBodySha256: commentBodySha256(body),
+    sourceDeliveryId: "github-original-delivery",
+  };
+  const options = {
+    comment,
+    event,
+    priorClaim: null,
+    targetRepo: "openclaw/openclaw",
+  };
+
+  assert.equal(routedCommentSourceDeliveryId(options), "github-original-delivery");
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      ...options,
+      comment: { ...comment, updated_at: "2026-07-12T20:01:00Z" },
+    }),
+    null,
+  );
+  assert.equal(
+    routedCommentSourceDeliveryId({ ...options, comment: { ...comment, body: `${body} edited` } }),
+    null,
+  );
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      ...options,
+      event: { ...event, authenticated: false },
+    }),
+    null,
+  );
+  const priorClaim = {
+    repo: "openclaw/openclaw",
+    comment_id: "456",
+    comment_updated_at: comment.updated_at,
+    comment_body_sha256: commentBodySha256(body),
+    source_delivery_id: "github-durable-delivery",
+  };
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      ...options,
+      event: { ...event, authenticated: false, sourceDeliveryId: null },
+      priorClaim,
+    }),
+    "github-durable-delivery",
+  );
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      ...options,
+      comment: { ...comment, body: `${body} edited` },
+      event: { ...event, authenticated: false, sourceDeliveryId: null },
+      priorClaim,
+    }),
+    null,
+  );
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      ...options,
+      priorClaim: {
+        ...priorClaim,
+        source_delivery_id: undefined,
+        source_delivery_conflict: true,
+      },
+    }),
+    null,
+    "an authenticated redelivery must never resurrect conflicted durable provenance",
+  );
+});
+
+test("missing timestamps or authenticated provenance use the full router path", () => {
+  const ledger = exactVersionLedger({
+    status: "executed",
+    body: "@clawsweeper re-review",
+  });
+  const base = {
+    sourceAction: "created",
+    targetRepo: "openclaw/openclaw",
+    commentId: 456,
+    commentUpdatedAt: "2026-07-12T20:00:00Z",
+    commentBodyDigest: commentBodySha256("@clawsweeper re-review"),
+    forceReprocess: false,
+    ledger,
+    verificationLedgers: [structuredClone(ledger), structuredClone(ledger)],
+  };
+
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      ...base,
+      authenticated: true,
+      commentUpdatedAt: null,
+    }),
+    { suppress: false, reason: "incomplete_exact_version" },
+  );
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      ...base,
+      authenticated: false,
+    }),
+    { suppress: false, reason: "auth_uncertain" },
+  );
+});
+
+test("retryable claims and failed action leases are never short-circuited", () => {
+  for (const status of ["waiting", "claimed"]) {
+    const ledger = exactVersionLedger({
+      status,
+      body: "@clawsweeper re-review",
+      actions: [{ action: "dispatch_clawsweeper", status }],
+    });
+    assert.deepEqual(
+      exactCommentVersionFastPathDecision({
+        authenticated: true,
+        sourceAction: "created",
+        targetRepo: "openclaw/openclaw",
+        commentId: 456,
+        commentUpdatedAt: "2026-07-12T20:00:00Z",
+        commentBodyDigest: commentBodySha256("@clawsweeper re-review"),
+        forceReprocess: false,
+        ledger,
+        verificationLedgers: [structuredClone(ledger), structuredClone(ledger)],
+      }),
+      { suppress: false, reason: "version_retryable" },
+    );
+  }
+
+  const failedLedger = exactVersionLedger({
+    status: "executed",
+    body: "@clawsweeper re-review",
+    actions: [{ action: "dispatch_clawsweeper", status: "failed" }],
+  });
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      authenticated: true,
+      sourceAction: "created",
+      targetRepo: "openclaw/openclaw",
+      commentId: 456,
+      commentUpdatedAt: "2026-07-12T20:00:00Z",
+      commentBodyDigest: commentBodySha256("@clawsweeper re-review"),
+      forceReprocess: false,
+      ledger: failedLedger,
+      verificationLedgers: [structuredClone(failedLedger), structuredClone(failedLedger)],
+    }),
+    { suppress: false, reason: "lease_uncertain" },
+  );
+});
+
+test("concurrent ledger changes fail closed to the full router path", () => {
+  const ledger = exactVersionLedger({
+    status: "executed",
+    body: "@clawsweeper re-review",
+  });
+  const changedLedger = structuredClone(ledger);
+  changedLedger.updated_at = "2026-07-12T20:01:00Z";
+
+  assert.deepEqual(
+    exactCommentVersionFastPathDecision({
+      authenticated: true,
+      sourceAction: "created",
+      targetRepo: "openclaw/openclaw",
+      commentId: 456,
+      commentUpdatedAt: "2026-07-12T20:00:00Z",
+      commentBodyDigest: commentBodySha256("@clawsweeper re-review"),
+      forceReprocess: false,
+      ledger,
+      verificationLedgers: [structuredClone(ledger), changedLedger],
+    }),
+    { suppress: false, reason: "state_drift" },
+  );
+});
 
 test("synthetic dispatch claims retain a stable idempotency lookup across router runs", () => {
   const idempotencyKey = "repair-loop-label-sweep:openclaw/openclaw:automerge:74499";
@@ -54,6 +334,48 @@ test("synthetic dispatch receipt material is stable within an attempt and change
   assert.notEqual(
     dispatchReceiptKeyMaterial(command, firstClaim),
     dispatchReceiptKeyMaterial(command, nextClaim),
+  );
+});
+
+test("production forced replay parsing scopes claims and dispatch keys by durable attempt", () => {
+  const baseArgs = {
+    repo: "openclaw/openclaw",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+  };
+  const baseCommand = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-12T20:00:00Z:automerge",
+    comment_id: "991122",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+  };
+  const forcedCommand = (attemptId: string) => ({
+    ...baseCommand,
+    ...forcedReplayCommandFields(
+      readCommentRouterConfig({
+        ...baseArgs,
+        "force-reprocess": true,
+        "attempt-id": attemptId,
+      }),
+    ),
+  });
+
+  const first = forcedCommand("forced-replay-41001");
+  const firstRetry = forcedCommand("forced-replay-41001");
+  const second = forcedCommand("forced-replay-41002");
+  assert.deepEqual(dispatchClaimLookupKeys(first), dispatchClaimLookupKeys(firstRetry));
+  assert.equal(routerDispatchReceiptKey(first, null), routerDispatchReceiptKey(firstRetry, null));
+  assert.deepEqual(
+    dispatchClaimLookupKeys(first).filter((key) => dispatchClaimLookupKeys(second).includes(key)),
+    [],
+  );
+  assert.notEqual(routerDispatchReceiptKey(first, null), routerDispatchReceiptKey(second, null));
+
+  const normalReplay = { ...baseCommand, processed_at: "2026-07-12T20:05:00Z" };
+  assert.deepEqual(dispatchClaimLookupKeys(baseCommand), dispatchClaimLookupKeys(normalReplay));
+  assert.equal(
+    routerDispatchReceiptKey(baseCommand, null),
+    routerDispatchReceiptKey(normalReplay, null),
   );
 });
 
@@ -242,6 +564,324 @@ test("appendLedger records claimed dispatch commands as recoverable idempotency 
       job_path: null,
     },
   ]);
+});
+
+test("forced replay claims survive ledger interruption without cross-attempt aliases", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const processedAt = "2026-07-12T20:05:00Z";
+  const base = {
+    idempotency_key:
+      "clawsweeper-repair:openclaw/openclaw:74499:991122:2026-07-12T20:00:00Z:automerge",
+    comment_id: "991122",
+    comment_version_key: "991122:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "claimed",
+    processed_at: processedAt,
+    intent: "automerge",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const firstAttempt = {
+    ...base,
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+  };
+  const ledger = { updated_at: null, commands: [] };
+  assert.equal(appendLedger(ledger, [firstAttempt]), true);
+  writeLedger(ledgerPath, ledger);
+
+  const restored = readLedger(ledgerPath);
+  assert.equal(restored.commands.length, 1);
+  assert.equal(restored.commands[0]?.forced_replay, true);
+  assert.equal(restored.commands[0]?.attempt_id, firstAttempt.attempt_id);
+
+  const priorClaims = new Map<string, unknown>();
+  for (const claim of restored.commands) {
+    for (const key of dispatchClaimLookupKeys(claim)) priorClaims.set(key, claim);
+  }
+  const claimFor = (command: typeof firstAttempt) =>
+    dispatchClaimLookupKeys(command)
+      .map((key) => priorClaims.get(key))
+      .find(Boolean) ?? null;
+
+  const recoveredClaim = claimFor(firstAttempt);
+  assert.equal(recoveredClaim, restored.commands[0]);
+  assert.equal(claimFor({ ...base, forced_replay: false, attempt_id: undefined }), null);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: recoveredClaim,
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74499 [${routerDispatchReceiptKey(
+        firstAttempt,
+        recoveredClaim,
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+
+  assert.equal(
+    appendLedger(restored, [{ ...firstAttempt, attempt_id: "forced-replay-41002" }]),
+    true,
+  );
+  assert.equal(restored.commands.length, 1);
+  assert.equal(restored.commands[0]?.attempt_id, "forced-replay-41002");
+});
+
+test("refreshed forced replay claims survive bounded ledger trimming and restart", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const commentUpdatedAt = "2026-07-12T20:00:00Z";
+  const commands = Array.from({ length: 1000 }, (_, index) => ({
+    idempotency_key: `command-${index}`,
+    comment_id: String(index),
+    comment_version_key: `${index}:${commentUpdatedAt}`,
+    comment_updated_at: commentUpdatedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 74000 + index,
+    status: "executed",
+    processed_at: "2026-07-12T20:01:00Z",
+  }));
+  const forcedClaim = {
+    ...commands[0],
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const freshClaim = {
+    idempotency_key: "command-1000",
+    comment_id: "1000",
+    comment_version_key: `1000:${commentUpdatedAt}`,
+    comment_updated_at: commentUpdatedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 75000,
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const ledger = { updated_at: null, commands };
+
+  assert.equal(appendLedger(ledger, [forcedClaim, freshClaim]), true);
+  assert.equal(ledger.commands.length, 1000);
+  assert.equal(
+    ledger.commands.some((entry) => entry.comment_id === "1"),
+    false,
+  );
+  assert.deepEqual(
+    ledger.commands.slice(-2).map((entry) => entry.comment_id),
+    ["0", "1000"],
+  );
+  writeLedger(ledgerPath, ledger);
+
+  const restored = readLedger(ledgerPath);
+  const forcedKeys = new Set(dispatchClaimLookupKeys(forcedClaim));
+  const recoveredClaim =
+    restored.commands.find((entry) =>
+      dispatchClaimLookupKeys(entry).some((key) => forcedKeys.has(key)),
+    ) ?? null;
+  assert.equal(recoveredClaim?.attempt_id, forcedClaim.attempt_id);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: recoveredClaim,
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74000 [${routerDispatchReceiptKey(
+        forcedClaim,
+        recoveredClaim,
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+});
+
+test("atomic ledger writes preserve the previous forced claim across interruption", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const forcedClaim = {
+    idempotency_key: "claim-before-dispatch",
+    comment_id: "125",
+    comment_version_key: "125:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+    forced_replay: true,
+    attempt_id: "forced-replay-41001",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  writeLedger(ledgerPath, { updated_at: forcedClaim.processed_at, commands: [forcedClaim] });
+
+  const originalFsyncSync = fs.fsyncSync;
+  fs.fsyncSync = (() => {
+    throw new Error("simulated interrupted ledger write");
+  }) as typeof fs.fsyncSync;
+  try {
+    assert.throws(
+      () => writeLedger(ledgerPath, { updated_at: null, commands: [] }),
+      /simulated interrupted ledger write/,
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+  fs.writeFileSync(
+    path.join(directory, ".comment-router.json.interrupted.tmp"),
+    '{"updated_at":null,"commands":[',
+  );
+
+  const restored = readLedger(ledgerPath);
+  assert.equal(restored.commands.length, 1);
+  assert.equal(restored.commands[0]?.attempt_id, forcedClaim.attempt_id);
+  assert.deepEqual(
+    dispatchClaimDecision({
+      claim: restored.commands[0],
+      runs: [],
+      expectedTitle: `Review event item openclaw/openclaw#74499 [${routerDispatchReceiptKey(
+        forcedClaim,
+        restored.commands[0],
+      )}]`,
+      nowMs: Date.parse("2026-07-12T20:06:00Z"),
+    }),
+    { action: "wait", run: null },
+  );
+});
+
+test("readLedger initializes only missing files and fails closed on torn state", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  assert.deepEqual(readLedger(ledgerPath), { updated_at: null, commands: [] });
+
+  fs.writeFileSync(ledgerPath, '{"updated_at":null,"commands":[');
+  assert.throws(() => readLedger(ledgerPath), /failed to parse comment router ledger/);
+
+  fs.writeFileSync(ledgerPath, "[]");
+  assert.throws(() => readLedger(ledgerPath), /ledger must be an object/);
+
+  fs.writeFileSync(ledgerPath, '{"updated_at":null}');
+  assert.throws(() => readLedger(ledgerPath), /ledger commands must be an array/);
+});
+
+test("readLedger rejects malformed forced replay identity", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const base = {
+    idempotency_key: "claim-before-dispatch",
+    comment_id: "125",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+  };
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, forced_replay: true }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /attempt_id must be a non-empty token/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, attempt_id: "forced-replay-41001" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, forced_replay: "true", attempt_id: "forced-replay-41001" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+});
+
+test("readLedger fails closed on malformed claimed state before restart dispatch", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeLedger(ledgerPath, {
+    updated_at: "2026-07-12T20:05:00Z",
+    commands: [
+      {
+        status: "claimed",
+        processed_at: "2026-07-12T20:05:00Z",
+        forced_replay: true,
+        attempt_id: "forced-replay-41001",
+        actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+      },
+    ],
+  });
+
+  let dispatchReached = false;
+  assert.throws(() => {
+    const restored = readLedger(ledgerPath);
+    dispatchReached = true;
+    dispatchClaimDecision({
+      claim: restored.commands[0] ?? null,
+      runs: [],
+      expectedTitle: "Review event item openclaw/openclaw#74499 [router-abc]",
+    });
+  }, /requires a durable lookup identity/);
+  assert.equal(dispatchReached, false);
+});
+
+test("readLedger validates compact command entry structure", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-comment-router-ledger-"));
+  const ledgerPath = path.join(directory, "comment-router.json");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const base = {
+    idempotency_key: "claim-before-dispatch",
+    status: "claimed",
+    processed_at: "2026-07-12T20:05:00Z",
+  };
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, status: "ready" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /command status is invalid/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, processed_at: "not-a-timestamp" }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /processed_at must be a valid timestamp/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, actions: {} }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /actions must be an array of objects/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [{ ...base, target: [] }],
+  });
+  assert.throws(() => readLedger(ledgerPath), /target must be an object or null/);
+
+  writeLedger(ledgerPath, {
+    updated_at: null,
+    commands: [
+      base,
+      {
+        comment_id: "125",
+        comment_updated_at: "2026-07-12T20:00:00Z",
+        status: "claimed",
+        processed_at: "2026-07-12T20:05:00Z",
+      },
+    ],
+  });
+  assert.equal(readLedger(ledgerPath).commands.length, 2);
 });
 
 test("fresh dispatch claims wait for the Actions receipt visibility window", () => {
@@ -473,6 +1113,77 @@ test("appendLedger preserves the original timestamp while a claim waits", () => 
   assert.equal(ledger.commands[0].processed_at, processedAt);
 });
 
+test("appendLedger persists authenticated delivery identities across durable dispatch retries", () => {
+  const ledger = { updated_at: null, commands: [] };
+  const body = "@clawsweeper re-review";
+  appendLedger(ledger, [
+    {
+      idempotency_key: "claim-before-dispatch",
+      comment_id: "125",
+      comment_version_key: "125:2026-04-29T03:01:00Z",
+      comment_updated_at: "2026-04-29T03:01:00Z",
+      comment_body_sha256: commentBodySha256(body),
+      source_delivery_id: "github-original-command-delivery",
+      status: "claimed",
+      intent: "clawsweeper_re_review",
+      issue_number: 74499,
+      repo: "openclaw/openclaw",
+      actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+    },
+  ]);
+  const restoredClaim = ledger.commands[0];
+  assert.equal(restoredClaim.source_delivery_id, "github-original-command-delivery");
+  assert.equal(
+    routedCommentSourceDeliveryId({
+      comment: { id: 125, updated_at: "2026-04-29T03:01:00Z", body },
+      event: {
+        authenticated: false,
+        commentId: null,
+        commentUpdatedAt: null,
+        commentBodySha256: null,
+        sourceDeliveryId: null,
+      },
+      priorClaim: restoredClaim,
+      targetRepo: "openclaw/openclaw",
+    }),
+    "github-original-command-delivery",
+  );
+});
+
+test("appendLedger keeps delivery-conflict tombstones while durable commands advance", () => {
+  const base = {
+    idempotency_key: "claim-before-dispatch",
+    comment_id: "125",
+    comment_version_key: "125:2026-04-29T03:01:00Z",
+    comment_updated_at: "2026-04-29T03:01:00Z",
+    comment_body_sha256: commentBodySha256("@clawsweeper re-review"),
+    status: "waiting",
+    intent: "clawsweeper_re_review",
+    issue_number: 74499,
+    repo: "openclaw/openclaw",
+    processed_at: "2026-04-29T03:01:00Z",
+  };
+  const ledger = {
+    updated_at: null,
+    commands: [{ ...base, source_delivery_conflict: true }],
+  };
+
+  assert.equal(
+    appendLedger(ledger, [
+      {
+        ...base,
+        status: "executed",
+        source_delivery_id: "must-not-be-resurrected",
+        actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
+      },
+    ]),
+    true,
+  );
+  assert.equal(ledger.commands[0]?.status, "executed");
+  assert.equal(ledger.commands[0]?.source_delivery_conflict, true);
+  assert.equal(ledger.commands[0]?.source_delivery_id, undefined);
+});
+
 test("appendLedger upgrades claimed dispatch commands after execution", () => {
   const ledger = { updated_at: null, commands: [] };
 
@@ -552,6 +1263,7 @@ test("appendLedger reports compact executed writes", () => {
         comment_id: "125",
         comment_version_key: "125:2026-04-29T03:01:00Z",
         comment_updated_at: "2026-04-29T03:01:00Z",
+        comment_body_sha256: commentBodySha256("@clawsweeper re-review"),
         status: "executed",
         intent: "clawsweeper_re_review",
         issue_number: 74499,
@@ -562,6 +1274,7 @@ test("appendLedger reports compact executed writes", () => {
   );
 
   assert.equal(ledger.commands.length, 1);
+  assert.equal(ledger.commands[0].comment_body_sha256, commentBodySha256("@clawsweeper re-review"));
 });
 
 test("appendLedger preserves maintainer identity fields for automerge attribution", () => {
@@ -623,6 +1336,32 @@ test("appendLedger preserves compact executed actions for repair caps", () => {
   ]);
 });
 
+function exactVersionLedger({
+  status,
+  body,
+  actions = [],
+}: {
+  status: string;
+  body: string;
+  actions?: Array<Record<string, string>>;
+}) {
+  return {
+    updated_at: "2026-07-12T20:00:01Z",
+    commands: [
+      {
+        repo: "openclaw/openclaw",
+        comment_id: "456",
+        comment_version_key: "456:2026-07-12T20:00:00Z",
+        comment_updated_at: "2026-07-12T20:00:00Z",
+        comment_body_sha256: commentBodySha256(body),
+        status,
+        intent: "re_review",
+        actions,
+      },
+    ],
+  };
+}
+
 test("sortCommentsForRouting prioritizes edited durable review comments", () => {
   const sorted = sortCommentsForRouting([
     {
@@ -633,7 +1372,7 @@ test("sortCommentsForRouting prioritizes edited durable review comments", () => 
     },
     {
       id: 1,
-      body: "<!-- clawsweeper-verdict:pass item=74742 sha=abc confidence=high -->",
+      body: "<!-- clawsweeper-verdict:pass item=74742 sha=abc confidence=high live_verification=absent -->",
       created_at: "2026-04-30T02:00:00Z",
       updated_at: "2026-04-30T03:45:00Z",
     },
@@ -665,7 +1404,7 @@ test("selectCommentsForRouting keeps durable review comments beyond the recent c
     durableComments: [
       {
         id: 1,
-        body: "<!-- clawsweeper-verdict:pass item=74742 sha=abc confidence=high -->",
+        body: "<!-- clawsweeper-verdict:pass item=74742 sha=abc confidence=high live_verification=absent -->",
         created_at: "2026-04-30T02:00:00Z",
         updated_at: "2026-04-30T03:45:00Z",
       },
@@ -727,19 +1466,21 @@ test("summarizeChecks still blocks cancelled required checks", () => {
   assert.deepEqual(checks.terminalBlockers, ["required-build:CANCELLED"]);
 });
 
-test("summarizeChecks waits for a cancelled real behavior proof replacement", () => {
-  const checks = summarizeChecks([
-    {
-      name: "Real behavior proof",
-      workflowName: "Real behavior proof",
-      status: "COMPLETED",
-      conclusion: "CANCELLED",
-    },
-  ]);
+test("summarizeChecks waits for cancelled evidence-check replacements under both names", () => {
+  for (const name of ["Real behavior proof", "PR context and evidence"]) {
+    const checks = summarizeChecks([
+      {
+        name,
+        workflowName: name,
+        status: "COMPLETED",
+        conclusion: "CANCELLED",
+      },
+    ]);
 
-  assert.deepEqual(checks.blockers, ["Real behavior proof:CANCELLED"]);
-  assert.deepEqual(checks.pending, ["Real behavior proof:CANCELLED"]);
-  assert.deepEqual(checks.terminalBlockers, []);
+    assert.deepEqual(checks.blockers, [`${name}:CANCELLED`]);
+    assert.deepEqual(checks.pending, [`${name}:CANCELLED`]);
+    assert.deepEqual(checks.terminalBlockers, []);
+  }
 });
 
 test("summarizeChecks separates pending checks from terminal blockers", () => {
@@ -809,6 +1550,45 @@ test("summarizeChecks uses the latest run for duplicate check names", () => {
   assert.equal(checks.counts.SUCCESS, 2);
 });
 
+test("router status policy keeps representative decisions across the shared rollup", () => {
+  const checks = summarizeChecks([
+    {
+      name: "auto-response",
+      workflowName: "Auto Response",
+      status: "COMPLETED",
+      conclusion: "CANCELLED",
+    },
+    {
+      name: "queued",
+      workflowName: "CI",
+      status: "IN_PROGRESS",
+      conclusion: null,
+    },
+    {
+      name: "failed",
+      workflowName: "CI",
+      status: "COMPLETED",
+      conclusion: "FAILURE",
+    },
+    {
+      name: "passed",
+      workflowName: "CI",
+      status: "COMPLETED",
+      conclusion: "SUCCESS",
+    },
+  ]);
+
+  assert.deepEqual(checks, {
+    total: 4,
+    gatingTotal: 3,
+    counts: { CANCELLED: 1, IN_PROGRESS: 1, FAILURE: 1, SUCCESS: 1 },
+    blockers: ["queued:IN_PROGRESS", "failed:FAILURE"],
+    pending: ["queued:IN_PROGRESS"],
+    terminalBlockers: ["failed:FAILURE"],
+    externalBlockers: [],
+  });
+});
+
 test("skipped automerge ledger entries stay retryable", () => {
   assert.equal(
     shouldSuppressProcessedCommentVersion({
@@ -844,6 +1624,12 @@ test("mutation actor guard accepts only trusted bot identities", () => {
   const trustedBots = new Set(["clawsweeper[bot]", "openclaw-clawsweeper[bot]"]);
 
   assert.equal(normalizeGitHubActor("ClawSweeper[bot]"), "clawsweeper");
+  // Idempotent suffix strip: a doubled suffix must not survive one pass and
+  // collide with a real bot's normalized identity (#574).
+  assert.equal(normalizeGitHubActor("ClawSweeper[bot][bot]"), "clawsweeper");
+  assert.equal(normalizeGitHubActor("evil[BOT][bot][Bot]"), "evil");
+  assert.equal(normalizeGitHubActor(normalizeGitHubActor("evil[bot][bot]")), "evil");
+  assert.equal(normalizeGitHubActor("keeps[bot]inside"), "keeps[bot]inside");
   assert.equal(isAllowedMutationActor("ClawSweeper[bot]", trustedBots), true);
   assert.equal(isAllowedMutationActor("clawsweeper[bot]", trustedBots), true);
   assert.equal(isAllowedMutationActor("clawsweeper", trustedBots), false);

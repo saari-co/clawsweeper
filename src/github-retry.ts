@@ -1,7 +1,82 @@
 export type GhRetryKind = "none" | "throttle" | "transient";
 
+export type GitHubCredentialScope = "repository_actions" | "target_app";
+export type GitHubRateLimitProvenance =
+  | "retry_after"
+  | "rate_limit_reset"
+  | "rate_limit_status"
+  | "fallback";
+
+type GitHubRateLimitOptions = {
+  scope?: GitHubCredentialScope;
+  retryAt?: string | number;
+  provenance?: GitHubRateLimitProvenance;
+  authoritative?: boolean;
+};
+
+export class GitHubRateLimitError extends Error {
+  readonly retryAt: string;
+  readonly scope: GitHubCredentialScope;
+  readonly provenance: GitHubRateLimitProvenance;
+  readonly authoritative: boolean;
+
+  constructor(cause: unknown, now = Date.now(), options: GitHubRateLimitOptions = {}) {
+    const message = ghErrorText(cause);
+    const retryAfter = message.match(/\bretry-after\s*[:=]\s*(\d+)\b/i)?.[1];
+    const reset = message.match(/\bx-ratelimit-reset\s*[:=]\s*(\d+)\b/i)?.[1];
+    const propagated = message.match(/\brate limited until\s+(\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i)?.[1];
+    const propagatedScope = message.match(/\bcredential scope\s+([a-z_]+)\b/i)?.[1];
+    const propagatedProvenance = message.match(/\breset source\s+([a-z_]+)\b/i)?.[1];
+    const carriedProvenance = [
+      "retry_after",
+      "rate_limit_reset",
+      "rate_limit_status",
+      "fallback",
+    ].includes(propagatedProvenance || "")
+      ? (propagatedProvenance as GitHubRateLimitProvenance)
+      : null;
+    const explicitRetryAt =
+      typeof options.retryAt === "number"
+        ? options.retryAt
+        : Date.parse(options.retryAt || "") || 0;
+    const propagatedRetryAt = propagated ? Date.parse(propagated) || 0 : 0;
+    const hintedRetryAt = retryAfter
+      ? now + Number(retryAfter) * 1_000
+      : reset
+        ? Number(reset) * 1_000
+        : propagatedRetryAt;
+    const provenance =
+      options.provenance ??
+      (retryAfter ? "retry_after" : reset ? "rate_limit_reset" : carriedProvenance || "fallback");
+    const scope =
+      options.scope ??
+      (propagatedScope === "repository_actions" || propagatedScope === "target_app"
+        ? propagatedScope
+        : "target_app");
+    const retryFloor = propagatedRetryAt > now ? now : now + 60_000;
+    const retryAt = new Date(Math.max(retryFloor, explicitRetryAt, hintedRetryAt)).toISOString();
+    super(
+      `GitHub API rate limited until ${retryAt}; credential scope ${scope}; reset source ${provenance}: ${message}`,
+      { cause },
+    );
+    this.name = "GitHubRateLimitError";
+    this.retryAt = retryAt;
+    this.scope = scope;
+    this.provenance = provenance;
+    this.authoritative =
+      options.authoritative ??
+      Boolean(
+        retryAfter ||
+        reset ||
+        provenance === "rate_limit_status" ||
+        (propagated && carriedProvenance && carriedProvenance !== "fallback"),
+      );
+  }
+}
+
 const GH_THROTTLE_PATTERNS = [
   /was submitted too quickly/i,
+  /abuse detection/i,
   /secondary rate/i,
   /API rate limit exceeded/i,
   /rate limit/i,
@@ -9,6 +84,7 @@ const GH_THROTTLE_PATTERNS = [
 
 const GH_TRANSIENT_PATTERNS = [
   /unexpected EOF/i,
+  /unexpected end of JSON input/i,
   /connection reset/i,
   /connection reset by peer/i,
   /error connecting to api\.github\.com/i,

@@ -56,7 +56,7 @@ jobs:
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
+          owner: ${{ github.repository_owner }}
           permission-actions: write
           permission-contents: write
           permission-issues: write
@@ -68,6 +68,19 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app_token.outputs.token }}
 
+      - name: Resolve target repository
+        id: target
+        env:
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TARGET_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "Invalid target repository: $TARGET_REPO" >&2
+            exit 1
+          fi
+          target_slug="$(printf '%s' "$TARGET_REPO" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g')"
+          echo "target_slug=$target_slug" >> "$GITHUB_OUTPUT"
+
       - name: Create state token
         id: state-token
         uses: ./.github/actions/create-state-token
@@ -77,6 +90,11 @@ jobs:
 
       - uses: ./.github/actions/setup-state
         with:
+          coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          records-repo-slugs: ${{ steps.target.outputs.target_slug }}
+          hydrate-state-blobs: "false"
           token: ${{ steps.state-token.outputs.token }}
 
       - uses: ./.github/actions/setup-pnpm
@@ -85,6 +103,7 @@ jobs:
 
       - name: Plan conflict self-heal
         env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_ALLOW_EXECUTE: ${{ vars.CLAWSWEEPER_ALLOW_EXECUTE || '0' }}
           CLAWSWEEPER_ALLOW_FIX_PR: ${{ vars.CLAWSWEEPER_ALLOW_FIX_PR || '0' }}
@@ -107,6 +126,9 @@ jobs:
 
       - name: Commit conflict self-heal ledger
         if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.execute) || (github.event_name == 'schedule' && vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_EXECUTE == '1')) }}
+        continue-on-error: true
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           if [ ! -f results/conflict-self-heal-dispatch.json ]; then
             echo "No conflict self-heal ledger"

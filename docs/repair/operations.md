@@ -1,8 +1,21 @@
 # Operations
 
+- Status: active canonical repair operator runbook
+- Owner: ClawSweeper maintainers and the authorized repair operator
+- Source of truth: repair workflows/source, current gates, focused tests, and
+  live read-only GitHub state where needed
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Update when: commands, trust checks, gates, tokens, runners, routing,
+  publication, recovery, or promotion rules change
+
+This is the canonical live-operations page. Use the
+[repair entry point](README.md) for concepts and the local CLI catalog, the
+[internal feature map](internal-features.md) for implementation structure, and
+[auto-update PRs](auto-update-prs.md) for the trusted PR state contract.
+
 For the internal feature map across job creation, PR generation, comment
 commands, finalizers, self-heal, gates, and ledgers, see
-[`docs/INTERNAL_FEATURES.md`](INTERNAL_FEATURES.md).
+[`internal-features.md`](internal-features.md).
 
 For the trusted ClawSweeper-to-ClawSweeper PR repair loop, see
 [`docs/repair/auto-update-prs.md`](auto-update-prs.md).
@@ -46,12 +59,6 @@ pnpm run status -- \
   --bot-owned-proof-dispatches 0
 ```
 
-For commit-review findings, ClawSweeper dispatches
-`clawsweeper_commit_finding` to this repository. ClawSweeper fetches the latest
-markdown report, writes `results/commit-findings/<repo-slug>/<sha>.md`, and
-only opens a PR when the finding is an ordinary narrow bug/regression candidate.
-Security/privacy/supply-chain and broad findings are audit-only.
-
 ## Batch Flow
 
 1. Create or export cluster job markdown files under `jobs/<repo>/`.
@@ -78,7 +85,8 @@ Security/privacy/supply-chain and broad findings are audit-only.
 
 ## Manual Fix PR From Issue or PR Refs
 
-Use `scripts/create-job.ts` when ClawSweeper or a maintainer has identified a
+Use `pnpm run repair:create-job` (implemented by
+`src/repair/create-job.ts`) when ClawSweeper or a maintainer has identified a
 valid issue/PR cluster that should get one implementation PR. It writes one
 idempotent job file and checks for an existing open PR or branch before creating
 another job.
@@ -124,22 +132,12 @@ Keep `CLAWSWEEPER_ALLOW_MERGE=0` unless a human explicitly opens the merge gate.
 
 ## Manual Fix PR From Commit Finding
 
-Use the `commit finding intake` workflow for a ClawSweeper commit report:
-
-```bash
-gh workflow run repair-commit-finding-intake.yml \
-  --repo openclaw/clawsweeper \
-  -f target_repo=openclaw/openclaw \
-  -f commit_sha=<sha> \
-  -f report_repo=openclaw/clawsweeper \
-  -f report_path=records/openclaw-openclaw/commits/<sha>.md
-```
-
-The workflow is idempotent for the commit SHA. It updates the same audit file,
-job file, branch, and PR path on rerun.
-
-If latest `main` no longer needs a fix, the generated artifact allows a clean
-no-PR outcome and the audit file records the skip.
+The hosted commit-review and commit-finding intake workflows were retired in
+July 2026. Do not dispatch `repair-commit-finding-intake.yml`; that workflow no
+longer exists. Existing durable jobs with `job_intent: commit_finding` remain
+executable through the ordinary cluster worker for compatibility. New work
+should start from current issue/PR references or an explicitly prepared manual
+repair job after verifying the finding still applies to current `main`.
 
 ## Security Boundary
 
@@ -239,6 +237,31 @@ Use Blacksmith labels only when you intentionally want a non-parity hosted runne
 pnpm run repair:dispatch -- jobs/openclaw/cluster-*.md --mode plan --runner blacksmith-4vcpu-ubuntu-2404
 ```
 
+## Choosing the agent runner
+
+ClawSweeper uses Codex by default. Set `CLAWSWEEPER_RUNNER=openclaw` to run the
+agent lanes through the released OpenClaw CLI instead, and set the required
+`CLAWSWEEPER_OPENCLAW_MODEL` to a `provider/model` reference such as
+`openai/gpt-5.6-sol`. `CLAWSWEEPER_OPENCLAW_BIN` may override the executable;
+otherwise ClawSweeper runs `openclaw` from `PATH`.
+
+Providers that are not bundled with OpenClaw can be supplied through
+`CLAWSWEEPER_OPENCLAW_PROVIDERS_JSON`, a JSON object merged into
+`models.providers`; referenced provider API-key environment variables must also
+be present. Three providers ship as built-in defaults and need only their API key
+in the environment: `kimi/…` (Kimi Code endpoint, `KIMI_API_KEY`; models
+`kimi-for-coding` and `k3`), `cerebras/…` (Cerebras Code plans,
+`CEREBRAS_API_KEY`; model `zai-glm-4.7` until Cerebras retires it on
+2026-08-17), and `zai/…` (Z.AI GLM Coding Plan endpoint, `ZAI_API_KEY`;
+model `glm-5.2` — plan keys only work on the coding endpoint). The subprocess environment is deny-by-default: only the base OS
+surface, `OPENCLAW_*` controls, proxy settings, and known provider API keys
+reach the agent. ClawSweeper gives OpenClaw a fresh state directory, a coding tool
+profile limited to the target workspace, and the lane's existing timeout and
+reasoning effort. OpenClaw can exit zero for terminal agent failures, so the
+wrapper inspects its JSON envelope for agent errors, aborts, timeouts, exhausted
+fallbacks, and error payloads and converts them into ordinary non-zero process
+failures before existing retry logic sees the result.
+
 The workflow uses Node 24 and starts a local Codex Responses proxy from
 `OPENAI_API_KEY` inside an isolated per-run `CODEX_HOME`. Codex subprocesses use
 that proxy config and run without raw OpenAI or Codex API key environment
@@ -248,13 +271,13 @@ local `setup-codex` action's `auth-mode: login` input.
 Codex runs in a read-only sandbox for classification and receives no GitHub token. GitHub read access is scoped to deterministic preflight scripts. For reviewed fix artifacts, `execute-fix-artifact` gives Codex a temporary target checkout without GitHub credentials, then the deterministic executor commits, pushes, opens the replacement PR, and closes uneditable source PRs only after the replacement exists. When a replacement carries contributor work forward, non-bot source PR authors are added as `Co-authored-by` trailers and named in the replacement PR body and source close comment. Remaining write access is scoped to `apply-result`.
 
 The repair worker wrapper emits a heartbeat while Codex is running. Execute-side
-edit, review, final rebase, and write-preflight subprocesses emit the same
+edit, review, and final rebase subprocesses emit the same
 heartbeat. If a model call is slow, Actions logs should show
 `[clawsweeper repair] ... still running` about once a minute instead of ending
 with a silent no-output timeout.
 
 Automerge repair execution also updates the existing mutable automerge status
-comment at coarse milestones: validation plan, write preflight, Codex edit
+comment at coarse milestones: validation plan, Codex edit
 passes, validation/review loops, final base sync, and the post-repair automerge
 wait. These updates append or replace rows in the single progress timeline
 instead of adding new comments.
@@ -283,9 +306,17 @@ This avoids failing on GitHub's "No commits between" response when the repair is
 already represented on `main` or the resumed replacement branch collapsed to an
 empty diff after rebase.
 
-Runs for the same job path and mode share a concurrency group. Different cluster jobs can still run in parallel.
+Ordinary runs for the same job path share one concurrency group across modes.
+Different job paths can still run in parallel, and explicit requeues use a
+dedicated run-specific group.
 
 Live preflight hydrates job-provided refs by default and records linked refs without expanding them. Set repo variables `CLAWSWEEPER_MAX_LINKED_REFS` above `0` only for small clusters that need first-hop context and `CLAWSWEEPER_HYDRATE_COMMENTS=1` when comment bodies are necessary evidence; normal scale runs use issue/PR metadata, body excerpts, PR files, and PR checks.
+
+Exact-review producers normally deliver GitHub effects and submit prepared state
+mutations directly to the dashboard Worker. Production also keeps batch
+publication enabled for queued and direct-publication fallback items. Treat that
+as an active recovery path: do not remove or bypass it without a separately
+approved retirement plan, an empty-queue observation window, and rollback proof.
 
 ## Maintainer Comment Routing
 
@@ -298,6 +329,14 @@ it classifies the command, so the visible reply is available as soon as the
 target dispatcher starts. Exact comment dispatches scan only the source comment
 and use per-comment receiver concurrency; the scheduled sweep remains a
 five-minute fallback.
+The scheduled sweep persists a per-repository `updated_at` watermark and the
+comment ids already inspected at that exact timestamp. It reads repository
+comments oldest-first from that watermark and advances it only after the router
+process completes successfully. A GitHub installation rate limit, abuse-limit
+403, or 429 therefore emits a structured `github_throttled` defer and exits
+successfully without moving the watermark; the next sweep repeats the
+uncompleted interval. Other failures remain fatal. Exact-comment and exact-item
+dispatches never advance the scheduled watermark.
 The status comment itself uses one compact badge: `🦞👀` for acknowledgement,
 `🦞🧹` for review, `🦞🔧` for repair/build/fix work, and `🦞✅` for completed or
 paused work.
@@ -316,6 +355,19 @@ Worker queue coalesces item revisions and leases the executor before checkout.
 The target workflow remains a compatibility fallback when the webhook service
 is down or not installed for a repository; its direct event is bridged into the
 same queue.
+
+The standalone `repair:comment-webhook` listener bounds incoming bodies to 2 MiB
+before signature verification. It accepts declared-length and chunked bodies,
+rejects oversized declarations before reading, and checks streamed bytes as they
+arrive. An oversized body receives HTTP 400 before the connection closes.
+
+The listener limits each GitHub REST request,
+including reading its response body, to 15 seconds. A stalled request returns
+HTTP 503 with `retryable: true`; successful requests keep the existing response.
+This per-request deadline does not bound the total duration of a command that
+makes several GitHub requests. GitHub does not automatically redeliver failed
+webhooks; its delivery response window is 10 seconds, so this deadline bounds
+listener resources rather than guaranteeing delivery acknowledgment.
 
 Supported triggers:
 
@@ -345,7 +397,12 @@ Supported triggers:
 @openclaw-clawsweeper fix ci
 ```
 
-`review` and `re-review` dispatch ClawSweeper review again for an open issue or PR.
+`review` and `re-review` admit the exact comment version to the durable review
+queue for an open issue or PR. The hosted webhook is the fast path; the
+five-minute router scan is the recovery producer. Both converge on the same
+comment-version receipt, so a throttled router cannot lose the command and a
+redelivery cannot start the same version twice. The queue verifies the source
+comment and current PR head before it creates the marker-backed acknowledgement.
 Issue implementation commands (`implement`, `fix`, `build`, `create pr`, `fix issue`)
 dispatch the repair worker for one open issue and ask it to create or update a
 single ClawSweeper implementation PR. The generated job uses
@@ -370,11 +427,13 @@ unsupported target repos, and missing usable request/context. A maintainer
 override for a hard blocker does not permit code generation; it asks the worker
 to produce the safest useful non-code artifact, such as a plan, decomposition,
 or human-review handoff.
-When `CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS=1`, review publish can also dispatch
-the same lane automatically for strict bug reports only: `item_category: bug`,
-`reproduction_status: reproduced`, `reproduction_confidence: high`, high
-work confidence, and no feature/config/product-decision blockers. Those PRs are
-labeled `clawsweeper:autogenerated`.
+When `CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES=1`, review publish automatically
+dispatches the same lane for high-confidence bug reports: `item_category: bug`,
+`reproduction_status: reproduced` or a small `source_reproducible` fix,
+`reproduction_confidence: high`, high work confidence, and no
+feature/config/product-decision blockers. Those PRs are labeled
+`clawsweeper:autogenerated`, and the worker reproduces or establishes a failing
+regression before opening one.
 When `CLAWSWEEPER_AUTO_IMPLEMENT_VISION_FIT=1`, review publish can also
 dispatch the sibling vision-fit lane for small `VISION.md`-aligned issue work:
 `auto_implementation_candidate: vision_fit`, `vision_fit: aligned`,

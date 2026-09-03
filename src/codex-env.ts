@@ -41,7 +41,10 @@ export function redactInternalCodexModel(
   codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
 ): string {
   let redacted = value ?? "";
-  const configuredModels = [process.env.CLAWSWEEPER_INTERNAL_MODEL?.trim() ?? ""];
+  const configuredModels = [
+    process.env.CLAWSWEEPER_INTERNAL_MODEL?.trim() ?? "",
+    process.env.CLAWSWEEPER_OPENCLAW_MODEL?.trim() ?? "",
+  ];
   const configPath = codexHome ? join(codexHome, "config.toml") : "";
   if (configPath && existsSync(configPath)) {
     const match = readFileSync(configPath, "utf8").match(
@@ -69,6 +72,7 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   const ghToken = options.ghToken?.trim();
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
+  delete env.REPO_TOKEN;
   delete env.COMMIT_SWEEPER_TARGET_GH_TOKEN;
   delete env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN;
   delete env.CLAWSWEEPER_APP_ID;
@@ -77,8 +81,11 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN;
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
+  for (const key of Object.keys(env)) {
+    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
+  }
   if (!options.preserveCodexAuth) {
-    delete env.OPENAI_API_KEY;
+    if (env.CLAWSWEEPER_RUNNER !== "openclaw") delete env.OPENAI_API_KEY;
     delete env.CODEX_API_KEY;
     delete env.CODEX_ACCESS_TOKEN;
   }

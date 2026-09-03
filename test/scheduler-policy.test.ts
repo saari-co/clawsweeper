@@ -4,21 +4,27 @@ import test from "node:test";
 import {
   appendFloorBackfillCandidates,
   hotIntakeRecencyMs,
+  nextReviewDueAtMs,
   reviewPriority,
+  reviewedAtMs,
+  schedulerBucket,
   selectDueCandidates,
   shouldReviewItem,
-  shouldStopSaturatedPlanScan,
 } from "../dist/scheduler-policy.js";
+import { shouldSkipScheduledHotIntakeExactReviewForTest } from "../dist/clawsweeper.js";
 import { item } from "./helpers.ts";
 
 function schedulerCandidate(candidate) {
   return {
     item: candidate.item,
-    review: null,
+    review: candidate.review ?? null,
     priority: candidate.priority ?? reviewPriority(candidate.item, null),
     reviewedAt: candidate.reviewedAt ?? 0,
     nextDueAt: candidate.nextDueAt ?? 0,
     bucket: candidate.bucket,
+    ...(candidate.coverageTracked === undefined
+      ? {}
+      : { coverageTracked: candidate.coverageTracked }),
   };
 }
 
@@ -128,7 +134,44 @@ test("hot new items review daily unless target-side activity requires hourly cad
   );
 });
 
-test("scheduler ignores ClawSweeper-owned updated_at churn after review", () => {
+test("weekly coverage becomes due at six days to preserve deadline headroom", () => {
+  const reviewedAt = Date.parse("2026-07-01T12:00:00Z");
+  const review = {
+    reviewedAt: new Date(reviewedAt).toISOString(),
+    itemUpdatedAt: "2026-01-01T00:00:00Z",
+    reviewStatus: "complete",
+    reviewPolicy: "current",
+  };
+  const oldIssue = item({
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+  });
+
+  assert.equal(
+    shouldReviewItem(oldIssue, review, reviewedAt + 6 * 86_400_000 - 1, "current"),
+    false,
+  );
+  assert.equal(shouldReviewItem(oldIssue, review, reviewedAt + 6 * 86_400_000, "current"), true);
+});
+
+test("never-reviewed items are due while fresh tracked items stay excluded", () => {
+  const now = Date.parse("2026-07-30T12:00:00Z");
+  const candidate = item({
+    createdAt: "2026-07-29T12:00:00Z",
+    updatedAt: "2026-07-29T12:00:00Z",
+  });
+  const freshReview = {
+    reviewedAt: "2026-07-30T11:00:00Z",
+    itemUpdatedAt: "2026-07-29T12:00:00Z",
+    reviewStatus: "complete",
+    reviewPolicy: "current",
+  };
+
+  assert.equal(shouldReviewItem(candidate, null, now, "current"), true);
+  assert.equal(shouldReviewItem(candidate, freshReview, now, "current"), false);
+});
+
+test("scheduler keeps ambiguous post-sync activity due after review", () => {
   const reviewedAt = "2026-04-30T12:52:57Z";
   const review = {
     path: "items/123.md",
@@ -153,53 +196,92 @@ test("scheduler ignores ClawSweeper-owned updated_at churn after review", () => 
     ),
     false,
   );
+  const syncedAt = Date.parse("2026-04-30T13:04:59Z");
+  for (const syncField of ["reviewCommentSyncedAt", "labelsSyncedAt"]) {
+    assert.equal(
+      shouldReviewItem(
+        item({
+          createdAt: "2026-03-01T11:12:04Z",
+          updatedAt: "2026-04-30T13:04:58Z",
+        }),
+        { ...review, [syncField]: "2026-04-30T13:04:59Z" },
+        now,
+        "current",
+      ),
+      true,
+      `${syncField} cannot suppress ambiguous activity before its local sync clock`,
+    );
+    for (let lagSeconds = 1; lagSeconds <= 5; lagSeconds += 1) {
+      assert.equal(
+        shouldReviewItem(
+          item({
+            createdAt: "2026-03-01T11:12:04Z",
+            updatedAt: new Date(syncedAt + lagSeconds * 1000).toISOString(),
+          }),
+          { ...review, [syncField]: "2026-04-30T13:04:59Z" },
+          now,
+          "current",
+        ),
+        true,
+        `${syncField} update ${lagSeconds}s after synchronization remains due`,
+      );
+    }
+  }
+});
+
+test("scheduler keeps an exact post-mutation timestamp eligible for structural verification", () => {
+  const reviewedAt = "2026-08-01T14:52:41Z";
+  const automationItemUpdatedAt = "2026-08-01T14:53:29Z";
+  const review = {
+    path: "items/117.md",
+    markdown: "",
+    reviewedAt,
+    itemUpdatedAt: "2026-08-01T12:44:07Z",
+    reviewCommentSyncedAt: "2026-08-01T14:53:28Z",
+    automationItemUpdatedAt,
+    decision: "keep_open",
+    reviewStatus: "complete",
+    reviewPolicy: "current",
+  };
+
   assert.equal(
     shouldReviewItem(
       item({
-        createdAt: "2026-03-01T11:12:04Z",
-        updatedAt: "2026-04-30T13:05:00Z",
+        createdAt: "2026-07-24T06:00:00Z",
+        updatedAt: automationItemUpdatedAt,
       }),
-      { ...review, reviewCommentSyncedAt: "2026-04-30T13:04:59Z" },
-      now,
+      review,
+      Date.parse("2026-08-01T16:50:00Z"),
       "current",
     ),
     true,
+    "timestamp equality alone cannot prove that the matching activity belongs to ClawSweeper",
   );
   assert.equal(
     shouldReviewItem(
       item({
-        createdAt: "2026-03-01T11:12:04Z",
-        updatedAt: "2026-04-30T13:04:58Z",
+        createdAt: "2026-07-24T06:00:00Z",
+        updatedAt: "2026-08-01T14:53:30Z",
       }),
-      { ...review, reviewCommentSyncedAt: "2026-04-30T13:04:59Z" },
-      now,
-      "current",
-    ),
-    false,
-  );
-  assert.equal(
-    shouldReviewItem(
-      item({
-        createdAt: "2026-03-01T11:12:04Z",
-        updatedAt: "2026-04-30T13:04:58Z",
-      }),
-      { ...review, labelsSyncedAt: "2026-04-30T13:04:59Z" },
-      now,
-      "current",
-    ),
-    false,
-  );
-  assert.equal(
-    shouldReviewItem(
-      item({
-        createdAt: "2026-03-01T11:12:04Z",
-        updatedAt: "2026-04-30T13:05:00Z",
-      }),
-      { ...review, labelsSyncedAt: "2026-04-30T13:04:59Z" },
-      now,
+      review,
+      Date.parse("2026-08-01T16:50:00Z"),
       "current",
     ),
     true,
+    "a later target-side update remains due",
+  );
+  assert.equal(
+    shouldReviewItem(
+      item({
+        createdAt: "2026-07-24T06:00:00Z",
+        updatedAt: reviewedAt,
+      }),
+      { ...review, itemUpdatedAt: reviewedAt },
+      Date.parse("2026-08-01T16:50:00Z"),
+      "current",
+    ),
+    true,
+    "an unchanged item timestamp in the reviewed second remains structurally ambiguous",
   );
 });
 
@@ -358,7 +440,106 @@ test("normal scheduler reserves throughput for PR and older buckets", () => {
   assert.deepEqual(selectedNumbers(due, 8, now), [1, 2, 3, 4, 101, 201, 301, 5]);
 });
 
-test("normal scheduler prioritizes items already breaching weekly freshness", () => {
+test("bulk-filed issues sort last while scheduler bucket priority stays intact", () => {
+  const now = Date.parse("2026-07-16T12:00:00Z");
+  const due = [
+    {
+      item: item({
+        number: 1,
+        kind: "issue",
+        createdAt: "2026-07-15T00:00:00Z",
+        labels: ["clawsweeper:bulk-filed"],
+      }),
+      bucket: "hot_issue",
+      priority: 0,
+      nextDueAt: 0,
+    },
+    {
+      item: item({ number: 2, kind: "issue", createdAt: "2026-07-15T00:00:00Z" }),
+      bucket: "hot_issue",
+      priority: 0,
+      nextDueAt: 100,
+    },
+    {
+      item: item({
+        number: 3,
+        kind: "pull_request",
+        createdAt: "2026-07-15T00:00:00Z",
+      }),
+      bucket: "hot_pull_request",
+      priority: 1,
+      nextDueAt: 0,
+    },
+  ];
+
+  assert.deepEqual(selectedNumbers(due, 3, now), [2, 1, 3]);
+  assert.deepEqual(selectedNumbers(due, 1, now), [2]);
+
+  const onlyBulkHotIssue = due.filter((candidate) => candidate.item.number !== 2);
+  assert.deepEqual(selectedNumbers(onlyBulkHotIssue, 1, now), [1]);
+
+  const overdueWeeklyIssues = [
+    {
+      item: item({
+        number: 10,
+        createdAt: "2026-04-01T00:00:00Z",
+        labels: ["clawsweeper:bulk-filed"],
+      }),
+      bucket: "weekly_issue",
+      priority: 6,
+      nextDueAt: 0,
+    },
+    {
+      item: item({ number: 11, createdAt: "2026-05-01T00:00:00Z" }),
+      bucket: "weekly_issue",
+      priority: 6,
+      nextDueAt: 100,
+    },
+  ];
+  assert.deepEqual(selectedNumbers(overdueWeeklyIssues, 1, now), [11]);
+});
+
+test("mixed-bucket weekly-overdue ordering is transitive and globally bulk-last", () => {
+  const now = Date.parse("2026-07-16T12:00:00Z");
+  const due = [
+    {
+      item: item({
+        number: 21,
+        createdAt: "2026-04-01T00:00:00Z",
+        labels: ["clawsweeper:bulk-filed"],
+      }),
+      bucket: "hot_issue",
+      priority: 0,
+    },
+    {
+      item: item({
+        number: 22,
+        createdAt: "2026-05-01T00:00:00Z",
+        labels: ["clawsweeper:bulk-filed"],
+      }),
+      bucket: "weekly_issue",
+      priority: 6,
+    },
+    {
+      item: item({ number: 23, createdAt: "2026-06-01T00:00:00Z" }),
+      bucket: "hot_issue",
+      priority: 0,
+    },
+    {
+      item: item({
+        number: 24,
+        kind: "pull_request",
+        createdAt: "2026-07-01T00:00:00Z",
+      }),
+      bucket: "daily_pull_request",
+      priority: 3,
+    },
+  ];
+
+  assert.deepEqual(selectedNumbers(due, due.length, now), [23, 24, 21, 22]);
+});
+
+test("normal scheduler prioritizes oldest weekly-coverage timestamps before hot churn", () => {
   const now = Date.parse("2026-06-14T12:00:00Z");
   const due = [
     {
@@ -367,8 +548,10 @@ test("normal scheduler prioritizes items already breaching weekly freshness", ()
         kind: "issue",
         createdAt: "2026-06-13T00:00:00Z",
       }),
+      review: { reviewStatus: "complete", reviewedAt: "2026-06-08T11:00:00Z" },
       bucket: "hot_issue",
       priority: 0,
+      reviewedAt: Date.parse("2026-06-08T11:00:00Z"),
       nextDueAt: 0,
     },
     {
@@ -377,8 +560,10 @@ test("normal scheduler prioritizes items already breaching weekly freshness", ()
         kind: "pull_request",
         createdAt: "2026-06-01T00:00:00Z",
       }),
+      review: { reviewStatus: "complete", reviewedAt: "2026-06-07T12:00:00Z" },
       bucket: "daily_pull_request",
       priority: 3,
+      reviewedAt: Date.parse("2026-06-07T12:00:00Z"),
       nextDueAt: 0,
     },
     {
@@ -387,13 +572,108 @@ test("normal scheduler prioritizes items already breaching weekly freshness", ()
         kind: "issue",
         createdAt: "2026-05-01T00:00:00Z",
       }),
+      review: { reviewStatus: "complete", reviewedAt: "2026-06-06T12:00:00Z" },
       bucket: "weekly_issue",
       priority: 6,
+      reviewedAt: Date.parse("2026-06-06T12:00:00Z"),
       nextDueAt: 0,
     },
   ];
 
   assert.deepEqual(selectedNumbers(due, 3, now), [3, 2, 1]);
+});
+
+test("normal scheduling ranks untracked items above stale records, then oldest review first", () => {
+  const now = Date.parse("2026-06-14T12:00:00Z");
+  const due = [
+    {
+      item: item({ number: 1, createdAt: "2026-06-13T00:00:00Z" }),
+      bucket: "hot_issue",
+      priority: 0,
+      reviewedAt: 0,
+      nextDueAt: 0,
+    },
+    {
+      item: item({ number: 2, createdAt: "2026-01-01T00:00:00Z" }),
+      review: { reviewStatus: "complete", reviewedAt: "2026-06-07T12:00:00Z" },
+      bucket: "weekly_issue",
+      priority: 6,
+      reviewedAt: Date.parse("2026-06-07T12:00:00Z"),
+      nextDueAt: 0,
+    },
+    {
+      item: item({ number: 3, createdAt: "2026-01-01T00:00:00Z" }),
+      review: { reviewStatus: "complete", reviewedAt: "2026-06-06T12:00:00Z" },
+      bucket: "weekly_issue",
+      priority: 6,
+      reviewedAt: Date.parse("2026-06-06T12:00:00Z"),
+      nextDueAt: 0,
+    },
+  ];
+
+  assert.deepEqual(selectedNumbers(due, 3, now), [1, 3, 2]);
+});
+
+test("one repository's untracked backlog fills the queue-sized candidate limit", () => {
+  const now = Date.parse("2026-07-30T12:00:00Z");
+  const due = Array.from({ length: 3_084 }, (_, index) => ({
+    item: item({
+      number: index + 1,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    }),
+    bucket: "weekly_issue",
+    priority: 6,
+    reviewedAt: 0,
+    nextDueAt: 0,
+  }));
+
+  const selected = selectedNumbers(due, 128, now);
+  assert.equal(selected.length, 128);
+  assert.equal(new Set(selected).size, 128);
+});
+
+test("legacy reports missing canonical coverage win every slot before tracked refreshes", () => {
+  const now = Date.parse("2026-07-30T12:00:00Z");
+  const legacyUntracked = Array.from({ length: 3_000 }, (_, index) => ({
+    item: item({
+      number: index + 1,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    }),
+    review: { reviewStatus: "complete", reviewedAt: "2026-06-10T00:00:00Z" },
+    bucket: "weekly_issue",
+    priority: 6,
+    reviewedAt: Date.parse("2026-06-10T00:00:00Z"),
+    nextDueAt: 0,
+    coverageTracked: false,
+  }));
+  const tracked = Array.from({ length: 20 }, (_, index) => ({
+    item: item({
+      number: 3_001 + index,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    }),
+    review: { reviewStatus: "complete", reviewedAt: "2026-06-01T00:00:00Z" },
+    bucket: "weekly_issue",
+    priority: 6,
+    reviewedAt: Date.parse("2026-06-01T00:00:00Z"),
+    nextDueAt: 0,
+    coverageTracked: true,
+  }));
+
+  const selected = selectDueCandidates(
+    [...legacyUntracked, ...tracked].map(schedulerCandidate),
+    128,
+    undefined,
+    now,
+  );
+
+  assert.equal(selected.length, 128);
+  assert.equal(
+    selected.every((candidate) => candidate.coverageTracked === false),
+    true,
+  );
 });
 
 test("weekly freshness preselection still fills remaining scheduler capacity", () => {
@@ -471,13 +751,6 @@ test("normal scheduler can fill active floor from stale current reviews", () => 
   assert.deepEqual(backfilledNumbers(selected, backfill, 3, 2), [1, 10]);
 });
 
-test("normal scheduler can stop scanning once planned capacity is saturated", () => {
-  assert.equal(shouldStopSaturatedPlanScan({ dueCount: 99, capacity: 100 }), false);
-  assert.equal(shouldStopSaturatedPlanScan({ dueCount: 100, capacity: 100 }), true);
-  assert.equal(shouldStopSaturatedPlanScan({ dueCount: 150, capacity: 100 }), true);
-  assert.equal(shouldStopSaturatedPlanScan({ dueCount: 1, capacity: 0 }), false);
-});
-
 test("hot intake recency prefers newly updated or created issues", () => {
   assert.equal(
     hotIntakeRecencyMs(
@@ -502,5 +775,259 @@ test("hot intake recency prefers newly updated or created issues", () => {
       }),
     ),
     Date.parse("2026-04-29T22:30:00Z"),
+  );
+});
+
+test("CSW-088 suppresses only the immediate same-head and same-body hot-intake review", () => {
+  const reviewedAt = "2026-07-31T02:25:10.000Z";
+  const now = Date.parse("2026-07-31T02:30:00.000Z");
+  const head = "0a3959fe0123456789abcdef0123456789abcdef";
+  const sourceRevision = "4055368d78b5997d42460145ba92e74397576bb4b0aaf91bb063725f2f1cb63d";
+  const pullStateDigest = "b".repeat(64);
+  const reviewActivityCursor = `v1:0:${"c".repeat(64)}`;
+  const unchangedItemUpdatedAt = new Date(Date.parse(reviewedAt) - 1_000).toISOString();
+  const sameSnapshot = {
+    reviewStatus: "complete",
+    reviewedAt,
+    reviewHeadSha: head,
+    reviewSourceRevision: sourceRevision,
+    reviewPullStateDigest: pullStateDigest,
+    reviewActivityCursor,
+    currentHeadSha: head.toUpperCase(),
+    currentSourceRevision: sourceRevision,
+    currentPullStateDigest: pullStateDigest,
+    currentReviewActivityCursor: reviewActivityCursor,
+    itemUpdatedAt: unchangedItemUpdatedAt,
+    reviewItemUpdatedAt: unchangedItemUpdatedAt,
+    currentItemUpdatedAt: unchangedItemUpdatedAt,
+    now,
+  };
+
+  assert.equal(shouldSkipScheduledHotIntakeExactReviewForTest(sameSnapshot), true);
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      itemUpdatedAt: reviewedAt,
+      reviewItemUpdatedAt: reviewedAt,
+      currentItemUpdatedAt: reviewedAt,
+    }),
+    false,
+    "same-second reviewed item activity requires the complete structural path",
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentHeadSha: "f".repeat(40),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentSourceRevision: "a".repeat(64),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentPullStateDigest: "c".repeat(64),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentReviewActivityCursor: `v1:1:${"d".repeat(64)}`,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentItemUpdatedAt: new Date(Date.parse(reviewedAt) + 1).toISOString(),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      currentItemUpdatedAt: new Date(Date.parse(reviewedAt) + 1).toISOString(),
+      reviewCommentSyncedAt: new Date(Date.parse(reviewedAt) + 1).toISOString(),
+    }),
+    false,
+    "a local comment-sync clock cannot suppress same-second target activity",
+  );
+  const automationItemUpdatedAt = new Date(Date.parse(reviewedAt) + 2_000).toISOString();
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      itemUpdatedAt: automationItemUpdatedAt,
+      currentItemUpdatedAt: automationItemUpdatedAt,
+      automationItemUpdatedAt,
+      reviewCommentSyncedAt: new Date(Date.parse(reviewedAt) + 1_000).toISOString(),
+    }),
+    false,
+    "hot intake cannot suppress work from an item timestamp without a complete timeline receipt",
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      itemUpdatedAt: automationItemUpdatedAt,
+      currentItemUpdatedAt: automationItemUpdatedAt,
+      automationItemUpdatedAt,
+      reviewCommentSyncedAt: new Date(Date.parse(reviewedAt) + 1_000).toISOString(),
+      currentSourceRevision: "a".repeat(64),
+    }),
+    false,
+    "same-timestamp target activity remains due when the exact source receipt changed",
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      itemUpdatedAt: new Date(Date.parse(reviewedAt) + 1).toISOString(),
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      now: Date.parse(reviewedAt) + 60 * 60 * 1000,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSkipScheduledHotIntakeExactReviewForTest({
+      ...sameSnapshot,
+      reviewPolicy: "previous-policy",
+      currentReviewPolicy: "current-policy",
+    }),
+    false,
+  );
+});
+
+test("duplicate due candidates do not strand the rest of the batch", () => {
+  // GitHub's paginated issue listing is sorted by `updated`, so an item touched
+  // mid-pagination can be returned on two pages. selectDueCandidates already
+  // dedupes by repo#number; the weighted drain must not read that skip as
+  // "buckets are empty" and abandon the candidates queued behind it.
+  const now = Date.parse("2026-06-10T00:00:00Z");
+  const reviewedAt = now - 24 * 60 * 60 * 1000; // reviewed yesterday: not weekly-coverage-due
+  const weekly = (number) => ({
+    item: item({ number, kind: "issue", createdAt: "2020-01-01T00:00:00Z" }),
+    review: { reviewStatus: "complete", reviewedAt: new Date(reviewedAt).toISOString() },
+    priority: 6,
+    reviewedAt,
+    nextDueAt: 0,
+    bucket: "weekly_issue", // weight 1: a single duplicate fills one pass
+    coverageTracked: true,
+  });
+
+  // Control: no duplicates.
+  assert.deepEqual(selectedNumbers([weekly(1), weekly(2), weekly(3)], 4, now), [1, 2, 3]);
+
+  // One duplicate of #1 must not cost us #2 and #3.
+  assert.deepEqual(
+    selectedNumbers([weekly(1), weekly(1), weekly(2), weekly(3)], 4, now),
+    [1, 2, 3],
+  );
+
+  // Duplicates are still deduped, and capacity is still respected.
+  assert.deepEqual(selectedNumbers([weekly(1), weekly(1)], 4, now), [1]);
+  assert.deepEqual(selectedNumbers([weekly(1), weekly(1), weekly(2), weekly(3)], 2, now), [1, 2]);
+});
+
+test("a run of duplicates larger than the bucket weight still drains", () => {
+  // hot_issue has weight 4, so eight copies of #1 span two full passes with no
+  // new selection in the second one.
+  const now = Date.parse("2026-06-10T00:00:00Z");
+  const reviewedAt = now - 24 * 60 * 60 * 1000;
+  const hot = (number) => ({
+    item: item({ number, kind: "issue", createdAt: "2020-01-01T00:00:00Z" }),
+    review: { reviewStatus: "complete", reviewedAt: new Date(reviewedAt).toISOString() },
+    priority: 0,
+    reviewedAt,
+    nextDueAt: 0,
+    bucket: "hot_issue",
+    coverageTracked: true,
+  });
+  const due = [...Array.from({ length: 8 }, () => hot(1)), hot(2), hot(3)];
+
+  assert.deepEqual(selectedNumbers(due, 5, now), [1, 2, 3]);
+});
+
+test("duplicates across separate buckets do not stall the weighted drain", () => {
+  const now = Date.parse("2026-06-10T00:00:00Z");
+  const reviewedAt = now - 24 * 60 * 60 * 1000;
+  const candidate = (number, bucket, kind) => ({
+    item: item({ number, kind, createdAt: "2020-01-01T00:00:00Z" }),
+    review: { reviewStatus: "complete", reviewedAt: new Date(reviewedAt).toISOString() },
+    priority: 6,
+    reviewedAt,
+    nextDueAt: 0,
+    bucket,
+    coverageTracked: true,
+  });
+  const due = [
+    candidate(1, "weekly_issue", "issue"),
+    candidate(1, "weekly_issue", "issue"),
+    candidate(2, "daily_pull_request", "pull_request"),
+    candidate(2, "daily_pull_request", "pull_request"),
+    candidate(3, "weekly_issue", "issue"),
+    candidate(4, "daily_pull_request", "pull_request"),
+  ];
+
+  assert.deepEqual(
+    selectedNumbers(due, 6, now).sort((a, b) => a - b),
+    [1, 2, 3, 4],
+  );
+});
+
+test("pagination duplicates do not strand candidates the real planner produces", () => {
+  // The three cases above build candidates by hand. This one derives them the way
+  // dueCandidate() does, so it pins the shape the production planner actually
+  // emits: a PR created two days ago with a prior report is coverage-tracked,
+  // due at the 1-day cadence, and NOT weekly-coverage-due at 6 days - so the
+  // weighted drain, not the coverage preselect lane, owns selection.
+  //
+  // Reachability differs per bucket because a stall needs a whole weighted pass
+  // to consume only duplicates. hot_pull_request has weight 2, so it takes four
+  // page entries for one PR. weekly_issue is unreachable: there, "due" and
+  // "weekly-coverage-due" share the same 6-day threshold, and that lane takes
+  // candidates in a plain loop.
+  const now = Date.parse("2026-06-10T00:00:00Z");
+  const reviewedAt = now - 2 * 24 * 60 * 60 * 1000;
+  const review = {
+    reviewStatus: "complete",
+    reviewedAt: new Date(reviewedAt).toISOString(),
+  };
+  const pull = (number) =>
+    item({
+      number,
+      kind: "pull_request",
+      createdAt: new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+  const derived = (number) => {
+    const target = pull(number);
+    assert.equal(schedulerBucket(target, review, now), "hot_pull_request");
+    assert.equal(shouldReviewItem(target, review, now), true, "must be due");
+    return {
+      item: target,
+      review,
+      coverageTracked: true,
+      priority: reviewPriority(target, review, now),
+      reviewedAt: reviewedAtMs(review) ?? 0,
+      nextDueAt: nextReviewDueAtMs(target, review, now),
+      bucket: schedulerBucket(target, review, now),
+    };
+  };
+
+  // #1 listed on four pages: hot_pull_request weight 2, so one full pass
+  // consumes nothing but duplicates.
+  const due = [derived(1), derived(1), derived(1), derived(1), derived(2), derived(3)];
+  assert.deepEqual(
+    selectDueCandidates(due, 10, undefined, now).map((candidate) => candidate.item.number),
+    [1, 2, 3],
   );
 });

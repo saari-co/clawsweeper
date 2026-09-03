@@ -1,5 +1,13 @@
 # ClawSweeper Internal Feature Map
 
+- Status: active implementation reference; not an operator runbook
+- Owner: ClawSweeper maintainers
+- Source of truth: `src/repair/**`, repair workflows, job/result schemas, and
+  focused repair tests
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Update when: internal objects, execution stages, routing, ledgers, gates, or
+  extension points change
+
 Read when: changing ClawSweeper automation, debugging a generated PR, wiring
 comment commands, or deciding where a new lane belongs.
 
@@ -48,7 +56,7 @@ job. That is the primary duplicate-PR guard.
 
 Path: `.clawsweeper-repair/runs/<run>/cluster-plan.json`
 
-Created by `scripts/plan-cluster.ts`. It hydrates the listed GitHub refs,
+Created by `src/repair/plan-cluster.ts`. It hydrates the listed GitHub refs,
 linked refs, labels, bodies, comments, PR files, PR reviews, PR review
 comments, checks, and current `main` state. The Codex worker receives this as
 its live evidence bundle.
@@ -57,16 +65,16 @@ its live evidence bundle.
 
 Path: `.clawsweeper-repair/runs/<run>/result.json`
 
-Created by `scripts/run-worker.ts` via `codex exec` using
+Created by `src/repair/run-worker.ts` via `codex exec` using
 `schema/repair/codex-result.schema.json`. The worker can recommend actions and fix
 artifacts, but it must not mutate GitHub directly.
 
-`scripts/review-results.ts` validates the result before any follow-up lane
+`src/repair/review-results.ts` validates the result before any follow-up lane
 trusts it.
 
 Long Codex calls emit periodic `[clawsweeper repair] ... still running` log
 lines from the wrapper process. This covers both the planning worker and
-execute-side edit, review, rebase-reconcile, and write-preflight subprocesses,
+execute-side edit, review, and rebase-reconcile subprocesses,
 so GitHub Actions does not kill otherwise healthy repair jobs for lack of output
 before the debug artifact collection steps can run.
 
@@ -156,12 +164,14 @@ The cluster worker has two jobs:
    - labels ClawSweeper targets
    - uploads final artifacts
 
-The workflow concurrency group is based on job path and mode, so repeat
-dispatches of the same job queue instead of racing each other.
+The ordinary workflow concurrency group is based on job path only, so repeat
+dispatches and different modes for the same job queue behind its active run.
+Explicit requeues use a dedicated run-specific group so they can replace a
+stale-head worker without cancelling the active run's gate cleanup.
 
 ## Creating Implementation PRs
 
-Script: `scripts/execute-fix-artifact.ts`
+Script: `src/repair/execute-fix-artifact.ts`
 
 This is the PR creation and branch repair engine.
 
@@ -205,7 +215,7 @@ Generated ClawSweeper PRs are marked by:
 - branch prefix: `clawsweeper/`
 - committed repair job metadata for the branch cluster id
 
-The `clawsweeper` label is a reporting hint from `scripts/tag-clawsweeper-targets.ts`,
+The `clawsweeper` label is a reporting hint from `src/repair/tag-clawsweeper-targets.ts`,
 not a PR identity boundary.
 
 Current operational gotcha: OpenClaw's PR queue policy can close PRs when the
@@ -222,42 +232,14 @@ limit is `50`; set it to `0` only for a deliberately uncapped execution window.
 Common changelog and release-note files are ignored for this backpressure check
 because they are shared support files rather than a meaningful repair area.
 
-## ClawSweeper Commit Findings
+## ClawSweeper Commit Findings (retired intake)
 
-Workflow: `.github/workflows/repair-commit-finding-intake.yml`
-Script: `scripts/commit-finding-intake.ts`
-
-ClawSweeper can dispatch `clawsweeper_commit_finding` when a main-branch commit
-review report has `result: findings`. ClawSweeper treats that report as a source
-finding, not as an order to open a PR.
-
-The intake step fetches the report from latest `openclaw/clawsweeper@main`,
-writes one audit file, and then decides whether an automatic repair PR is
-allowed:
-
-- audit path: `results/commit-findings/<repo-slug>/<sha>.md`
-- job path: `jobs/<owner>/inbox/clawsweeper-commit-<repo-slug>-<shortsha>.md`
-- branch: `clawsweeper/clawsweeper-commit-<repo-slug>-<shortsha>`
-
-Non-finding, disabled, security/privacy/supply-chain, and broad findings stop
-at the audit record. Eligible ordinary bug/regression/reliability findings get a
-deterministic synthetic ClawSweeper result and fix artifact. That skips the normal
-cluster-planning Codex pass and sends the report straight to
-`execute-fix-artifact`, where Codex is used for the repair loop against latest
-target `main`. The executor handles trivial branch-refresh work before asking
-Codex to edit: a clean rebase that changes only commit ancestry skips the edit
-pass, and an isolated `CHANGELOG.md` rebase conflict is merged mechanically by
-preserving both sides before validation continues. Generated config checksum
-conflicts are also merged mechanically by keeping replayed checksum entries and
-current-main entries that the replayed commit did not touch.
-
-Commit-finding fix artifacts set `allow_no_pr: true`. If the repair loop
-verifies the report but produces no target-repo diff, ClawSweeper records a clean
-skipped no-PR outcome instead of failing the workflow.
-
-The generated job uses `source: clawsweeper_commit` and may have no issue/PR
-`candidates`. The fix artifact uses `repair_strategy: new_fix_pr`; merge and
-close actions remain blocked.
+The commit-review lane and its `repair-commit-finding-intake.yml` workflow were
+retired in July 2026, so no new `clawsweeper_commit_finding` dispatches occur.
+Existing jobs with `source: clawsweeper_commit` and `job_intent: commit_finding`
+remain executable through the ordinary cluster worker; their fix artifacts keep
+`allow_no_pr: true` and `repair_strategy: new_fix_pr`, with merge and close
+actions blocked.
 
 ## Issue Implementation Commands
 
@@ -281,8 +263,8 @@ of creating duplicates.
 ### Reviewed Reproducible Bug Intake
 
 `repair-issue-implementation-intake.yml` is the automatic version of the issue
-implementation lane. It is enabled only when
-`CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS=1`.
+implementation lane. For OpenClaw, it follows the single
+`CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES=1` master gate.
 
 The review report must be a strict bug candidate:
 
@@ -292,7 +274,8 @@ The review report must be a strict bug candidate:
 - `work_candidate: queue_fix_pr`
 - `work_confidence: high`
 - `item_category: bug`
-- `reproduction_status: reproduced`
+- `reproduction_status: reproduced`, or `source_reproducible` for a small,
+  high-confidence fix
 - `reproduction_confidence: high`
 - `requires_new_feature: false`
 - `requires_new_config_option: false`
@@ -324,7 +307,7 @@ label.
 
 ## Applying Comments, Closures, And Merges
 
-Script: `scripts/apply-result.ts`
+Script: `src/repair/apply-result.ts`
 
 This script owns safe GitHub mutations from reviewed worker results.
 
@@ -358,7 +341,7 @@ instead of merging.
 
 ## Post-Flight Finalization
 
-Script: `scripts/post-flight.ts`
+Script: `src/repair/post-flight.ts`
 
 Post-flight watches the PRs that `execute-fix-artifact` opened or repaired.
 It waits for merge readiness, validates merge preflight, and either:
@@ -372,8 +355,12 @@ for duplicate or superseded items covered by that fix.
 
 ## Open PR Finalizer
 
-Workflow: `.github/workflows/finalize-open-prs.yml`
-Script: `scripts/finalize-open-prs.ts`
+Script: `src/repair/finalize-open-prs.ts`
+
+The finalizer report runs with `--write-report` inside
+`repair-publish-results.yml` after every worker-result publish. The dedicated
+dispatch workflow was retired (dormant since April 2026); repair dispatch now
+happens only through the cluster lanes.
 
 The finalizer scans open ClawSweeper PRs in the target repo. It finds PRs by the
 `clawsweeper/*` branch prefix. It classifies blockers:
@@ -532,7 +519,12 @@ Branch mutation still requires the downstream `CLAWSWEEPER_ALLOW_EXECUTE=1` and
 Ledgers:
 
 - `results/comment-router.json`: processed command ledger
-- `results/comment-router-latest.json`: latest scan report
+- `results/comment-router-latest.json`: run-local latest scan report; workflows
+  consume it before exit but do not publish it as durable state
+
+The processed command ledger and changed `jobs/` publish together through the
+coordinator-guarded operational Git writer. Immutable command action events
+publish directly to R2.
 
 Command replies are marker-backed and edited in place per item, intent, and
 head SHA. Repeated maintainer nudges update the same small status comment
@@ -540,7 +532,7 @@ instead of leaving duplicate crustacean notes.
 
 ## Label Backfill
 
-Script: `scripts/tag-clawsweeper-targets.ts`
+Script: `src/repair/tag-clawsweeper-targets.ts`
 
 This script labels ClawSweeper-created or ClawSweeper-tracked PRs/issues in the
 target repo. It helps downstream tools and maintainers distinguish generated
@@ -557,9 +549,9 @@ truth.
 
 Scripts:
 
-- `scripts/sweep-openclaw-jobs.ts`
-- `scripts/promote-stuck-jobs.ts`
-- `scripts/requeue-job.ts`
+- `src/repair/sweep-openclaw-jobs.ts`
+- `src/repair/promote-stuck-jobs.ts`
+- `src/repair/requeue-job.ts`
 
 These scripts manage the ClawSweeper backlog:
 
@@ -573,8 +565,8 @@ inventory and dispatch pressure.
 
 ## Dashboard Publishing
 
-Workflow: `.github/workflows/publish-results.yml`
-Script: `scripts/publish-result.ts`
+Workflow: `.github/workflows/repair-publish-results.yml`
+Script: `src/repair/publish-result.ts`
 
 Publishing turns raw run artifacts into durable, sanitized summaries. It updates
 the README dashboard, per-cluster markdown reports, and aggregate JSON ledgers.
@@ -590,15 +582,21 @@ Important gates:
 - `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED`: opt-in for the scheduled
   `repair-cluster-intake.yml` imported-cluster intake. Direct repair import and
   dispatch commands are not blocked by this variable; they keep the existing
-  repair execution gates. Gitcrawl cluster import skips clusters with at least
-  75% closed members by default; `--skip-closed-percent` is the explicit
-  override.
-- `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT`: scheduled imported-cluster intake
-  limit; default `1` cluster per daily `repair-cluster-intake.yml` run.
+  repair execution gates. A model compares the live evidence for each offered
+  cluster and selects one useful candidate or rejects the batch.
+- `CLAWSWEEPER_CLUSTER_REPAIR_CANDIDATE_BATCH`: number of unprocessed clusters
+  offered to the scheduled selector model; default `8`. The selector emits at
+  most one cluster per daily `repair-cluster-intake.yml` run.
   The upstream `openclaw/gitcrawl-store` refreshes `openclaw/openclaw` every 15
-  minutes, so the intake records the processed portable DB SHA in
-  `results/cluster-repair-intake/<repo>.json` and skips duplicate ticks against
-  the same store snapshot.
+  minutes. Intake first appends the selected job, store identity, model
+  rationale and per-cluster decisions, and stable dispatch key to the
+  Cloudflare durable window. Decisions project through a separately versioned
+  sidecar so older strict-v2 dispatch-ledger readers remain compatible. Rejected
+  cluster IDs remain durable history, while only selected jobs are projected.
+  The materializer retries after publication loss and recovers retained pending
+  intent without duplicating completed workers.
+  Intake-triggered materializers receive one bounded priority turn before
+  yielding to queued batch or ordinary writers.
 - `CLAWSWEEPER_ALLOW_EXECUTE`: allows deterministic write lanes. Workflows treat
   any value except literal `1` as closed.
 - `CLAWSWEEPER_ALLOW_FIX_PR`: allows branch repair and replacement PR creation.
@@ -613,8 +611,10 @@ Important defaults:
 - `CLAWSWEEPER_MODEL`: GitHub Actions secret containing the actual worker model.
   Public workflow inputs and generated state use only `internal`.
 - `CLAWSWEEPER_CODEX_REASONING_EFFORT`: model reasoning effort. Repair workers
-  default to `high` and normalize accidental `xhigh` overrides back to `high`
-  to keep automerge repair latency predictable.
+  default to `high`; ordinary planning and repair normalize `xhigh` to `high`.
+- `CLAWSWEEPER_FIX_PR_MODEL` and `CLAWSWEEPER_FIX_PR_REASONING_EFFORT`:
+  automatic issue fix/PR execution defaults to `gpt-5.6-sol` with `xhigh`
+  reasoning without changing the normal planning or automerge repair model.
 - `CLAWSWEEPER_CODEX_SERVICE_TIER`: Codex service tier. Repair workers default
   to `fast`.
 - `CLAWSWEEPER_CODEX_LOGIN_METHOD`: Codex login mode for local runs. Defaults

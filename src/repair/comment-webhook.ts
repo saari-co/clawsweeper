@@ -3,20 +3,36 @@ import crypto from "node:crypto";
 import http from "node:http";
 
 import { repositoryProfileFor } from "../repository-profiles.js";
+import {
+  hostedTargetRetryableAdmission,
+  probeHostedPublicTarget,
+  type HostedTargetAdmission,
+} from "../hosted-target-admission.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import {
+  isAssistPublicationCommentBody,
   isProofNudgeCommentBody,
   parseCommand,
   staleClosedItemCommandReason,
 } from "./comment-router-core.js";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
+import { isExactReviewCloseGuardLabel } from "./exact-review-guard-labels.js";
+import { commentBodySha256 } from "./comment-router-utils.js";
+import {
+  directReReviewAdditionalPrompt,
+  reReviewContextFromClawSweeperComment,
+} from "./comment-command-text.js";
+import { directReReviewIntake } from "./direct-re-review-admission.js";
+import { postExactReviewCommandIntake } from "./exact-review-command-queue.js";
 
 const DEFAULT_PORT = 8787;
+export const WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const GITHUB_FETCH_TIMEOUT_MS = 15_000;
 const REVIEW_REPO = "openclaw/clawsweeper";
 const COMMAND_PATTERN =
   /(^|[ \t\r\n])@(?:clawsweeper|openclaw-clawsweeper)\b(?:\[bot\])?|(^|[ \t\r\n])\/(?:clawsweeper|review|re-review|rerun[ -]?review|status|explain|fix|build|implement|create[ -]?pr|fix[ -]?issue|autofix|auto[ -]?fix|automerge|auto[ -]?merge|approve|stop|autoclose)\b/i;
 const ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-const ISSUE_ITEM_ACTIONS = new Set(["opened", "reopened", "edited"]);
+const ISSUE_ITEM_ACTIONS = new Set(["opened", "reopened", "edited", "unlocked", "unlabeled"]);
 const PULL_ITEM_ACTIONS = new Set([
   "opened",
   "reopened",
@@ -24,6 +40,8 @@ const PULL_ITEM_ACTIONS = new Set([
   "ready_for_review",
   "converted_to_draft",
   "edited",
+  "unlocked",
+  "unlabeled",
 ]);
 const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
 const inFlightFastAcks = new Map<string, Promise<number>>();
@@ -34,9 +52,17 @@ type AcceptedIssueCommentWebhook = {
   targetRepo: string;
   targetBranch: string;
   itemNumber: number;
+  itemKind: "issue" | "pull_request";
+  itemState: string;
   commentId: number;
   installationId: number;
   sourceAction: string;
+  commentBody: string;
+  commentAuthor: string;
+  commentUrl: string;
+  maintainerAuthorized: boolean;
+  commentUpdatedAt?: string;
+  commentBodySha256?: string;
 };
 
 type AcceptedItemWebhook = {
@@ -50,6 +76,11 @@ type AcceptedItemWebhook = {
   sourceEvent: "issues" | "pull_request";
   sourceAction: string;
   supersedesInProgress: boolean;
+  sourceHeadSha?: string;
+  sourceBaseSha?: string;
+  sourceIsDraft?: boolean;
+  sourceContentRevision?: string;
+  sourceUpdatedAt?: string;
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
 };
@@ -90,8 +121,14 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[clawsweeper webhook] ${message}`);
-    response.writeHead(400, { "content-type": "application/json" });
-    response.end(`${JSON.stringify({ ok: false, error: message })}\n`);
+    const retryable = /command intake failed \(HTTP (?:429|5\d\d)\)|aborted|timed out/i.test(
+      message,
+    );
+    if (!request.readableEnded) response.setHeader("connection", "close");
+    response.writeHead(retryable ? 503 : 400, { "content-type": "application/json" });
+    response.end(
+      `${JSON.stringify(retryable ? { ok: false, retryable: true } : { ok: false, error: message })}\n`,
+    );
   }
 }
 
@@ -105,9 +142,58 @@ export async function handleGitHubWebhook({
   const decision = classifyWebhook({ event, payload });
   if (!decision.accepted) return { statusCode: 202, body: decision };
   const accepted = decision as AcceptedWebhook;
-
   const appJwt = createAppJwt();
-  const dispatchToken = await createReviewRepoDispatchToken({ appJwt });
+  let reviewInstallationId = 0;
+  let admission: HostedTargetAdmission;
+  try {
+    reviewInstallationId = await reviewRepoInstallationId({ appJwt });
+    const metadataToken = await createInstallationToken({
+      appJwt,
+      installationId: reviewInstallationId,
+      label: REVIEW_REPO,
+      repositories: [repoName(REVIEW_REPO)],
+      permissions: { metadata: "read" },
+    });
+    admission = await probeHostedPublicTarget(accepted.targetRepo, metadataToken, fetch);
+  } catch (error) {
+    admission = hostedTargetRetryableAdmission(error);
+  }
+  if (admission.outcome !== "public") return standaloneAdmissionResponse(admission);
+
+  if (
+    accepted.type === "issue_comment" &&
+    accepted.itemState === "open" &&
+    reReviewContextFromClawSweeperComment(accepted.commentBody) !== null
+  ) {
+    const intake = directReReviewIntake({
+      targetRepo: accepted.targetRepo,
+      targetBranch: accepted.targetBranch,
+      itemNumber: accepted.itemNumber,
+      itemKind: accepted.itemKind,
+      installationId: accepted.installationId,
+      sourceCommentId: accepted.commentId,
+      sourceCommentUpdatedAt: accepted.commentUpdatedAt ?? "",
+      commandBodyDigest: accepted.commentBodySha256 ?? "",
+      commandOrigin: "hosted_webhook",
+      additionalPrompt: directReReviewAdditionalPrompt({
+        body: accepted.commentBody,
+        maintainerAuthorized: accepted.maintainerAuthorized,
+        author: accepted.commentAuthor,
+        commentUrl: accepted.commentUrl,
+      }),
+    });
+    const result = await postExactReviewCommandIntake({
+      queueUrl:
+        process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL ||
+        process.env.QUEUE_URL ||
+        "https://clawsweeper.openclaw.ai",
+      secret: process.env.CLAWSWEEPER_WEBHOOK_SECRET || "",
+      intake,
+    });
+    return { statusCode: 202, body: { ok: true, ...result } };
+  }
+
+  const dispatchToken = await createReviewRepoDispatchToken({ appJwt, reviewInstallationId });
 
   if (accepted.type === "item") {
     await dispatchItemReview({ token: dispatchToken, accepted });
@@ -144,6 +230,8 @@ export async function handleGitHubWebhook({
     commentId: accepted.commentId,
     statusCommentId,
     sourceAction: accepted.sourceAction,
+    ...(accepted.commentUpdatedAt ? { commentUpdatedAt: accepted.commentUpdatedAt } : {}),
+    ...(accepted.commentBodySha256 ? { commentBodyDigest: accepted.commentBodySha256 } : {}),
   });
   settleFastAckComments({
     token: targetToken,
@@ -176,6 +264,9 @@ export function classifyIssueCommentWebhook({
   const issue = asRecord(payload.issue);
   const repo = asRecord(payload.repository);
   const association = String(comment.author_association ?? "").toUpperCase();
+  if (isAssistPublicationCommentBody(String(comment.body ?? ""))) {
+    return { accepted: false, reason: "assist publication comment" };
+  }
   if (isProofNudgeCommentBody(String(comment.body ?? ""))) {
     return { accepted: false, reason: "proof nudge comment" };
   }
@@ -220,16 +311,34 @@ export function classifyIssueCommentWebhook({
   if (!Number.isInteger(installationId) || installationId <= 0) {
     return { accepted: false, reason: "missing installation id" };
   }
+  const commentUpdatedAt = exactWebhookTimestamp(comment.updated_at);
   return {
     accepted: true,
     type: "issue_comment",
     targetRepo,
     targetBranch,
     itemNumber,
+    itemKind: issue.pull_request ? "pull_request" : "issue",
+    itemState: String(issue.state ?? "").toLowerCase(),
     commentId,
     installationId,
     sourceAction: String(payload.action ?? "created"),
+    commentBody: String(comment.body ?? ""),
+    commentAuthor: String(asRecord(comment.user).login ?? ""),
+    commentUrl: String(comment.html_url ?? ""),
+    maintainerAuthorized: ALLOWED_ASSOCIATIONS.has(association),
+    ...(commentUpdatedAt
+      ? {
+          commentUpdatedAt,
+          commentBodySha256: commentBodySha256(comment.body),
+        }
+      : {}),
   };
+}
+
+function exactWebhookTimestamp(value: JsonValue) {
+  const text = String(value ?? "").trim();
+  return text && Number.isFinite(Date.parse(text)) ? text : null;
 }
 
 export function classifyItemWebhook({ event, payload }: { event: string; payload: LooseRecord }) {
@@ -246,6 +355,9 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
 
   if (event === "issues") {
     if (!ISSUE_ITEM_ACTIONS.has(action)) return { accepted: false, reason: "unsupported action" };
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
     const issue = asRecord(payload.issue);
     const itemNumber = Number(issue.number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
@@ -261,17 +373,28 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
       installationId,
       sourceEvent: "issues",
       sourceAction: action,
-      supersedesInProgress: action === "edited",
+      supersedesInProgress: ["edited", "unlocked", "unlabeled"].includes(action),
     };
   }
 
   if (event === "pull_request") {
     if (!PULL_ITEM_ACTIONS.has(action)) return { accepted: false, reason: "unsupported action" };
+    if (action === "unlabeled" && !isCloseGuardLabel(payload.label)) {
+      return { accepted: false, reason: "unsupported action" };
+    }
     const pull = asRecord(payload.pull_request);
     const itemNumber = Number(pull.number);
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
       return { accepted: false, reason: "missing pull request number" };
     }
+    const sourceHeadSha = String(asRecord(pull.head).sha ?? "")
+      .trim()
+      .toLowerCase();
+    const sourceBaseSha = String(asRecord(pull.base).sha ?? "")
+      .trim()
+      .toLowerCase();
+    const sourceContentRevision = pullRequestEditedContentRevision(action, pull);
+    const sourceUpdatedAt = exactWebhookTimestamp(pull.updated_at);
     const reviewBudget = adaptiveReviewBudgetForPullRequest(pull);
     return {
       accepted: true,
@@ -283,13 +406,45 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
       installationId,
       sourceEvent: "pull_request",
       sourceAction: action,
-      supersedesInProgress: ["edited", "synchronize", "ready_for_review"].includes(action),
+      ...(/^[0-9a-f]{40}$/.test(sourceHeadSha) ? { sourceHeadSha } : {}),
+      ...(/^[0-9a-f]{40}$/.test(sourceBaseSha) ? { sourceBaseSha } : {}),
+      ...(typeof pull.draft === "boolean" ? { sourceIsDraft: pull.draft } : {}),
+      ...(sourceContentRevision ? { sourceContentRevision } : {}),
+      ...(sourceUpdatedAt ? { sourceUpdatedAt } : {}),
+      supersedesInProgress: [
+        "edited",
+        "synchronize",
+        "ready_for_review",
+        "unlocked",
+        "unlabeled",
+      ].includes(action),
       codexTimeoutMs: reviewBudget.codexTimeoutMs,
       mediaProofTimeoutMs: reviewBudget.mediaProofTimeoutMs,
     };
   }
 
   return { accepted: false, reason: "unsupported event" };
+}
+
+function pullRequestEditedContentRevision(action: string, pull: LooseRecord) {
+  if (
+    action !== "edited" ||
+    typeof pull.title !== "string" ||
+    (pull.body !== null && typeof pull.body !== "string")
+  ) {
+    return null;
+  }
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ version: 1, title: pull.title, body: pull.body || "" }))
+    .digest("hex");
+}
+
+function isCloseGuardLabel(value: JsonValue) {
+  const label = String(asRecord(value).name ?? "")
+    .trim()
+    .toLowerCase();
+  return isExactReviewCloseGuardLabel(label);
 }
 
 export function adaptiveCodexTimeoutMsForTest(pull: LooseRecord) {
@@ -391,7 +546,7 @@ async function createInstallationToken({
     path: `/app/installations/${installationId}/access_tokens`,
     method: "POST",
     body: {
-      repository_names: repositories.filter(Boolean),
+      repositories: repositories.filter(Boolean),
       permissions,
     },
     authScheme: "Bearer",
@@ -401,7 +556,7 @@ async function createInstallationToken({
   return token;
 }
 
-async function createReviewRepoDispatchToken({ appJwt }: { appJwt: string }) {
+async function reviewRepoInstallationId({ appJwt }: { appJwt: string }) {
   const installation = await githubFetch({
     token: appJwt,
     path: `/repos/${REVIEW_REPO}/installation`,
@@ -412,15 +567,37 @@ async function createReviewRepoDispatchToken({ appJwt }: { appJwt: string }) {
   if (!Number.isInteger(installationId) || installationId <= 0) {
     throw new Error(`review repo installation response missing id for ${REVIEW_REPO}`);
   }
+  return installationId;
+}
+
+async function createReviewRepoDispatchToken({
+  appJwt,
+  reviewInstallationId,
+}: {
+  appJwt: string;
+  reviewInstallationId: number;
+}) {
   return createInstallationToken({
     appJwt,
-    installationId,
+    installationId: reviewInstallationId,
     label: REVIEW_REPO,
     repositories: [repoName(REVIEW_REPO)],
     permissions: {
       contents: "write",
     },
   });
+}
+
+function standaloneAdmissionResponse(admission: HostedTargetAdmission) {
+  return admission.outcome === "terminal"
+    ? {
+        statusCode: 202,
+        body: { ok: false, accepted: false, reason: "private_target_unsupported" },
+      }
+    : {
+        statusCode: 503,
+        body: { ok: false, error: "target_visibility_unverified", retryable: true },
+      };
 }
 
 function createAppJwt() {
@@ -655,7 +832,9 @@ async function addReaction({
       body: { content },
     });
   } catch (error) {
-    if (!/\b422\b|already exists/i.test(String(error))) throw error;
+    if (!/\b422\b|already exists/i.test(String(error))) {
+      console.warn(`[clawsweeper webhook] comment reaction failed: ${String(error)}`);
+    }
   }
 }
 
@@ -680,10 +859,22 @@ async function dispatchItemReview({
         source_event: accepted.sourceEvent,
         source_action: accepted.sourceAction,
         supersedes_in_progress: accepted.supersedesInProgress,
-        ...(accepted.codexTimeoutMs ? { codex_timeout_ms: accepted.codexTimeoutMs } : {}),
-        ...(accepted.mediaProofTimeoutMs
-          ? { media_proof_timeout_ms: accepted.mediaProofTimeoutMs }
-          : {}),
+        queue_claim: {
+          ...(accepted.sourceHeadSha ? { source_head_sha: accepted.sourceHeadSha } : {}),
+          ...(accepted.sourceBaseSha ? { source_base_sha: accepted.sourceBaseSha } : {}),
+          ...(typeof accepted.sourceIsDraft === "boolean"
+            ? { source_is_draft: accepted.sourceIsDraft }
+            : {}),
+          ...(accepted.sourceContentRevision
+            ? { source_content_revision: accepted.sourceContentRevision }
+            : {}),
+          ...(accepted.sourceUpdatedAt ? { source_updated_at: accepted.sourceUpdatedAt } : {}),
+          installation_id: accepted.installationId,
+          ...(accepted.codexTimeoutMs ? { codex_timeout_ms: accepted.codexTimeoutMs } : {}),
+          ...(accepted.mediaProofTimeoutMs
+            ? { media_proof_timeout_ms: accepted.mediaProofTimeoutMs }
+            : {}),
+        },
       },
     },
   });
@@ -697,6 +888,8 @@ async function dispatchCommentRouter({
   commentId,
   statusCommentId,
   sourceAction,
+  commentUpdatedAt,
+  commentBodyDigest,
 }: {
   token: string;
   targetRepo: string;
@@ -705,6 +898,8 @@ async function dispatchCommentRouter({
   commentId: number;
   statusCommentId: number;
   sourceAction: string;
+  commentUpdatedAt?: string;
+  commentBodyDigest?: string;
 }) {
   await githubFetch({
     token,
@@ -720,7 +915,9 @@ async function dispatchCommentRouter({
         status_comment_id: statusCommentId,
         source_event: "issue_comment",
         source_action: sourceAction,
-        max_comments: "1",
+        comment_event_auth: "github_webhook_v1",
+        ...(commentUpdatedAt ? { comment_updated_at: commentUpdatedAt } : {}),
+        ...(commentBodyDigest ? { comment_body_sha256: commentBodyDigest } : {}),
       },
     },
   });
@@ -748,6 +945,7 @@ async function githubFetch({
       "user-agent": "clawsweeper-comment-webhook",
       "x-github-api-version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS),
   };
   if (body !== undefined) init.body = JSON.stringify(body);
   const response = await fetch(`https://api.github.com${path}`, init);
@@ -757,9 +955,21 @@ async function githubFetch({
   return text ? (JSON.parse(text) as LooseRecord) : {};
 }
 
-async function readBody(request: http.IncomingMessage) {
+export async function readBody(request: http.IncomingMessage) {
+  if (Number(request.headers["content-length"]) > WEBHOOK_MAX_BODY_BYTES) {
+    throw new Error(`request body exceeds ${WEBHOOK_MAX_BODY_BYTES} bytes`);
+  }
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  let received = 0;
+  // Let the HTTP response finish before Node closes an oversized request's connection.
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+    const next = Buffer.from(chunk);
+    received += next.length;
+    if (received > WEBHOOK_MAX_BODY_BYTES) {
+      throw new Error(`request body exceeds ${WEBHOOK_MAX_BODY_BYTES} bytes`);
+    }
+    chunks.push(next);
+  }
   return Buffer.concat(chunks).toString("utf8");
 }
 

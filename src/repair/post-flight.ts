@@ -11,38 +11,32 @@ import {
   validateJob,
 } from "./lib.js";
 import { stripAnsi } from "./comment-router-utils.js";
-import { externalMessageProvenance, postMergeCloseoutComment } from "./external-messages.js";
 import {
   ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   ghJsonWithRetry as ghJson,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
-import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
+import { parsePullRequestUrl, sameRepoSlug } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
   CLAWSWEEPER_LABEL,
   CLAWSWEEPER_LABEL_COLOR,
   CLAWSWEEPER_LABEL_DESCRIPTION,
 } from "./constants.js";
-import { AUTOMERGE_LABEL } from "./comment-router-core.js";
+import { AUTOMERGE_LABEL, AUTOMERGE_BLOCKING_LABEL_NAMES } from "./exact-review-guard-labels.js";
 import { numberEnv } from "./env-utils.js";
 import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import { compactText as compactPlainText } from "./text-utils.js";
+import { rollUpStatusChecks } from "./status-check-rollup.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const FIX_PR_MERGE_STATES = new Set(["CLEAN", "HAS_HOOKS", "UNSTABLE"]);
 const FIX_PR_ACTIONS = new Set(["open_fix_pr", "repair_contributor_branch"]);
 const FIX_PR_READY_STATUSES = new Set(["opened", "pushed"]);
-const POST_MERGE_CLOSE_ACTIONS = new Set([
-  "close_duplicate",
-  "close_superseded",
-  "close_fixed_by_candidate",
-  "post_merge_close",
-]);
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
@@ -116,9 +110,6 @@ for (const action of fixReport.actions ?? []) {
   if (!FIX_PR_ACTIONS.has(String(action.action ?? ""))) continue;
   const finalized = finalizeFixPr(action);
   report.actions.push(finalized);
-  if (finalized.status === "executed") {
-    report.actions.push(...finalizePostMergeCloseouts(action, finalized));
-  }
 }
 
 if (report.actions.length === 0) {
@@ -129,7 +120,30 @@ if (report.actions.length === 0) {
   });
 }
 
+report.closure_authorization = buildClosureAuthorization(report.actions);
 writeReport(report, resultPath);
+
+function buildClosureAuthorization(actions: LooseRecord[]) {
+  const mergedFixes = actions
+    .filter(
+      (action) =>
+        action.action === "finalize_fix_pr" &&
+        action.status === "executed" &&
+        typeof action.pr === "string" &&
+        /^#\d+$/.test(action.pr) &&
+        typeof action.merge_commit_sha === "string" &&
+        action.merge_commit_sha.trim(),
+    )
+    .map((action) => ({
+      fix_ref: action.pr,
+      merge_commit_sha: action.merge_commit_sha,
+    }));
+  return {
+    version: 1,
+    status: mergedFixes.length > 0 ? "authorized" : "not_authorized",
+    merged_fixes: mergedFixes,
+  };
+}
 
 function finalizeFixPr(action: LooseRecord) {
   const base = {
@@ -148,7 +162,7 @@ function finalizeFixPr(action: LooseRecord) {
   }
 
   const parsed = parsePullRequestUrl(action.pr_url ?? action.target);
-  if (!parsed || parsed.repo !== result.repo) {
+  if (!parsed || !sameRepoSlug(parsed.repo, result.repo)) {
     return { ...base, status: "blocked", reason: "fix PR URL is missing or outside target repo" };
   }
 
@@ -219,6 +233,21 @@ function finalizeFixPr(action: LooseRecord) {
       waited_ms: waitedMs,
     };
   }
+
+  const currentPull = fetchPullRequest(result.repo, parsed.number);
+  const currentPolicyBlock = validateMergePolicy(action, currentPull);
+  if (currentPolicyBlock) {
+    return { ...prBase, status: "blocked", reason: currentPolicyBlock, waited_ms: waitedMs };
+  }
+  if (currentPull.head?.sha !== pull.head?.sha) {
+    return {
+      ...prBase,
+      status: "blocked",
+      reason: "pull request head changed during merge authorization",
+      waited_ms: waitedMs,
+    };
+  }
+  pull = currentPull;
 
   const mergeMessage = buildRepairSquashMergeMessage({
     target: parsed.number,
@@ -328,117 +357,18 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
   }
 }
 
-function finalizePostMergeCloseouts(fixAction: LooseRecord, finalized: LooseRecord) {
-  const fixPr = parsePullRequestUrl(fixAction.pr_url ?? fixAction.target);
-  if (!fixPr) return [];
-  const fixRef = `#${fixPr.number}`;
-  const fixUrl = `https://github.com/${result.repo}/pull/${fixPr.number}`;
-  const closeouts: JsonValue[] = [];
-  for (const action of result.actions ?? []) {
-    const actionName = String(action.action ?? "");
-    if (!POST_MERGE_CLOSE_ACTIONS.has(actionName)) continue;
-    if (!["blocked", "planned"].includes(String(action.status ?? ""))) continue;
-    const target = normalizeIssueRef(action.target);
-    if (!target || target === fixPr.number) continue;
-    const candidateFix = normalizeIssueRef(
-      action.candidate_fix ?? action.fixed_by ?? action.fix_candidate,
-    );
-    if (candidateFix !== fixPr.number) continue;
-    closeouts.push(
-      finalizePostMergeCloseout({ action, actionName, target, fixRef, fixUrl, finalized }),
-    );
-  }
-  return closeouts;
-}
-
-function finalizePostMergeCloseout({
-  action,
-  actionName,
-  target,
-  fixRef,
-  fixUrl,
-  finalized,
-}: LooseRecord) {
-  const base = {
-    action: "post_merge_closeout",
-    source_action: actionName,
-    target: `#${target}`,
-    canonical: action.canonical ?? undefined,
-    candidate_fix: fixRef,
-    fix_pr: fixUrl,
-  };
-  const live = fetchIssue(result.repo, target);
-  if (live.state !== "open") {
-    return {
-      ...base,
-      status: live.state === "closed" ? "executed" : "skipped",
-      reason:
-        live.state === "closed"
-          ? "target already closed after canonical fix merged"
-          : `target is ${live.state}`,
-      live_state: live.state,
-      merge_commit_sha: finalized.merge_commit_sha ?? null,
-    };
-  }
-  if (hasLiveSecuritySignal(target, live.labels ?? [])) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "security-sensitive target requires central security triage",
-    };
-  }
-  if (dryRun) {
-    return {
-      ...base,
-      status: "planned",
-      reason: "dry run",
-      merge_commit_sha: finalized.merge_commit_sha ?? null,
-    };
-  }
-
-  ghBestEffort([
-    "issue",
-    "edit",
-    String(target),
-    "--repo",
-    result.repo,
-    "--add-label",
-    "clawsweeper",
-  ]);
-  ghWithRetry([
-    "issue",
-    "comment",
-    String(target),
-    "--repo",
-    result.repo,
-    "--body",
-    postMergeCloseoutComment({
-      actionName,
-      fixUrl,
-      provenance: externalMessageProvenance({
-        reviewedSha:
-          finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
-      }),
-    }),
-  ]);
-  if (live.pull_request) {
-    ghWithRetry(["pr", "close", String(target), "--repo", result.repo]);
-  } else {
-    ghWithRetry(["issue", "close", String(target), "--repo", result.repo, "--reason", "completed"]);
-  }
-  const after = fetchIssue(result.repo, target);
-  return {
-    ...base,
-    status: after.state === "closed" ? "executed" : "blocked",
-    reason:
-      after.state === "closed" ? "closed after canonical fix merged" : `target is ${after.state}`,
-    live_state: after.state,
-    merge_commit_sha: finalized.merge_commit_sha ?? null,
-  };
-}
-
 function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
-  if (isAutomergeReplacementMerge(action, pull)) return "";
+  if (job.frontmatter.source === "pr_automerge") {
+    if (job.frontmatter.repair_mode !== "automerge") {
+      return "autofix-only job cannot merge";
+    }
+    const pullAuthorization = validateAutomergePullAuthorization(pull);
+    if (pullAuthorization) return pullAuthorization;
+    const replacementBlock = replacementPullRequestMergeBlock(action, pull);
+    if (replacementBlock) return replacementBlock;
+  }
+  const blockedLabel = AUTOMERGE_BLOCKING_LABEL_NAMES.find((label) => hasLabel(pull.labels, label));
+  if (blockedLabel) return `protected or paused repair label: ${blockedLabel}`;
   if (!job.frontmatter.allowed_actions.includes("merge")) return "job does not allow merge";
   if ((job.frontmatter.blocked_actions ?? []).includes("merge"))
     return "merge is blocked by job frontmatter";
@@ -446,13 +376,39 @@ function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
   return "";
 }
 
-function isAutomergeReplacementMerge(action: LooseRecord, pull: LooseRecord) {
-  return (
-    job.frontmatter.source === "pr_automerge" &&
-    action.action === "open_fix_pr" &&
-    result.fix_artifact?.repair_strategy === "replace_uneditable_branch" &&
-    hasLabel(pull.labels, AUTOMERGE_LABEL)
-  );
+function validateAutomergePullAuthorization(pull: LooseRecord): string {
+  if (!hasLabel(pull.labels, AUTOMERGE_LABEL)) {
+    return "merge requires an explicit clawsweeper:automerge label";
+  }
+  const blockedLabel = AUTOMERGE_BLOCKING_LABEL_NAMES.find((label) => hasLabel(pull.labels, label));
+  return blockedLabel ? `protected or paused repair label: ${blockedLabel}` : "";
+}
+
+function replacementPullRequestMergeBlock(action: LooseRecord, pull: LooseRecord): string {
+  if (action.action !== "open_fix_pr") {
+    return "";
+  }
+
+  const canonical = job.frontmatter.canonical ?? [];
+  if (canonical.length !== 1 || !/^#?[1-9]\d*$/.test(String(canonical[0] ?? ""))) {
+    return "automerge job must identify one canonical source pull request";
+  }
+  const canonicalNumber = Number(String(canonical[0]).replace(/^#/, ""));
+  if (!Number.isSafeInteger(canonicalNumber)) {
+    return "automerge job canonical source pull request is invalid";
+  }
+  const adoptedNumber = Number(String(job.frontmatter.cluster_id).match(/-(\d+)$/)?.[1] ?? 0);
+  if (adoptedNumber !== canonicalNumber) {
+    return "automerge job canonical source does not match its adopted pull request";
+  }
+  const replacement =
+    Number(pull.number) !== canonicalNumber ||
+    action.repair_strategy === "replace_uneditable_branch" ||
+    Boolean(action.fallback_source_pr) ||
+    result.fix_artifact?.repair_strategy === "replace_uneditable_branch";
+  if (!replacement) return "";
+
+  return "replacement pull request requires a fresh current-head ClawSweeper review; automatic merge disabled";
 }
 
 function isIssueImplementationJob() {
@@ -557,12 +513,11 @@ function validateMergePreflight(preflight: LooseRecord) {
 
 function validateStatusChecks(checks: LooseRecord[]) {
   if (!Array.isArray(checks) || checks.length === 0) return "no PR checks found";
-  const ignored = ignoredCheckNames();
   const blockers: LooseRecord[] = [];
   let considered = 0;
-  for (const check of latestCheckRuns(checks)) {
+  for (const { check, ignored } of postFlightStatusCheckRollup(checks)) {
     const name = String(check.name ?? check.context ?? "unknown check");
-    if (isIgnoredStatusCheck(check, ignored)) continue;
+    if (ignored) continue;
     considered += 1;
     const status = String(check.status ?? check.state ?? "").toUpperCase();
     const conclusion = String(check.conclusion ?? "").toUpperCase();
@@ -597,68 +552,23 @@ function shouldWaitForIssueImplementationChecks(checkBlock: string, view: LooseR
 }
 
 function hasPendingChecks(checks: LooseRecord[]) {
-  const ignored = ignoredCheckNames();
-  return latestCheckRuns(checks ?? []).some((check: JsonValue) => {
-    if (isIgnoredStatusCheck(check, ignored)) return false;
+  return postFlightStatusCheckRollup(checks ?? []).some(({ check, ignored }) => {
+    if (ignored) return false;
     return isPendingStatusCheck(check);
   });
 }
 
-function isIgnoredStatusCheck(check: LooseRecord, ignored: Set<string>) {
-  const name = String(check.name ?? check.context ?? "unknown check").toLowerCase();
-  const workflow = String(check.workflowName ?? "").toLowerCase();
-  return ignored.has(name) || Boolean(workflow && ignored.has(workflow));
-}
-
-function latestCheckRuns(checks: LooseRecord[]) {
-  const byKey = new Map<string, LooseRecord>();
-  for (const check of checks) {
-    const key = checkIdentity(check);
-    const previous = byKey.get(key);
-    if (!previous || checkTimestamp(check) >= checkTimestamp(previous)) byKey.set(key, check);
-  }
-  return [...byKey.values()];
-}
-
-function checkIdentity(check: LooseRecord) {
-  const name = String(check.name ?? check.context ?? "unknown check").toLowerCase();
-  const workflow = String(check.workflowName ?? "").toLowerCase();
-  return `${workflow}\n${name}`;
-}
-
-function checkTimestamp(check: LooseRecord) {
-  for (const field of [
-    "startedAt",
-    "started_at",
-    "createdAt",
-    "created_at",
-    "completedAt",
-    "completed_at",
-  ]) {
-    const parsed = Date.parse(String(check[field] ?? ""));
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (isPendingStatusCheck(check)) return Number.MAX_SAFE_INTEGER;
-  return 0;
+function postFlightStatusCheckRollup(checks: LooseRecord[]) {
+  return rollUpStatusChecks(
+    checks,
+    process.env.CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS ?? DEFAULT_IGNORED_CHECKS.join(","),
+  );
 }
 
 function isPendingStatusCheck(check: LooseRecord) {
   const status = String(check.status ?? check.state ?? "").toUpperCase();
   const conclusion = String(check.conclusion ?? "").toUpperCase();
   return !conclusion && Boolean(status) && !["COMPLETED", "SUCCESS"].includes(status);
-}
-
-function ignoredCheckNames() {
-  const configured = String(
-    process.env.CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS ?? DEFAULT_IGNORED_CHECKS.join(","),
-  );
-  return new Set(
-    configured
-      .split(",")
-      .map((item: JsonValue) => item.trim())
-      .map((item: string) => item.toLowerCase())
-      .filter(Boolean),
-  );
 }
 
 function shouldRequirePrChecks() {
@@ -721,10 +631,6 @@ function fetchPullRequest(repo: string, number: JsonValue) {
   return ghJson(["api", `repos/${repo}/pulls/${number}`]);
 }
 
-function fetchIssue(repo: string, number: JsonValue) {
-  return ghJson(["api", `repos/${repo}/issues/${number}`]);
-}
-
 function fetchPullRequestView(repo: string, number: JsonValue) {
   return ghJson([
     "pr",
@@ -774,10 +680,6 @@ function writeReport(report: LooseRecord, resultPath: string) {
   const reportPath = path.join(path.dirname(resultPath), "post-flight-report.json");
   fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
-}
-
-function normalizeIssueRef(value: JsonValue) {
-  return issueNumberFromRef(value);
 }
 
 function compactText(text: string, maxLength: number) {

@@ -1,5 +1,13 @@
 # Auto-Updating ClawSweeper PRs
 
+- Status: active trusted PR repair/automerge contract
+- Owner: ClawSweeper maintainers
+- Source of truth: comment router, repair worker/executor, finalizers, labels,
+  merge gates, and focused automerge tests
+- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Update when: command trust, adoption, repair budgets, labels, validation,
+  exact-head review, merge, or stop/resume behavior changes
+
 Read when: changing ClawSweeper PR repair automation, ClawSweeper review
 integration, comment routing, duplicate dispatch guards, or generated-PR
 marking.
@@ -62,6 +70,11 @@ Trusted automation:
 The trusted automation lane exists only for review bots we control. It does
 not treat random `@clawsweeper`, `@openclaw-clawsweeper`, or contributor prose as
 permission to spend workers or push commits.
+
+Status comment adoption and recovery require a readable trusted author login.
+Missing, empty, and unknown authors are rejected. Logins match case-insensitively
+without trimming: the router accepts `clawsweeper` and its configured trusted
+bots; the repair executor accepts `clawsweeper` and the two default bots above.
 
 ## Review Comment Shape
 
@@ -233,6 +246,21 @@ ClawSweeper has three layers of duplicate protection:
 - scheduled router scans synthesize an internal repair-loop command for open
   PRs that still carry `clawsweeper:autofix` or `clawsweeper:automerge`, so
   stale labelled PRs can be repaired or re-reviewed without a fresh comment;
+- a trusted, uniquely owned review-start marker leases an exact PR head or
+  issue source revision until the worker's bounded timeout plus a ten-minute
+  grace period. Scheduled label sweeps skip leased PR heads, while broad and
+  event apply workers defer every leased item;
+- current reports carrying an item revision plus the review lease owner and
+  server comment ID acquire or reuse an owned mutation lease, revalidate the
+  live revision and durable tuple before label, comment, and close phases, and
+  release only that exact report-owned or transient apply lease after the item
+  action. Legacy backlog reports without a complete tuple keep the prior apply
+  path but still defer to active leases and newer durable verdicts;
+- comment routing suppresses an older same-head verdict while a later lease is
+  active, then admits only the replacement verdict carrying that lease's exact
+  owner and comment identity;
+- exact-event review results are published, applied, and routed only after the
+  review succeeds and writes the expected fresh item artifact;
 - trusted ClawSweeper repairs are capped per PR and per PR head SHA.
 
 The default caps are ten automatic repair iterations per PR and two
@@ -251,8 +279,9 @@ ten automatic ClawSweeper-triggered repair iterations. The per-PR cap is total
 across all head SHAs and stops the automatic review/repair loop even when every
 iteration produces a new commit.
 
-Runs for the same job path and mode share the `repair-cluster-worker.yml` concurrency
-group, so repeated dispatches queue instead of racing the same branch.
+Ordinary runs for the same job path share the `repair-cluster-worker.yml`
+concurrency group across modes, so repeated dispatches queue instead of racing
+the same branch. Explicit requeues use a dedicated run-specific group.
 
 For automerge activation and scheduled label sweeps, a dirty or behind merge
 state is enough to dispatch repair. That lets Codex rebase or resolve conflicts
@@ -404,7 +433,13 @@ Scripts:
 Durable state:
 
 - `results/comment-router.json`
+
+Run-local diagnostics:
+
 - `results/comment-router-latest.json`
+
+The router ledger and changed `jobs/` use the coordinator-guarded operational
+Git writer. Immutable command action events publish directly to R2.
 
 Important knobs:
 

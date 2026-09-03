@@ -2,7 +2,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import { DEFAULT_ALLOWED_REPOSITORY_PERMISSIONS } from "./comment-router-core.js";
 import { currentProjectRepo, readMaxLiveWorkers } from "./lib.js";
 import { assertRepo, commaSet, positiveInteger } from "./comment-router-utils.js";
-import { AUTOMATION_LIMITS } from "./limits.js";
+import { AUTOMATION_LIMITS } from "../limits.js";
 import {
   DEFAULT_HEAD_PREFIX,
   DEFAULT_TARGET_REPO,
@@ -27,6 +27,7 @@ export type CommentRouterConfig = {
   headPrefix: string;
   execute: boolean;
   forceReprocess: boolean;
+  attemptId: string | null;
   writeReport: boolean;
   waitForCapacity: boolean;
   maxLiveWorkers: number;
@@ -39,6 +40,7 @@ export type CommentRouterConfig = {
   lookupConcurrency: number;
   lookbackMinutes: number;
   since: string;
+  sinceCommentIds: Set<number>;
   itemNumbers: Set<number>;
   commentIds: Set<number>;
   statusCommentId: number | null;
@@ -94,6 +96,26 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
   assertRepo(repairRepo, "repair-repo");
   assertRepo(reviewRepo, "review-repo");
 
+  const forceReprocess = Boolean(
+    args["force-reprocess"] ||
+    args.force_reprocess ||
+    process.env.CLAWSWEEPER_COMMENT_FORCE_REPROCESS === "1",
+  );
+  const requestedAttemptId =
+    args["attempt-id"] ??
+    args.attempt_id ??
+    process.env.CLAWSWEEPER_COMMENT_ATTEMPT_ID ??
+    (forceReprocess && process.env.GITHUB_RUN_ID
+      ? `forced-replay-${process.env.GITHUB_RUN_ID}`
+      : null);
+  const attemptId = optionalAttemptId(requestedAttemptId);
+  if (attemptId && !forceReprocess) {
+    throw new Error("--attempt-id requires --force-reprocess");
+  }
+  if (forceReprocess && !attemptId) {
+    throw new Error("--force-reprocess requires --attempt-id or GITHUB_RUN_ID");
+  }
+
   return {
     targetRepo,
     targetBranch,
@@ -106,11 +128,8 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
     model,
     headPrefix,
     execute: Boolean(args.execute),
-    forceReprocess: Boolean(
-      args["force-reprocess"] ||
-      args.force_reprocess ||
-      process.env.CLAWSWEEPER_COMMENT_FORCE_REPROCESS === "1",
-    ),
+    forceReprocess,
+    attemptId,
     writeReport: Boolean(args["write-report"] || args.execute),
     waitForCapacity: Boolean(args["wait-for-capacity"]),
     maxLiveWorkers: readMaxLiveWorkers(args),
@@ -149,6 +168,7 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
       args.since,
       new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString(),
     ),
+    sinceCommentIds: numberSet(args["since-comment-ids"], "since-comment-ids"),
     itemNumbers: numberSet(
       [args["item-number"], args["item-numbers"], process.env.CLAWSWEEPER_COMMENT_ITEM_NUMBERS]
         .filter((value) => value !== undefined && value !== null)
@@ -182,6 +202,13 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
   };
 }
 
+export function forcedReplayCommandFields(
+  config: Pick<CommentRouterConfig, "forceReprocess" | "attemptId">,
+): LooseRecord {
+  if (!config.forceReprocess || !config.attemptId) return {};
+  return { forced_replay: true, attempt_id: config.attemptId };
+}
+
 function stringSetting(value: JsonValue, fallback: string): string {
   const text = String(value ?? fallback).trim();
   return text || fallback;
@@ -211,6 +238,19 @@ function optionalNumber(value: JsonValue, label: string): number | null {
   if (!Number.isInteger(parsed) || parsed <= 0)
     throw new Error(`${label} must be a positive integer`);
   return parsed;
+}
+
+function optionalAttemptId(value: JsonValue): string | null {
+  const attemptId = String(value ?? "").trim();
+  if (!attemptId) return null;
+  if (
+    attemptId.length > 128 ||
+    /\s/.test(attemptId) ||
+    attemptId.includes(String.fromCharCode(0))
+  ) {
+    throw new Error("--attempt-id must be a non-empty token of at most 128 characters");
+  }
+  return attemptId;
 }
 
 function numberSet(value: JsonValue, name: string): Set<number> {

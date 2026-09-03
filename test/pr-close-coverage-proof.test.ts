@@ -1,12 +1,51 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { useFakeScanner } from "./agent-input-scan-helpers.ts";
 
 import {
   buildPrCloseCoverageProofPrompt,
+  runPrCloseCoverageProofModel,
+  createPrCloseCoverageProofEnvelope,
+  parsePrCloseCoverageProofEnvelope,
+  prCloseCoverageProofEnvelopePath,
   parsePrCloseCoverageProofModelResult,
   prCloseCoverageProofCloseDecision,
+  prCloseCoverageProofPromptSha256,
+  validatePrCloseCoverageProofEnvelopeBinding,
 } from "../dist/pr-close-coverage-proof.js";
+
+const concreteCoverageProof = {
+  sourceSummary: "PR A fixes the auth route.",
+  coveringSummary: "PR B fixes the same auth route.",
+  coveredWork: ["PR B includes the auth route fix that PR A proposed."],
+  uniqueSourceWork: [] as string[],
+  decision: "covered" as const,
+  reason: "PR B covers PR A's auth behavior and PR A has no unique remaining work.",
+};
+const proofPromptSha256 = "a".repeat(64);
+
+const proofPullRequest = (number: number) => ({
+  number,
+  title: `Auth route ${number}`,
+  url: `https://github.com/openclaw/openclaw/pull/${number}`,
+  state: "open",
+  mergedAt: null,
+  body: `Auth route body ${number}`,
+  updatedAt: "2026-07-10T00:00:00Z",
+  comments: [{ author: "octocat", body: `Auth route comment ${number}` }],
+  commentsTruncated: false,
+});
 
 test("PR close coverage proof rejects blank covered work before closing", () => {
   const decision = prCloseCoverageProofCloseDecision({
@@ -68,17 +107,132 @@ for (const scenario of [
 }
 
 test("PR close coverage proof can close when coverage is concrete", () => {
-  const decision = prCloseCoverageProofCloseDecision({
-    sourceSummary: "PR A fixes the auth route.",
-    coveringSummary: "PR B fixes the same auth route.",
-    coveredWork: ["PR B includes the auth route fix that PR A proposed."],
-    uniqueSourceWork: [],
-    decision: "covered",
-    reason: "PR B covers PR A's auth behavior and PR A has no unique remaining work.",
-  });
+  const decision = prCloseCoverageProofCloseDecision(concreteCoverageProof);
 
   assert.equal(decision.close, true);
   assert.equal(decision.proof.decision, "covered");
+});
+
+test("PR close coverage proof envelope binds repo and exact pull request snapshots", () => {
+  const source = proofPullRequest(10);
+  const covering = proofPullRequest(20);
+  const envelope = createPrCloseCoverageProofEnvelope({
+    targetRepo: "OpenClaw/OpenClaw",
+    generatedAt: "2026-07-10T01:02:03.000Z",
+    promptSha256: proofPromptSha256,
+    source,
+    covering,
+    proof: concreteCoverageProof,
+  });
+
+  assert.equal(envelope.targetRepo, "openclaw/openclaw");
+  assert.equal(envelope.source.number, 10);
+  assert.equal(envelope.covering.number, 20);
+  validatePrCloseCoverageProofEnvelopeBinding(envelope, {
+    targetRepo: "openclaw/openclaw",
+    promptSha256: proofPromptSha256,
+    source,
+    covering,
+  });
+  assert.match(prCloseCoverageProofEnvelopePath("proofs", 10, 20), /10-20\.proof\.json$/);
+});
+
+for (const scenario of [
+  {
+    name: "different repository",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      targetRepo: "openclaw/clawhub",
+    }),
+    expected: /target repo/,
+  },
+  {
+    name: "stale prompt snapshot",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      promptSha256: "0".repeat(64),
+    }),
+    expected: /prompt snapshot/,
+  },
+  {
+    name: "different source item",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      source: { ...value.source, number: 11 },
+    }),
+    expected: /proof source #11/,
+  },
+  {
+    name: "stale source snapshot",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      source: { ...value.source, snapshotSha256: "0".repeat(64) },
+    }),
+    expected: /source snapshot/,
+  },
+  {
+    name: "stale covering snapshot",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      covering: { ...value.covering, snapshotSha256: "0".repeat(64) },
+    }),
+    expected: /covering snapshot/,
+  },
+  {
+    name: "future generation timestamp",
+    mutate: (value: ReturnType<typeof createPrCloseCoverageProofEnvelope>) => ({
+      ...value,
+      generatedAt: "2099-01-01T00:00:00.000Z",
+    }),
+    expected: /timestamp is in the future/,
+  },
+]) {
+  test(`PR close coverage proof envelope rejects ${scenario.name}`, () => {
+    const source = proofPullRequest(10);
+    const covering = proofPullRequest(20);
+    const envelope = createPrCloseCoverageProofEnvelope({
+      targetRepo: "openclaw/openclaw",
+      promptSha256: proofPromptSha256,
+      source,
+      covering,
+      proof: concreteCoverageProof,
+    });
+
+    assert.throws(
+      () =>
+        validatePrCloseCoverageProofEnvelopeBinding(scenario.mutate(envelope), {
+          targetRepo: "openclaw/openclaw",
+          promptSha256: proofPromptSha256,
+          source,
+          covering,
+        }),
+      scenario.expected,
+    );
+  });
+}
+
+test("PR close coverage proof envelope parser is strict", () => {
+  const envelope = createPrCloseCoverageProofEnvelope({
+    targetRepo: "openclaw/openclaw",
+    promptSha256: proofPromptSha256,
+    source: proofPullRequest(10),
+    covering: proofPullRequest(20),
+    proof: concreteCoverageProof,
+  });
+
+  assert.throws(
+    () => parsePrCloseCoverageProofEnvelope({ ...envelope, artifactPath: "../../forged.json" }),
+    /unexpected keys: artifactPath/,
+  );
+  assert.throws(
+    () =>
+      parsePrCloseCoverageProofEnvelope({
+        ...envelope,
+        source: { ...envelope.source, number: "10" },
+      }),
+    /source\.number must be a number/,
+  );
+  assert.throws(() => prCloseCoverageProofEnvelopePath("proofs", -1, 20), /positive integer/);
 });
 
 test("PR close coverage proof can close concrete loopback embeddings bypass work", () => {
@@ -245,6 +399,38 @@ test("PR close coverage proof prompt escapes fenced blocks in JSON payloads", ()
   assert.doesNotMatch(prompt, /\\n```\\n/);
 });
 
+test("PR close coverage proof binding ignores the owned item update timestamp", () => {
+  const source = proofPullRequest(10);
+  const covering = proofPullRequest(20);
+  const options = {
+    source,
+    covering,
+    reportMarkdown: [
+      "---",
+      "decision: close",
+      "automation_item_updated_at: 2026-08-01T14:53:29Z",
+      "---",
+      "",
+      "Close as covered.",
+    ].join("\n"),
+    relationshipSignalSnippets: ["#20 covers #10"],
+    promptTemplate: "Decide whether PR B covers PR A.",
+  };
+
+  const original = prCloseCoverageProofPromptSha256(options);
+  const updatedOperationalTimestamp = prCloseCoverageProofPromptSha256({
+    ...options,
+    reportMarkdown: options.reportMarkdown.replace("2026-08-01T14:53:29Z", "2026-08-01T14:54:30Z"),
+  });
+  const updatedDecision = prCloseCoverageProofPromptSha256({
+    ...options,
+    reportMarkdown: options.reportMarkdown.replace("decision: close", "decision: keep_open"),
+  });
+
+  assert.equal(updatedOperationalTimestamp, original);
+  assert.notEqual(updatedDecision, original);
+});
+
 test("PR close coverage proof prompt requires concrete coverage proof", () => {
   const prompt = readFileSync("prompts/pr-close-coverage-proof.md", "utf8");
 
@@ -273,3 +459,81 @@ test("PR close coverage proof prompt requires concrete coverage proof", () => {
   assert.doesNotMatch(prompt, /must not be auto-closed/);
   assert.doesNotMatch(prompt, /patchSignature/);
 });
+
+for (const admission of ["clean", "invalid-output"])
+  test(
+    `PR close coverage proof ${admission} leaves no prompt copies in the proof tree`,
+    { skip: process.platform === "win32" },
+    (t) => {
+      const root = mkdtempSync(join(tmpdir(), "clawsweeper-proof-scratch-test-"));
+      try {
+        const workDir = join(root, "pr-close-coverage-proof");
+        mkdirSync(workDir);
+        const promptPath = join(workDir, "95982-111523.prompt.md");
+        writeFileSync(promptPath, "stale unscanned prompt");
+        useFakeScanner(
+          t,
+          `
+assert.equal(fs.existsSync(${JSON.stringify(promptPath)}), false);
+${admission === "invalid-output" ? "process.exit(183);" : ""}
+`,
+        );
+        const binDir = join(root, "bin");
+        mkdirSync(binDir, { recursive: true });
+        const fakeCodex = join(binDir, "codex");
+        writeFileSync(
+          fakeCodex,
+          [
+            "#!/bin/sh",
+            'out=""',
+            'prev=""',
+            'for a in "$@"; do',
+            '  if [ "$prev" = "--output-last-message" ]; then out="$a"; fi',
+            '  prev="$a"',
+            "done",
+            "cat > /dev/null",
+            "cat > \"$out\" <<'JSON'",
+            JSON.stringify(concreteCoverageProof),
+            "JSON",
+            "exit 0",
+          ].join("\n"),
+        );
+        chmodSync(fakeCodex, 0o755);
+        const schemaPath = join(root, "schema.json");
+        writeFileSync(schemaPath, "{}\n");
+        const previousCodexBin = process.env.CODEX_BIN;
+        process.env.CODEX_BIN = fakeCodex;
+        try {
+          const run = () =>
+            runPrCloseCoverageProofModel({
+              source: proofPullRequest(95982),
+              covering: proofPullRequest(111523),
+              markdown: "Report markdown.",
+              relationshipSignalSnippets: [],
+              runtime: {
+                model: "gpt-test",
+                reasoningEffort: "low",
+                sandboxMode: "read-only",
+                serviceTier: "",
+                timeoutMs: 30_000,
+                workDir,
+                rootDir: root,
+                schemaPath,
+                promptTemplate: "Prove close coverage.",
+              },
+            });
+          if (admission === "invalid-output")
+            assert.throws(run, /Agent input scan refused: scanner_failed/);
+          else assert.equal(run().decision, "covered");
+        } finally {
+          if (previousCodexBin === undefined) delete process.env.CODEX_BIN;
+          else process.env.CODEX_BIN = previousCodexBin;
+        }
+        // The workDir is uploaded verbatim as the close-coverage proof artifact;
+        // its validator only admits N-M.proof.json and manifest.json.
+        assert.deepEqual(readdirSync(workDir), []);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );

@@ -1,0 +1,92 @@
+<!--
+Optional linked context:
+Add a visible `Closes #<issue-number>` or `Related: #<issue-number>` line
+below this comment.
+
+Required PR title:
+type: user-facing description
+Use a parenthesized scope only when it adds clarity:
+fix(auth): login redirect loops when session cookie is expired
+
+Types: feat, fix, improve, refactor, docs, chore.
+For fixes, describe the user-visible symptom and trigger:
+fix: task list fails to load when user has no environments
+Avoid implementation details such as:
+fix: add null check to task query
+-->
+
+<details>
+<summary>Additional instructions</summary>
+
+**MUST:** Keep **Allow edits from maintainers** enabled for this PR so maintainers
+can help update the branch when needed.
+
+</details>
+
+## What Problem This Solves
+
+<!--
+Describe the concrete user, product, or operational problem.
+For fixes, begin with:
+"Fixes an issue where users <do X> would <experience Y> when <condition>."
+or:
+"Resolves a problem where..."
+
+Name the affected UI surface or workflow. Do not describe the code-level cause here.
+-->
+
+## Why This Change Was Made
+
+<!--
+In one or two sentences, explain the complete shipped solution, key design
+decisions, and relevant boundaries or non-goals. Include implementation detail
+only when it helps reviewers understand user-visible behavior or risk.
+Avoid file-by-file narration.
+-->
+
+## User Impact
+
+<!--
+State what users, operators, or developers can now do or expect. Lead with the
+concrete benefit and use user-facing language. If there is no user-visible
+impact, say so plainly.
+-->
+
+## OpenClaw Bay Impact
+
+<!--
+For lifecycle/review-publication, queue/workflow, status/telemetry, or dashboard
+data-contract changes, name the affected Bay surface and its proof. Otherwise,
+state why Bay is unaffected. See AGENTS.md.
+-->
+
+## Documentation Impact
+
+<!--
+For every code, configuration, workflow, API, UI, package, policy, or integration
+change, name the canonical documentation reviewed and summarize any required
+updates. If no documentation changes are needed, explain why the existing
+contract remains accurate.
+
+For new or changed documentation, also classify it as active, proposed,
+compatibility-only, or historical. Active runbooks and volatile references must
+name their role owner, source of truth, verified scope/revision, and update
+triggers. See CONTRIBUTING.md.
+-->
+
+## Evidence
+
+<!--
+Show the most useful proof that this change works. Screenshots, screencasts,
+terminal output, focused tests, CI results, live observations, redacted logs,
+and artifact links are all useful. Include before/after evidence for visual
+changes when it clarifies the result.
+
+Reviewers will inspect the code, tests, and CI. Use this section to make the
+validation easy to understand, not to restate the diff.
+
+For code-bearing changes, include the current `## Real Behavior Proof` package
+described in [CONTRIBUTING.md](../CONTRIBUTING.md). After review feedback, update
+this main PR body and request a re-review only after the branch, proof, and body
+are current.
+-->

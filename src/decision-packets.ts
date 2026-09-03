@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, relative } from "node:path";
+import { basename, dirname, relative } from "node:path";
+import { parseReportFrontMatter } from "./report-front-matter.js";
 
 export type MaintainerDecisionKind =
   | "none"
@@ -160,7 +161,13 @@ export function emptyMaintainerDecision(): MaintainerDecision {
 }
 
 export function maintainerDecisionFromReport(markdown: string): MaintainerDecision | null {
-  const raw = frontMatter(markdown).maintainer_decision;
+  return maintainerDecisionFromFrontMatter(frontMatter(markdown));
+}
+
+function maintainerDecisionFromFrontMatter(
+  frontmatter: Record<string, string>,
+): MaintainerDecision | null {
+  const raw = frontmatter.maintainer_decision;
   if (!raw || raw === "none" || raw === "unknown") return null;
   let parsed: unknown;
   try {
@@ -183,8 +190,10 @@ export function buildDecisionPacketFromReport(
   markdown: string,
   options: DecisionPacketBuildOptions = {},
 ): DecisionPacket | null {
-  const frontmatter = frontMatter(markdown);
-  const decision = maintainerDecisionFromReport(markdown);
+  const parsedFrontmatter = readFrontMatter(markdown);
+  if (parsedFrontmatter.ambiguous) return null;
+  const frontmatter = parsedFrontmatter.values;
+  const decision = maintainerDecisionFromFrontMatter(frontmatter);
   const repo = frontmatter.repository;
   const kind = frontmatter.type;
   const number = numberValue(frontmatter.number);
@@ -251,16 +260,36 @@ export function buildDecisionPacketFromReport(
 export function renderDecisionPacketPublicBlock(markdown: string): string {
   const packet = buildDecisionPacketFromReport(markdown);
   if (!packet) return "";
-  const options = packet.options.map(
-    (option) =>
-      `  - **${option.title}${option.recommended ? " (recommended)" : ""}:** ${option.body}`,
-  );
+  const recommendation = packet.options.find((option) => option.recommended);
+  const tableCell = (value: string) =>
+    value
+      .replace(/\\/g, "\\\\")
+      .replace(/<(?=[a-z/!?])/gi, "&lt;")
+      .replace(/\r?\n|\r/g, "<br>")
+      .replace(/\|/g, "\\|")
+      .trim();
+  if (!recommendation) {
+    // A packet without a flagged recommendation is still an outstanding maintainer
+    // choice; show the question and any available options instead of hiding it.
+    const optionCells = packet.options.length
+      ? packet.options
+          .map((option) => `**${tableCell(option.title)}:** ${tableCell(option.body)}`)
+          .join("<br>")
+      : "Maintainer decision needed.";
+    return [
+      "| Question | Options |",
+      "|---|---|",
+      `| ${tableCell(packet.question)} | ${optionCells} |`,
+      "",
+      `Why: ${packet.rationale}`,
+    ].join("\n");
+  }
   return [
-    `- Question: ${packet.question}`,
-    `- Rationale: ${packet.rationale}`,
-    `- Likely owner: ${packet.likelyOwner.person} — ${packet.likelyOwner.reason}`,
-    "- Options:",
-    ...options,
+    "| Question | Recommendation |",
+    "|---|---|",
+    `| ${tableCell(packet.question)} | **${tableCell(recommendation.title)}:** ${tableCell(recommendation.body)} |`,
+    "",
+    `Why: ${packet.rationale}`,
   ].join("\n");
 }
 
@@ -273,9 +302,14 @@ export function syncDecisionPacketRecord(
     ...(options.reportUrl ? { reportUrl: options.reportUrl } : {}),
     ...(options.subjectState ? { subjectState: options.subjectState } : {}),
   });
-  const number = numberValue(frontMatter(options.markdown).number);
+  const frontmatter = readFrontMatter(options.markdown);
+  const reportNumber = reportNumberFromPath(options.reportPath);
+  const metadataNumber = frontmatter.ambiguous ? null : numberValue(frontmatter.values.number);
+  const number = reportNumber ?? metadataNumber;
   const packetPath = number === null ? undefined : `${options.packetsDir}/${number}.json`;
-  if (!packet || !packetPath) {
+  const packetMatchesReport =
+    packet !== null && (reportNumber === null || packet.subject.number === reportNumber);
+  if (!packetMatchesReport || !packetPath) {
     if (packetPath && existsSync(packetPath)) unlinkSync(packetPath);
     return {
       markdown: replacePacketFrontmatter(options.markdown, "none", "none"),
@@ -352,14 +386,26 @@ function enumValue<T extends string>(value: unknown, values: ReadonlySet<T>, pat
 }
 
 function frontMatter(markdown: string): Record<string, string> {
-  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const parsed = readFrontMatter(markdown);
+  if (parsed.ambiguous) throw new Error("report front matter is ambiguous");
+  return parsed.values;
+}
+
+function readFrontMatter(markdown: string): {
+  values: Record<string, string>;
+  ambiguous: boolean;
+} {
+  const parsed = parseReportFrontMatter(markdown);
   const values: Record<string, string> = {};
-  for (const line of (match?.[1] ?? "").split(/\r?\n/)) {
-    const separator = line.indexOf(":");
-    if (separator <= 0) continue;
-    values[line.slice(0, separator).trim()] = unquote(line.slice(separator + 1).trim());
+  if (!parsed) return { values, ambiguous: false };
+  let ambiguous = parsed.ambiguous;
+  const competingKeys = new Set([...parsed.competingKeys].map((key) => key.trim()));
+  for (const [rawKey, entries] of parsed.fields) {
+    const key = rawKey.trim();
+    if (Object.hasOwn(values, key) || competingKeys.has(key)) ambiguous = true;
+    values[key] = unquote((entries[0] ?? "").trim());
   }
-  return values;
+  return { values, ambiguous };
 }
 
 function replacePacketFrontmatter(markdown: string, path: string, sha256: string): string {
@@ -433,6 +479,11 @@ function unquote(value: string): string {
 
 function repoRelativePath(repoRoot: string, path: string): string {
   return relative(repoRoot, path).replace(/\\/g, "/");
+}
+
+function reportNumberFromPath(reportPath: string): number | null {
+  const match = basename(reportPath).match(/(?:^|-)([1-9]\d*)\.md$/);
+  return numberValue(match?.[1]);
 }
 
 function escapeRegExp(value: string): string {

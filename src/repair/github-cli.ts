@@ -4,7 +4,9 @@ import { promisify } from "node:util";
 import { stripAnsi } from "./comment-router-utils.js";
 import { ghCliEnv } from "./process-env.js";
 import { repoRoot } from "./paths.js";
-import { ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
+import { GitHubRateLimitError, ghRetryKind, ghRetryWaitMs } from "../github-retry.js";
+import { parseGhJsonWithRetry, parseGhJsonWithRetryAsync } from "../github-json.js";
+import { isPublicOpenClawReadOnlyRequest } from "../github-public-read.js";
 import { resolveCommand } from "../command.js";
 
 const execFileAsync = promisify(execFile);
@@ -13,11 +15,19 @@ export type GhRunOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string;
+  timeoutMs?: number;
 };
 
 export type GhRetryOptions = GhRunOptions & {
   attempts?: number;
 };
+
+type PublicReadFallback = {
+  appToken: string;
+  options: GhRunOptions;
+};
+
+const claimedPublicReadFallbackTokens = new Set<string>();
 
 export function ghJson<T = JsonValue>(ghArgs: string[], options: GhRunOptions = {}): T {
   return JSON.parse(ghText(ghArgs, options) || "null") as T;
@@ -27,14 +37,22 @@ export function ghJsonWithRetry<T = JsonValue>(
   ghArgs: string[],
   options: GhRetryOptions | number = {},
 ): T {
-  return JSON.parse(ghTextWithRetry(ghArgs, options) || "null") as T;
+  return parseGhJsonWithRetry<T>(() => ghTextWithRetry(ghArgs, options) || "null", ghArgs, {
+    onRetry: (_error, attempt) => sleepMs(ghRetryWaitMs("transient", attempt - 1)),
+  });
 }
 
 export async function ghJsonWithRetryAsync<T = JsonValue>(
   ghArgs: string[],
   options: GhRetryOptions | number = {},
 ): Promise<T> {
-  return JSON.parse((await ghTextWithRetryAsync(ghArgs, options)) || "null") as T;
+  return parseGhJsonWithRetryAsync<T>(
+    async () => (await ghTextWithRetryAsync(ghArgs, options)) || "null",
+    ghArgs,
+    {
+      onRetry: (_error, attempt) => sleepAsync(ghRetryWaitMs("transient", attempt - 1)),
+    },
+  );
 }
 
 export function ghJsonBestEffort<T = JsonValue>(
@@ -134,6 +152,7 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
     } catch (error) {
       lastError = error;
       const retryKind = ghRetryKind(error);
+      if (retryKind === "throttle") throw new GitHubRateLimitError(error);
       if (attempt >= attempts || retryKind === "none") throw error;
       sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
     }
@@ -142,10 +161,11 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
 }
 
 export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
-  const env = ghEnv(options.env);
+  const env = ghCommandEnv(ghArgs, options);
   const command = ghCommand(ghArgs, env);
   const text = execFileSync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
+    timeout: ghRunTimeoutMs(options, env),
     env,
     encoding: "utf8",
     input: options.input,
@@ -158,13 +178,33 @@ export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
 export function ghTextWithRetry(ghArgs: string[], options: GhRetryOptions | number = {}): string {
   const resolved = resolveRetryOptions(options);
   const attempts = Math.max(1, resolved.attempts ?? 6);
+  let activeOptions: GhRunOptions = resolved;
+  const publicReadFallback = publicReadFallbackOptions(ghArgs, resolved);
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return ghText(ghArgs, resolved);
+      return ghText(ghArgs, activeOptions);
     } catch (error) {
       lastError = error;
       const retryKind = ghRetryKind(error);
+      const fallback =
+        retryKind === "throttle" ? claimPublicReadFallback(publicReadFallback) : null;
+      if (retryKind === "throttle" && fallback) {
+        activeOptions = fallback;
+        try {
+          return ghText(ghArgs, fallback);
+        } catch (fallbackError) {
+          lastError = fallbackError;
+          const fallbackRetryKind = ghRetryKind(fallbackError);
+          if (fallbackRetryKind === "throttle") {
+            throw new GitHubRateLimitError(fallbackError);
+          }
+          if (attempt >= attempts || fallbackRetryKind === "none") throw fallbackError;
+          sleepMs(ghRetryWaitMs(fallbackRetryKind, attempt - 1));
+          continue;
+        }
+      }
+      if (retryKind === "throttle") throw new GitHubRateLimitError(error);
       if (attempt >= attempts || retryKind === "none") throw error;
       sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
     }
@@ -178,13 +218,33 @@ export async function ghTextWithRetryAsync(
 ): Promise<string> {
   const resolved = resolveRetryOptions(options);
   const attempts = Math.max(1, resolved.attempts ?? 6);
+  let activeOptions: GhRunOptions = resolved;
+  const publicReadFallback = publicReadFallbackOptions(ghArgs, resolved);
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await ghTextAsync(ghArgs, resolved);
+      return await ghTextAsync(ghArgs, activeOptions);
     } catch (error) {
       lastError = error;
       const retryKind = ghRetryKind(error);
+      const fallback =
+        retryKind === "throttle" ? claimPublicReadFallback(publicReadFallback) : null;
+      if (retryKind === "throttle" && fallback) {
+        activeOptions = fallback;
+        try {
+          return await ghTextAsync(ghArgs, fallback);
+        } catch (fallbackError) {
+          lastError = fallbackError;
+          const fallbackRetryKind = ghRetryKind(fallbackError);
+          if (fallbackRetryKind === "throttle") {
+            throw new GitHubRateLimitError(fallbackError);
+          }
+          if (attempt >= attempts || fallbackRetryKind === "none") throw fallbackError;
+          await sleepAsync(ghRetryWaitMs(fallbackRetryKind, attempt - 1));
+          continue;
+        }
+      }
+      if (retryKind === "throttle") throw new GitHubRateLimitError(error);
       if (attempt >= attempts || retryKind === "none") throw error;
       await sleepAsync(ghRetryWaitMs(retryKind, attempt - 1));
     }
@@ -194,10 +254,11 @@ export async function ghTextWithRetryAsync(
 
 export async function ghTextAsync(ghArgs: string[], options: GhRunOptions = {}): Promise<string> {
   if (options.input !== undefined) return ghText(ghArgs, options);
-  const env = ghEnv(options.env);
+  const env = ghCommandEnv(ghArgs, options);
   const command = ghCommand(ghArgs, env);
   const { stdout } = await execFileAsync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
+    timeout: ghRunTimeoutMs(options, env),
     env,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -229,6 +290,7 @@ export function ghSpawn(ghArgs: string[], options: GhRunOptions = {}) {
   const command = ghCommand(ghArgs, env);
   return spawnSync(command.command, command.args, {
     cwd: options.cwd ?? repoRoot(),
+    timeout: ghRunTimeoutMs(options, env),
     encoding: "utf8",
     env,
     input: options.input,
@@ -238,6 +300,56 @@ export function ghSpawn(ghArgs: string[], options: GhRunOptions = {}) {
 
 export function ghEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return ghCliEnv(overrides);
+}
+
+function ghCommandEnv(ghArgs: readonly string[], options: GhRunOptions): NodeJS.ProcessEnv {
+  const overrides = options.env ?? {};
+  const env = ghEnv(overrides);
+  const publicToken = publicReadToken(ghArgs, options, env);
+  if (!publicToken) return env;
+  return ghEnv({ ...overrides, GH_TOKEN: publicToken });
+}
+
+function publicReadToken(
+  ghArgs: readonly string[],
+  options: GhRunOptions,
+  env = ghEnv(options.env ?? {}),
+): string | null {
+  const overrides = options.env ?? {};
+  const publicToken = process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN?.trim();
+  if (
+    !publicToken ||
+    options.input !== undefined ||
+    Object.hasOwn(overrides, "GH_TOKEN") ||
+    Object.hasOwn(overrides, "GITHUB_TOKEN") ||
+    (env.GH_HOST && env.GH_HOST.toLowerCase() !== "github.com") ||
+    !isPublicOpenClawReadOnlyRequest(ghArgs)
+  ) {
+    return null;
+  }
+  return publicToken;
+}
+
+function publicReadFallbackOptions(
+  ghArgs: readonly string[],
+  options: GhRunOptions,
+): PublicReadFallback | null {
+  const overrides = options.env ?? {};
+  const publicToken = publicReadToken(ghArgs, options);
+  const appToken = process.env.GH_TOKEN?.trim();
+  if (!publicToken || !appToken || publicToken === appToken) {
+    return null;
+  }
+  return {
+    appToken,
+    options: { ...options, env: { ...overrides, GH_TOKEN: appToken } },
+  };
+}
+
+function claimPublicReadFallback(fallback: PublicReadFallback | null): GhRunOptions | null {
+  if (!fallback || claimedPublicReadFallbackTokens.has(fallback.appToken)) return null;
+  claimedPublicReadFallbackTokens.add(fallback.appToken);
+  return fallback.options;
 }
 
 export function ghErrorText(error: unknown): string {
@@ -268,9 +380,31 @@ export function ghStdoutFromError(error: unknown): string {
   ).trim();
 }
 
+function ghRunTimeoutMs(options: GhRunOptions, env: NodeJS.ProcessEnv): number {
+  if (
+    options.timeoutMs !== undefined &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+  ) {
+    return Math.max(1, Math.floor(options.timeoutMs));
+  }
+  const configured = Number(
+    env.CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS ?? env.CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS,
+  );
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(30_000, Math.floor(configured))
+    : 120_000;
+}
+
 function resolveRetryOptions(options: GhRetryOptions | number): GhRetryOptions {
   if (typeof options === "number") return { attempts: options };
-  return options;
+  if (options.attempts !== undefined) return options;
+  const configuredValue =
+    options.env?.CLAWSWEEPER_GH_RETRY_ATTEMPTS ?? process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  if (configuredValue == null || configuredValue.trim() === "") return options;
+  const configuredAttempts = Number(configuredValue);
+  if (!Number.isFinite(configuredAttempts)) return options;
+  return { ...options, attempts: Math.max(1, Math.floor(configuredAttempts)) };
 }
 
 function ghCommand(

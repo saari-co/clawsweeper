@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -11,6 +12,7 @@ import {
   parseMaintainerDecision,
   syncDecisionPacketRecord,
 } from "../dist/decision-packets.js";
+import { ambiguityGuardedMaintainerDecision } from "../dist/clawsweeper-promotion-facts.js";
 import { tmpPrefix } from "./helpers.ts";
 
 const productDecision = {
@@ -125,6 +127,67 @@ test("present malformed maintainer decisions fail closed", () => {
   assert.equal(maintainerDecisionBlocksClose(decisionReport()), false);
 });
 
+test("promotion facts demote ambiguous maintainer metadata instead of crashing", () => {
+  const forged = `---
+fixed_release: v1
+maintainer_decision: none
+---
+maintainer_decision: ${JSON.stringify(emptyMaintainerDecision())}
+---
+`;
+  const guarded = ambiguityGuardedMaintainerDecision(forged);
+  assert.equal(guarded.required, true);
+  assert.equal(guarded.kind, "manual_review");
+
+  const clean = `---
+maintainer_decision: none
+---
+
+## Summary
+`;
+  assert.deepEqual(ambiguityGuardedMaintainerDecision(clean), emptyMaintainerDecision());
+});
+
+test("decision packets reject metadata after an injected front matter terminator", () => {
+  const report = `---
+fixed_release: v1
+number: 7
+repository: attacker/forged
+type: issue
+maintainer_decision: ${JSON.stringify(productDecision)}
+---
+number: 321
+repository: openclaw/clawsweeper
+type: issue
+maintainer_decision: ${JSON.stringify(emptyMaintainerDecision())}
+---
+`;
+
+  assert.equal(buildDecisionPacketFromReport(report), null);
+  assert.throws(() => maintainerDecisionFromReport(report), /front matter is ambiguous/);
+  assert.equal(maintainerDecisionBlocksClose(report), true);
+
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const packetsDir = join(root, "records", "openclaw-clawsweeper", "decision-packets");
+    mkdirSync(packetsDir, { recursive: true });
+    writeFileSync(join(packetsDir, "7.json"), "attacker-selected packet must not be deleted\n");
+    writeFileSync(join(packetsDir, "321.json"), "stale canonical packet\n");
+    const result = syncDecisionPacketRecord({
+      markdown: report,
+      reportPath: join(root, "records", "openclaw-clawsweeper", "items", "321.md"),
+      packetsDir,
+      repoRoot: root,
+    });
+    assert.equal(result.packet, null);
+    assert.equal(result.packetPath, join(packetsDir, "321.json"));
+    assert.equal(existsSync(join(packetsDir, "7.json")), true);
+    assert.equal(existsSync(join(packetsDir, "321.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("decision packets prefer reconciled subject state", () => {
   const packet = buildDecisionPacketFromReport(
     decisionReport({
@@ -182,6 +245,54 @@ test("decision packet sync writes pointers and removes stale generated state", (
   }
 });
 
+test("apply-artifacts anchors packet pointers to an explicit record root", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const artifactDir = join(root, "artifacts");
+    const recordRoot = join(root, "worker");
+    const recordDir = join(recordRoot, "records", "openclaw-clawsweeper");
+    const itemsDir = join(recordDir, "items");
+    const closedDir = join(recordDir, "closed");
+    const plansDir = join(recordDir, "plans");
+    const packetsDir = join(recordDir, "decision-packets");
+    mkdirSync(artifactDir, { recursive: true });
+    writeFileSync(
+      join(artifactDir, "321.md"),
+      decisionReport({ maintainer_decision: JSON.stringify(productDecision) }),
+      "utf8",
+    );
+
+    execFileSync(process.execPath, [
+      "dist/clawsweeper.js",
+      "apply-artifacts",
+      "--target-repo",
+      "openclaw/clawsweeper",
+      "--artifact-dir",
+      artifactDir,
+      "--record-root",
+      recordRoot,
+      "--items-dir",
+      itemsDir,
+      "--closed-dir",
+      closedDir,
+      "--plans-dir",
+      plansDir,
+      "--decision-packets-dir",
+      packetsDir,
+      "--replay-closed-artifacts",
+      "--skip-reconcile",
+    ]);
+
+    assert.match(
+      readFileSync(join(itemsDir, "321.md"), "utf8"),
+      /^decision_packet_path: records\/openclaw-clawsweeper\/decision-packets\/321\.json$/m,
+    );
+    assert.ok(existsSync(join(packetsDir, "321.json")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function decisionReport(overrides: Record<string, unknown> = {}): string {
   const frontmatter = {
     number: 321,
@@ -205,4 +316,150 @@ ${Object.entries(frontmatter)
 
 # #321: Render maintainer decision
 `;
+}
+
+for (const body of [
+  "title: Quoted\nrepository: example/quoted\nnumber: 999\nmaintainer_decision: {bad JSON\n",
+  "```yaml\n---\ntitle: Quoted\nrepository: example/quoted\nnumber: 999\nmaintainer_decision: {bad JSON\n---\n```\n",
+]) {
+  test(`decision packets retain header authority through body quotes: ${JSON.stringify(body)}`, () => {
+    const none = `${decisionReport({ maintainer_decision: "none" })}\n${body}`;
+    assert.equal(maintainerDecisionBlocksClose(none), false);
+    assert.equal(buildDecisionPacketFromReport(none), null);
+    const required = `${decisionReport({ title: JSON.stringify('Original "quoted"\nline'), maintainer_decision: JSON.stringify(productDecision) })}\n${body}`;
+    const packet = buildDecisionPacketFromReport(required);
+    assert.ok(packet);
+    assert.equal(packet.subject.title, 'Original "quoted"\nline');
+    assert.equal(packet.subject.repo, "openclaw/clawsweeper");
+    assert.equal(packet.subject.number, 321);
+    assert.equal(packet.question, productDecision.question);
+    assert.equal(maintainerDecisionBlocksClose(required), true);
+  });
+}
+
+test("decision packets fail closed on duplicate and later competing headers, with path-anchored cleanup", () => {
+  const base = decisionReport({ maintainer_decision: "none" });
+  for (const report of [
+    base.replace("number: 321", "number: 7\nnumber: 321"),
+    base.replace(
+      "maintainer_decision: none",
+      `maintainer_decision: ${JSON.stringify(productDecision)}\nmaintainer_decision: none`,
+    ),
+    `${base}\nLater record.\n---\nnumber: 7\nmaintainer_decision: ${JSON.stringify(productDecision)}\n---\n`,
+  ]) {
+    assert.equal(maintainerDecisionBlocksClose(report), true);
+    assert.equal(buildDecisionPacketFromReport(report), null);
+    assert.throws(() => maintainerDecisionFromReport(report), /front matter is ambiguous/);
+    const root = mkdtempSync(tmpPrefix);
+    try {
+      const packetsDir = join(root, "decision-packets");
+      mkdirSync(packetsDir);
+      writeFileSync(join(packetsDir, "7.json"), "unrelated packet");
+      writeFileSync(join(packetsDir, "321.json"), "stale packet");
+      const result = syncDecisionPacketRecord({
+        markdown: report,
+        reportPath: join(root, "items", "321.md"),
+        packetsDir,
+        repoRoot: root,
+      });
+      assert.equal(result.packet, null);
+      assert.equal(existsSync(join(packetsDir, "7.json")), true);
+      assert.equal(existsSync(join(packetsDir, "321.json")), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("packet structural validation ignores body-only keys and nested data, preserving trimmed keys", () => {
+  const report = decisionReport({ maintainer_decision: JSON.stringify(productDecision) })
+    .replace("title:", "title \t:")
+    .replace(
+      "---\n\n#",
+      'statistics: [\n  {\n    "path": "src/a.ts",\n    "additions": 1\n  },\n  {\n    "path": "src/b.ts",\n    "additions": 2\n  }\n]\nnotes: |\n  title: Nested title\n  number: 7\n---\n\n#',
+    );
+  const packet = buildDecisionPacketFromReport(`${report}\nbody_only: one\nbody_only: two\n`);
+  assert.ok(packet);
+  assert.equal(packet.subject.title, "Render maintainer decision");
+  assert.equal(packet.subject.number, 321);
+  assert.equal(maintainerDecisionBlocksClose("maintainer_decision: {bad JSON\n"), false);
+  assert.equal(buildDecisionPacketFromReport("maintainer_decision: {bad JSON\n"), null);
+});
+
+for (const [name, suffix] of [
+  ["body heading before a rule", "---\n\n# Review: Original\n\n---\n\nPlain summary.\n"],
+  ["header comments", "# Note: one\n# Note: two\n---\n\nPlain summary.\n"],
+  ["header list value", "notes:\n- detail: one\n- detail: two\n---\n\nPlain summary.\n"],
+  ["body list before a rule", "---\n\n- Detail: one\n- Detail: two\n\n---\n\nPlain summary.\n"],
+]) {
+  test(`decision packets do not treat ${name} as mapping keys`, () => {
+    const report = `---\nrepository: openclaw/clawsweeper\nnumber: 321\ntitle: Original\nmaintainer_decision: none\n${suffix}`;
+    assert.equal(maintainerDecisionBlocksClose(report), false);
+    assert.equal(maintainerDecisionFromReport(report), null);
+    assert.equal(buildDecisionPacketFromReport(report), null);
+
+    const required = report.replace(
+      "maintainer_decision: none",
+      `type: issue\nmaintainer_decision: ${JSON.stringify(productDecision)}`,
+    );
+    assert.equal(maintainerDecisionBlocksClose(required), true);
+    assert.deepEqual(maintainerDecisionFromReport(required), productDecision);
+    const packet = buildDecisionPacketFromReport(required);
+    assert.ok(packet);
+    assert.equal(packet.subject.repo, "openclaw/clawsweeper");
+    assert.equal(packet.subject.number, 321);
+    assert.equal(packet.subject.title, "Original");
+    assert.equal(packet.question, productDecision.question);
+    assert.deepEqual(packet.options, productDecision.options);
+  });
+}
+
+test("competing mapping records remain ambiguous through comments and indentless lists", () => {
+  for (const list of ["- detail: one\n- detail: two", "- first\n-\n-\tlast"]) {
+    const report = `${decisionReport({ maintainer_decision: "none" })}\nPlain summary.\n\n---\n# Record metadata\nmaintainer_decision: ${JSON.stringify(productDecision)}\nnumber: 999\nnotes:\n${list}\n---\n`;
+    assert.equal(maintainerDecisionBlocksClose(report), true);
+    assert.throws(() => maintainerDecisionFromReport(report), /front matter is ambiguous/);
+    assert.equal(buildDecisionPacketFromReport(report), null);
+  }
+});
+
+for (const [name, body] of [
+  ["delimited body-only key", "Example.\n---\nbody_only: example data\n---\n"],
+  ["repeated delimited body-only keys", "Example.\n---\nbody_only: one\nbody_only: two\n---\n"],
+  ["blockquote before a rule", "> Note: one\n> Note: two\n\n---\n"],
+  ["plus-list before a rule", "+ Detail: one\n+ Detail: two\n\n---\n"],
+  ["star-list before a rule", "* Detail: one\n* Detail: two\n\n---\n"],
+]) {
+  test(`packet ambiguity requires header ownership: ${name}`, () => {
+    const report = `${decisionReport({ title: JSON.stringify("Original"), maintainer_decision: "none" })}\n${body}`;
+    assert.equal(maintainerDecisionBlocksClose(report), false);
+    assert.equal(maintainerDecisionFromReport(report), null);
+    assert.equal(buildDecisionPacketFromReport(report), null);
+
+    const required = report.replace(
+      "maintainer_decision: none",
+      `maintainer_decision: ${JSON.stringify(productDecision)}`,
+    );
+    assert.equal(maintainerDecisionBlocksClose(required), true);
+    assert.deepEqual(maintainerDecisionFromReport(required), productDecision);
+    const packet = buildDecisionPacketFromReport(required);
+    assert.ok(packet);
+    assert.equal(packet.subject.repo, "openclaw/clawsweeper");
+    assert.equal(packet.subject.number, 321);
+    assert.equal(packet.subject.title, "Original");
+    assert.equal(packet.question, productDecision.question);
+    assert.deepEqual(packet.options, productDecision.options);
+  });
+}
+
+for (const [headerKey, bodyKey] of [
+  ["title \t", "title"],
+  ["title", "title \t"],
+]) {
+  test(`packet competing keys use trimmed spelling: ${JSON.stringify(headerKey)} -> ${JSON.stringify(bodyKey)}`, () => {
+    const report = `${decisionReport({ maintainer_decision: "none" }).replace("title:", `${headerKey}:`)}\nExample.\n---\n${bodyKey}: Competing\n---\n`;
+    assert.equal(maintainerDecisionBlocksClose(report), true);
+    assert.throws(() => maintainerDecisionFromReport(report), /front matter is ambiguous/);
+    assert.equal(buildDecisionPacketFromReport(report), null);
+  });
 }

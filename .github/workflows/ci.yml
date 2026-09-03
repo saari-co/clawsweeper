@@ -21,38 +21,70 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  hosted-review-scan:
+    name: Hosted native review scan smoke
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build
+      - uses: ./.github/actions/setup-codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
+      - name: Prove refusal then clean structured review
+        run: node scripts/hosted-review-scan-smoke.mjs "$RUNNER_TEMP/hosted-review-scan-proof.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hosted-review-scan-proof
+          path: ${{ runner.temp }}/hosted-review-scan-proof.json
+          if-no-files-found: error
+
   check:
     name: pnpm check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-        with:
-          sparse-checkout: |
-            .github
-            config
-            dashboard
-            docs
-            instructions
-            prompts
-            schema
-            scripts
-            src
-            test
-            .oxfmtrc.json
-            AGENTS.md
-            README.md
-            package.json
-            pnpm-lock.yaml
-            tsconfig.dashboard.json
-            tsconfig.json
-            tsconfig.repair.json
-          sparse-checkout-cone-mode: false
+
+      - name: Validate workflow semantics
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_LINUX_AMD64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          actionlint_archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --show-error --silent --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$actionlint_archive"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$actionlint_archive" | sha256sum --check -
+          tar -xzf "$actionlint_archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" \
+            -shellcheck= \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml
 
       - uses: ./.github/actions/setup-pnpm
 
       - name: Run check
         run: pnpm run check
+
+  sparse-repair-builds:
+    name: sparse repair build smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Build each sparse repair checkout
+        run: pnpm run test:workflow-sparse-checkout
 
   windows-codex-launch:
     name: Windows Codex launcher

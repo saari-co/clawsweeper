@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  allowedRepairOwners,
+  assertAllowedOwner,
   hasDeterministicSecuritySignal,
   hasSecuritySignalText,
+  isAllowedRepairOwner,
   parseArgs,
   parseSimpleYaml,
   renderPrompt,
@@ -51,6 +54,32 @@ candidates:
   assert.deepEqual(validateJob({ frontmatter }), ["unsupported job_intent: surprise"]);
 });
 
+test("validateJob accepts only explicit autofix or automerge repair modes", () => {
+  const base = `repo: openclaw/openclaw
+cluster_id: smoke
+mode: autonomous
+allowed_actions:
+  - comment
+candidates:
+  - "#1"
+`;
+
+  for (const mode of ["autofix", "automerge"]) {
+    const frontmatter = parseSimpleYaml(`${base}repair_mode: ${mode}\n`);
+    assert.deepEqual(validateJob({ frontmatter }), []);
+  }
+
+  const invalid = parseSimpleYaml(`${base}repair_mode: merge-everything\n`);
+  assert.deepEqual(validateJob({ frontmatter: invalid }), [
+    "unsupported repair_mode: merge-everything",
+  ]);
+
+  assert.throws(
+    () => parseSimpleYaml(`${base}repair_mode: automerge\nrepair_mode: autofix\n`),
+    /duplicate repair_mode/,
+  );
+});
+
 test("security signal detection ignores non-security advisory wording", () => {
   assert.equal(
     hasSecuritySignalText(
@@ -84,5 +113,24 @@ test("deterministic security signals accept labels and structured ClawSweeper ma
       comments: ["<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->"],
     }),
     true,
+  );
+});
+
+test("repair owner policy accepts a comma or whitespace separated owner list", () => {
+  assert.deepEqual(allowedRepairOwners("openclaw, steipete"), ["openclaw", "steipete"]);
+  assert.deepEqual(allowedRepairOwners("  OpenClaw   steipete\n"), ["openclaw", "steipete"]);
+  assert.deepEqual(allowedRepairOwners(undefined), []);
+
+  assert.equal(isAllowedRepairOwner("openclaw/openclaw", "openclaw,steipete"), true);
+  assert.equal(isAllowedRepairOwner("steipete/oracle", "openclaw,steipete"), true);
+  assert.equal(isAllowedRepairOwner("Steipete/oracle", "openclaw,steipete"), true);
+  assert.equal(isAllowedRepairOwner("evil/oracle", "openclaw,steipete"), false);
+  // An empty policy keeps the historical fail-open behavior of assertAllowedOwner.
+  assert.equal(isAllowedRepairOwner("anyone/repo", undefined), true);
+
+  assertAllowedOwner("steipete/oracle", "openclaw,steipete");
+  assert.throws(
+    () => assertAllowedOwner("evil/oracle", "openclaw,steipete"),
+    /repo owner evil does not match CLAWSWEEPER_ALLOWED_OWNER=openclaw,steipete/,
   );
 });

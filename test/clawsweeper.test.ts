@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { parse as parseYaml } from "yaml";
 
 import {
   applyDecisionPriority,
@@ -13,6 +14,7 @@ import {
   codexLoginConfig,
   codexLoginMethod,
   coverageProofRetryExhaustedRuntimeBudget,
+  dashboardFailedReviewRetryActivityForTest,
   dashboardClosedAt,
   formatRecentClosedRows,
   ghRetryKind,
@@ -20,6 +22,7 @@ import {
   isGitHubNotFoundError,
   isGitHubRequiresAuthenticationError,
   isLockedConversationCommentError,
+  itemSourceRevisionSha256ForTest,
   itemNumbersArg,
   lockedConversationApplyReason,
   parseDecision,
@@ -39,6 +42,7 @@ import {
   timeoutWithinRuntimeBudget,
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
+import { GitHubRateLimitError } from "../dist/github-retry.js";
 import { AUTOMATION_LIMITS } from "../dist/limits.js";
 import {
   auditRecord,
@@ -93,8 +97,9 @@ test("review comments include a compact maintainer decision packet block", () =>
 
   assert.match(comment, /\*\*Maintainer decision needed\*\*/);
   assert.match(comment, /Should this product contract be accepted\?/);
-  assert.match(comment, /Accept the contract \(recommended\)/);
-  assert.match(comment, /Likely owner: @owner/);
+  assert.match(comment, /\| Question \| Recommendation \|/);
+  assert.match(comment, /\*\*Accept the contract:\*\* Adopt and document the proposed behavior\./);
+  assert.doesNotMatch(comment, /Likely owner: @owner/);
 });
 
 test("close proposals that require maintainer decisions render as kept open", () => {
@@ -110,14 +115,33 @@ test("close proposals that require maintainer decisions render as kept open", ()
     "implemented_or_shipped",
   );
 
-  assert.match(comment, /\*\*Maintainer decision needed\*\*/);
+  assert.match(comment, /## Decision needed/);
   assert.match(comment, /Should this product contract be accepted\?/);
-  assert.match(comment, /Accept the contract \(recommended\)/);
-  assert.match(comment, /Likely owner: @owner/);
+  assert.match(comment, /\| Question \| Recommendation \|/);
+  assert.match(comment, /\*\*Accept the contract:\*\* Adopt and document the proposed behavior\./);
+  assert.doesNotMatch(comment, /Likely owner: @owner/);
   assert.match(comment, /clawsweeper-verdict:needs-human/);
   assert.doesNotMatch(comment, /Closing this PR/);
   assert.doesNotMatch(comment, /clawsweeper-verdict:close/);
   assert.doesNotMatch(comment, /clawsweeper-action:close-required/);
+});
+
+test("review-only comments omit actionable automation markers", () => {
+  const report = implementedCloseReport({
+    repository: "openclaw/openclaw",
+    type: "pull_request",
+    pull_head_sha: "abc123def456",
+  });
+  const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
+  const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {
+    suppressAutomationMarkers: true,
+  });
+
+  assert.match(routableComment, /clawsweeper-(?:verdict|action):/);
+  assert.match(comment, /Review details/);
+  assert.match(comment, /clawsweeper-review-version/);
+  assert.doesNotMatch(comment, /clawsweeper-verdict:/);
+  assert.doesNotMatch(comment, /clawsweeper-action:/);
 });
 
 test("apply-decisions archives live-closed skipped records without reopening close gates", () => {
@@ -142,7 +166,7 @@ const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {
@@ -261,7 +285,7 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
   }
 });
 
-test("apply-decisions writes decision packets for changed-since-review reports", () => {
+test("apply-decisions writes decision packets for protected close-guard reports", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -323,8 +347,8 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
-        action: "skipped_changed_since_review",
-        reason: "updated_at changed",
+        action: "skipped_protected_label",
+        reason: "protected label: clawsweeper:needs-product-decision",
       },
     ]);
     assert.equal(existsSync(join(root, "decision-packets", "321.json")), true);
@@ -422,13 +446,8 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
-        action: "review_comment_synced",
-        reason: "updated durable Codex review comment",
-      },
-      {
-        number: 321,
-        action: "kept_open",
-        reason: `maintainer decision required: ${maintainerDecision.question}`,
+        action: "skipped_protected_label",
+        reason: "protected label: clawsweeper:needs-product-decision",
       },
     ]);
   } finally {
@@ -553,7 +572,7 @@ const updatedAt = { 321: "2026-05-01T00:00:00Z", 322: "2026-05-02T00:00:00Z" };
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
 if (args[0] === "api" && commentMatch) {
@@ -714,7 +733,7 @@ const comments = ${JSON.stringify({ 321: first.comment, 322: second.comment })};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
 if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
@@ -722,6 +741,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
   const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
   appendFileSync(logPath, JSON.stringify(["comment-patch", body]) + "\\n");
   console.log(JSON.stringify({ id: 9000 + 321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", body }));
+} else if (args[0] === "api" && /\\/issues\\/\\d+\\/timeline(?:\\?|$)/.test(path)) {
+  console.log("HTTP/2 200\\n\\n[]");
 } else if (args[0] === "api" && commentMatch) {
   const number = Number(commentMatch[1]);
   const body = comments[number];
@@ -809,13 +830,17 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
       calls.some((args) => args.some((arg) => arg.includes("/issues/322"))),
       false,
     );
-    const reviewCommentListFetches = calls.filter(
-      (args) =>
-        args[0] === "api" &&
-        (args[1] ?? "").includes("/issues/321/comments") &&
-        args.includes("--paginate"),
-    );
-    assert.equal(reviewCommentListFetches.length, 1);
+    const commentMutationIndex = calls.findIndex((args) => args[0] === "comment-patch");
+    assert.ok(commentMutationIndex >= 0);
+    const postMutationReviewCommentFetches = calls
+      .slice(commentMutationIndex + 1)
+      .filter(
+        (args) =>
+          args[0] === "api" &&
+          (args[1] ?? "").includes("/issues/321/comments") &&
+          args.includes("--paginate"),
+      );
+    assert.equal(postMutationReviewCommentFetches.length, 1);
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
@@ -853,11 +878,32 @@ test("apply-decisions syncs labels when first review placeholder advanced issue 
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
 
+    const issue = {
+      number: 321,
+      title: "Render work plans",
+      body: null,
+      html_url: "https://github.com/openclaw/clawsweeper/issues/321",
+      created_at: "2026-05-01T00:00:00Z",
+      updated_at: "2026-05-01T00:01:01Z",
+      closed_at: null,
+      state: "open",
+      locked: false,
+      active_lock_reason: null,
+      author_association: "CONTRIBUTOR",
+      user: { login: "reporter" },
+      labels: [],
+      comments: 1,
+      pull_request: null,
+    };
+    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
     const report = workPlanCandidateReport({
       number: 321,
       reviewed_at: "2026-05-01T00:05:00Z",
       item_snapshot_hash: "reviewed-snapshot-321",
       item_updated_at: "2026-05-01T00:00:00Z",
+      item_source_revision: sourceRevision,
+      review_lease_owner: "review-owner",
+      review_lease_comment_id: "9321",
       triage_priority: "P1",
       impact_labels: JSON.stringify(["impact:message-loss"]),
       item_category: "bug",
@@ -874,19 +920,25 @@ test("apply-decisions syncs labels when first review placeholder advanced issue 
       number: 321,
       kind: "issue",
       title: "Render work plans",
+      headSha: sourceRevision,
+      leaseOwner: "review-owner",
     });
 
     const ghMock = `
 const { appendFileSync, readFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
 const placeholder = ${JSON.stringify(placeholder)};
+const issue = ${JSON.stringify(issue)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
 const path = args.includes("-i") ? args[args.indexOf("-i") + 1] : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
-if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
+if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path) && args.includes("DELETE")) {
+  appendFileSync(logPath, JSON.stringify(["lease-delete", path]) + "\\n");
+  console.log("");
+} else if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
   const inputPath = args[args.indexOf("--input") + 1];
   const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
   appendFileSync(logPath, JSON.stringify(["comment-patch", body]) + "\\n");
@@ -894,6 +946,18 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     id: 9321,
     html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321",
     created_at: "2026-05-01T00:01:00Z",
+    updated_at: "2026-05-01T00:06:00Z",
+    user: { login: "clawsweeper[bot]" },
+    body
+  }));
+} else if (args[0] === "api" && commentMatch && args.includes("--method") && args.includes("POST")) {
+  const inputPath = args[args.indexOf("--input") + 1];
+  const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["comment-post", body]) + "\\n");
+  console.log(JSON.stringify({
+    id: 9322,
+    html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9322",
+    created_at: "2026-05-01T00:06:00Z",
     updated_at: "2026-05-01T00:06:00Z",
     user: { login: "clawsweeper[bot]" },
     body
@@ -915,22 +979,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     actor: { login: "clawsweeper[bot]" }
   }]));
 } else if (args[0] === "api" && issueMatch) {
-  console.log(JSON.stringify({
-    number: 321,
-    title: "Render work plans",
-    html_url: "https://github.com/openclaw/clawsweeper/issues/321",
-    created_at: "2026-05-01T00:00:00Z",
-    updated_at: "2026-05-01T00:01:01Z",
-    closed_at: null,
-    state: "open",
-    locked: false,
-    active_lock_reason: null,
-    author_association: "CONTRIBUTOR",
-    user: { login: "reporter" },
-    labels: [],
-    comments: 1,
-    pull_request: null
-  }));
+  console.log(JSON.stringify(issue));
 } else if (args[0] === "issue" && args[1] === "view") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
 } else if (args[0] === "api" && path.startsWith("search/issues?")) {
@@ -1239,6 +1288,12 @@ test("apply mode prioritizes matching close proposals before comment sync", () =
     close_reason: "implemented_on_main",
     action_taken: "kept_open",
   });
+  const lowSignalLiveGuard = reportFrontMatter({
+    type: "pull_request",
+    decision: "close",
+    close_reason: "low_signal_unmergeable_pr",
+    action_taken: "skipped_low_signal_live_guard",
+  });
   const pairBlockedOpenClosingPr = reportFrontMatter({
     decision: "close",
     close_reason: "implemented_on_main",
@@ -1265,6 +1320,7 @@ test("apply mode prioritizes matching close proposals before comment sync", () =
   assert.equal(applyDecisionPriority(legacyMaintainerSkip, "issue"), 0);
   assert.equal(applyDecisionPriority(legacyInvalidDecision, "issue"), 0);
   assert.equal(applyDecisionPriority(legacyKeptOpen, "issue"), 0);
+  assert.equal(applyDecisionPriority(lowSignalLiveGuard, "pull_request"), 0);
   assert.equal(applyDecisionPriority(pairBlockedOpenClosingPr, "issue"), 1);
   assert.equal(applyDecisionPriority(pairBlockedSameAuthor, "issue"), 1);
   assert.equal(applyDecisionPriority(pullRequestClose, "issue"), 1);
@@ -1414,7 +1470,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline/.test(path)) {
   console.log(JSON.stringify([]));
@@ -1567,7 +1623,7 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments$/.test(path) && args.includ
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline/.test(path)) {
   console.log(JSON.stringify([]));
@@ -1719,7 +1775,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
-} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+} else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline/.test(path)) {
   console.log(JSON.stringify([]));
@@ -1907,7 +1963,7 @@ test("coverage proof timeout cannot exceed the remaining apply runtime", () => {
 });
 
 test("coverage proof refreshes its timeout after linked PR hydration", () => {
-  const source = readText("src/clawsweeper.ts");
+  const source = readText("src/clawsweeper-coverage-proof.ts");
   const gateStart = source.indexOf("function prCloseCoverageProofGateResult");
   const gateEnd = source.indexOf("function renderPrCloseCoverageProofReportSection", gateStart);
   const gate = source.slice(gateStart, gateEnd);
@@ -1964,7 +2020,7 @@ test("recorded label sync covers only matching automation-owned updates", () => 
     false,
   );
   assert.match(
-    readText("src/clawsweeper.ts"),
+    readText("src/clawsweeper-apply-source-freshness.ts"),
     /recordedLabelSyncMatches[\s\S]*truncationCountsAsActivity: true/,
   );
 });
@@ -1997,6 +2053,7 @@ test("spam comment intake coalesces duplicate comment deliveries", () => {
 
 test("spam scanner exact dispatches publish only per-comment audit records", () => {
   const workflow = readText(".github/workflows/spam-scanner.yml");
+  const scanner = readText("src/repair/spam-scanner.ts");
 
   assert.match(workflow, /format\('spam-scanner-\{0\}-issue-comment-\{1\}'/);
   assert.match(workflow, /format\('spam-scanner-\{0\}-review-comment-\{1\}'/);
@@ -2007,6 +2064,7 @@ test("spam scanner exact dispatches publish only per-comment audit records", () 
   );
   assert.match(workflow, /--path results\/spam-scanner\.json/);
   assert.match(workflow, /cancel-in-progress: false/);
+  assert.match(scanner, /reasoning: \{ effort: "high" \}/);
 });
 
 test("issue implementation workflow lets job intent choose dispatch capacity", () => {
@@ -2016,7 +2074,7 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
     workflow.indexOf("\npermissions:"),
   );
 
-  assert.equal(dispatchInputs.match(/^      [a-z_]+:/gm)?.length, 10);
+  assert.equal(dispatchInputs.match(/^      [a-z_]+:/gm)?.length, 9);
   assert.doesNotMatch(workflow, /^\s+intake_runner:/m);
   assert.match(
     workflow,
@@ -2040,10 +2098,9 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
   assert.match(workflow, /MODEL: internal/);
   assert.match(workflow, /echo "target_slug=\$target_slug"/);
   assert.match(workflow, /sed -E 's\/\[\^a-z0-9_\.-\]\+\/-\/g;/);
-  assert.match(
-    workflow,
-    /sparse-checkout: \|\n\s+records\/\$\{\{ steps\.target\.outputs\.target_slug \}\}\n\s+jobs\n\s+results/,
-  );
+  assert.match(workflow, /coordinator-class: cluster_intake/);
+  assert.match(workflow, /sparse-checkout: \|\n\s+jobs\n\s+results/);
+  assert.doesNotMatch(workflow, /sparse-checkout:[\s\S]{0,120}records\//);
 });
 
 test("repair workers hydrate only durable jobs from generated state", () => {
@@ -2054,11 +2111,9 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
-  assert.equal(
-    workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
-      ?.length,
-    2,
-  );
+  assert.equal(workflow.match(/uses: \.\/\.github\/actions\/setup-state/g)?.length, 2);
+  assert.match(workflow, /sparse-checkout: jobs/);
+  assert.doesNotMatch(workflow, /sparse-checkout: \|\n\s+jobs\n\s+ledger/);
   assert.match(workflow, /CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(workflow, /actions\/cache\/restore@v6/);
   assert.match(workflow, /actions\/cache\/save@v6/);
@@ -2069,7 +2124,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /\.status == "ready"/);
   assert.match(
     workflow,
-    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assert.match(
     workflow,
@@ -2080,28 +2135,18 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.doesNotMatch(workflow, /if: \$\{\{[^\n]*env\.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN/);
 });
 
-test("reviewed viable issues dispatch generated PRs and backfill durable open reports", () => {
+test("viable issue implementation stays in the broad durable backfill lane", () => {
   const workflow = readText(".github/workflows/sweep.yml");
-  const eventDispatchStart = workflow.indexOf("- name: Dispatch viable issue implementation");
-  const eventDispatch = workflow.slice(
-    eventDispatchStart,
-    workflow.indexOf("\n  plan:", eventDispatchStart),
-  );
+  const eventReviewStart = workflow.indexOf("\n  event-review-apply:");
+  const planStart = workflow.indexOf("\n  plan:", eventReviewStart);
+  const eventReview = workflow.slice(eventReviewStart, planStart);
 
-  assert.ok(eventDispatchStart >= 0);
-  assert.match(eventDispatch, /--candidate-kind viable/);
-  assert.match(eventDispatch, /\/tmp\/viable-event-candidate\.tsv/);
-  assert.match(eventDispatch, /repair-issue-implementation-intake\.yml/);
-  assert.match(eventDispatch, /-f candidate_kind=viable/);
-  assert.match(eventDispatch, /-f report_repo=openclaw\/clawsweeper-state/);
-  assert.match(eventDispatch, /steps\.target\.outputs\.target_repo != 'openclaw\/openclaw'/);
-  assert.match(eventDispatch, /steps\.target\.outputs\.target_repo != 'openclaw\/clawhub'/);
-  assert.doesNotMatch(eventDispatch, /vision-fit-implementation-candidates/);
+  assert.doesNotMatch(eventReview, /Dispatch viable issue implementation/);
   assert.match(workflow, /- name: Backfill viable open issue implementation candidates/);
   assert.match(workflow, /--report-dir "records\/\$target_slug\/items"/);
   assert.equal(workflow.match(/--report-dir "records\/\$target_slug\/items"/g)?.length, 3);
   assert.doesNotMatch(workflow, /CLAWSWEEPER_AUTO_IMPLEMENT_BACKFILL/);
-  assert.equal(workflow.match(/vars\.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1'/g)?.length, 4);
+  assert.ok((workflow.match(/vars\.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1'/g) || []).length >= 5);
 });
 
 test("sweep workflow executes only durable queue leases without runner-side admission", () => {
@@ -2112,7 +2157,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   const eventReviewBlock = workflow.slice(
     workflow.indexOf("\n  event-review-apply:"),
-    workflow.indexOf("\n  plan:"),
+    workflow.indexOf("\n  event-review-publish:"),
   );
   const claimIndex = eventReviewBlock.indexOf("- name: Claim exact-review queue lease");
   const setupPnpmIndex = eventReviewBlock.indexOf("- uses: ./.github/actions/setup-pnpm");
@@ -2121,28 +2166,125 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   const setupCodexIndex = eventReviewBlock.indexOf("- uses: ./.github/actions/setup-codex");
   const exactReviewIndex = eventReviewBlock.indexOf("- name: Review exact event item");
+  const primaryResultIndex = eventReviewBlock.indexOf(
+    "- name: Export exact review generation result",
+  );
+  const failReviewIndex = eventReviewBlock.indexOf(
+    "- name: Fail unsuccessful exact review generation",
+  );
+  const completeLeaseIndex = eventReviewBlock.indexOf("- name: Complete exact-review queue lease");
+  const uploadBundleIndex = eventReviewBlock.indexOf("- name: Upload exact review artifact bundle");
+  const claimStep = eventReviewBlock.slice(
+    claimIndex,
+    eventReviewBlock.indexOf("\n      - ", claimIndex + 1),
+  );
+  const completeLeaseStep = eventReviewBlock.slice(
+    completeLeaseIndex,
+    eventReviewBlock.indexOf("\n      - ", completeLeaseIndex + 1),
+  );
+  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, completeLeaseIndex);
+  const failReviewStep = eventReviewBlock.slice(failReviewIndex);
   const exactReviewStep = eventReviewBlock.slice(
     exactReviewIndex,
-    eventReviewBlock.indexOf("- name: Create state token", exactReviewIndex),
+    eventReviewBlock.indexOf("- name: Create exact review artifact bundle", exactReviewIndex),
   );
 
   assert.match(
     eventReviewBlock,
-    /group: clawsweeper-event-review-\$\{\{ github\.event\.client_payload\.target_repo/,
+    /group: clawsweeper-event-review-\$\{\{ github\.event\.client_payload\.queue_claim\.item_key \|\| github\.event\.client_payload\.item_key \|\| github\.run_id \}\}/,
   );
   assert.match(eventReviewBlock, /github\.event\.client_payload\.queue_lease_id != ''/);
   assert.match(legacyIntakeBlock, /Queue legacy exact-review event/);
   assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
+  assert.match(legacyIntakeBlock, /\/internal\/exact-review\/branch-authority/);
   assert.match(legacyIntakeBlock, /x-clawsweeper-exact-review-signature/);
   assert.match(legacyIntakeBlock, /CLAWSWEEPER_WEBHOOK_SECRET/);
+  assert.doesNotMatch(legacyIntakeBlock, /gh api "repos\/\$target_repo" --jq \.default_branch/);
+  assert.match(legacyIntakeBlock, /targetBranch \? \{ targetBranch \} : \{\}/);
+  assert.doesNotMatch(legacyIntakeBlock, /targetBranch: payload\.target_branch \|\| "main"/);
+  assert.match(legacyIntakeBlock, /payload\.source_event === "pull_request_target"/);
+  assert.match(legacyIntakeBlock, /payload\.ingress_route === "target_dispatcher"/);
+  assert.match(legacyIntakeBlock, /fingerprint: ingressFingerprint/);
+  assert.match(legacyIntakeBlock, /commandStatusMarker: payload\.command_status_marker/);
+  assert.match(legacyIntakeBlock, /statusCommentId: payload\.status_comment_id/);
+  assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
   assert.match(eventReviewBlock, /cancel-in-progress: false/);
+  assert.match(exactReviewStep, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.match(exactReviewStep, /--readonly-openclaw/);
+  assert.match(exactReviewStep, /--skip-start-comment/);
   assert.ok(claimIndex >= 0);
   assert.ok(setupPnpmIndex > claimIndex);
   assert.ok(inProgressStatusIndex > setupPnpmIndex);
   assert.ok(setupCodexIndex > inProgressStatusIndex);
   assert.ok(exactReviewIndex > setupCodexIndex);
+  assert.ok(primaryResultIndex > exactReviewIndex);
+  assert.equal(
+    eventReviewBlock.match(/- name: Fail unsuccessful exact review generation/g)?.length,
+    1,
+  );
+  assert.ok(uploadBundleIndex > exactReviewIndex);
+  assert.ok(primaryResultIndex > uploadBundleIndex);
+  assert.ok(completeLeaseIndex > primaryResultIndex);
+  assert.ok(failReviewIndex > completeLeaseIndex);
+  assert.match(eventReviewBlock, /\.github\/actions\/setup-state/);
+  assert.match(eventReviewBlock, /repair:exact-review-direct-publication/);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/complete/);
+  assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
+  assert.match(
+    claimStep,
+    /hasTuple \? \{ item_key: itemKey, lease_revision: leaseRevision \} : \{\}/,
+  );
+  assert.match(claimStep, /response\.protocol_version \|\| 1/);
+  assert.match(claimStep, /const legacyDecision = \{/);
+  assert.match(claimStep, /run_attempt: runAttempt/);
+  assert.match(failReviewStep, /exact-review-generation-result\.outputs\.outcome != 'success'/);
+  assert.match(failReviewStep, /complete-exact-review-queue\.outcome != 'success'/);
+  assert.match(primaryResultStep, /REVIEW_OUTCOME:/);
+  assert.match(primaryResultStep, /PUBLICATION_QUEUE_OUTCOME:/);
+  assert.match(primaryResultStep, /REVIEW_OUTCOME" = "cancelled"/);
+  assert.match(primaryResultStep, /echo "outcome=\$outcome" >> "\$GITHUB_OUTPUT"/);
+  assert.match(
+    completeLeaseStep,
+    /PRIMARY_OUTCOME: \$\{\{ steps\.exact-review-generation-result\.outputs\.outcome \|\| 'failure' \}\}/,
+  );
+  assert.doesNotMatch(completeLeaseStep, /JOB_STATUS:/);
+  assert.match(completeLeaseStep, /if: \$\{\{[^\n]*always\(\)[^\n]*\}\}/);
+  assert.match(completeLeaseStep, /steps\.claim-exact-review-queue\.outputs\.claimed == 'true'/);
+  assert.match(completeLeaseStep, /continue-on-error: true/);
+  assert.match(completeLeaseStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
+  assert.match(
+    completeLeaseStep,
+    /PROTOCOL_VERSION: \$\{\{ steps\.claim-exact-review-queue\.outputs\.protocol_version \}\}/,
+  );
+  assert.match(completeLeaseStep, /const primaryOutcome = String\(process\.env\.PRIMARY_OUTCOME/);
+  assert.match(completeLeaseStep, /\["success", "cancelled", "failure"\]\.includes/);
+  assert.match(completeLeaseStep, /claim_generation: claimGeneration/);
+  assert.match(completeLeaseStep, /item_key: process\.env\.ITEM_KEY/);
+  assert.match(completeLeaseStep, /lease_revision: leaseRevision/);
+  assert.match(completeLeaseStep, /run_attempt: runAttempt/);
+  assert.match(completeLeaseStep, /outcome,/);
+  // A completion callback is non-fatal only when the queue proves that this
+  // exact lease was superseded. Unknown conflicts and every other non-2xx
+  // status stay visible.
+  assert.doesNotMatch(completeLeaseStep, /curl --fail/);
+  assert.match(completeLeaseStep, /--write-out '%\{http_code\}'/);
+  assert.match(completeLeaseStep, /if \[\[ "\$status" == 2\* \]\]; then\s*\n\s*exit 0/);
+  // Completion accepts only its audited supersession response; claim-path
+  // conflicts and ambiguous ownership misses must keep failing the run.
+  assert.match(completeLeaseStep, /const safeConflicts = new Set\(\["lease_superseded"\]\);/);
+  assert.doesNotMatch(completeLeaseStep, /"lease_not_claimed"/);
+  assert.doesNotMatch(completeLeaseStep, /"lease_not_active"/);
+  assert.doesNotMatch(completeLeaseStep, /"lease_already_claimed"/);
+  assert.doesNotMatch(completeLeaseStep, /"stale_run_attempt"/);
+  assert.doesNotMatch(completeLeaseStep, /"lease_decision_unavailable"/);
+  assert.match(
+    completeLeaseStep,
+    /if \(!safeConflicts\.has\(response\.error\)\) process\.exit\(1\);/,
+  );
+  assert.match(completeLeaseStep, /Unexpected exact-review completion conflict/);
+  assert.match(completeLeaseStep, /Exact-review completion returned HTTP \$status/);
+  assert.match(completeLeaseStep, /if \[\[ "\$status" != 5\* \]\]; then\s*\n\s*exit 1/);
   assert.match(eventReviewBlock, /exact-review queue leased this run/);
   assert.doesNotMatch(eventReviewBlock, /repair:codex-capacity/);
   assert.doesNotMatch(eventReviewBlock, /capacity-requeue/);
@@ -2160,6 +2302,21 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.doesNotMatch(exactReviewStep, /--codex-timeout-ms 600000/);
 });
 
+test("target dispatcher documents opt-in cross-route identity", () => {
+  const dispatcher = readText("docs/target-dispatcher.md");
+
+  assert.match(dispatcher, /## Cross-route exact-review identity/);
+  assert.doesNotMatch(dispatcher, /maintainer decision required/i);
+  assert.match(dispatcher, /ingress_route:"target_dispatcher"/);
+  assert.match(dispatcher, /ingress_fingerprint/);
+  assert.match(dispatcher, /recorded as stale source/);
+  assert.match(dispatcher, /later verified\s+direct decision promotes that same queue item/);
+  assert.match(dispatcher, /legacy-only delivery stays a safe\s+fallback/);
+  assert.match(dispatcher, /delayed matching counterpart is\s+also suppressed/);
+  assert.match(dispatcher, /rejects as stale is not an admission receipt/);
+  assert.match(dispatcher, /not a\s+head-SHA dedupe key/);
+});
+
 test("sweep workflow gives high-context Codex reviews twenty minutes by default", () => {
   const workflow = readText(".github/workflows/sweep.yml");
 
@@ -2170,24 +2327,35 @@ test("sweep workflow gives high-context Codex reviews twenty minutes by default"
   assert.doesNotMatch(workflow, /codex_timeout_ms=(?:600000|900000)/);
 });
 
-test("Codex workflows install pinned CLI releases and keep the model secret", () => {
+test("agent workflows install pinned CLI releases and keep runner models secret", () => {
   const action = readText(".github/actions/setup-codex/action.yml");
+  const openclawAction = readText(".github/actions/setup-openclaw/action.yml");
+  const localCheck = readText("scripts/check-local-codex.mjs");
   const workflows = [
     ".github/workflows/assist.yml",
-    ".github/workflows/commit-review.yml",
     ".github/workflows/maintainer-activity-report.yml",
     ".github/workflows/repair-cluster-worker.yml",
-    ".github/workflows/repair-commit-finding-intake.yml",
     ".github/workflows/sweep.yml",
   ].map((file) => readText(file));
 
-  assert.match(action, /codex-version:[\s\S]*default: "0\.139\.0"/);
+  assert.match(action, /codex-version:[\s\S]*default: "0\.146\.0"/);
   assert.match(action, /proxy-version:[\s\S]*default: "0\.139\.0"/);
   assert.match(action, /@openai\/codex@\$\{\{ inputs\['codex-version'\] \}\}/);
   assert.match(action, /@openai\/codex-responses-api-proxy@\$\{\{ inputs\['proxy-version'\] \}\}/);
   assert.doesNotMatch(action, /@latest/);
+  assert.match(localCheck, /CLAWSWEEPER_LOCAL_CODEX_MODEL \?\? "gpt-5\.6-sol"/);
+  assert.match(localCheck, /model_reasoning_effort="high"/);
+  assert.doesNotMatch(localCheck, /CLAWSWEEPER_PREFER_WINDOWS_CODEX_APP/);
+  assert.doesNotMatch(localCheck, /gpt-5\.5/);
   assert.match(action, /env -u OPENAI_API_KEY[\s\S]*-u CLAWSWEEPER_INTERNAL_MODEL/);
   assert.equal(action.match(/--ignore-scripts/g)?.length, 2);
+  assert.match(action, /runner\.os == 'Linux' && runner\.environment == 'github-hosted'/);
+  assert.match(action, /kernel\.unprivileged_userns_clone=1/);
+  assert.match(action, /kernel\.apparmor_restrict_unprivileged_userns=0/);
+  assert.match(
+    action,
+    /codex sandbox --permission-profile :read-only -C "\$GITHUB_WORKSPACE" -- \/bin\/true/,
+  );
   for (const workflow of workflows) {
     assert.match(workflow, /CLAWSWEEPER_MODEL: internal/);
     assert.match(workflow, /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ secrets\.CLAWSWEEPER_MODEL \}\}/);
@@ -2197,6 +2365,39 @@ test("Codex workflows install pinned CLI releases and keep the model secret", ()
       .filter((candidate) => /(?:OPENAI_API_KEY|CLAWSWEEPER_INTERNAL_MODEL):/.test(candidate))) {
       assert.match(line, /^\s{10,}/);
     }
+  }
+
+  assert.match(openclawAction, /openclaw-version:[\s\S]*default: "2026\.7\.2"/);
+  assert.match(openclawAction, /openclaw@\$\{\{ inputs\['openclaw-version'\] \}\}/);
+  assert.doesNotMatch(openclawAction, /@latest/);
+  for (const step of parseYaml(openclawAction).runs.steps) {
+    assert.match(step.if ?? "", /env\.CLAWSWEEPER_RUNNER == 'openclaw'/);
+  }
+  // Source builds bridge unreleased OpenClaw features and must stay pinned to
+  // an exact SHA, gated to the openclaw runner, and off by default.
+  assert.match(openclawAction, /openclaw-source-ref:[\s\S]*default: ""/);
+  assert.equal(openclawAction.match(/inputs\['openclaw-source-ref'\] != ''/g)?.length, 2);
+  assert.match(openclawAction, /inputs\['openclaw-source-ref'\] == ''/);
+  assert.match(openclawAction, /CLAWSWEEPER_OPENCLAW_BIN=\$launcher/);
+  const runnerWorkflowFiles = [
+    ".github/workflows/assist.yml",
+    ".github/workflows/repair-cluster-worker.yml",
+    ".github/workflows/spam-scanner.yml",
+    ".github/workflows/sweep.yml",
+  ];
+  for (const workflow of runnerWorkflowFiles.map((file) => readText(file))) {
+    assert.match(workflow, /CLAWSWEEPER_RUNNER: \$\{\{ vars\.CLAWSWEEPER_RUNNER \|\| 'codex' \}\}/);
+    assert.match(
+      workflow,
+      /CLAWSWEEPER_OPENCLAW_MODEL: \$\{\{ secrets\.CLAWSWEEPER_OPENCLAW_MODEL \}\}/,
+    );
+    assert.match(workflow, /CLAWSWEEPER_OPENCLAW_PROVIDERS_JSON/);
+    assert.match(workflow, /KIMI_API_KEY: \$\{\{/);
+  }
+  for (const file of runnerWorkflowFiles.filter(
+    (candidate) => candidate !== ".github/workflows/spam-scanner.yml",
+  )) {
+    assert.match(readText(file), /setup-openclaw/);
   }
 });
 
@@ -2214,15 +2415,19 @@ test("background review fanout keeps per-review transient recovery", () => {
 
 test("synchronous Codex review surfaces use the shared bounded runner", () => {
   for (const file of [
-    "src/clawsweeper.ts",
+    "src/clawsweeper-review-runtime.ts",
     "src/commit-sweeper.ts",
     "src/pr-close-coverage-proof.ts",
   ]) {
     const source = readText(file);
-    assert.match(source, /runCodexProcess/);
+    assert.match(source, /runAgentProcess/);
+    assert.doesNotMatch(source, /runCodexProcess/);
     assert.doesNotMatch(source, /spawnSync\(\s*"codex"/);
   }
-  assert.match(readText("src/clawsweeper.ts"), /"--output-last-message",\s*outputPath,\s*"--json"/);
+  assert.match(
+    readText("src/clawsweeper-review-runtime.ts"),
+    /"--output-last-message",\s*outputPath,\s*"--json"/,
+  );
 });
 
 test("failed Codex workers use bounded automatic retry paths", () => {
@@ -2231,8 +2436,10 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   const executor = readText("src/repair/execute-fix-artifact.ts");
   const selfHeal = readText("src/repair/self-heal-failed-runs.ts");
 
-  assert.match(worker, /appendCodexOutputCapture/);
-  assert.match(worker, /openCodexOutputCapture\(codexTranscriptPath\)/);
+  assert.match(worker, /runAgentProcess/);
+  assert.match(worker, /stdoutPath: String\(codexTranscriptPath\)/);
+  assert.match(worker, /stderrPath: String\(stderrPath\)/);
+  assert.match(worker, /startCodexWorkerHeartbeat/);
   assert.match(outputCapture, /DEFAULT_CODEX_OUTPUT_FILE_BYTES = 128 \* 1024 \* 1024/);
   assert.match(outputCapture, /Codex output truncated; final tail follows/);
   assert.doesNotMatch(worker, /Codex output exceeded|CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);
@@ -2262,29 +2469,21 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   const cluster = readText(".github/workflows/repair-cluster-worker.yml");
   const clusterIntake = readText(".github/workflows/repair-cluster-intake.yml");
   const router = readText(".github/workflows/repair-comment-router.yml");
-  const finalizer = readText(".github/workflows/repair-finalize-open-prs.yml");
   const selfHeal = readText(".github/workflows/repair-self-heal.yml");
   const sweep = readText(".github/workflows/sweep.yml");
   const dispatchJobs = readText("src/repair/dispatch-jobs.ts");
   const importGitcrawl = readText("src/repair/import-gitcrawl-clusters.ts");
   const importLowSignal = readText("src/repair/import-gitcrawl-low-signal-prs.ts");
   const issueImplementation = readText(".github/workflows/repair-issue-implementation-intake.yml");
-  const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
-  const existingRepairWorkflows = [
-    cluster,
-    router,
-    finalizer,
-    selfHeal,
-    sweep,
-    issueImplementation,
-    commitFinding,
-  ].join("\n");
+  const existingRepairWorkflows = [cluster, router, selfHeal, sweep, issueImplementation].join(
+    "\n",
+  );
 
   assert.doesNotMatch(existingRepairWorkflows, /CLAWSWEEPER_FEATURE_REPAIR_ENABLED/);
-  assert.match(sweep, /pnpm run repair:comment-router -- \\\n[\s\S]*--execute/);
+  assert.match(sweep, /gh workflow run repair-comment-router\.yml/);
+  assert.doesNotMatch(sweep, /pnpm run repair:comment-router -- \\\n[\s\S]*--execute/);
   assert.match(router, /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \]; \}/);
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
-  assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(clusterIntake, /SCHEDULE_ENABLED/);
   assert.match(clusterIntake, /CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED/);
   const intakeJobHeader = clusterIntake.slice(
@@ -2306,22 +2505,26 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   assert.doesNotMatch(importLowSignal, /CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED/);
 });
 
-test("cluster intake publishes generated repair state through state repo", () => {
+test("cluster intake directly publishes git-only jobs before dispatch", () => {
   const workflow = readText(".github/workflows/repair-cluster-intake.yml");
   const stateTokenIndex = workflow.indexOf("uses: ./.github/actions/create-state-token");
   const setupStateIndex = workflow.indexOf("uses: ./.github/actions/setup-state");
-  const importIndex = workflow.indexOf("- name: Import one cluster from gitcrawl-store");
-  const publishIndex = workflow.indexOf("- name: Publish intake jobs and ledger");
+  const importIndex = workflow.indexOf("- name: Prepare unprocessed cluster candidates");
+  const publishIndex = workflow.indexOf("- name: Durably accept cluster intake");
+  const recoverIndex = workflow.indexOf("- name: Recover pending cluster dispatches");
 
   assert.notEqual(stateTokenIndex, -1);
   assert.notEqual(setupStateIndex, -1);
   assert.notEqual(importIndex, -1);
   assert.notEqual(publishIndex, -1);
+  assert.notEqual(recoverIndex, -1);
   assert.ok(stateTokenIndex < setupStateIndex, "state token must be created before setup-state");
-  assert.ok(setupStateIndex < importIndex, "state repo must be hydrated before job import");
-  assert.ok(setupStateIndex < publishIndex, "state repo must be configured before publish-main");
-  assert.match(workflow, /--path jobs/);
-  assert.match(workflow, /--path results\/cluster-repair-intake/);
+  assert.ok(setupStateIndex < recoverIndex, "state repo must be hydrated before recovery");
+  assert.ok(recoverIndex < importIndex, "pending dispatch recovery must precede new intake");
+  assert.ok(importIndex < publishIndex, "selection must finish before durable acceptance");
+  assert.match(workflow, /repair:publish-cluster-intake/);
+  assert.match(workflow, /CLAWSWEEPER_DISPATCH_REF: \$\{\{ github\.ref_name \}\}/);
+  assert.doesNotMatch(workflow, /state-materializer\.yml|pnpm run repair:dispatch/);
 });
 
 test("conflict self-heal publishes exact-head jobs before worker dispatch", () => {
@@ -2358,10 +2561,6 @@ test("review prompt keeps automerge opt-in from becoming generic manual review",
   assert.match(prompt, /`maintainer` label/);
   assert.match(prompt, /large `size:\*` label/);
   assert.match(prompt, /choose `queue_fix_pr` even when the\s+finding is process-only or P3/);
-  assert.match(prompt, /`CHANGELOG\.md` is release-owned/);
-  assert.match(prompt, /Do not\s+make missing `CHANGELOG\.md` a review finding/i);
-  assert.match(prompt, /ask for PR-body or commit\s+message context/);
-  assert.doesNotMatch(prompt, /missing required changelog\s+entry/);
   assert.match(prompt, /does not by itself block a clean automerge verdict/);
 });
 
@@ -2389,28 +2588,39 @@ test("review prompts require reproduction and solution assessment details", () =
   assert.match(commitPrompt, /Is this the best way to solve the issue\?/);
 });
 
-test("commit review workflow settles and reviews from target main", () => {
-  const workflow = readText(".github/workflows/commit-review.yml");
-
-  assert.doesNotMatch(workflow, /clawsweeper_commit_review/);
-  assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /gh workflow run commit-review\.yml/);
-  assert.match(workflow, /CLAWSWEEPER_COMMIT_REVIEW_SETTLE_SECONDS \|\| '60'/);
-  assert.match(workflow, /sleep "\$SETTLE_SECONDS"/);
-  assert.match(workflow, /Check out target main/);
-  assert.match(workflow, /checkout -B main refs\/remotes\/origin\/main/);
-  assert.doesNotMatch(workflow, /checkout --detach "\$COMMIT_SHA"/);
-});
-
-test("sweep target write tokens can merge pull requests", () => {
+test("sweep target write tokens retain merge and terminal acknowledgement scopes", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const targetWriteTokenBlocks = workflow
     .split("- name: Create target write token")
     .slice(1)
     .map((block) => block.split("\n      - ")[0]);
+  const finalizationStart = workflow.indexOf("\n  event-review-terminal-finalization:");
+  const finalizationEnd = workflow.indexOf("\n  target-fanout:", finalizationStart);
+  assert.ok(finalizationStart >= 0);
+  assert.ok(finalizationEnd > finalizationStart);
+  const finalizationJob = workflow.slice(finalizationStart, finalizationEnd);
+  const finalizationTokens = finalizationJob
+    .split("- name: Create target write token")
+    .slice(1)
+    .map((block) => block.split("\n      - ")[0]);
 
-  assert.equal(targetWriteTokenBlocks.length, 3);
-  for (const block of targetWriteTokenBlocks) {
+  assert.equal(targetWriteTokenBlocks.length, 5);
+  assert.equal(finalizationTokens.length, 1);
+  const finalizationToken = finalizationTokens[0];
+  assert.ok(finalizationToken);
+  assert.match(finalizationToken, /permission-issues: write/);
+  assert.match(finalizationToken, /permission-pull-requests: write/);
+  assert.doesNotMatch(finalizationToken, /permission-contents: write/);
+
+  const contentWritingTokenBlocks = targetWriteTokenBlocks.filter(
+    (block) => block !== finalizationToken,
+  );
+  assert.equal(contentWritingTokenBlocks.length, 4);
+  const compositeAction = readText(".github/actions/create-target-write-token/action.yml");
+  assert.match(compositeAction, /permission-contents: write/);
+  assert.match(compositeAction, /permission-pull-requests: write/);
+  for (const block of contentWritingTokenBlocks) {
+    if (block.includes("uses: ./.github/actions/create-target-write-token")) continue;
     assert.match(block, /permission-contents: write/);
     assert.match(block, /permission-pull-requests: write/);
   }
@@ -2418,6 +2628,13 @@ test("sweep target write tokens can merge pull requests", () => {
 
 test("sweep review recovery uses explicit failed shard artifacts", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const publishEventResult = readText("src/repair/publish-event-result.ts");
+  const recoveryStart = workflow.indexOf("\n  recover-review-failures:");
+  const retryStart = workflow.indexOf("\n  retry-failed-reviews:", recoveryStart);
+  const eventReviewStart = workflow.indexOf("\n  event-review-apply:");
+  const targetFanoutStart = workflow.indexOf("\n  target-fanout:", eventReviewStart);
+  const recoveryJob = workflow.slice(recoveryStart, retryStart);
+  const eventReviewJob = workflow.slice(eventReviewStart, targetFanoutStart);
 
   assert.match(
     workflow,
@@ -2436,6 +2653,55 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   assert.doesNotMatch(
     workflow,
     /needs\.review\.result == 'failure' \|\| needs\.review\.result == 'cancelled'/,
+  );
+  assert.match(recoveryJob, /actions: read/);
+  assert.match(recoveryJob, /contents: read/);
+  assert.match(recoveryJob, /QUEUE_URL:/);
+  assert.match(recoveryJob, /CLAWSWEEPER_WEBHOOK_SECRET:/);
+  assert.match(recoveryJob, /delivery_id: \("router:" \+ \$dispatch_key\)/);
+  assert.match(recoveryJob, /sourceAction: "failed_review_shard_recovery"/);
+  assert.match(recoveryJob, /--arg dispatch_key/);
+  assert.match(recoveryJob, /x-clawsweeper-exact-review-signature/);
+  assert.match(recoveryJob, /\/internal\/exact-review\/enqueue/);
+  assert.match(
+    recoveryJob,
+    /\.ok == true and \(\.queued == true or \.deduped == true or \.shed == true or \.accepted == false\)/,
+  );
+  assert.match(recoveryJob, /Recovery skipped because the target is disabled/);
+  assert.match(recoveryJob, /Recovery shed by exact-review queue backpressure/);
+  assert.match(recoveryJob, /for attempt in 1 2 3/);
+  assert.match(recoveryJob, /failed_recovery_dispatches/);
+  assert.match(
+    recoveryJob,
+    /max_additional_prompt_bytes=\$\(\(5000 - \$\{#recovery_marker\} - 2\)\)/,
+  );
+  assert.match(recoveryJob, /LC_ALL=C wc -c/);
+  assert.match(recoveryJob, /set \+o pipefail/);
+  assert.match(recoveryJob, /iconv -f UTF-8 -t UTF-8 -c/);
+  assert.doesNotMatch(recoveryJob, /workflow run sweep\.yml/);
+  assert.doesNotMatch(recoveryJob, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
+  assert.match(eventReviewJob, /CLAIM_TARGET_BRANCH:/);
+  assert.match(eventReviewJob, /target_branch="\$CLAIM_TARGET_BRANCH"/);
+  assert.match(eventReviewJob, /REVIEW_ONLY:/);
+  assert.match(
+    eventReviewJob,
+    /sourceAction == 'failed_review_shard_recovery' && 'true' \|\| 'false'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Queue deferred exact verdict router[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(eventReviewJob, /Export exact review publication result[\s\S]*REVIEW_ONLY:/);
+  assert.match(
+    eventReviewJob,
+    /React to target item completion[\s\S]*sourceAction == 'failed_review_shard_recovery'/,
+  );
+  assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" != "true" \]/);
+  assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" = "true" \]/);
+  assert.match(publishEventResult, /reviewOnly: process\.env\.REVIEW_ONLY === "true"/);
+  assert.match(
+    publishEventResult,
+    /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
   );
 });
 
@@ -2460,7 +2726,117 @@ test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", (
   assert.match(retryBlock, /--dry-run/);
   assert.match(retryBlock, /--workflow-repo "\$GITHUB_REPOSITORY"/);
   assert.match(retryBlock, /--target-repo "\$TARGET_REPO"/);
-  assert.match(retryBlock, /--path records\/openclaw-openclaw/);
+  assert.match(retryBlock, /RETRY_MAX_RUNTIME_MS:.*'600000'/);
+  assert.match(retryBlock, /--max-runtime-ms "\$RETRY_MAX_RUNTIME_MS"/);
+  assert.match(retryBlock, /--state-dir results\/failed-review-retries\/openclaw-openclaw/);
+  assert.match(retryBlock, /--path results\/failed-review-retries\/openclaw-openclaw/);
+  assert.doesNotMatch(retryBlock, /--path records\/openclaw-openclaw/);
+  const publishIndex = retryBlock.indexOf("- name: Publish failed-review retry state");
+  const uploadIndex = retryBlock.indexOf("- uses: actions/upload-artifact@v7");
+  assert.ok(publishIndex > 0);
+  assert.ok(uploadIndex > publishIndex);
+  assert.match(
+    retryBlock.slice(publishIndex, uploadIndex),
+    /if: \$\{\{ always\(\) && vars\.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles\('results\/failed-review-retries\/openclaw-openclaw\/\*\.json'\) != '' \}\}/,
+  );
+  assert.match(
+    retryBlock.slice(uploadIndex, retryBlock.indexOf("\n\n", uploadIndex)),
+    /if: \$\{\{ always\(\) \}\}/,
+  );
+});
+
+test("dashboard operation counters include persisted failed-review retry sidecars", () => {
+  const dir = mkdtempSync(tmpPrefix);
+  try {
+    const number = 42;
+    const revision = "a".repeat(64);
+    const at = "2026-07-09T12:00:00.000Z";
+    writeFileSync(
+      join(dir, `${number}.json`),
+      `${JSON.stringify({
+        schema_version: 1,
+        repo: "openclaw/openclaw",
+        number,
+        status: "exhausted",
+        revision_kind: "item_source_revision",
+        revision,
+        attempts: 2,
+        max_attempts: 2,
+        last_at: at,
+        reason: "retry budget exhausted",
+      })}\n`,
+      "utf8",
+    );
+    const activity = dashboardFailedReviewRetryActivityForTest({
+      markdown: reportFrontMatter({
+        number: String(number),
+        repository: "openclaw/openclaw",
+        type: "issue",
+        item_source_revision: revision,
+        review_status: "failed",
+        action_taken: "kept_open",
+      }),
+      number,
+      stateDir: dir,
+      now: Date.parse("2026-07-09T12:01:00.000Z"),
+    });
+
+    assert.equal(activity.last15Minutes.failedReviewRetries, 0);
+    assert.equal(activity.last15Minutes.failedReviewRetryExhaustions, 1);
+    assert.equal(activity.lastHour.failedReviewRetryExhaustions, 1);
+    assert.equal(activity.last24Hours.failedReviewRetryExhaustions, 1);
+
+    writeFileSync(
+      join(dir, `${number}.json`),
+      `${JSON.stringify({
+        schema_version: 1,
+        repo: "openclaw/openclaw",
+        number,
+        status: "dispatched",
+        revision_kind: "item_source_revision",
+        revision,
+        attempts: 1,
+        max_attempts: 2,
+        last_at: at,
+        reason: "retry dispatched",
+      })}\n`,
+      "utf8",
+    );
+    const dispatchedActivity = dashboardFailedReviewRetryActivityForTest({
+      markdown: reportFrontMatter({
+        number: String(number),
+        repository: "openclaw/openclaw",
+        type: "issue",
+        item_source_revision: revision,
+        review_status: "failed",
+        action_taken: "kept_open",
+      }),
+      number,
+      stateDir: dir,
+      now: Date.parse("2026-07-09T12:01:00.000Z"),
+    });
+    assert.equal(dispatchedActivity.last15Minutes.failedReviewRetries, 1);
+    assert.equal(dispatchedActivity.last15Minutes.failedReviewRetryExhaustions, 0);
+
+    writeFileSync(join(dir, `${number}.json`), "{\n", "utf8");
+    const malformedActivity = dashboardFailedReviewRetryActivityForTest({
+      markdown: reportFrontMatter({
+        number: String(number),
+        repository: "openclaw/openclaw",
+        type: "issue",
+        item_source_revision: revision,
+        review_status: "failed",
+        action_taken: "kept_open",
+      }),
+      number,
+      stateDir: dir,
+      now: Date.parse("2026-07-09T12:01:00.000Z"),
+    });
+    assert.equal(malformedActivity.last15Minutes.failedReviewRetries, 0);
+    assert.equal(malformedActivity.last15Minutes.failedReviewRetryExhaustions, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("sweep dashboard status writes are scoped to the target repository", () => {
@@ -2472,19 +2848,6 @@ test("sweep dashboard status writes are scoped to the target repository", () => 
     const block = workflow.slice(match.index, match.index + 220);
     assert.match(block, /--target-repo /);
   }
-});
-
-test("sweep status writer preserves non-apply health and clears stale apply updates", () => {
-  const source = readText("src/clawsweeper.ts");
-
-  assert.match(
-    source,
-    /state\.startsWith\("Apply "\)\s+\?\s+null\s+:\s+readSweepStatusSummary\(profile\)\?\.applyHealth/,
-  );
-  assert.match(source, /apply_health: applyHealth \?\? null/);
-  assert.match(source, /last_close_apply_health: lastCloseApplyHealth \?\? null/);
-  assert.match(source, /previousStatus\?\.lastCloseApplyHealth/);
-  assert.match(source, /previousStatus\?\.applyHealth\?\.mode === "close"/);
 });
 
 test("review parser strips environment access caveats from risks", () => {
@@ -2545,7 +2908,10 @@ test("codex subprocess env strips GitHub and App credentials", () => {
   try {
     process.env.GH_TOKEN = "gh";
     process.env.GITHUB_TOKEN = "github";
+    process.env.REPO_TOKEN = "workflow-repository";
     process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN = "target";
+    process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN = "workflow-public";
+    process.env.CLAWSWEEPER_TARGET_GH_TOKEN = "target-app";
     process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN = "codex-target";
     process.env.CLAWSWEEPER_APP_ID = "123";
     process.env.CLAWSWEEPER_APP_PRIVATE_KEY = "private";
@@ -2560,7 +2926,10 @@ test("codex subprocess env strips GitHub and App credentials", () => {
 
     assert.equal(env.GH_TOKEN, undefined);
     assert.equal(env.GITHUB_TOKEN, undefined);
+    assert.equal(env.REPO_TOKEN, undefined);
     assert.equal(env.COMMIT_SWEEPER_TARGET_GH_TOKEN, undefined);
+    assert.equal(env.CLAWSWEEPER_PUBLIC_GH_TOKEN, undefined);
+    assert.equal(env.CLAWSWEEPER_TARGET_GH_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_APP_ID, undefined);
     assert.equal(env.CLAWSWEEPER_APP_PRIVATE_KEY, undefined);
@@ -2576,19 +2945,41 @@ test("codex subprocess env strips GitHub and App credentials", () => {
   }
 });
 
+test("OpenClaw subprocess env preserves provider auth without exposing Codex auth", () => {
+  const originalEnv = { ...process.env };
+  try {
+    process.env.CLAWSWEEPER_RUNNER = "openclaw";
+    process.env.OPENAI_API_KEY = "openai";
+    process.env.CODEX_API_KEY = "codex";
+    process.env.CODEX_ACCESS_TOKEN = "codex-access";
+
+    const env = codexEnv();
+
+    assert.equal(env.OPENAI_API_KEY, "openai");
+    assert.equal(env.CODEX_API_KEY, undefined);
+    assert.equal(env.CODEX_ACCESS_TOKEN, undefined);
+  } finally {
+    process.env = originalEnv;
+  }
+});
+
 test("codex subprocess env can expose an explicit read-only GitHub token", () => {
   const originalEnv = { ...process.env };
   try {
     process.env.GH_TOKEN = "ambient";
     process.env.GITHUB_TOKEN = "github";
+    process.env.REPO_TOKEN = "workflow-repository";
     process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN = "hidden";
+    process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN = "workflow-public";
     process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN = "hidden-codex";
 
     const env = codexEnv({ ghToken: "target-read" });
 
     assert.equal(env.GH_TOKEN, "target-read");
     assert.equal(env.GITHUB_TOKEN, undefined);
+    assert.equal(env.REPO_TOKEN, undefined);
     assert.equal(env.COMMIT_SWEEPER_TARGET_GH_TOKEN, undefined);
+    assert.equal(env.CLAWSWEEPER_PUBLIC_GH_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN, undefined);
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
   } finally {
@@ -2638,6 +3029,8 @@ test("audit detects live/local state drift and unsafe proposed records", () => {
         labels: ["maintainer"],
         decision: "close",
         closeReason: "implemented_on_main",
+        confidence: "high",
+        reviewedAt: "2026-04-25T12:00:00.000Z",
         action: "proposed_close",
       }),
       auditRecord(7, { reviewStatus: "stale_local_checkout_blocked" }),
@@ -2671,6 +3064,22 @@ test("audit detects live/local state drift and unsafe proposed records", () => {
   assert.equal(result.counts.duplicateRecords, 1);
   assert.equal(result.counts.protectedProposed, 1);
   assert.equal(result.findings.protectedProposed[0].number, 6);
+  assert.equal(result.counts.autoCloseOpen, 1);
+  assert.deepEqual(result.findings.autoCloseOpen[0], {
+    number: 9,
+    kind: "issue",
+    title: "Item 9",
+    labels: ["maintainer"],
+    action: "proposed_close",
+    decision: "close",
+    closeReason: "implemented_on_main",
+    confidence: "high",
+    reviewedAt: "2026-04-25T12:00:00.000Z",
+    reviewStatus: "complete",
+    currentState: "open",
+    itemPath: "items/9.md",
+    updatedAt: "2026-01-01T00:00:00Z",
+  });
   assert.equal(result.counts.staleReviews, 1);
 });
 
@@ -2843,6 +3252,10 @@ test("GitHub retry classifier distinguishes throttle and transient failures", ()
   assert.equal(ghRetryKind(throttled), "throttle");
   assert.equal(shouldRetryGh(throttled), true);
   assert.equal(ghRetryKind(new Error("gh: HTTP 429: Too Many Requests")), "throttle");
+  assert.equal(
+    ghRetryKind(new Error("You have triggered an abuse detection mechanism")),
+    "throttle",
+  );
   assert.equal(ghRetryWaitMs("throttle", 0), 30_000);
   assert.equal(ghRetryWaitMs("throttle", 3), 60_000);
   assert.equal(ghRetryWaitMs("transient", 0), 2_000);
@@ -2852,6 +3265,13 @@ test("GitHub retry classifier distinguishes throttle and transient failures", ()
   });
   assert.equal(ghRetryKind(eof), "transient");
   assert.equal(shouldRetryGh(eof), true);
+
+  const truncatedJq = Object.assign(
+    new Error("Command failed: gh api repos/openclaw/openclaw/issues --jq .[]"),
+    { stderr: "unexpected end of JSON input\n" },
+  );
+  assert.equal(ghRetryKind(truncatedJq), "transient");
+  assert.equal(shouldRetryGh(truncatedJq), true);
 
   const connectionReset = new Error(
     "Post https://api.github.com/graphql: read: connection reset by peer",
@@ -2898,6 +3318,45 @@ test("GitHub not found errors are recognizable non-retryable lookup misses", () 
   );
   assert.equal(isGitHubNotFoundError(error), true);
   assert.equal(shouldRetryGh(error), false);
+});
+
+test("GitHub rate-limit deferrals preserve available reset hints and safe defaults", () => {
+  const now = Date.parse("2026-08-05T10:00:00.000Z");
+  const retryAfter = new GitHubRateLimitError(
+    new Error("HTTP 429: secondary rate limit\nRetry-After: 120"),
+    now,
+  );
+  assert.equal(retryAfter.retryAt, "2026-08-05T10:02:00.000Z");
+  assert.equal(retryAfter.provenance, "retry_after");
+  assert.equal(retryAfter.authoritative, true);
+
+  const secondaryWithBothHints = new GitHubRateLimitError(
+    new Error(
+      `HTTP 403: secondary rate limit\nRetry-After: 30\nx-ratelimit-reset: ${now / 1_000 + 300}`,
+    ),
+    now,
+  );
+  assert.equal(secondaryWithBothHints.retryAt, "2026-08-05T10:01:00.000Z");
+  assert.equal(secondaryWithBothHints.provenance, "retry_after");
+
+  const reset = new GitHubRateLimitError(
+    new Error(`HTTP 403: API rate limit exceeded\nx-ratelimit-reset: ${now / 1_000 + 300}`),
+    now,
+  );
+  assert.equal(reset.retryAt, "2026-08-05T10:05:00.000Z");
+  assert.equal(reset.provenance, "rate_limit_reset");
+  assert.equal(new GitHubRateLimitError(reset, now + 1_000).retryAt, reset.retryAt);
+  const fallback = new GitHubRateLimitError(new Error("HTTP 429: rate limit reached"), now);
+  const wrappedFallback = new GitHubRateLimitError(fallback, now + 1_000);
+  assert.equal(fallback.authoritative, false);
+  assert.equal(wrappedFallback.retryAt, fallback.retryAt);
+  assert.equal(wrappedFallback.provenance, "fallback");
+  assert.equal(wrappedFallback.authoritative, false);
+  assert.equal(fallback.retryAt, "2026-08-05T10:01:00.000Z");
+  const wrappedExpiredFallback = new GitHubRateLimitError(fallback, now + 61_000);
+  assert.equal(wrappedExpiredFallback.retryAt, "2026-08-05T10:02:01.000Z");
+  assert.equal(wrappedExpiredFallback.provenance, "fallback");
+  assert.equal(wrappedExpiredFallback.authoritative, false);
 });
 
 test("closing pull request references preserve fork repository identity", () => {

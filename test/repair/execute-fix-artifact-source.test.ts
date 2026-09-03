@@ -4,6 +4,48 @@ import test from "node:test";
 
 import { readText } from "../helpers.ts";
 
+test("repair workflow and executor share coherent production timeout defaults", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const workflow = readText(
+    path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
+  );
+
+  assert.match(source, /repairTimeoutBudgetFromEnv\(\s*process\.env,?\s*\)/);
+  assert.match(source, /currentCodexTimeoutMs\(true\)/);
+  assert.match(workflow, /timeout-minutes: 120/);
+  assert.match(
+    workflow,
+    /CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS \|\| '1800000' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS \|\| '4200000' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS \|\| '1800000' \}\}/,
+  );
+  assert.match(workflow, /name: Execute credited fix artifact[\s\S]*timeout-minutes: 70/);
+});
+
+test("repair review preserves the checkout accepted by changed-surface validation", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const reviewStart = source.indexOf("function runCodexReview({");
+  const reviewEnd = source.indexOf("function extractCodexReviewFromJsonl(", reviewStart);
+  const review = source.slice(reviewStart, reviewEnd);
+
+  assert.match(source, /const defaultCodexReviewSandbox = "read-only";/);
+  assert.match(review, /"--sandbox",\s*codexReviewSandbox/);
+  assert.match(review, /validation commands listed below have already passed/);
+  assert.match(review, /do not rerun them or start nested autoreview helpers/);
+  assert.match(
+    review,
+    /do not modify tracked files, ignored artifacts, dependency caches, or Git metadata/,
+  );
+  assert.match(review, /Validation commands actually run:/);
+  assert.doesNotMatch(review, /process\.env\.GITHUB_ACTIONS.*danger-full-access/);
+});
+
 test("no-op automerge repair updates outcome and re-enters router before exit", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
@@ -14,22 +56,18 @@ test("no-op automerge repair updates outcome and re-enters router before exit", 
   assert.ok(noPlannedBranch, "expected no planned fix actions branch");
   assert.match(noPlannedBranch, /report\.reason = "no planned fix actions";/);
 
-  const continuationIndex = noPlannedBranch.indexOf(
-    "appendAutomergeRepairOutcomeComment(report, resultPath);",
-  );
   const writeReportIndex = noPlannedBranch.indexOf("writeReport(report, resultPath);");
   const exitIndex = noPlannedBranch.indexOf("process.exit(0);");
 
-  assert.notEqual(continuationIndex, -1);
   assert.notEqual(writeReportIndex, -1);
   assert.notEqual(exitIndex, -1);
   assert.ok(
-    continuationIndex < writeReportIndex && writeReportIndex < exitIndex,
-    "no-op repair must update automerge continuation before writing the terminal report and exiting",
+    writeReportIndex < exitIndex,
+    "no-op repair must durably write the terminal report before exiting",
   );
 });
 
-test("repair source branch writability preflight runs before expensive repair preflights", () => {
+test("repair source branch writability preflight runs before target repair", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
 
@@ -38,18 +76,42 @@ test("repair source branch writability preflight runs before expensive repair pr
   );
   const checkoutIndex = source.indexOf("ensureTargetCheckout(result.repo, targetDir);");
   const validationIndex = source.indexOf("preflightTargetValidationPlan(");
-  const codexPreflightIndex = source.indexOf("const writePreflight = runCodexWritePreflight();");
+  const repairIndex = source.indexOf("outcome = executeRepairBranch({ fixArtifact, targetDir });");
 
   assert.notEqual(branchPreflightIndex, -1);
   assert.notEqual(checkoutIndex, -1);
   assert.notEqual(validationIndex, -1);
-  assert.notEqual(codexPreflightIndex, -1);
+  assert.notEqual(repairIndex, -1);
   assert.ok(
     branchPreflightIndex < checkoutIndex &&
       checkoutIndex < validationIndex &&
-      validationIndex < codexPreflightIndex,
-    "live source-branch writability must be resolved before checkout, validation planning, and Codex write preflight",
+      validationIndex < repairIndex,
+    "live source-branch writability must be resolved before checkout, validation planning, and repair",
   );
+});
+
+test("repair branch rechecks the planned head on the PR object used for checkout", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const repairStart = source.indexOf("function executeRepairBranch(");
+  const checkoutEnd = source.indexOf("prepareTargetToolchain(", repairStart);
+  assert.notEqual(repairStart, -1);
+  assert.notEqual(checkoutEnd, -1);
+  const checkoutWindow = source.slice(repairStart, checkoutEnd);
+
+  const pullFetchIndex = checkoutWindow.indexOf("const pull = fetchPullRequest(");
+  const plannedHeadIndex = checkoutWindow.indexOf("automergePlanningHeadBlock({");
+  const checkoutIndex = checkoutWindow.indexOf("checkoutSourcePullRequestHead({");
+  assert.notEqual(pullFetchIndex, -1);
+  assert.notEqual(plannedHeadIndex, -1);
+  assert.notEqual(checkoutIndex, -1);
+  assert.ok(
+    pullFetchIndex < plannedHeadIndex && plannedHeadIndex < checkoutIndex,
+    "the live PR head must be bound to the planned revision before that PR object reaches checkout",
+  );
+  assert.match(checkoutWindow, /currentHeadSha: pull\.head\?\.sha/);
+  assert.match(checkoutWindow, /expected_head_sha: planningHeadBlock\.expectedHeadSha/);
+  assert.match(checkoutWindow, /current_head_sha: planningHeadBlock\.currentHeadSha/);
+  assert.match(checkoutWindow, /requeue_required: true/);
 });
 
 test("repair branch pushes settle and re-check the exact source head", () => {
@@ -98,9 +160,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   assert.match(preparedReplacement, /skipMergedSourceReplacementWithoutDiff\(\{/);
 
   const preparedSkipIndex = preparedReplacement.indexOf("skipMergedSourceReplacementWithoutDiff({");
-  const preparedPushIndex = preparedReplacement.indexOf(
-    "pushRecoverableBranch({ targetDir, branch });",
-  );
+  const preparedPushIndex = preparedReplacement.indexOf("pushRecoverableBranch({");
   const preparedCreateIndex = preparedReplacement.indexOf('"pr",\n        "create"');
   assert.notEqual(preparedSkipIndex, -1);
   assert.notEqual(preparedPushIndex, -1);
@@ -123,7 +183,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   );
 });
 
-test("terminal Codex failures do not request repair requeue", () => {
+test("terminal Codex and persistent setup failures do not request repair requeue", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
   const helperStart = source.indexOf("function isRetryableCodexFailure(");
@@ -135,14 +195,19 @@ test("terminal Codex failures do not request repair requeue", () => {
   const terminalGuardIndex = helper.indexOf(
     "if (messages.some((value) => isTerminalCodexErrorMessage(value))) return false;",
   );
+  const setupGuardIndex = helper.indexOf(
+    "if (isPersistentCodexSetupFailure(message)) return false;",
+  );
   const broadFallbackIndex = helper.indexOf("/Codex .*(?:timed out|failed|exited)");
 
   assert.notEqual(terminalGuardIndex, -1);
+  assert.notEqual(setupGuardIndex, -1);
   assert.notEqual(broadFallbackIndex, -1);
   assert.ok(
-    terminalGuardIndex < broadFallbackIndex,
-    "terminal model-access failures must be rejected before the broad Codex failure fallback",
+    terminalGuardIndex < setupGuardIndex && setupGuardIndex < broadFallbackIndex,
+    "terminal and persistent setup failures must be rejected before the broad Codex failure fallback",
   );
+  assert.match(source, /sandbox \(\?:wrapper\|startup\)/);
 });
 
 test("repair Codex heartbeat wrapper uses bounded process capture", () => {
@@ -154,7 +219,11 @@ test("repair Codex heartbeat wrapper uses bounded process capture", () => {
   assert.notEqual(helperStart, -1);
   assert.notEqual(helperEnd, -1);
   const helper = source.slice(helperStart, helperEnd);
-  assert.match(helper, /return runCodexProcess\(\{/);
+  assert.match(helper, /return runAgentProcess\(\{/);
+  assert.match(helper, /prompt: options\.input/);
+  assert.match(helper, /model,/);
+  assert.match(helper, /reasoningEffort: codexReasoningEffort/);
+  assert.match(helper, /codexExtraArgs: args\.slice\(1\)/);
   assert.match(helper, /\{ stdoutPath: options\.stdoutPath \}/);
   assert.match(helper, /\{ stderrPath: options\.stderrPath \}/);
   assert.doesNotMatch(helper, /spawnSync\("codex"/);
@@ -174,7 +243,174 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(pushStart, pushEnd), /assertIssueImplementationNotPaused\(\)/);
   assert.notEqual(helperStart, -1);
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
+  assert.match(source.slice(helperStart, helperEnd), /clawsweeper:bulk-filed/);
+  assert.match(source.slice(helperStart, helperEnd), /operator_override !== true/);
+  assert.match(source.slice(helperStart, helperEnd), /is bulk-filed; refusing to push or open/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
+});
+
+test("repair publication pushes the accepted checkout through isolated Git auth", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const isolation = readText(path.join(process.cwd(), "src/repair/git-network-isolation.ts"));
+  assert.match(source, /assertTargetPublicationGitConfiguration\(cwd, timeoutMs\)/);
+  assert.match(source, /runIsolatedGitNetwork\(\{ args, cwd, env, timeoutMs, token \}\)/);
+  assert.match(isolation, /GIT_ASKPASS: askpassPath/);
+  assert.match(isolation, /`--git-dir=\$\{networkGitDir\}`/);
+  assert.match(isolation, /GIT_OBJECT_DIRECTORY: source\.objectDirectory/);
+  assert.match(isolation, /"push\.gpgSign=false"/);
+  assert.match(isolation, /"push\.recurseSubmodules=no"/);
+  assert.match(isolation, /"submodule\.recurse=false"/);
+  assert.match(source, /assertTargetCheckoutBinding\(targetDir, checkoutBinding/);
+  assert.match(
+    source,
+    /assertRepairBranchWritable\(\{[\s\S]*?sourceRef: prep\.commit,[\s\S]*?\}\)/,
+  );
+  assert.match(source, /const args = repairBranchPushArgs\(\{ pull, sourceRef \}\)/);
+  assert.match(source, /sourceRef: checkoutBinding\.headSha/);
+  assert.match(source, /`--force-with-lease=refs\/heads\/\$\{pull\.head\.ref\}:\$\{headSha\}`/);
+  assert.match(source, /`--force-with-lease=\$\{targetRef\}:\$\{remoteSha\}`/);
+  assert.match(source, /if \(publishedSha !== sourceRef\)/);
+  assert.doesNotMatch(source, /gh", \["auth", "setup-git"\]/);
+  assert.doesNotMatch(source, /`HEAD:\$\{pull\.head\.ref\}`/);
+});
+
+test("recoverable branch publication carries the pre-validation remote lease", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const contributorStart = source.indexOf("function executeRepairBranch(");
+  const contributorEnd = source.indexOf("function repairPushSettleSeconds(", contributorStart);
+  const contributor = source.slice(contributorStart, contributorEnd);
+  const replacementStart = source.indexOf("function executeReplacementBranch(");
+  const replacementEnd = source.indexOf(
+    "function updateAutomergeProgressStatus(",
+    replacementStart,
+  );
+  const replacement = source.slice(replacementStart, replacementEnd);
+  const recoveryStart = source.indexOf("function checkoutRecoverableReplacementBranch(");
+  const recoveryEnd = source.indexOf("function commitCheckpointIfNeeded(", recoveryStart);
+  const recovery = source.slice(recoveryStart, recoveryEnd);
+  const pushStart = source.indexOf("function pushRecoverableBranch(");
+  const pushEnd = source.indexOf("function assertIssueImplementationNotPaused(", pushStart);
+  const push = source.slice(pushStart, pushEnd);
+
+  assert.ok(
+    contributor.indexOf("const replacementRemoteLeaseSha = trustedRemoteBranchSha(") <
+      contributor.indexOf("prepareTargetToolchain("),
+  );
+  assert.match(contributor, /expectedRemoteSha: replacementRemoteLeaseSha/);
+  assert.ok(
+    replacement.indexOf("checkoutRecoverableReplacementBranch({") <
+      replacement.indexOf("prepareTargetToolchain("),
+  );
+  assert.match(replacement, /expectedRemoteSha: branchState\.remote_lease_sha/);
+  assert.match(recovery, /const remoteLeaseSha = trustedRemoteBranchSha\(branch, targetDir\)/);
+  assert.match(recovery, /if \(recoveredHeadSha !== remoteLeaseSha\)/);
+  assert.match(recovery, /remote_lease_sha: remoteLeaseSha/);
+  assert.match(push, /typeof expectedRemoteSha !== "string"/);
+  assert.doesNotMatch(push, /trustedRemoteBranchSha\(/);
+});
+
+test("replacement recovery materializes the fetched commit before branch attachment", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const recoveryStart = source.indexOf("function checkoutRecoverableReplacementBranch(");
+  const recoveryEnd = source.indexOf("function commitCheckpointIfNeeded(", recoveryStart);
+  const recovery = source.slice(recoveryStart, recoveryEnd);
+
+  const leaseCheck = recovery.indexOf("if (recoveredHeadSha !== remoteLeaseSha)");
+  const materialize = recovery.indexOf("materializeTargetCommitWithIsolation({");
+  const branchSwitch = recovery.indexOf("switchTargetBranchWithPlumbing({");
+  assert.notEqual(leaseCheck, -1);
+  assert.notEqual(materialize, -1);
+  assert.notEqual(branchSwitch, -1);
+  assert.ok(leaseCheck < materialize && materialize < branchSwitch);
+  assert.match(recovery, /expectedHeadSha: recoveredHeadSha/);
+});
+
+test("final publication rebase uses the verified isolated Git path", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const reconcileStart = source.indexOf("function reconcileLatestBaseBeforePush(");
+  const reconcileEnd = source.indexOf("function runCodexBaseReconcile(", reconcileStart);
+  const reconcile = source.slice(reconcileStart, reconcileEnd);
+  const codexStart = reconcileEnd;
+  const codexEnd = source.indexOf("function readTextIfExists(", codexStart);
+  const codexReconcile = source.slice(codexStart, codexEnd);
+
+  assert.match(reconcile, /rebaseTargetOntoVerifiedBase\(\{/);
+  assert.match(reconcile, /baseRef: baseSha/);
+  assert.match(reconcile, /const completed = runCodexBaseReconcile\(\{/);
+  assert.match(codexReconcile, /buildFinalBaseReconcilePrompt\(\{/);
+  assert.match(codexReconcile, /completeTargetRebaseWithIsolation\(\{/);
+  assert.match(codexReconcile, /expectedBaseRef: baseSha/);
+  assert.match(codexReconcile, /requireInProgress: true/);
+  assert.match(
+    codexReconcile,
+    /do not run git rebase --continue, git rebase --skip, or git rebase --abort/,
+  );
+  assert.match(codexReconcile, /leave the rebase pending/);
+  assert.match(
+    codexReconcile,
+    /prompt\.replace\(NORMAL_REBASE_COMPLETION_RULE, FINAL_REBASE_HANDOFF_RULE\)/,
+  );
+  assert.doesNotMatch(
+    codexReconcile,
+    /Resolve this final rebase so the branch is mergeable on current main, then leave the checkout in a normal non-rebasing state/,
+  );
+  assert.doesNotMatch(reconcile, /rebaseOntoBase\(/);
+  assert.doesNotMatch(reconcile, /completeRebaseIfResolved\(/);
+});
+
+test("final rebase checks stay pinned across the workspace-write Codex handoff", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const reconcileStart = source.indexOf("function reconcileLatestBaseBeforePush(");
+  const reconcileEnd = source.indexOf("function runCodexBaseReconcile(", reconcileStart);
+  const reconcile = source.slice(reconcileStart, reconcileEnd);
+  const codexEnd = source.indexOf("function readTextIfExists(", reconcileEnd);
+  const codexReconcile = source.slice(reconcileEnd, codexEnd);
+  const syncStart = source.indexOf("const sync = reconcileLatestBaseBeforePush({");
+  const syncEnd = source.indexOf('logProgress("final base sync result"', syncStart);
+  const syncCaller = source.slice(syncStart, syncEnd);
+
+  assert.match(
+    reconcile,
+    /const baseSha = pinRepairBase\(\(\) =>[\s\S]*?`\$\{baseRef\}\^\{commit\}`/,
+  );
+  assert.match(reconcile, /ancestor: baseSha/);
+  assert.match(reconcile, /baseRef: baseSha/);
+  assert.match(reconcile, /runCodexBaseReconcile\(\{[\s\S]*?baseSha,/);
+  assert.match(reconcile, /base_sha: baseSha/);
+  assert.match(codexReconcile, /expectedBaseRef: baseSha/);
+  assert.doesNotMatch(codexReconcile, /expectedBaseRef: `origin\//);
+  assert.match(
+    syncCaller,
+    /const synchronizedBaseSha = pinRepairBase\(\(\) => String\(sync\.base_sha \?\? ""\)\)\.sha/,
+  );
+  assert.doesNotMatch(syncCaller, /rev-parse/);
+});
+
+test("all repair rebase transitions use isolated Git plumbing", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const mechanical = readText(
+    path.join(process.cwd(), "src/repair/mechanical-rebase-conflicts.ts"),
+  );
+
+  assert.doesNotMatch(source, /\brebaseOntoBase\(/);
+  assert.doesNotMatch(source, /\bcompleteRebaseIfResolved\(/);
+  assert.doesNotMatch(mechanical, /run\("git", \["add"/);
+  const resolverStart = source.indexOf("function resolveAndCompleteMechanicalRebase(");
+  const resolverEnd = source.indexOf("function branchUpdateState(", resolverStart);
+  const resolver = source.slice(resolverStart, resolverEnd);
+  assert.ok(
+    resolver.indexOf("tryResolveMechanicalRebaseConflicts({") <
+      resolver.indexOf("completeMechanicallyResolvedRebase({"),
+  );
+  assert.doesNotMatch(resolver, /unmergedPaths\(/);
+  assert.ok(
+    [...source.matchAll(/rebaseTargetOntoVerifiedBase\(\{/g)].length >= 3,
+    "initial, replacement, and final-base rebases must use isolated plumbing",
+  );
+  assert.ok(
+    [...source.matchAll(/completeTargetRebaseWithIsolation\(\{/g)].length >= 3,
+    "mechanical and post-Codex continuations must use isolated plumbing",
+  );
 });
 
 test("repair contract gates the final cumulative tree, not individual checkpoints", () => {
@@ -185,29 +421,97 @@ test("repair contract gates the final cumulative tree, not individual checkpoint
     "four checkpoint call sites plus the ordinary commit helper should remain",
   );
   assert.doesNotMatch(source, /commitRepairCheckpointIfNeeded|checkpointBaseHead/);
-  assert.match(source, /enforceFinalRepairContract\(\{ fixArtifact, targetDir, baseBranch \}\)/);
-  assert.equal(
-    [...source.matchAll(/pushIntermediateCheckpoint\?\.\(\)/g)].length,
-    4,
-    "contract jobs must defer all four recovery pushes until final validation",
+  assert.match(
+    source,
+    /enforceFinalRepairContract\(\{ fixArtifact, targetDir, baseSha: acceptedBaseSha \}\)/,
   );
-  assert.match(source, /if \(hasRepairContract \|\| historyCompaction\?\.status === "compacted"\)/);
+  assert.doesNotMatch(source, /pushIntermediateCheckpoint|pushCheckpoint/);
+  assert.match(source, /captureFinalTargetCheckoutBinding\(/);
+  assert.match(source, /checkout_binding: checkoutBinding/);
 
   const compact = source.indexOf("const historyCompaction =");
   const enforce = source.indexOf("enforceFinalRepairContract(", compact);
-  const publish = source.indexOf("if (hasRepairContract", enforce);
-  const commit = source.indexOf('const commit = run("git", ["rev-parse", "HEAD"]', publish);
-  assert.ok(compact < enforce && enforce < publish && publish < commit);
+  const binding = source.indexOf(
+    "const checkoutBinding = captureFinalTargetCheckoutBinding(",
+    enforce,
+  );
+  const result = source.indexOf("checkout_binding: checkoutBinding", binding);
+  assert.ok(compact < enforce && enforce < binding && binding < result);
 });
 
-test("final repair contract compares the repaired tree with the latest base", () => {
+test("final repair contract and compaction use the exact accepted base SHA", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   const start = source.indexOf("function enforceFinalRepairContract(");
   const end = source.indexOf("function pushRecoverableBranch(", start);
   const helper = source.slice(start, end);
   assert.match(source, /\.\/repair-contract\.js/);
-  assert.match(helper, /const baseRef = `origin\/\$\{baseBranch\}`/);
-  assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseRef\}\.\.HEAD`/);
+  assert.match(source, /let acceptedBaseSha = targetBaseSha/);
+  assert.match(source, /acceptedBaseSha = synchronizedBaseSha/);
+  assert.match(source, /baseRef: baseSha/);
+  assert.match(source, /target_base_sha: acceptedBaseSha/);
+  assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseSha\}\.\.HEAD`/);
   assert.match(helper, /enforceRepairContract\(\{ fixArtifact, changedFiles \}\)/);
+  assert.doesNotMatch(helper, /origin\//);
   assert.doesNotMatch(helper, /--porcelain=v1|phase|checkpoint/);
+
+  const syncStart = source.indexOf("const sync = reconcileLatestBaseBeforePush({");
+  const alreadyCurrent = source.indexOf('if (sync.status !== "already-current")', syncStart);
+  const acceptedUpdate = source.indexOf("acceptedBaseSha = synchronizedBaseSha", syncStart);
+  assert.ok(syncStart < acceptedUpdate && acceptedUpdate < alreadyCurrent);
+});
+
+test("contributor repair review loop stays on one pinned target base", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const validation = readText(path.join(process.cwd(), "src/repair/target-validation.ts"));
+  const promptBuilder = readText(path.join(process.cwd(), "src/repair/fix-prompt-builder.ts"));
+
+  assert.match(
+    source,
+    /const targetBaseSha = pinRepairBase\(\(\) =>[\s\S]*?run\("git", \["rev-parse", `origin\/\$\{baseBranch\}`\]/,
+  );
+  assert.match(source, /validateAndReviewLoop\(\{[\s\S]*targetBaseSha/);
+  assert.match(source, /pinnedBaseRef: targetBaseSha/);
+  assert.match(
+    source,
+    /runDiffCheck\(\{[\s\S]*?baseRef: targetBaseSha,[\s\S]*?checkoutBinding[\s\S]*?\}\)/,
+  );
+  assert.match(source, /pinned target base \$\{targetBaseSha\}/);
+  assert.match(validation, /pinnedBaseRef\?: string/);
+  assert.match(source, /classifyExternalBaseValidationFailure\(\{/);
+  assert.match(
+    source,
+    /rebaseResult\?\.status === "conflicts" \? \(sourceHead \?\? targetBaseSha\) : currentHead\(targetDir\)/,
+  );
+  assert.match(validation, /if \(!options\.pinnedBaseRef\) \{[\s\S]*ensureMergeBaseAvailable/);
+  assert.match(promptBuilder, /Pinned target base SHA: \$\{targetBaseSha\}/);
+});
+
+test("final synchronized tree is reviewed and reports persist before publication", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+
+  assert.match(source, /reviewAfterFinalBaseSync\(\{/);
+  assert.match(source, /validateAndReviewSynchronizedTree\(\{/);
+  assert.match(source, /repairDeltaPaths: finalSyncRepairDeltaPaths/);
+  assert.match(source, /attempt: "final-sync"/);
+  assert.match(source, /finalizeExecutionReport\(\{/);
+});
+
+test("repair workflow renews target credentials before deferred outcome publication", () => {
+  const workflow = readText(
+    path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
+  );
+  const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
+  const renewIndex = workflow.indexOf("- name: Renew target write token for post-flight");
+  const publishIndex = workflow.indexOf("- name: Publish deferred fix outcome");
+  const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
+
+  assert.ok(
+    executeIndex < renewIndex && renewIndex < publishIndex && publishIndex < postFlightIndex,
+  );
+  assert.match(workflow.slice(executeIndex, renewIndex), /--latest --defer-publication/);
+  assert.match(
+    workflow.slice(publishIndex, postFlightIndex),
+    /GH_TOKEN: \${{ steps\.target_post_flight_token\.outputs\.token }}/,
+  );
+  assert.match(workflow.slice(publishIndex, postFlightIndex), /--latest --publish-report-only/);
 });

@@ -5,7 +5,18 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "./lib.js";
 import { isJsonObject } from "./json-types.js";
-import { AUTOMATION_LIMITS, WORKER_CONFIG, workerLimit, type WorkerLane } from "./limits.js";
+import { readReportFrontMatterField, type FrontMatterField } from "../report-front-matter.js";
+import { AUTOMATION_LIMITS, WORKER_CONFIG, workerLimit, type WorkerLane } from "../limits.js";
+import {
+  fetchExactReviewQueuePressure,
+  queuePressureLevel,
+  type QueuePressureLevel,
+} from "../queue-pressure.js";
+import {
+  isLiveRecheckCloseGuardAction,
+  isSelectableApplyCloseAction,
+} from "../apply-close-actions.js";
+import { repositoryProfileFor } from "../repository-profiles.js";
 
 type ApplyAction = {
   action: string;
@@ -33,8 +44,24 @@ type ApplyReportSummaryOptions = {
   cursorPath: string;
   cursorRequired: boolean;
   candidateCount?: number | null;
+  candidateCounts?: ApplyCandidateCounts | null;
   cursorAdvanceCount?: number | null;
   scheduledIntervalMinutes?: number | null;
+};
+
+export type ApplyCandidateCounts = {
+  confirmed_proposal: number;
+  guarded_retry: number;
+  proof_required: number;
+  promotion_total: number;
+  promotion_eligible: number;
+  promotion_cooldown_eligible: number;
+  cooldown_eligible_total: number;
+  inconsistent_or_stale: number;
+};
+
+export type ProposedItemInventory = ApplyCandidateCounts & {
+  eligible_total: number;
 };
 
 type ApplyReportSummary = {
@@ -44,6 +71,8 @@ type ApplyReportSummary = {
   mode: string;
   status: "ok" | "idle" | "needs_attention";
   summary: string;
+  examined: number | null;
+  action_records: number;
   processed: number;
   processed_limit: number | null;
   close_limit: number | null;
@@ -107,6 +136,7 @@ type ApplyCycleSummary = {
     | "missing_window_size"
     | "no_apply_ready_candidates";
   apply_ready_count: number | null;
+  candidate_counts: ApplyCandidateCounts | null;
   window_size: number | null;
   estimated_full_cycle_windows: number | null;
   estimated_full_cycle_minutes: number | null;
@@ -134,7 +164,7 @@ type AdaptiveApplyBatchSize = {
 
 const args = parseArgs(process.argv.slice(2));
 
-function runCli(): void {
+async function runCli(): Promise<void> {
   const command = args._[0];
   if (!command) throw new Error("workflow utility command is required");
 
@@ -195,6 +225,7 @@ function runCli(): void {
             candidateCount: optionalString("candidate-count")
               ? nonNegativeIntegerArg("candidate-count")
               : null,
+            candidateCounts: applyCandidateCounts(optionalString("candidate-counts-json")),
             cursorAdvanceCount: optionalString("cursor-advance-count")
               ? nonNegativeIntegerArg("cursor-advance-count")
               : null,
@@ -247,10 +278,20 @@ function runCli(): void {
           workerLimit(requiredWorkerLane(optionalString("lane") || positionalString(1)), {
             activeCritical: numberArg("active-critical", 0),
             activeBackground: numberArg("active-background", 0),
+            pressureLevel: requiredQueuePressureLevel(optionalString("pressure-level") || "none"),
           }),
         ),
       );
       break;
+    case "queue-pressure": {
+      const pressure = await fetchExactReviewQueuePressure({
+        queueUrl: requiredString("queue-url"),
+      });
+      process.stdout.write(
+        `${JSON.stringify({ ...pressure, level: queuePressureLevel(pressure) })}\n`,
+      );
+      break;
+    }
     case "worker-config":
       process.stdout.write(JSON.stringify(WORKER_CONFIG, null, 2));
       break;
@@ -259,6 +300,9 @@ function runCli(): void {
       break;
     case "proposed-item-count":
       process.stdout.write(String(proposedItemCount(proposedItemOptions())));
+      break;
+    case "proposed-item-inventory":
+      printProposedItemInventory(proposedItemOptions());
       break;
     case "proposed-item-quality-summary":
       printProposedItemQualitySummary(proposedItemOptions());
@@ -289,6 +333,11 @@ function runCli(): void {
     case "merge-apply-reports":
       mergeApplyReports(requiredString("dir"), requiredString("output"));
       break;
+    case "apply-requeue-review-item-numbers":
+      process.stdout.write(
+        applyRequeueReviewItemNumbers(requiredString("report"), numberArg("limit", 0)).join(","),
+      );
+      break;
     default:
       throw new Error(`unknown workflow utility command: ${command}`);
   }
@@ -298,7 +347,6 @@ function requiredWorkerLane(value: string): WorkerLane {
   const allowed = new Set<WorkerLane>([
     "normal_review",
     "hot_intake",
-    "commit_review",
     "repair",
     "automerge_repair",
     "issue_implementation",
@@ -308,6 +356,11 @@ function requiredWorkerLane(value: string): WorkerLane {
   ]);
   if (allowed.has(value as WorkerLane)) return value as WorkerLane;
   throw new Error(`unknown worker lane: ${value}`);
+}
+
+function requiredQueuePressureLevel(value: string): QueuePressureLevel {
+  if (value === "none" || value === "soft" || value === "hard" || value === "unknown") return value;
+  throw new Error(`unknown queue pressure level: ${value}`);
 }
 
 export function automationLimit(limitPath: string): number {
@@ -507,6 +560,35 @@ export function countActions(reportPath: string, action: string): number {
   return readApplyActions(reportPath).filter((entry) => entry.action === action).length;
 }
 
+export const APPLY_REQUEUE_UNVERIFIED_CHECKOUT_REASON =
+  "review lacks verified local checkout access";
+
+// Close-mode apply cannot close a record whose source drifted since review or
+// whose stored review never verified local checkout access. Both blocks have
+// the same cure: a fresh exact review. Source-drift skips come first because
+// their close proposals are already confirmed and only need re-verification.
+export function applyRequeueReviewItemNumbers(reportPath: string, limit: number): number[] {
+  if (!Number.isInteger(limit) || limit <= 0) return [];
+  const actions = readApplyActions(reportPath);
+  const selected: number[] = [];
+  const seen = new Set<number>();
+  const push = (entry: ApplyAction): void => {
+    const number = entry.number;
+    if (number === undefined || seen.has(number) || selected.length >= limit) return;
+    seen.add(number);
+    selected.push(number);
+  };
+  for (const entry of actions) {
+    if (entry.action === "skipped_changed_since_review") push(entry);
+  }
+  for (const entry of actions) {
+    if (entry.action === "kept_open" && entry.reason === APPLY_REQUEUE_UNVERIFIED_CHECKOUT_REASON) {
+      push(entry);
+    }
+  }
+  return selected;
+}
+
 export function applyContinuationBlocker(
   values: readonly unknown[],
   options: ApplyContinuationBlockerOptions,
@@ -540,6 +622,12 @@ export function applyContinuationBlocker(
 
 export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyReportSummary {
   const actions = readApplyActions(options.reportPath);
+  const examined =
+    options.cursorRequired &&
+    options.cursorAdvanceCount !== null &&
+    options.cursorAdvanceCount !== undefined
+      ? options.cursorAdvanceCount
+      : null;
   const lanes = summarizeApplyLanes(actions, options.mode);
   const skipReasons: Record<string, number> = {};
   let closed = 0;
@@ -560,6 +648,7 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
     mode: options.mode,
     cursorRequired: options.cursorRequired,
     candidateCount: options.candidateCount ?? null,
+    candidateCounts: options.candidateCounts ?? null,
     cursorAdvanceCount: options.cursorAdvanceCount ?? null,
     scheduledIntervalMinutes: options.scheduledIntervalMinutes ?? null,
   });
@@ -567,7 +656,7 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   if (
     options.cursorRequired &&
     processedLimit !== null &&
-    actions.length >= processedLimit &&
+    (actions.length >= processedLimit || (examined !== null && examined >= processedLimit)) &&
     !cursor
   ) {
     attentionReasons.push("cursor_required_but_missing_after_full_window");
@@ -596,10 +685,15 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   const nextActions = applySkipNextActions(skipReasons);
 
   const status =
-    actions.length === 0 ? "idle" : attentionReasons.length > 0 ? "needs_attention" : "ok";
+    attentionReasons.length > 0
+      ? "needs_attention"
+      : actions.length === 0 && (examined === null || examined === 0)
+        ? "idle"
+        : "ok";
   const summary = applyReportHealthSummary({
     status,
-    processed: actions.length,
+    examined,
+    actionRecords: actions.length,
     processedLimit,
     closed,
     commentSynced,
@@ -615,6 +709,8 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
     mode: options.mode,
     status,
     summary,
+    examined,
+    action_records: actions.length,
     processed: actions.length,
     processed_limit: processedLimit,
     close_limit: options.closeLimit,
@@ -770,7 +866,16 @@ const APPLY_SKIP_NEXT_ACTION_DETAILS: Record<string, ApplySkipNextActionDetail> 
     summary: "The close-coverage proof check failed transiently before reaching a decision.",
     next_step: "Inspect the proof failure, then retry after model and GitHub access recover.",
   },
+  retry_stale_canonical_comment_sync: {
+    bucket: "review_refresh",
+    owner: "clawsweeper",
+    retryable: true,
+    label: "Retry comment correction",
+    summary: "A stale canonical close verdict still needs to be replaced on GitHub.",
+    next_step: "Retry durable comment sync until the conservative keep-open correction succeeds.",
+  },
   skipped_protected_label: maintainerDecisionAction(),
+  skipped_close_exempt_label: maintainerDecisionAction(),
   skipped_policy_exempt: maintainerDecisionAction(),
   skipped_maintainer_authored: {
     bucket: "maintainer_review",
@@ -787,6 +892,14 @@ const APPLY_SKIP_NEXT_ACTION_DETAILS: Record<string, ApplySkipNextActionDetail> 
     label: "Conversation locked",
     summary: "GitHub blocked the durable comment write because the conversation is locked.",
     next_step: "Unlock the conversation before retrying comment sync, or leave it unchanged.",
+  },
+  skipped_low_signal_live_guard: {
+    bucket: "stable_skip",
+    owner: "none",
+    retryable: false,
+    label: "Live close guard",
+    summary: "Current GitHub state no longer satisfies the low-signal close policy.",
+    next_step: "Leave the item open until a later review or live-state change makes it eligible.",
   },
   skipped_same_author_pair: {
     bucket: "stable_skip",
@@ -885,6 +998,7 @@ function applyCycleSummary(options: {
   mode: string;
   cursorRequired: boolean;
   candidateCount: number | null;
+  candidateCounts: ApplyCandidateCounts | null;
   cursorAdvanceCount: number | null;
   scheduledIntervalMinutes: number | null;
 }): ApplyCycleSummary {
@@ -899,6 +1013,7 @@ function applyCycleSummary(options: {
     return {
       basis: "not_close_cursor",
       apply_ready_count: options.candidateCount,
+      candidate_counts: options.candidateCounts,
       window_size: windowSize,
       estimated_full_cycle_windows: null,
       estimated_full_cycle_minutes: null,
@@ -910,6 +1025,7 @@ function applyCycleSummary(options: {
     return {
       basis: "missing_candidate_count",
       apply_ready_count: null,
+      candidate_counts: options.candidateCounts,
       window_size: windowSize,
       estimated_full_cycle_windows: null,
       estimated_full_cycle_minutes: null,
@@ -921,17 +1037,19 @@ function applyCycleSummary(options: {
     return {
       basis: "no_apply_ready_candidates",
       apply_ready_count: 0,
+      candidate_counts: options.candidateCounts,
       window_size: windowSize,
       estimated_full_cycle_windows: 0,
       estimated_full_cycle_minutes: 0,
       scheduled_interval_minutes: cadence,
-      label: "No confirmed close proposals or live promotion probes are waiting in this lane.",
+      label: zeroCandidateCycleLabel(options.candidateCounts),
     };
   }
   if (!windowSize) {
     return {
       basis: "missing_window_size",
       apply_ready_count: options.candidateCount,
+      candidate_counts: options.candidateCounts,
       window_size: null,
       estimated_full_cycle_windows: null,
       estimated_full_cycle_minutes: null,
@@ -944,11 +1062,19 @@ function applyCycleSummary(options: {
   return {
     basis: "scheduled_close_cursor",
     apply_ready_count: options.candidateCount,
+    candidate_counts: options.candidateCounts,
     window_size: windowSize,
     estimated_full_cycle_windows: windows,
     estimated_full_cycle_minutes: minutes,
     scheduled_interval_minutes: cadence,
-    label: cycleLabel(options.candidateCount, windowSize, windows, minutes, cadence),
+    label: cycleLabel(
+      options.candidateCount,
+      windowSize,
+      windows,
+      minutes,
+      cadence,
+      options.candidateCounts,
+    ),
   };
 }
 
@@ -958,10 +1084,37 @@ function cycleLabel(
   windows: number,
   minutes: number | null,
   cadence: number | null,
+  counts: ApplyCandidateCounts | null,
 ): string {
-  const base = `${candidateCount} close candidates (confirmed proposals plus live promotion probes) at ${windowSize} records per latest cursor advance: about ${windows} window${windows === 1 ? "" : "s"}`;
+  const base = `${candidateCount} currently actionable close candidates${candidateCountBreakdown(counts)} at ${windowSize} records per latest cursor advance: about ${windows} window${windows === 1 ? "" : "s"}`;
   if (!minutes || !cadence) return `${base}.`;
   return `${base}; scheduled cadence alone would take roughly ${durationLabel(minutes)} at ${cadence}-minute intervals, while successful windows can continue sooner.`;
+}
+
+function zeroCandidateCycleLabel(counts: ApplyCandidateCounts | null): string {
+  if (!counts) return "No currently actionable close candidates are waiting in this lane.";
+  const coolingPromotions = Math.max(
+    0,
+    counts.promotion_total - counts.promotion_cooldown_eligible,
+  );
+  const eligibleBacklog = counts.cooldown_eligible_total
+    ? ` ${counts.cooldown_eligible_total} candidate${counts.cooldown_eligible_total === 1 ? " meets" : "s meet"} cooldown rules but none were admitted by this scheduler window.`
+    : "";
+  const suffix = coolingPromotions
+    ? ` ${coolingPromotions} promotion probe${coolingPromotions === 1 ? " is" : "s are"} cooling down.`
+    : "";
+  return `No currently actionable close candidates are waiting in this lane.${eligibleBacklog}${suffix}`;
+}
+
+function candidateCountBreakdown(counts: ApplyCandidateCounts | null): string {
+  if (!counts) return "";
+  const confirmed = `${counts.confirmed_proposal} confirmed proposal${counts.confirmed_proposal === 1 ? "" : "s"}`;
+  const guarded = `${counts.guarded_retry} guarded ${counts.guarded_retry === 1 ? "retry" : "retries"}`;
+  const promotions = `${counts.promotion_eligible}/${counts.promotion_total} promotion probe${counts.promotion_total === 1 ? "" : "s"} admitted`;
+  const proof = `${counts.proof_required} ${counts.proof_required === 1 ? "requires" : "require"} proof`;
+  const inconsistent = `${counts.inconsistent_or_stale} inconsistent or stale record${counts.inconsistent_or_stale === 1 ? "" : "s"} excluded`;
+  const cooldownBacklog = `${counts.cooldown_eligible_total} cooldown-eligible backlog (${counts.promotion_cooldown_eligible} promotions)`;
+  return ` (${confirmed}, ${guarded}, ${promotions}; ${proof}; ${cooldownBacklog}; ${inconsistent})`;
 }
 
 function durationLabel(minutes: number): string {
@@ -972,7 +1125,8 @@ function durationLabel(minutes: number): string {
 }
 function applyReportHealthSummary(options: {
   status: ApplyReportSummary["status"];
-  processed: number;
+  examined: number | null;
+  actionRecords: number;
   processedLimit: number | null;
   closed: number;
   commentSynced: number;
@@ -980,15 +1134,19 @@ function applyReportHealthSummary(options: {
   cursor: ApplyReportSummary["cursor"];
   attentionReasons: string[];
 }): string {
-  if (options.status === "idle") return "Apply processed no records in this run.";
-  const budget =
+  const actionRecords =
     options.processedLimit === null
-      ? `${options.processed} processed`
-      : `${options.processed}/${options.processedLimit} processed`;
+      ? `${options.actionRecords} action records`
+      : `${options.actionRecords}/${options.processedLimit} action records`;
+  const examined =
+    options.examined === null ? "examined count unavailable" : `${options.examined} examined`;
+  if (options.status === "idle") {
+    return `Apply produced no action records in this run; ${examined}.`;
+  }
   const cursorText = options.cursor
     ? `cursor at #${options.cursor.next_after_number}`
     : "no cursor recorded";
-  const base = `${budget}; ${options.closed} closed, ${options.commentSynced} comments synced, ${options.skipped} skipped; ${cursorText}.`;
+  const base = `${examined}; ${actionRecords}; ${options.closed} closed, ${options.commentSynced} comments synced, ${options.skipped} skipped; ${cursorText}.`;
   if (options.attentionReasons.length === 0) return base;
   return `${base} Attention: ${options.attentionReasons.join(", ")}.`;
 }
@@ -1039,6 +1197,7 @@ type ProposedItemOptions = {
   batchSize?: number | null;
   cursorPath?: string | null;
   coverageProofLimit?: number | null;
+  closeLimit?: number | null;
   itemNumbers?: ReadonlySet<number> | null;
 };
 
@@ -1054,8 +1213,84 @@ export function proposedItemNumbers(options: ProposedItemOptions): number[] {
 }
 
 export function proposedItemCount(options: ProposedItemOptions): number {
-  return selectedProposedItemCandidates({ ...options, batchSize: null, cursorPath: null }, "all")
-    .length;
+  return proposedItemInventory(options).eligible_total;
+}
+
+export function proposedItemInventory(options: ProposedItemOptions): ProposedItemInventory {
+  return proposedItemInventorySelection(options).inventory;
+}
+
+function proposedItemInventorySelection(options: ProposedItemOptions): {
+  inventory: ProposedItemInventory;
+  itemNumbers: number[];
+} {
+  const nowMs = Date.now();
+  const allCandidates = selectedProposedItemCandidates(
+    { ...options, batchSize: null, cursorPath: null },
+    "all",
+  );
+  const cooldownEligibleCandidates = allCandidates.filter(
+    (candidate) =>
+      candidate.stage !== "promotion_probe" || !promotionProbeCoolingDown(candidate, nowMs),
+  );
+  const eligibleCandidates =
+    options.batchSize && options.batchSize > 0
+      ? selectedProposedItemCandidates(options, "all", allCandidates, nowMs)
+      : cooldownEligibleCandidates;
+  const candidateNumbers = new Set(allCandidates.map((candidate) => candidate.number));
+  const confirmedCandidates = eligibleCandidates.filter(
+    (candidate) => candidate.stage === "confirmed_close",
+  );
+  return {
+    itemNumbers: eligibleCandidates.map((candidate) => candidate.number),
+    inventory: {
+      eligible_total: eligibleCandidates.length,
+      confirmed_proposal: confirmedCandidates.filter(
+        (candidate) => candidate.action === "proposed_close",
+      ).length,
+      guarded_retry: confirmedCandidates.filter(
+        (candidate) => candidate.action !== "proposed_close",
+      ).length,
+      proof_required: eligibleCandidates.filter((candidate) => candidate.coverageProof).length,
+      promotion_total: allCandidates.filter((candidate) => candidate.stage === "promotion_probe")
+        .length,
+      promotion_eligible: eligibleCandidates.filter(
+        (candidate) => candidate.stage === "promotion_probe",
+      ).length,
+      promotion_cooldown_eligible: cooldownEligibleCandidates.filter(
+        (candidate) => candidate.stage === "promotion_probe",
+      ).length,
+      cooldown_eligible_total: cooldownEligibleCandidates.length,
+      inconsistent_or_stale: inconsistentOrStaleProposedItemCount(options, candidateNumbers),
+    },
+  };
+}
+
+function printProposedItemInventory(options: ProposedItemOptions): void {
+  const { inventory, itemNumbers } = proposedItemInventorySelection(options);
+  const candidateCounts: ApplyCandidateCounts = {
+    confirmed_proposal: inventory.confirmed_proposal,
+    guarded_retry: inventory.guarded_retry,
+    proof_required: inventory.proof_required,
+    promotion_total: inventory.promotion_total,
+    promotion_eligible: inventory.promotion_eligible,
+    promotion_cooldown_eligible: inventory.promotion_cooldown_eligible,
+    cooldown_eligible_total: inventory.cooldown_eligible_total,
+    inconsistent_or_stale: inventory.inconsistent_or_stale,
+  };
+  printOutput({
+    item_numbers: itemNumbers.join(","),
+    apply_ready_count: String(inventory.eligible_total),
+    confirmed_proposal: String(inventory.confirmed_proposal),
+    guarded_retry: String(inventory.guarded_retry),
+    proof_required: String(inventory.proof_required),
+    promotion_total: String(inventory.promotion_total),
+    promotion_eligible: String(inventory.promotion_eligible),
+    promotion_cooldown_eligible: String(inventory.promotion_cooldown_eligible),
+    cooldown_eligible_total: String(inventory.cooldown_eligible_total),
+    inconsistent_or_stale: String(inventory.inconsistent_or_stale),
+    candidate_counts_json: JSON.stringify(candidateCounts),
+  });
 }
 
 export function proposedPrCloseCoverageItemNumbers(options: ProposedItemOptions): number[] {
@@ -1069,6 +1304,7 @@ type ProposedItemSelection = "all" | "pr-close-coverage-proof" | "quality-summar
 type ProposedItemCandidate = {
   number: number;
   applyCheckedAt: string;
+  reviewedAt: string;
   kind: string;
   closeReason: string;
   action: string;
@@ -1101,27 +1337,61 @@ type ProposedItemQualitySummary = {
   buckets: ProposedItemQualityBucketSummary[];
 };
 
+const FAST_CLOSE_BUCKET_ORDER: ProposedItemQualityBucket[] = [
+  "ready_implemented",
+  "duplicate_or_superseded",
+  "other",
+  "aging_or_low_signal",
+  "policy_sensitive",
+  "retry_after_guard_skip",
+  "needs_pr_close_coverage",
+  "promotion_probe",
+];
+
+// Promotion probes hydrate related live graphs; a fresh review bypasses this daily backoff.
+const APPLY_PROMOTION_PROBE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+const ALLOWED_CLOSE_REASONS = new Set([
+  "abandoned_pr",
+  "author_pr_budget_exceeded",
+  "cannot_reproduce",
+  "clawhub",
+  "duplicate_or_superseded",
+  "incoherent",
+  "implemented_on_main",
+  "low_signal_unmergeable_pr",
+  "mostly_implemented_on_main",
+  "not_actionable_in_repo",
+  "stalled_unproven_pr",
+  "stale_insufficient_info",
+  "unconfirmed_product_direction",
+  "unsponsored_feature_request",
+]);
+
+function prioritizeFastCloseCandidates(
+  candidates: ProposedItemCandidate[],
+): ProposedItemCandidate[] {
+  const rank = new Map(FAST_CLOSE_BUCKET_ORDER.map((bucket, index) => [bucket, index]));
+  return candidates
+    .map((candidate, index) => ({ candidate, index }))
+    .sort(
+      (left, right) =>
+        (rank.get(left.candidate.qualityBucket) ?? Number.MAX_SAFE_INTEGER) -
+          (rank.get(right.candidate.qualityBucket) ?? Number.MAX_SAFE_INTEGER) ||
+        left.index - right.index,
+    )
+    .map(({ candidate }) => candidate);
+}
+
 function selectedProposedItemCandidates(
   options: ProposedItemOptions,
   selection: ProposedItemSelection,
+  candidateSnapshot?: readonly ProposedItemCandidate[],
+  nowMs = Date.now(),
 ): ProposedItemCandidate[] {
   const itemsDir = path.join("records", targetSlug(options.targetRepo), "items");
-  if (!fs.existsSync(itemsDir)) return [];
+  if (!candidateSnapshot && !fs.existsSync(itemsDir)) return [];
 
-  const allowedReasons = new Set([
-    "abandoned_pr",
-    "cannot_reproduce",
-    "clawhub",
-    "duplicate_or_superseded",
-    "incoherent",
-    "implemented_on_main",
-    "low_signal_unmergeable_pr",
-    "mostly_implemented_on_main",
-    "not_actionable_in_repo",
-    "stalled_unproven_pr",
-    "stale_insufficient_info",
-    "unconfirmed_product_direction",
-  ]);
   const allowedCloseReasons =
     options.applyCloseReasons === "all"
       ? null
@@ -1136,83 +1406,111 @@ function selectedProposedItemCandidates(
       ? options.minAgeDays * 24 * 60 * 60 * 1000
       : options.minAgeMinutes * 60 * 1000;
 
-  const candidates: ProposedItemCandidate[] = fs
-    .readdirSync(itemsDir)
-    .filter((name) => /(?:^|[a-z0-9-]-)\d+\.md$/.test(name))
-    .flatMap((name) => {
-      const number = numberFor(name);
-      if (options.itemNumbers && !options.itemNumbers.has(number)) return [];
-      const markdown = fs.readFileSync(path.join(itemsDir, name), "utf8");
-      if (repoFor(markdown, name) !== options.targetRepo) return [];
-      const type = frontMatterValue(markdown, "type");
-      if (options.applyKind !== "all" && type && type !== options.applyKind) return [];
-      const decision = frontMatterValue(markdown, "decision");
-      const action = frontMatterValue(markdown, "action_taken");
-      const confidence = frontMatterValue(markdown, "confidence");
-      const reason = frontMatterValue(markdown, "close_reason");
-      const selectableClose =
-        decision === "close" &&
-        confidence === "high" &&
-        isSelectableCloseAction(action, reason) &&
-        allowedForTarget(options.targetRepo, type, reason, allowedReasons) &&
-        (!allowedCloseReasons || allowedCloseReasons.has(reason));
-      const selectablePromotion =
-        decision === "keep_open" &&
-        action === "kept_open" &&
-        type === "pull_request" &&
-        frontMatterValue(markdown, "review_status") === "complete" &&
-        frontMatterValue(markdown, "local_checkout_access") === "verified" &&
-        hasPullRequestClosePromotionSignal(markdown, options.targetRepo, {
-          staleMinAgeMs: options.staleMinAgeDays * 24 * 60 * 60 * 1000,
-        }) &&
-        allowedForTarget(options.targetRepo, type, "duplicate_or_superseded", allowedReasons) &&
-        (!allowedCloseReasons || allowedCloseReasons.has("duplicate_or_superseded"));
-      const selectableProofPromotion =
-        selectablePromotion && hasLinkedPullRequestSupersessionSignal(markdown, options.targetRepo);
-      if (!selectableClose && !selectablePromotion) return [];
-      const prCloseCoverageProofCanRun =
-        type === "pull_request" &&
-        ((selectableClose && reason === "duplicate_or_superseded") || selectableProofPromotion);
-      if (selection === "pr-close-coverage-proof" && !prCloseCoverageProofCanRun) return [];
-      if (
-        (reason === "stale_insufficient_info" || reason === "mostly_implemented_on_main") &&
-        !olderThan(
-          frontMatterValue(markdown, "item_created_at"),
-          options.staleMinAgeDays * 24 * 60 * 60 * 1000,
-        )
-      ) {
-        return [];
-      }
-      if (!olderThan(frontMatterValue(markdown, "item_created_at"), minAgeMs)) return [];
-      const candidateCloseReason = selectablePromotion ? "duplicate_or_superseded" : reason;
-      return [
-        {
-          number,
-          applyCheckedAt: frontMatterValue(markdown, "apply_checked_at"),
-          kind: type,
-          closeReason: candidateCloseReason,
-          action,
-          stage: selectablePromotion ? ("promotion_probe" as const) : ("confirmed_close" as const),
-          coverageProof: prCloseCoverageProofCanRun,
-          qualityBucket: proposedItemQualityBucket({
-            action,
-            closeReason: candidateCloseReason,
-            prCloseCoverageProofCanRun,
-            promotionProbe: selectablePromotion,
-          }),
-        },
-      ];
-    })
-    .sort((left, right) => left.number - right.number);
+  const candidates: ProposedItemCandidate[] = candidateSnapshot
+    ? [...candidateSnapshot]
+    : fs
+        .readdirSync(itemsDir)
+        .filter((name) => /(?:^|[a-z0-9-]-)\d+\.md$/.test(name))
+        .flatMap((name) => {
+          const number = numberFor(name);
+          if (options.itemNumbers && !options.itemNumbers.has(number)) return [];
+          const markdown = fs.readFileSync(path.join(itemsDir, name), "utf8");
+          if (repoFor(markdown, name) !== options.targetRepo) return [];
+          const type = frontMatterValue(markdown, "type");
+          if (options.applyKind !== "all" && type && type !== options.applyKind) return [];
+          const decision = frontMatterValue(markdown, "decision");
+          const action = frontMatterValue(markdown, "action_taken");
+          const confidence = frontMatterValue(markdown, "confidence");
+          const reason = frontMatterValue(markdown, "close_reason");
+          const selectableClose =
+            decision === "close" &&
+            confidence === "high" &&
+            isSelectableCloseAction(action, reason) &&
+            allowedForTarget(options.targetRepo, type, reason, ALLOWED_CLOSE_REASONS) &&
+            (!allowedCloseReasons || allowedCloseReasons.has(reason));
+          const promotionCloseReasons = pullRequestClosePromotionReasons(
+            markdown,
+            options.targetRepo,
+            {
+              staleMinAgeMs: options.staleMinAgeDays * 24 * 60 * 60 * 1000,
+            },
+          );
+          const selectedPromotionCloseReasons = promotionCloseReasons.filter(
+            (promotionReason) =>
+              allowedForTarget(options.targetRepo, type, promotionReason, ALLOWED_CLOSE_REASONS) &&
+              (!allowedCloseReasons || allowedCloseReasons.has(promotionReason)),
+          );
+          const selectablePromotion =
+            decision === "keep_open" &&
+            action === "kept_open" &&
+            type === "pull_request" &&
+            frontMatterValue(markdown, "review_status") === "complete" &&
+            frontMatterValue(markdown, "local_checkout_access") === "verified" &&
+            frontMatterValue(markdown, "local_checkout_access_source") === "runner_preflight_v1" &&
+            hasPullRequestClosePromotionSignal(markdown, options.targetRepo, {
+              staleMinAgeMs: options.staleMinAgeDays * 24 * 60 * 60 * 1000,
+            }) &&
+            selectedPromotionCloseReasons.length > 0;
+          const selectableProofPromotion =
+            selectablePromotion &&
+            selectedPromotionCloseReasons.includes("duplicate_or_superseded") &&
+            hasLinkedPullRequestSupersessionSignal(markdown, options.targetRepo);
+          if (!selectableClose && !selectablePromotion) return [];
+          const prCloseCoverageProofCanRun =
+            type === "pull_request" &&
+            ((selectableClose && reason === "duplicate_or_superseded") || selectableProofPromotion);
+          if (selection === "pr-close-coverage-proof" && !prCloseCoverageProofCanRun) return [];
+          if (
+            (reason === "stale_insufficient_info" || reason === "mostly_implemented_on_main") &&
+            !olderThan(
+              frontMatterValue(markdown, "item_created_at"),
+              options.staleMinAgeDays * 24 * 60 * 60 * 1000,
+            )
+          ) {
+            return [];
+          }
+          if (!olderThan(frontMatterValue(markdown, "item_created_at"), minAgeMs)) return [];
+          const candidateCloseReason = selectablePromotion
+            ? selectedPromotionCloseReasons[0]!
+            : reason;
+          return [
+            {
+              number,
+              applyCheckedAt: frontMatterValue(markdown, "apply_checked_at"),
+              reviewedAt: frontMatterValue(markdown, "reviewed_at"),
+              kind: type,
+              closeReason: candidateCloseReason,
+              action,
+              stage: selectablePromotion
+                ? ("promotion_probe" as const)
+                : ("confirmed_close" as const),
+              coverageProof: prCloseCoverageProofCanRun,
+              qualityBucket: proposedItemQualityBucket({
+                action,
+                closeReason: candidateCloseReason,
+                prCloseCoverageProofCanRun,
+                promotionProbe: selectablePromotion,
+              }),
+            },
+          ];
+        })
+        .sort((left, right) => left.number - right.number);
   const batchSize = options.batchSize ?? null;
   if (!batchSize || batchSize <= 0) return candidates;
+  const coolDownPromotionProbes = !options.itemNumbers || options.itemNumbers.size === 0;
+  const readyCandidates = candidates.filter(
+    (candidate) =>
+      candidate.stage !== "promotion_probe" ||
+      !coolDownPromotionProbes ||
+      !promotionProbeCoolingDown(candidate, nowMs),
+  );
   const cursor = options.cursorPath ? readApplyCursor(options.cursorPath) : null;
   const rotate = (
     stage: ProposedItemCandidate["stage"],
     coverageProof: boolean | null,
     position: ApplyCursorPosition | null,
   ): ProposedItemCandidate[] => {
-    const sorted = candidates
+    const sorted = readyCandidates
       .filter(
         (candidate) =>
           candidate.stage === stage &&
@@ -1234,24 +1532,103 @@ function selectedProposedItemCandidates(
   // hydration cannot consume an entire apply window ahead of real proposals.
   if (options.coverageProofLimit === null || options.coverageProofLimit === undefined) {
     return [
-      ...rotate("confirmed_close", null, cursor),
+      ...prioritizeFastCloseCandidates(rotate("confirmed_close", null, cursor)),
       ...rotate("promotion_probe", null, cursor),
     ].slice(0, batchSize);
   }
 
-  const proofLimit = Math.max(0, Math.min(options.coverageProofLimit, batchSize));
-  const fastCandidates = [
-    ...rotate("confirmed_close", false, cursor),
-    ...rotate("promotion_probe", false, cursor),
-  ];
+  const closeLimit = Math.max(1, Math.min(options.closeLimit ?? batchSize, batchSize));
+  const proofLimit = Math.max(0, Math.min(options.coverageProofLimit, batchSize, closeLimit));
+  const fastConfirmedCandidates = prioritizeFastCloseCandidates(
+    rotate("confirmed_close", false, cursor),
+  );
   const proofCursor = cursor?.coverageProof ?? cursor;
+  // Preserve confirmed proof work ahead of speculative promotions. Any reserve
+  // left after confirmed proofs lets the promotion-proof pool rotate independently.
   const proofCandidates = [
     ...rotate("confirmed_close", true, proofCursor),
     ...rotate("promotion_probe", true, proofCursor),
   ];
   const selectedProof = proofCandidates.slice(0, proofLimit);
-  const selectedFast = fastCandidates.slice(0, batchSize - selectedProof.length);
-  return [...selectedFast, ...selectedProof];
+  const selectedFast = fastConfirmedCandidates.slice(0, batchSize - selectedProof.length);
+  // Let ready closes run first, but place every reserved proof before those
+  // closes could hit the mutation limit and stop the checkpoint. A candidate
+  // can close both a PR and its same-author issue counterpart.
+  const maxClosesPerCandidate = 2;
+  const closesReservedBeforeLastProof = Math.max(0, selectedProof.length - 1) * 2;
+  const candidatesBeforeProof = Math.floor(
+    Math.max(0, closeLimit - 1 - closesReservedBeforeLastProof) / maxClosesPerCandidate,
+  );
+  const preProofFastCount = selectedProof.length
+    ? Math.min(selectedFast.length, candidatesBeforeProof)
+    : selectedFast.length;
+  const selectedPromotions = rotate("promotion_probe", false, cursor).slice(
+    0,
+    batchSize - selectedFast.length - selectedProof.length,
+  );
+  return [
+    ...selectedFast.slice(0, preProofFastCount),
+    ...selectedProof,
+    ...selectedFast.slice(preProofFastCount),
+    ...selectedPromotions,
+  ];
+}
+
+function inconsistentOrStaleProposedItemCount(
+  options: ProposedItemOptions,
+  candidateNumbers: ReadonlySet<number>,
+): number {
+  const itemsDir = path.join("records", targetSlug(options.targetRepo), "items");
+  if (!fs.existsSync(itemsDir)) return 0;
+  const allowedCloseReasons =
+    options.applyCloseReasons === "all"
+      ? null
+      : new Set(
+          options.applyCloseReasons
+            .split(",")
+            .map((reason) => reason.trim())
+            .filter(Boolean),
+        );
+  const minAgeMs =
+    options.minAgeMinutes === null
+      ? options.minAgeDays * 24 * 60 * 60 * 1000
+      : options.minAgeMinutes * 60 * 1000;
+  return fs
+    .readdirSync(itemsDir)
+    .filter((name) => /(?:^|[a-z0-9-]-)\d+\.md$/.test(name))
+    .filter((name) => {
+      const number = numberFor(name);
+      if (candidateNumbers.has(number)) return false;
+      if (options.itemNumbers && !options.itemNumbers.has(number)) return false;
+      const markdown = fs.readFileSync(path.join(itemsDir, name), "utf8");
+      if (repoFor(markdown, name) !== options.targetRepo) return false;
+      const type = frontMatterValue(markdown, "type");
+      if (options.applyKind !== "all" && type && type !== options.applyKind) return false;
+      const action = frontMatterValue(markdown, "action_taken");
+      if (action !== "proposed_close" && action !== "retry_pr_close_coverage_proof") return false;
+      const reason = frontMatterValue(markdown, "close_reason");
+      if (allowedCloseReasons && !allowedCloseReasons.has(reason)) return false;
+      if (
+        ALLOWED_CLOSE_REASONS.has(reason) &&
+        !allowedForTarget(options.targetRepo, type, reason, ALLOWED_CLOSE_REASONS)
+      ) {
+        return false;
+      }
+      const createdAt = frontMatterValue(markdown, "item_created_at");
+      if (
+        (reason === "stale_insufficient_info" || reason === "mostly_implemented_on_main") &&
+        !olderThan(createdAt, options.staleMinAgeDays * 24 * 60 * 60 * 1000)
+      ) {
+        return false;
+      }
+      return olderThan(createdAt, minAgeMs);
+    }).length;
+}
+
+function promotionProbeCoolingDown(candidate: ProposedItemCandidate, nowMs = Date.now()): boolean {
+  const checkedAtMs = timestampValue(candidate.applyCheckedAt);
+  if (checkedAtMs === 0 || timestampValue(candidate.reviewedAt) > checkedAtMs) return false;
+  return nowMs - checkedAtMs < APPLY_PROMOTION_PROBE_COOLDOWN_MS;
 }
 
 export function proposedItemQualitySummary(
@@ -1342,7 +1719,19 @@ function proposedItemQualityBucket(options: {
 }): ProposedItemQualityBucket {
   if (options.promotionProbe) return "promotion_probe";
   if (options.prCloseCoverageProofCanRun) return "needs_pr_close_coverage";
-  if (options.closeReason === "unconfirmed_product_direction") return "policy_sensitive";
+  if (
+    options.closeReason === "unconfirmed_product_direction" ||
+    options.closeReason === "unsponsored_feature_request" ||
+    options.closeReason === "author_pr_budget_exceeded"
+  )
+    return "policy_sensitive";
+  if (
+    options.action === "skipped_invalid_decision" ||
+    options.action === "skipped_maintainer_authored" ||
+    isLiveRecheckCloseGuardAction(options.action)
+  ) {
+    return "retry_after_guard_skip";
+  }
   if (
     options.closeReason === "abandoned_pr" ||
     options.closeReason === "stale_insufficient_info" ||
@@ -1351,12 +1740,6 @@ function proposedItemQualityBucket(options: {
     options.closeReason === "low_signal_unmergeable_pr"
   ) {
     return "aging_or_low_signal";
-  }
-  if (
-    options.action === "skipped_invalid_decision" ||
-    options.action === "skipped_maintainer_authored"
-  ) {
-    return "retry_after_guard_skip";
   }
   if (options.closeReason === "duplicate_or_superseded") return "duplicate_or_superseded";
   if (options.closeReason === "implemented_on_main" || options.closeReason === "clawhub") {
@@ -1401,22 +1784,8 @@ function timestampValue(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-const SELECTABLE_CLOSE_ACTIONS = new Set([
-  "proposed_close",
-  "retry_pr_close_coverage_proof",
-  "kept_open",
-  "skipped_open_closing_pr",
-  "skipped_same_author_pair",
-]);
-
-const RETRYABLE_CLOSE_SKIP_ACTIONS = new Set([
-  "skipped_maintainer_authored",
-  "skipped_invalid_decision",
-]);
-
 function isSelectableCloseAction(action: string, reason: string): boolean {
-  if (RETRYABLE_CLOSE_SKIP_ACTIONS.has(action)) return reason === "implemented_on_main";
-  return SELECTABLE_CLOSE_ACTIONS.has(action);
+  return isSelectableApplyCloseAction(action, reason);
 }
 
 function hasPullRequestClosePromotionSignal(
@@ -1425,10 +1794,43 @@ function hasPullRequestClosePromotionSignal(
   options: { staleMinAgeMs: number },
 ): boolean {
   return (
+    (hasAuthorPrBudgetPromotionSignal(markdown) &&
+      olderThan(frontMatterValue(markdown, "item_created_at"), 7 * 24 * 60 * 60 * 1000)) ||
     hasLinkedPullRequestSupersessionSignal(markdown, targetRepo) ||
-    ((hasRecommendedPauseOrCloseOption(markdown) || hasStaleFRatedPullRequestSignal(markdown)) &&
+    ((hasRecommendedPauseOrCloseOption(markdown) ||
+      hasLowSignalPullRequestPromotionSignal(markdown)) &&
       olderThan(frontMatterValue(markdown, "item_created_at"), options.staleMinAgeMs))
   );
+}
+
+function pullRequestClosePromotionReasons(
+  markdown: string,
+  targetRepo: string,
+  options: { staleMinAgeMs: number },
+): Array<"author_pr_budget_exceeded" | "duplicate_or_superseded" | "low_signal_unmergeable_pr"> {
+  const linkedSupersession = hasLinkedPullRequestSupersessionSignal(markdown, targetRepo);
+  const recommendedPauseOrClose = hasRecommendedPauseOrCloseOption(markdown);
+  const reasons: Array<
+    "author_pr_budget_exceeded" | "duplicate_or_superseded" | "low_signal_unmergeable_pr"
+  > = [];
+  if (
+    hasAuthorPrBudgetPromotionSignal(markdown) &&
+    olderThan(frontMatterValue(markdown, "item_created_at"), 7 * 24 * 60 * 60 * 1000)
+  ) {
+    reasons.push("author_pr_budget_exceeded");
+  }
+  if (linkedSupersession || recommendedPauseOrClose) reasons.push("duplicate_or_superseded");
+  // Pause-or-close is a deterministic duplicate promotion. A linked PR is only
+  // speculative until live hydration, so an F-rated report can still fall back
+  // to the low-signal promotion when that linked candidate does not cover it.
+  if (
+    !recommendedPauseOrClose &&
+    hasLowSignalPullRequestPromotionSignal(markdown) &&
+    olderThan(frontMatterValue(markdown, "item_created_at"), options.staleMinAgeMs)
+  ) {
+    reasons.push("low_signal_unmergeable_pr");
+  }
+  return reasons;
 }
 
 function hasLinkedPullRequestSupersessionSignal(markdown: string, targetRepo: string): boolean {
@@ -1482,13 +1884,93 @@ function hasRecommendedPauseOrCloseOption(markdown: string): boolean {
   });
 }
 
-function hasStaleFRatedPullRequestSignal(markdown: string): boolean {
-  return (
-    frontMatterValue(markdown, "pr_rating_overall") === "F" ||
-    frontMatterValue(markdown, "pr_rating_proof") === "F" ||
-    sectionLineValue(markdown, "Overall tier") === "F" ||
-    sectionLineValue(markdown, "Proof tier") === "F"
+const PR_RATING_TIER_VALUES = new Set(["S", "A", "B", "C", "D", "F", "NA"]);
+const PROOF_STATUS_VALUES = new Set([
+  "sufficient",
+  "override",
+  "insufficient",
+  "mock_only",
+  "missing",
+  "not_applicable",
+]);
+
+function trustedPromotionValue(
+  markdown: string,
+  key: string,
+  legacySectionValue: string,
+  allowed: ReadonlySet<string>,
+): { invalid: boolean; value: string } {
+  const field = frontMatterField(markdown, key);
+  if (field.status === "ambiguous") return { invalid: true, value: "" };
+  const value = field.status === "value" ? field.value : legacySectionValue;
+  return { invalid: Boolean(value) && !allowed.has(value), value };
+}
+
+function hasLowSignalPullRequestPromotionSignal(markdown: string): boolean {
+  const ratingSection = sectionValue(markdown, "PR Rating");
+  const proofSection = sectionValue(markdown, "Real Behavior Proof");
+  const overallTier = trustedPromotionValue(
+    markdown,
+    "pr_rating_overall",
+    sectionLineValue(ratingSection, "Overall tier"),
+    PR_RATING_TIER_VALUES,
   );
+  const proofTier = trustedPromotionValue(
+    markdown,
+    "pr_rating_proof",
+    sectionLineValue(ratingSection, "Proof tier"),
+    PR_RATING_TIER_VALUES,
+  );
+  const proofStatus = trustedPromotionValue(
+    markdown,
+    "real_behavior_proof_status",
+    sectionLineValue(proofSection, "Status"),
+    PROOF_STATUS_VALUES,
+  );
+  if (overallTier.invalid || proofTier.invalid || proofStatus.invalid) return false;
+  return (
+    overallTier.value === "F" &&
+    (proofTier.value === "F" ||
+      ["missing", "mock_only", "insufficient"].includes(proofStatus.value))
+  );
+}
+
+function hasAuthorPrBudgetPromotionSignal(markdown: string): boolean {
+  const ratingSection = sectionValue(markdown, "PR Rating");
+  const proofSection = sectionValue(markdown, "Real Behavior Proof");
+  const overallTier = trustedPromotionValue(
+    markdown,
+    "pr_rating_overall",
+    sectionLineValue(ratingSection, "Overall tier"),
+    PR_RATING_TIER_VALUES,
+  );
+  const proofStatus = trustedPromotionValue(
+    markdown,
+    "real_behavior_proof_status",
+    sectionLineValue(proofSection, "Status"),
+    PROOF_STATUS_VALUES,
+  );
+  if (overallTier.invalid || proofStatus.invalid) return false;
+  if (
+    ["S", "A", "B"].includes(overallTier.value) &&
+    ["sufficient", "override"].includes(proofStatus.value)
+  ) {
+    return false;
+  }
+  return (
+    ["D", "F"].includes(overallTier.value) ||
+    ["missing", "mock_only", "insufficient"].includes(proofStatus.value)
+  );
+}
+
+export function pullRequestClosePromotionSignalsForTest(markdown: string): {
+  authorBudget: boolean;
+  lowSignal: boolean;
+} {
+  return {
+    authorBudget: hasAuthorPrBudgetPromotionSignal(markdown),
+    lowSignal: hasLowSignalPullRequestPromotionSignal(markdown),
+  };
 }
 
 function closePromotionSignalTexts(markdown: string): string[] {
@@ -1504,20 +1986,76 @@ function closePromotionSignalTexts(markdown: string): string[] {
 }
 
 export function commentSyncBatchOutput(options: CommentSyncBatchOptions): Record<string, string> {
-  const candidates = commentSyncCandidates(options.targetRepo, options.applyKind);
+  const urgentCandidates = new Map<number, number>();
+  const targetSlug = commentSyncTargetSlug(options.targetRepo);
+  const automaticAllItemCursor =
+    options.applyKind === "all" && path.basename(options.cursorPath) === `${targetSlug}.json`;
+  const candidates = commentSyncCandidates(
+    options.targetRepo,
+    options.applyKind,
+    urgentCandidates,
+    automaticAllItemCursor,
+  );
   const cursor = readCommentSyncCursor(options.cursorPath);
-  const afterCursor = candidates.filter((number) => number > cursor).slice(0, options.batchSize);
-  const selected =
-    afterCursor.length > 0
+  const hasCandidatesAfterCursor = candidates.some((number) => number > cursor);
+  const urgentAfterCursor = candidates.filter(
+    (number) => number > cursor && urgentCandidates.has(number),
+  );
+  const reviewedUrgent = candidates.filter((number) => (urgentCandidates.get(number) ?? 0) > 0);
+  let urgent = (
+    reviewedUrgent.length > 0
+      ? reviewedUrgent
+      : urgentAfterCursor.length > 0
+        ? urgentAfterCursor
+        : candidates.filter((number) => urgentCandidates.has(number))
+  )
+    .sort(
+      (left, right) =>
+        (urgentCandidates.get(right) ?? 0) - (urgentCandidates.get(left) ?? 0) || left - right,
+    )
+    .slice(0, options.batchSize);
+  let urgentSet = new Set(urgent);
+  const blockedCursorCandidate = candidates.find(
+    (number) => !urgentSet.has(number) && (!hasCandidatesAfterCursor || number > cursor),
+  );
+  if (
+    options.batchSize > 1 &&
+    urgent.length === options.batchSize &&
+    blockedCursorCandidate !== undefined
+  ) {
+    urgent = urgent.slice(0, -1);
+    urgentSet = new Set(urgent);
+  }
+  const afterCursor = candidates
+    .filter((number) => number > cursor && !urgentSet.has(number))
+    .slice(0, options.batchSize - urgent.length);
+  const regular =
+    afterCursor.length > 0 || hasCandidatesAfterCursor
       ? afterCursor
-      : candidates.filter((number) => number > 0).slice(0, options.batchSize);
-  const nextCursor = selected.length > 0 ? selected[selected.length - 1] : cursor;
+      : candidates
+          .filter((number) => number > 0 && !urgentSet.has(number))
+          .slice(0, options.batchSize - urgent.length);
+  // The numeric frontier owns cursor progress. Run its first record before
+  // opportunistic urgent repairs so a slow urgent window cannot repeatedly
+  // exhaust the runtime budget without ever reaching the frontier.
+  const selected = regular.length > 0 ? [regular[0]!, ...urgent, ...regular.slice(1)] : urgent;
+  const highestUrgent = urgent.length > 0 ? Math.max(...urgent) : cursor;
+  const urgentCanAdvanceCursor =
+    urgent.length > 0 &&
+    (urgent.every((number) => number > cursor) || !hasCandidatesAfterCursor) &&
+    !candidates.some(
+      (number) =>
+        !urgentSet.has(number) &&
+        number < highestUrgent &&
+        (number > cursor || !hasCandidatesAfterCursor),
+    );
+  const nextCursor = regular.at(-1) ?? (urgentCanAdvanceCursor ? highestUrgent : cursor);
   return {
     item_numbers: selected.join(","),
     count: String(selected.length),
     cursor: String(cursor),
     next_cursor: String(nextCursor),
-    wrapped: String(candidates.length > 0 && afterCursor.length === 0),
+    wrapped: String(candidates.length > 0 && !hasCandidatesAfterCursor),
   };
 }
 
@@ -1711,9 +2249,53 @@ function applyCheckedAtForItem(targetRepo: string, itemNumber: number): string {
   return "";
 }
 
+function applyCandidateCounts(value: string): ApplyCandidateCounts | null {
+  if (!value) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("candidate-counts-json must be valid JSON");
+  }
+  if (!isJsonObject(parsed)) throw new Error("candidate-counts-json must be an object");
+  const keys: Array<keyof ApplyCandidateCounts> = [
+    "confirmed_proposal",
+    "guarded_retry",
+    "proof_required",
+    "promotion_total",
+    "promotion_eligible",
+    "promotion_cooldown_eligible",
+    "cooldown_eligible_total",
+    "inconsistent_or_stale",
+  ];
+  const counts = {} as ApplyCandidateCounts;
+  for (const key of keys) {
+    const count = Number(parsed[key]);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error(`candidate-counts-json.${key} must be a non-negative integer`);
+    }
+    counts[key] = count;
+  }
+  if (counts.promotion_eligible > counts.promotion_total) {
+    throw new Error("candidate-counts-json.promotion_eligible cannot exceed promotion_total");
+  }
+  if (counts.promotion_cooldown_eligible > counts.promotion_total) {
+    throw new Error(
+      "candidate-counts-json.promotion_cooldown_eligible cannot exceed promotion_total",
+    );
+  }
+  if (counts.promotion_eligible > counts.promotion_cooldown_eligible) {
+    throw new Error(
+      "candidate-counts-json.promotion_eligible cannot exceed promotion_cooldown_eligible",
+    );
+  }
+  return counts;
+}
+
 function proposedItemOptions(): ProposedItemOptions {
   const batchSizeText = optionalString("batch-size");
   const coverageProofLimitText = optionalString("coverage-proof-limit");
+  const closeLimitText = optionalString("close-limit");
   return {
     targetRepo: requiredString("target-repo"),
     applyKind: optionalString("apply-kind") || "all",
@@ -1724,6 +2306,7 @@ function proposedItemOptions(): ProposedItemOptions {
     batchSize: batchSizeText ? numberArg("batch-size", 0) : null,
     cursorPath: optionalString("cursor-path") || null,
     coverageProofLimit: coverageProofLimitText ? numberArg("coverage-proof-limit", 0) : null,
+    closeLimit: closeLimitText ? numberArg("close-limit", 1) : null,
     itemNumbers: itemNumberSet(optionalString("item-numbers")),
   };
 }
@@ -1737,11 +2320,13 @@ function commentSyncBatchOptions(): CommentSyncBatchOptions {
   };
 }
 
-function commentSyncCandidates(targetRepo: string, applyKind: string): number[] {
-  const targetSlug = targetRepo
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+function commentSyncCandidates(
+  targetRepo: string,
+  applyKind: string,
+  urgentCandidates = new Map<number, number>(),
+  automaticAllItemCursor = false,
+): number[] {
+  const targetSlug = commentSyncTargetSlug(targetRepo);
   const itemsDir = path.join("records", targetSlug, "items");
   if (!fs.existsSync(itemsDir)) return [];
 
@@ -1753,19 +2338,140 @@ function commentSyncCandidates(targetRepo: string, applyKind: string): number[] 
       if (repoFor(markdown, name) !== targetRepo) return [];
       const type = frontMatterValue(markdown, "type");
       if (applyKind !== "all" && type !== applyKind) return [];
-      if (frontMatterValue(markdown, "review_status") !== "complete") return [];
+      const reviewStatus = frontMatterValue(markdown, "review_status");
+      const failedReview = reviewStatus === "failed";
+      if (reviewStatus !== "complete" && !failedReview) return [];
       if (!frontMatterValue(markdown, "item_snapshot_hash")) return [];
       const actionTaken = frontMatterValue(markdown, "action_taken");
+      if (actionTaken === "skipped_invalid_decision") {
+        const decision = frontMatterValue(markdown, "decision");
+        const closeReason = frontMatterValue(markdown, "close_reason");
+        if (
+          decision === "close" &&
+          !repositoryProfileFor(targetRepo).applyCloseRules[
+            type === "pull_request" ? "pull_request" : "issue"
+          ]?.some((allowedReason) => allowedReason === closeReason)
+        ) {
+          return [];
+        }
+      }
+      const guardedReview =
+        actionTaken === "skipped_protected_label" ||
+        actionTaken === "skipped_maintainer_authored" ||
+        actionTaken === "skipped_close_exempt_label" ||
+        actionTaken === "skipped_invalid_decision";
+      const verifiedLocalCheckout =
+        frontMatterValue(markdown, "local_checkout_access") === "verified" &&
+        frontMatterValue(markdown, "local_checkout_access_source") === "runner_preflight_v1";
+      const storedReviewCommentId = frontMatterValue(markdown, "review_comment_id");
+      const storedReviewCommentUrl = frontMatterValue(markdown, "review_comment_url");
+      const hasStoredReviewComment =
+        Boolean(storedReviewCommentId && !["none", "unknown"].includes(storedReviewCommentId)) &&
+        Boolean(storedReviewCommentUrl && !["none", "unknown"].includes(storedReviewCommentUrl));
+      const changedDuplicateClose =
+        actionTaken === "skipped_changed_since_review" &&
+        frontMatterValue(markdown, "decision") === "close" &&
+        frontMatterValue(markdown, "close_reason") === "duplicate_or_superseded" &&
+        hasStoredReviewComment;
+      const reviewCommentHash = frontMatterValue(markdown, "review_comment_sha256");
+      const requiresDurableCommentRepair =
+        actionTaken === "retry_stale_canonical_comment_sync" ||
+        changedDuplicateClose ||
+        !reviewCommentHash ||
+        !/^[a-f\d]{64}$/i.test(reviewCommentHash);
+      const invalidReviewCommentHash =
+        !reviewCommentHash || !/^[a-f\d]{64}$/i.test(reviewCommentHash);
+      const syncedAt = Date.parse(frontMatterValue(markdown, "review_comment_synced_at") ?? "");
+      const hasSyncedTimestamp = Number.isFinite(syncedAt);
+      const verifiedAt = Date.parse(frontMatterValue(markdown, "review_comment_checked_at") ?? "");
+      const commentConfirmedAt = Math.max(
+        hasSyncedTimestamp ? syncedAt : 0,
+        Number.isFinite(verifiedAt) ? verifiedAt : 0,
+      );
+      const guardedSourceDrift =
+        guardedReview &&
+        Boolean(
+          frontMatterValue(markdown, "current_item_updated_at") ||
+          frontMatterValue(markdown, "current_item_snapshot_hash"),
+        );
+      const reviewedAt = Math.max(
+        Date.parse(frontMatterValue(markdown, "last_full_review_at") || "") || 0,
+        Date.parse(frontMatterValue(markdown, "reviewed_at") || "") || 0,
+        guardedReview && !guardedSourceDrift
+          ? Date.parse(frontMatterValue(markdown, "apply_checked_at") || "") || 0
+          : 0,
+      );
+      const freshlyReviewedSinceSync = commentConfirmedAt > 0 && reviewedAt > commentConfirmedAt;
       if (
-        actionTaken !== "kept_open" &&
-        actionTaken !== "proposed_close" &&
-        actionTaken !== "skipped_pr_close_coverage_proof"
+        failedReview &&
+        hasStoredReviewComment &&
+        !requiresDurableCommentRepair &&
+        hasSyncedTimestamp &&
+        commentConfirmedAt > 0 &&
+        !freshlyReviewedSinceSync &&
+        Date.now() - commentConfirmedAt < 7 * 24 * 60 * 60 * 1000
       ) {
         return [];
       }
-      return [numberFor(name)];
+      if (
+        guardedReview &&
+        type === "issue" &&
+        hasStoredReviewComment &&
+        !invalidReviewCommentHash &&
+        hasSyncedTimestamp &&
+        commentConfirmedAt > 0 &&
+        !freshlyReviewedSinceSync &&
+        (!failedReview || Date.now() - commentConfirmedAt < 7 * 24 * 60 * 60 * 1000)
+      ) {
+        return [];
+      }
+      // PR head changes are discoverable only through the executor's live fetch.
+      if (
+        automaticAllItemCursor &&
+        type === "issue" &&
+        hasStoredReviewComment &&
+        !requiresDurableCommentRepair &&
+        hasSyncedTimestamp
+      ) {
+        if (
+          commentConfirmedAt > 0 &&
+          (!Number.isFinite(reviewedAt) || reviewedAt <= commentConfirmedAt) &&
+          Date.now() - commentConfirmedAt < 7 * 24 * 60 * 60 * 1000
+        ) {
+          return [];
+        }
+      }
+      if (
+        actionTaken !== "kept_open" &&
+        actionTaken !== "proposed_close" &&
+        actionTaken !== "skipped_pr_close_coverage_proof" &&
+        actionTaken !== "retry_pr_close_coverage_proof" &&
+        actionTaken !== "retry_stale_canonical_comment_sync" &&
+        !guardedReview &&
+        !changedDuplicateClose
+      ) {
+        return [];
+      }
+      const number = numberFor(name);
+      if (
+        automaticAllItemCursor &&
+        verifiedLocalCheckout &&
+        (!hasStoredReviewComment ||
+          invalidReviewCommentHash ||
+          (!hasSyncedTimestamp && Number.isFinite(verifiedAt)) ||
+          (guardedReview && commentConfirmedAt <= 0) ||
+          ((actionTaken === "kept_open" || actionTaken === "proposed_close" || guardedReview) &&
+            freshlyReviewedSinceSync))
+      ) {
+        urgentCandidates.set(number, reviewedAt);
+      }
+      return [number];
     })
     .sort((left, right) => left - right);
+}
+
+function commentSyncTargetSlug(targetRepo: string): string {
+  return targetRepo.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
 }
 
 function readCommentSyncCursor(cursorPath: string): number {
@@ -1925,13 +2631,16 @@ function checkpointNumber(name: string): number {
   return Number(name.match(/\d+/)?.[0] ?? 0);
 }
 
+function frontMatterField(markdown: string, key: string): FrontMatterField {
+  const field = readReportFrontMatterField(markdown, key);
+  if (field.status !== "value") return field;
+  const value = field.value.trim().replace(/^"|"$/g, "");
+  return value ? { status: "value", value } : { status: "ambiguous" };
+}
+
 function frontMatterValue(markdown: string, key: string): string {
-  return (
-    markdown
-      .match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]
-      ?.trim()
-      .replace(/^"|"$/g, "") ?? ""
-  );
+  const field = frontMatterField(markdown, key);
+  return field.status === "value" ? field.value : "";
 }
 
 function jsonArrayFrontMatter(markdown: string, key: string): JsonValue[] {
@@ -2000,6 +2709,8 @@ function allowedForTarget(
       (type === "pull_request" && reason === "mostly_implemented_on_main")
     );
   if (type !== "pull_request" && reason === "unconfirmed_product_direction") return false;
+  if (type !== "pull_request" && reason === "author_pr_budget_exceeded") return false;
+  if (type === "pull_request" && reason === "unsponsored_feature_request") return false;
   if (type === "pull_request" && reason === "stale_insufficient_info") return false;
   if (type !== "pull_request" && reason === "mostly_implemented_on_main") return false;
   if (type !== "pull_request" && reason === "low_signal_unmergeable_pr") return false;
@@ -2019,4 +2730,4 @@ function isCliEntrypoint(): boolean {
   return Boolean(entrypoint && import.meta.url === pathToFileURL(entrypoint).href);
 }
 
-if (isCliEntrypoint()) runCli();
+if (isCliEntrypoint()) await runCli();

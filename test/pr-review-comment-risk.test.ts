@@ -6,6 +6,44 @@ import {
   reviewAutomationMarkersFromReport,
 } from "../dist/clawsweeper.js";
 import { detailsBody, reportFrontMatter } from "./helpers.ts";
+import { asRecord } from "../dist/clawsweeper-item-policy.js";
+import { createReportOrchestrationFoundation } from "../dist/clawsweeper-orchestration-foundation.js";
+import { createRecordMetadata } from "../dist/clawsweeper-record-metadata.js";
+import { pinnedTestRolePaths } from "./openclaw-file-role-fixture.ts";
+
+test("support-only surface moves +57 to Tests while the reviewer production metric stays intact", () => {
+  const metric = {
+    label: "Production vs test LOC",
+    value: "production +0/-0; tests +57/-0",
+    reason: "Synthetic reviewer assessment of the support-only change.",
+  };
+  const report = `${reportFrontMatter({
+    type: "pull_request",
+    number: "12345",
+    work_candidate: "none",
+    pr_surface_files: JSON.stringify([
+      { path: pinnedTestRolePaths[0], additions: 57, deletions: 0 },
+    ]),
+    pr_surface_files_truncated: false,
+    review_metrics: JSON.stringify([metric]),
+  })}
+
+## Summary
+
+Updates test support.
+`;
+  const comment = renderReviewCommentFromReport(report, "none");
+  assert.match(comment, /\| Source \| 0 \| 0 \| 0 \| 0 \|/);
+  assert.match(comment, /\| Tests \| 1 \| 57 \| 0 \| \+57 \|/);
+  assert.match(comment, /Total \+57 across 1 file\./);
+  assert.ok(comment.includes(`| **${metric.label}** | ${metric.value} | ${metric.reason} |`));
+  const truncated = renderReviewCommentFromReport(
+    report.replace("pr_surface_files_truncated: false", "pr_surface_files_truncated: true"),
+    "none",
+  );
+  assert.doesNotMatch(truncated, /View PR surface stats|\| Tests \|/);
+  assert.ok(truncated.includes(metric.value));
+});
 
 test("security-needs-attention reports block unopted repair and automerge pass markers", () => {
   const securitySection = `
@@ -131,9 +169,10 @@ Reason: ${duplicateRisk}
     "none",
   );
 
-  assert.ok(comment.includes(`**Next step before merge**\n- [P2] ${duplicateRisk}`));
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${duplicateRisk}`));
   assert.doesNotMatch(comment, /Remaining risk \/ open question:/);
-  assert.doesNotMatch(comment, /\*\*Risk before merge\*\*/);
+  assert.doesNotMatch(comment, /### Merge-risk options/);
   assert.equal(comment.split(duplicateRisk).length - 1, 1);
 });
 
@@ -168,10 +207,15 @@ Confirm both merge risks before merge.
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(comment, /- \[P1\] Blocked workflow actions must render as P1\./);
-  assert.match(comment, /- \[P2\] Timeout fallback wording should remain scannable\./);
-  assert.doesNotMatch(comment, /- \[P1\] Blocked workflow actions.*\n- Timeout fallback/s);
+  assert.match(comment, /## Before merge/);
+  assert.match(
+    comment,
+    /- \[ \] \*\*Resolve merge risk \(P1\)\*\* - Blocked workflow actions must render as P1\./,
+  );
+  assert.match(
+    comment,
+    /- \[ \] \*\*Resolve merge risk \(P2\)\*\* - Timeout fallback wording should remain scannable\./,
+  );
 });
 
 test("pull request risk text does not priority-prefix routine CI noise", () => {
@@ -205,8 +249,11 @@ ${routineCiRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(comment, new RegExp(`- ${routineCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(comment, /## Before merge/);
+  // Routine CI noise stays visible in the collapsed details but is not counted as
+  // remaining merge work.
+  assert.doesNotMatch(comment, /- \[ \] \*\*Resolve merge risk\*\*/);
+  assert.ok(comment.includes(routineCiRisk));
   assert.doesNotMatch(
     comment,
     new RegExp(`\\[P[12]\\] ${routineCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
@@ -259,11 +306,7 @@ ${routineStatusStep}
       "none",
     );
 
-    assert.match(comment, /\*\*Next step before merge\*\*/);
-    assert.match(
-      comment,
-      new RegExp(`- ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-    );
+    assert.match(comment, /## Before merge/);
     assert.doesNotMatch(
       comment,
       new RegExp(`\\[P[12]\\] ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
@@ -302,11 +345,8 @@ ${actionableCiRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableCiRisk}`));
 });
 
 test("pull request risk text keeps diff-caused status-check risk actionable", () => {
@@ -340,11 +380,8 @@ ${actionableStatusRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableStatusRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableStatusRisk}`));
 });
 
 test("pull request risk text keeps diff-caused required-check risk actionable", () => {
@@ -379,11 +416,8 @@ ${actionableRequiredRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableRequiredRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableRequiredRisk}`));
 });
 
 test("pull request risk text keeps broken passing-check risk actionable", () => {
@@ -447,10 +481,12 @@ ${actionablePassingRisk}
       "none",
     );
 
-    assert.match(comment, /\*\*Risk before merge\*\*/);
+    assert.match(comment, /## Before merge/);
     assert.match(
       comment,
-      new RegExp(`- \\[P[01]\\] ${actionablePassingRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+      new RegExp(
+        `- \\[ \\] \\*\\*Resolve merge risk \\(P[01]\\)\\*\\* - ${actionablePassingRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      ),
     );
   }
 });
@@ -484,16 +520,13 @@ Adds a small runtime change with tests and docs.
     "none",
   );
 
-  const evidenceDetails = detailsBody(comment, "Evidence reviewed");
+  const evidenceDetails = detailsBody(comment, "Agent review details");
   const visibleBeforeEvidence = comment.slice(
     0,
-    comment.indexOf("<summary>Evidence reviewed</summary>"),
+    comment.indexOf("<summary><strong>Agent review details</strong></summary>"),
   );
 
-  assert.match(
-    visibleBeforeEvidence,
-    /PR surface: Source \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
-  );
+  assert.doesNotMatch(visibleBeforeEvidence, /PR surface:/);
   assert.doesNotMatch(visibleBeforeEvidence, /<summary>View PR surface stats<\/summary>/);
   assert.doesNotMatch(
     visibleBeforeEvidence,
@@ -501,16 +534,15 @@ Adds a small runtime change with tests and docs.
   );
   assert.match(
     evidenceDetails,
-    /PR surface:\n\nSource \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
+    /### PR surface\n\nSource \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
   );
   assert.match(evidenceDetails, /<summary>View PR surface stats<\/summary>/);
   assert.match(
     evidenceDetails,
     /\| \*\*Total\*\* \| \*\*3\*\* \| \*\*21\*\* \| \*\*3\*\* \| \*\*\+18\*\* \|/,
   );
-  assert.match(comment, /\*\*Review metrics:\*\* none identified\./);
-  assert.ok(comment.indexOf("PR surface:") < comment.indexOf("**Review metrics:**"));
-  assert.ok(comment.indexOf("**Review metrics:**") < comment.indexOf("**Merge readiness**"));
+  assert.match(evidenceDetails, /### Review metrics\n\nNone\./);
+  assert.ok(comment.indexOf("### PR surface") < comment.indexOf("### Review metrics"));
 });
 
 test("pull request comments render one review metric digest item", () => {
@@ -543,10 +575,10 @@ Updates repository automation.
     "none",
   );
 
-  assert.match(comment, /\*\*Review metrics:\*\* 1 noteworthy metric\./);
+  assert.match(comment, /### Review metrics/);
   assert.match(
     comment,
-    /- \*\*Workflow surfaces changed:\*\* 1 workflow changed\. The PR changes repository automation behavior that maintainers should review before merge\./,
+    /\| \*\*Workflow surfaces changed\*\* \| 1 workflow changed \| The PR changes repository automation behavior that maintainers should review before merge\. \|/,
   );
 });
 
@@ -588,14 +620,13 @@ Adds configuration behavior and proof updates.
     "none",
   );
 
-  assert.match(comment, /\*\*Review metrics:\*\* 2 noteworthy metrics\./);
+  assert.match(comment, /### Review metrics/);
   assert.match(
     comment,
-    /- \*\*Config\/default surfaces changed:\*\* 2 added, 1 changed, 0 removed\./,
+    /\| \*\*Config\/default surfaces changed\*\* \| 2 added, 1 changed, 0 removed \|/,
   );
-  assert.match(comment, /- \*\*Proof files affected:\*\* 3 files affected\./);
-  assert.ok(comment.indexOf("PR surface:") < comment.indexOf("**Review metrics:**"));
-  assert.ok(comment.indexOf("**Review metrics:**") < comment.indexOf("**Merge readiness**"));
+  assert.match(comment, /\| \*\*Proof files affected\*\* \| 3 files affected \|/);
+  assert.ok(comment.indexOf("### PR surface") < comment.indexOf("### Review metrics"));
 });
 
 test("PR surface is OpenClaw pull-request only", () => {
@@ -632,6 +663,144 @@ Keep this open.
 
   assert.doesNotMatch(otherRepoComment, /PR surface:/);
   assert.doesNotMatch(issueComment, /PR surface:/);
+});
+
+function surfaceReport(files: unknown, truncated = false): string {
+  return `${reportFrontMatter({
+    repository: "openclaw/openclaw",
+    type: "pull_request",
+    decision: "keep_open",
+    close_reason: "none",
+    work_candidate: "none",
+    pr_surface_files: JSON.stringify(files),
+    pr_surface_files_truncated: String(truncated),
+  })}\n\n## Summary\n\nReview completed.\n`;
+}
+
+// Use the existing production factories; the CLI regression covers actual report persistence.
+const surfaceFoundation = createReportOrchestrationFoundation({
+  ...createRecordMetadata({} as Parameters<typeof createRecordMetadata>[0]),
+  asRecord,
+  labelPolicy: {},
+} as Parameters<typeof createReportOrchestrationFoundation>[0]);
+
+test("PR surface context and report normalization preserve strict counts and exact paths", () => {
+  const files = surfaceFoundation.prSurfaceFilesFromContext({
+    issue: {},
+    comments: [],
+    timeline: [],
+    pullFiles: [
+      { filename: " src/space.ts ", additions: 0, deletions: 0 },
+      { filename: "src/max.ts", additions: Number.MAX_SAFE_INTEGER, deletions: 1 },
+    ],
+    counts: { comments: 0, timeline: 0, pullFiles: 2, pullFilesHydrated: 2 },
+  });
+  assert.deepEqual(files, [
+    { path: " src/space.ts ", additions: 0, deletions: 0 },
+    { path: "src/max.ts", additions: Number.MAX_SAFE_INTEGER, deletions: 1 },
+  ]);
+  assert.deepEqual(surfaceFoundation.prSurfaceFilesFromReport(surfaceReport(files)), files);
+  const zero = renderReviewCommentFromReport(surfaceReport([files![0]]), "none");
+  assert.match(zero, /\| \*\*Total\*\* \| \*\*1\*\* \| \*\*0\*\* \| \*\*0\*\* \| \*\*0\*\* \|/);
+});
+
+test("PR surface missing or invalid statistics round-trip as unknown, never partial totals", () => {
+  for (const value of [
+    undefined,
+    null,
+    "",
+    "0",
+    "3",
+    "invalid",
+    false,
+    {},
+    [],
+    -1,
+    0.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    for (const field of ["additions", "deletions"]) {
+      const input = { filename: "src/unknown.ts", additions: 0, deletions: 0, [field]: value };
+      const files = surfaceFoundation.prSurfaceFilesFromContext({
+        issue: {},
+        comments: [],
+        timeline: [],
+        pullFiles: [input, { filename: "src/known.ts", additions: 4, deletions: 2 }],
+      });
+      assert.deepEqual(files?.[0], {
+        path: input.filename,
+        additions: 0,
+        deletions: 0,
+        [field]: null,
+      });
+      const report = surfaceReport(files);
+      assert.deepEqual(surfaceFoundation.prSurfaceFilesFromReport(report), files);
+      // Old persisted reports may contain malformed values without passing through context extraction.
+      const directReport = surfaceReport([
+        { path: input.filename, additions: 0, deletions: 0, [field]: value },
+        files![1],
+      ]);
+      assert.deepEqual(surfaceFoundation.prSurfaceFilesFromReport(directReport), files);
+      for (const candidate of [report, directReport]) {
+        const comment = renderReviewCommentFromReport(candidate, "none");
+        assert.match(comment, /PR surface statistics unavailable: complete line counts/);
+        assert.doesNotMatch(comment, /\| \*\*Total\*\* \|/);
+      }
+    }
+  }
+});
+
+test("PR surface incomplete file lists cannot produce a numeric aggregate", () => {
+  const file = { filename: "src/a.ts", additions: 1, deletions: 0 };
+  for (const counts of [
+    { pullFilesTruncated: true },
+    { pullFiles: 2 },
+    { pullFilesHydrated: 2 },
+    { pullFiles: 0 },
+    { pullFilesHydrated: 0 },
+    { pullFiles: -1 },
+    { pullFiles: null },
+    { pullFiles: "1" },
+  ]) {
+    assert.equal(
+      surfaceFoundation.prSurfaceFilesFromContext({
+        issue: {},
+        comments: [],
+        timeline: [],
+        pullFiles: [file],
+        counts: { comments: 0, timeline: 0, ...counts },
+      }),
+      null,
+    );
+  }
+  for (const entry of [{ omitted: 1 }, { filename: "", additions: 0, deletions: 0 }, null]) {
+    assert.equal(
+      surfaceFoundation.prSurfaceFilesFromContext({
+        issue: {},
+        comments: [],
+        timeline: [],
+        pullFiles: [file, entry],
+      }),
+      null,
+    );
+  }
+  const known = { path: "src/a.ts", additions: 1, deletions: 0 };
+  for (const report of [
+    surfaceReport([known], true),
+    surfaceReport([known, { omitted: 1 }]),
+    surfaceReport([known, {}]),
+    surfaceReport([known, null]),
+    surfaceReport(null),
+    surfaceReport({ files: [known] }),
+    surfaceReport([known]).replace(/^pr_surface_files: .*$/m, 'pr_surface_files: [{"path":'),
+  ]) {
+    assert.equal(surfaceFoundation.prSurfaceFilesFromReport(report), null);
+    const comment = renderReviewCommentFromReport(report, "none");
+    assert.match(comment, /PR surface statistics unavailable: the file list is incomplete/);
+    assert.doesNotMatch(comment, /\| \*\*Total\*\* \|/);
+  }
 });
 
 function mergeRiskReviewComment({
@@ -719,7 +888,7 @@ test("pull request keep-open review comments render repairable merge-risk option
     ],
   });
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
+  assert.match(comment, /### Merge-risk options/);
   assert.match(comment, new RegExp(escapeRegExpForTest(mergeRisk)));
   assert.doesNotMatch(comment, /Why this matters:/);
   assert.match(
