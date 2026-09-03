@@ -1541,6 +1541,7 @@ esac
       encoding: "utf8" as const,
       env: {
         ...process.env,
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
         GH_BIN: fakeGh,
         CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
       },
