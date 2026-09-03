@@ -1,6 +1,8 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { readTargetRepositoryConfigSource } from "./target-repository-config.js";
 
 export type RepositoryItemKind = "issue" | "pull_request";
 export type RepositoryLiveTestSurface = "browser" | "terminal";
@@ -260,7 +262,7 @@ function readTargetRepositoryConfig(
   filePath = join(repoRoot(), "config", "target-repositories.json"),
 ): TargetRepositoryConfig {
   if (!existsSync(filePath)) return { schemaVersion: 1, repositories: [], genericFallbacks: [] };
-  const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+  const parsed = readTargetRepositoryConfigSource(filePath);
   return validateTargetRepositoryConfig(parsed);
 }
 
