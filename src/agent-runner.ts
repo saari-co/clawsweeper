@@ -202,19 +202,7 @@ export function runAgentCheckoutInspection(options: {
   }
   return verifyCheckoutChallenge(
     runCodexProcess({
-      args: [
-        "sandbox",
-        "--permission-profile",
-        ":read-only",
-        "-C",
-        options.cwd,
-        "--",
-        "git",
-        "hash-object",
-        "--no-filters",
-        "--",
-        fingerprintPath,
-      ],
+      args: codexCheckoutInspectionArgs(options.cwd, fingerprintPath, env),
       cwd: options.cwd,
       env,
       input: "",
@@ -222,6 +210,34 @@ export function runAgentCheckoutInspection(options: {
     }),
     fingerprint,
   );
+}
+
+export function codexCheckoutInspectionArgs(
+  cwd: string,
+  fingerprintPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const args = [
+    "sandbox",
+    "--permission-profile",
+    ":read-only",
+    "-C",
+    cwd,
+    "--",
+    "git",
+    "hash-object",
+    "--no-filters",
+    "--",
+    fingerprintPath,
+  ];
+  // Ubuntu can restrict unprivileged user namespaces through AppArmor, which
+  // prevents Codex's bubblewrap backend from initializing loopback before this
+  // read-only attestation command runs. Keep the current upstream default and
+  // let affected hosts opt into Codex's Landlock backend explicitly.
+  if (env.CLAWSWEEPER_CODEX_CHECKOUT_LEGACY_LANDLOCK === "1") {
+    args.unshift("--enable", "use_legacy_landlock");
+  }
+  return args;
 }
 
 function selectOpenclawCheckoutChallenge(

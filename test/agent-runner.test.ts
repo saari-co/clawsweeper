@@ -9,6 +9,7 @@ import { useFakeScanner } from "./agent-input-scan-helpers.ts";
 import {
   agentRunner,
   codexAgentArgs,
+  codexCheckoutInspectionArgs,
   runAgentCheckoutInspection,
   runAgentProcess,
 } from "../dist/agent-runner.js";
@@ -99,6 +100,23 @@ test("agent runner preserves ordered repair-worker Codex arguments", () => {
       codexExtraArgs: ordered,
     }),
     ["exec", ...ordered],
+  );
+});
+
+test("checkout inspection opts into legacy Landlock only for configured hosts", () => {
+  const ordinary = codexCheckoutInspectionArgs("/target", "tracked.txt", {});
+  assert.deepEqual(ordinary.slice(0, 3), ["sandbox", "--permission-profile", ":read-only"]);
+  assert.deepEqual(
+    codexCheckoutInspectionArgs("/target", "tracked.txt", {
+      CLAWSWEEPER_CODEX_CHECKOUT_LEGACY_LANDLOCK: "1",
+    }),
+    ["--enable", "use_legacy_landlock", ...ordinary],
+  );
+  assert.deepEqual(
+    codexCheckoutInspectionArgs("/target", "tracked.txt", {
+      CLAWSWEEPER_CODEX_CHECKOUT_LEGACY_LANDLOCK: "true",
+    }),
+    ordinary,
   );
 });
 
