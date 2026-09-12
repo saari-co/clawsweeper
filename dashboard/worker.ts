@@ -19,6 +19,11 @@ import {
   type DashboardEnv,
 } from "./dashboard-pages.ts";
 import { liveActivityBaySnapshot } from "./live-activity.ts";
+import {
+  privateUnifiedReviewStatus,
+  unifiedReviewHtml,
+  unifiedReviewStatus,
+} from "./unified-review-dashboard.ts";
 import { summarizeDashboardHealth } from "./dashboard-health.ts";
 import {
   createGithubAppTokenFor,
@@ -1244,10 +1249,22 @@ export default {
       return healthHistoryJson(request, env);
     if (url.pathname === "/api/automerge-metrics" && request.method === "GET")
       return automergeMetricsJson(request, env);
+    if (url.pathname === "/api/reviews" && request.method === "GET")
+      return unifiedReviewStatus(request, env);
+    if (url.pathname === "/api/private/reviews" && request.method === "GET")
+      return privateUnifiedReviewStatus(request, env);
     if (url.pathname === "/api/status") return statusJson(request, env, ctx);
     if (url.pathname === "/api/triage") return triageJson(request, env, ctx);
     if (url.pathname === "/api/pr-proof-triage") return prProofTriageJson(request, env, ctx);
-    if (url.pathname === "/" || url.pathname === "/index.html") return html(dashboardHtml(env));
+    if (url.pathname === "/reviews") return html(unifiedReviewHtml("public"));
+    if (url.pathname === "/" || url.pathname === "/index.html")
+      return html(
+        env.DASHBOARD_HOME === "private-reviews"
+          ? unifiedReviewHtml("private")
+          : env.DASHBOARD_HOME === "reviews"
+            ? unifiedReviewHtml("public")
+            : dashboardHtml(env),
+      );
     if (url.pathname === "/bay") return demoHtml(bayHtml());
     if (url.pathname === "/bay-demo")
       return Response.redirect(new URL("/bay", url.origin).toString(), 308);

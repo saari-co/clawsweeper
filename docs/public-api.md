@@ -29,6 +29,7 @@ branch, not a promise that every method will remain supported.
 | `/api/apply-observability`               | `GET`  | Global closed apply-lane counts and failure categories without repository or run links.              |
 | `/api/health-history`                    | `GET`  | Historical health from `healthHistoryJson`.                                                          |
 | `/api/automerge-metrics`                 | `GET`  | Global automerge counts, rates, buckets, and outcomes without filters or session rows.               |
+| `/api/reviews`                           | `GET`  | Privacy-filtered review projection limited to verified-public repositories and proof links.          |
 | `/api/status`                            | `ANY`  | Closed status plus bounded allowlisted public references, reprojected on every cache/store boundary. |
 | `/api/triage`                            | `ANY`  | Closed issue-triage view descriptors, bounded counts, and completeness only.                         |
 | `/api/pr-proof-triage`                   | `ANY`  | Closed proof-triage view descriptors, bounded counts, and completeness only.                         |
@@ -37,6 +38,16 @@ branch, not a promise that every method will remain supported.
 removing a literal observer route in `dashboard/worker.ts` requires updating
 that manifest and this table. The checker excludes `/api/events`, because it is
 an ingest mutation rather than an observer route.
+
+`/api/reviews` returns no tenant rows unless its deployment explicitly binds
+the corresponding read-only telemetry services and the row repository appears
+in `PUBLIC_BAY_REPOS`. It removes tenant lane details, private proof links, and
+source-specific errors. An absent or invalid source is reported as unavailable
+with `row_count: null`, not as zero activity. The distinct
+`/api/private/reviews` route is not a public API: it verifies the existing
+Cloudflare Access JWT before reading normalized private tenant projections. The
+aggregator receives no App private key, queue mutation authority, or state-store
+writer credential.
 
 For egress field interpretation, use
 [GitHub publication egress telemetry](github-egress-telemetry.md). For other
