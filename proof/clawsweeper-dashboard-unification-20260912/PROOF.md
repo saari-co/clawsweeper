@@ -63,6 +63,18 @@ represents missing or stale telemetry truthfully.
 - Pre-commit Codex review repair cycle 2 fixed canonical public proof URL
   validation, missing-finding-count truth, and public/private page renderer
   separation. The repair limit is now reached.
+- Owner decision: Bobby explicitly authorized repair cycle 3 for the single
+  accepted P1 lifecycle-truth defect. The bounded repair maps bare `completed`
+  to `unknown`, requires an explicit successful conclusion before rendering
+  `success`, and deterministically covers failed and cancelled conclusions.
+- Repair cycle 3 focused proof: 16 observer tests passed, including bare
+  `completed`, explicit success, failed, and cancelled cases. Dashboard build,
+  dashboard/test lint, and documentation checks passed.
+- Repair cycle 3 full `pnpm run check`: static checks, all builds, all lint,
+  the observer suite, 286 test files, and aggregate coverage passed. The only
+  failure remained the unrelated `apply-drift-refresh` fixture because this
+  host resolves macOS Bash 3.2 without `mapfile`; GNU Bash is not installed on
+  the host for an invocation-only rerun.
 - Full `pnpm run check`: static, all builds, all lint, 286 test files including
   the observer suite, and aggregate coverage passed. The only failure is the
   unchanged host fixture `test/apply-drift-refresh.test.ts`, which invokes

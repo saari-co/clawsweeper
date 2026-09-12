@@ -32,6 +32,7 @@ function feed(tenant: "saari" | "dinkuskit", overrides: Record<string, unknown> 
         base_sha: SHA_A,
         head_sha: SHA_B,
         ci: "completed",
+        ci_conclusion: "success",
         openclaw: tenant === "saari" ? "clean" : undefined,
         clawsweeper: "success",
         rating: "B Platinum Hermit",
@@ -123,6 +124,27 @@ test("normalizes exact tuple telemetry and keeps absent OpenClaw state unknown",
   assert.equal(result.rows[0]?.executor, "github-actions/codex");
   assert.equal(result.rows[0]?.findings_total, 4);
   assert.equal(result.rows[0]?.findings_actionable, 1);
+});
+
+test("does not infer success from a bare completed lifecycle state", () => {
+  const value = feed("saari") as { rows: Array<Record<string, unknown>> };
+  delete value.rows[0]!.ci_conclusion;
+  const result = normalizeTenantFeed("saari", value, NOW);
+  assert.equal(result.rows[0]?.ci, "unknown");
+});
+
+test("uses explicit terminal conclusions for completed lifecycle states", () => {
+  const failed = feed("saari") as { rows: Array<Record<string, unknown>> };
+  failed.rows[0]!.ci_conclusion = "failure";
+  failed.rows[0]!.openclaw = "completed";
+  failed.rows[0]!.openclaw_conclusion = "cancelled";
+  failed.rows[0]!.clawsweeper = "completed";
+  failed.rows[0]!.clawsweeper_conclusion = "success";
+
+  const result = normalizeTenantFeed("saari", failed, NOW);
+  assert.equal(result.rows[0]?.ci, "failure");
+  assert.equal(result.rows[0]?.openclaw, "failure");
+  assert.equal(result.rows[0]?.clawsweeper, "success");
 });
 
 test("keeps absent finding counts unknown", () => {

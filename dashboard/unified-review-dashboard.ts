@@ -108,13 +108,27 @@ function sha(value: unknown): string | null {
   return text && SHA_RE.test(text) ? text.toLowerCase() : null;
 }
 
-function state(value: unknown): ReviewState {
+function state(value: unknown, conclusion?: unknown): ReviewState {
   const text = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (["queued", "pending", "requested", "waiting"].includes(text)) return "pending";
   if (["running", "in_progress", "in-progress"].includes(text)) return "running";
-  if (["success", "successful", "completed", "clean", "pass", "passed"].includes(text))
-    return "success";
-  if (["failure", "failed", "error", "cancelled", "timed_out"].includes(text)) return "failure";
+  if (text === "completed") {
+    const terminal = typeof conclusion === "string" ? conclusion.trim().toLowerCase() : "";
+    if (["success", "successful", "clean", "pass", "passed"].includes(terminal)) {
+      return "success";
+    }
+    if (["failure", "failed", "error", "cancelled", "canceled", "timed_out"].includes(terminal)) {
+      return "failure";
+    }
+    if (["blocked", "needs-human", "needs_human", "human_gate"].includes(terminal)) {
+      return "blocked";
+    }
+    if (["skipped", "not_applicable", "n/a"].includes(terminal)) return "skipped";
+    return "unknown";
+  }
+  if (["success", "successful", "clean", "pass", "passed"].includes(text)) return "success";
+  if (["failure", "failed", "error", "cancelled", "canceled", "timed_out"].includes(text))
+    return "failure";
   if (["blocked", "needs-human", "needs_human", "human_gate"].includes(text)) return "blocked";
   if (["skipped", "not_applicable", "n/a"].includes(text)) return "skipped";
   return "unknown";
@@ -236,9 +250,9 @@ export function normalizeTenantFeed(
       pr_number: prNumber,
       base_sha: sha(row.base_sha),
       head_sha: headSha,
-      ci: state(row.ci),
-      openclaw: state(row.openclaw),
-      clawsweeper: state(row.clawsweeper),
+      ci: state(row.ci, row.ci_conclusion),
+      openclaw: state(row.openclaw, row.openclaw_conclusion),
+      clawsweeper: state(row.clawsweeper, row.clawsweeper_conclusion),
       rating,
       proof_links: proofLinks(row.proof_links),
       engine_sha: sha(row.engine_sha),

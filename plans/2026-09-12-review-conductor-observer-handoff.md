@@ -40,9 +40,13 @@ count. No percentage or success/failure is inferred from absence.
 If Review Conductor later publishes tenant-local events, use append-only events
 bound to the same tuple and epoch:
 
-- `ci.requested|running|completed`
-- `openclaw.requested|running|completed`
-- `clawsweeper.requested|running|completed`
+- `ci.requested|running|completed` plus `ci_conclusion` for terminal truth
+- `openclaw.requested|running|completed` plus `openclaw_conclusion` for terminal truth
+- `clawsweeper.requested|running|completed` plus `clawsweeper_conclusion` for terminal truth
+
+Bare `completed` lifecycle states normalize to `unknown`. A feeder must provide
+an explicit terminal conclusion; only an explicit successful conclusion renders
+as `success`, while failed or cancelled conclusions render as `failure`.
 - `orchestration.blocked|superseded|completed`
 
 Each event carries `observed_at`, `source`, and proof references. Status is a
