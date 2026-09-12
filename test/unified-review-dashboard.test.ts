@@ -147,3 +147,84 @@ test("worker exposes the review API and review page without mutation credentials
   assert.match(html, /data-tenant="dinkuskit"/);
   assert.doesNotMatch(html, /GITHUB_APP_PRIVATE_KEY/);
 });
+
+test("fails an entire source closed when any row identity is malformed", () => {
+  const result = normalizeTenantFeed(
+    "saari",
+    feed("saari", { rows: [{ repository: "invalid", pr_number: 0, source: "fixture" }] }),
+    NOW,
+  );
+  assert.equal(result.projection.status, "invalid");
+  assert.equal(result.projection.row_count, null);
+  assert.deepEqual(result.rows, []);
+});
+
+test("rejects future-dated source and observation timestamps", () => {
+  const future = new Date(NOW + 120_000).toISOString();
+  const generated = normalizeTenantFeed("saari", feed("saari", { generated_at: future }), NOW);
+  assert.equal(generated.projection.status, "invalid");
+
+  const observedFeed = feed("saari") as { rows: Array<Record<string, unknown>> };
+  observedFeed.rows[0]!.observed_at = future;
+  const observed = normalizeTenantFeed("saari", observedFeed, NOW);
+  assert.equal(observed.projection.status, "invalid");
+  assert.equal(observed.projection.row_count, null);
+});
+
+test("a tenant-specific request neither fetches nor waits for the other tenant", async () => {
+  let saariCalls = 0;
+  const response = await unifiedReviewStatus(
+    new Request("https://example.test/api/reviews?tenant=dinkuskit"),
+    {
+      SAARI_REVIEW_TELEMETRY: {
+        fetch: () => {
+          saariCalls += 1;
+          return new Promise<Response>(() => undefined);
+        },
+      },
+      DINKUSKIT_REVIEW_TELEMETRY: {
+        fetch: async () => Response.json(feed("dinkuskit")),
+      },
+    },
+    NOW,
+    20,
+  );
+  const body = (await response.json()) as {
+    sources: Array<{ tenant: string }>;
+    rows: Array<{ tenant: string }>;
+  };
+  assert.equal(saariCalls, 0);
+  assert.deepEqual(
+    body.sources.map((source) => source.tenant),
+    ["dinkuskit"],
+  );
+  assert.deepEqual(
+    body.rows.map((row) => row.tenant),
+    ["dinkuskit"],
+  );
+});
+
+test("a stalled selected feeder becomes explicitly unavailable at its deadline", async () => {
+  const response = await unifiedReviewStatus(
+    new Request("https://example.test/api/reviews?tenant=saari"),
+    {
+      SAARI_REVIEW_TELEMETRY: {
+        fetch: () => new Promise<Response>(() => undefined),
+      },
+    },
+    NOW,
+    10,
+  );
+  const body = (await response.json()) as {
+    sources: Array<{ status: string; row_count: number | null; error: string }>;
+  };
+  assert.deepEqual(body.sources[0], {
+    tenant: "saari",
+    status: "unavailable",
+    generated_at: null,
+    freshness: "unknown",
+    row_count: null,
+    lane: null,
+    error: "telemetry deadline exceeded",
+  });
+});

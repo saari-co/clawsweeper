@@ -19,6 +19,8 @@ const SHA_RE = /^[0-9a-f]{40}$/i;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const MAX_ROWS = 500;
 const DEFAULT_STALE_AFTER_SECONDS = 600;
+const DEFAULT_FEED_TIMEOUT_MS = 3_000;
+const MAX_FUTURE_SKEW_MS = 60_000;
 
 export const CLAWSWEEPER_RANKS = [
   "S Challenger Crab",
@@ -79,10 +81,12 @@ function nonEmptyString(value: unknown, max = 300): string | null {
   return text && text.length <= max ? text : null;
 }
 
-function isoDate(value: unknown): string | null {
+function isoDate(value: unknown, now: number): string | null {
   const text = nonEmptyString(value, 80);
   if (!text || !Number.isFinite(Date.parse(text))) return null;
-  return new Date(text).toISOString();
+  const timestamp = Date.parse(text);
+  if (timestamp > now + MAX_FUTURE_SKEW_MS) return null;
+  return new Date(timestamp).toISOString();
 }
 
 function sha(value: unknown): string | null {
@@ -169,7 +173,7 @@ export function normalizeTenantFeed(
   if (!feed || feed.schema_version !== "clawsweeper.telemetry.v1" || feed.tenant !== tenant) {
     return unavailable(tenant, "invalid", "invalid telemetry envelope");
   }
-  const generatedAt = isoDate(feed.generated_at);
+  const generatedAt = isoDate(feed.generated_at, now);
   const lane = laneBoundary(feed.lane);
   const rawRows = Array.isArray(feed.rows) ? feed.rows : null;
   if (!generatedAt || !lane || !rawRows || rawRows.length > MAX_ROWS) {
@@ -184,7 +188,7 @@ export function normalizeTenantFeed(
   const rows: UnifiedRow[] = [];
   for (const value of rawRows) {
     const row = object(value);
-    if (!row) continue;
+    if (!row) return unavailable(tenant, "invalid", "telemetry contains a malformed row");
     const repository = nonEmptyString(row.repository, 200);
     const prNumber = Number(row.pr_number);
     const source = nonEmptyString(row.source, 300);
@@ -194,9 +198,13 @@ export function normalizeTenantFeed(
       !Number.isInteger(prNumber) ||
       prNumber < 1 ||
       !source
-    )
-      continue;
-    const observedAt = isoDate(row.observed_at);
+    ) {
+      return unavailable(tenant, "invalid", "telemetry contains a malformed row identity");
+    }
+    const observedAt = isoDate(row.observed_at, now);
+    if (row.observed_at !== null && row.observed_at !== undefined && !observedAt) {
+      return unavailable(tenant, "invalid", "telemetry contains an invalid observation timestamp");
+    }
     const headSha = sha(row.head_sha);
     const rating = CLAWSWEEPER_RANKS.includes(row.rating as (typeof CLAWSWEEPER_RANKS)[number])
       ? (row.rating as (typeof CLAWSWEEPER_RANKS)[number])
@@ -256,15 +264,33 @@ function requestedTenant(request: Request): Tenant | "all" {
   return value === "saari" || value === "dinkuskit" ? value : "all";
 }
 
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("telemetry deadline exceeded")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export async function unifiedReviewStatus(
   request: Request,
   env: UnifiedDashboardEnv,
   now = Date.now(),
+  feedTimeoutMs = DEFAULT_FEED_TIMEOUT_MS,
 ) {
+  const view = requestedTenant(request);
+  const tenants: Tenant[] = view === "all" ? TENANTS : [view];
   const results = await Promise.all(
-    TENANTS.map(async (tenant): Promise<SourceResult> => {
+    tenants.map(async (tenant): Promise<SourceResult> => {
       try {
-        return normalizeTenantFeed(tenant, await readTenantFeed(tenant, env), now);
+        const feed = await withDeadline(readTenantFeed(tenant, env), feedTimeoutMs);
+        return normalizeTenantFeed(tenant, feed, now);
       } catch (error) {
         return unavailable(
           tenant,
@@ -274,16 +300,13 @@ export async function unifiedReviewStatus(
       }
     }),
   );
-  const view = requestedTenant(request);
-  const selected =
-    view === "all" ? results : results.filter((result) => result.projection.tenant === view);
   return new Response(
     JSON.stringify({
       schema_version: "clawsweeper.dashboard.v1",
       generated_at: new Date(now).toISOString(),
       view,
-      sources: selected.map((result) => result.projection),
-      rows: selected.flatMap((result) => result.rows),
+      sources: results.map((result) => result.projection),
+      rows: results.flatMap((result) => result.rows),
     }),
     {
       status: 200,

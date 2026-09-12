@@ -6,3 +6,6 @@
 {"at":"2026-09-12T14:55:00Z","event":"full_check_partial","passed":["static","build_all","lint_all","dashboard_tests","aggregate_coverage"],"unrelated_host_failure":"apply-drift-refresh requires GNU Bash mapfile; host resolved /bin/bash 3.2"}
 {"at":"2026-09-12T14:56:00Z","event":"local_browser_proof_passed","all_rows":2,"dinkuskit_rows":1,"tenant_isolation":true,"screenshots":["all-view.png","dinkuskit-view.png"]}
 {"at":"2026-09-12T14:58:00Z","event":"implementation_committed","head":"c434d324a9ae52749c532f93577d141543479a5a"}
+{"at":"2026-09-12T15:04:47Z","event":"exact_local_review_completed","reviewed_head":"a6a4463894bc7dc26b3cc0df720a1583f01693b0","decision":"keep_open","confidence":"high","findings":4}
+{"at":"2026-09-12T15:05:00Z","event":"hosted_ci_passed","reviewed_head":"a6a4463894bc7dc26b3cc0df720a1583f01693b0","run_id":34700818962}
+{"at":"2026-09-12T15:07:00Z","event":"repair_cycle_completed","cycle":1,"resolved":["malformed_rows_fail_closed","future_timestamps_rejected","tenant_fetch_isolation","feed_deadline"],"focused_tests":10,"remaining":"public-safe versus authenticated-private projection"}
