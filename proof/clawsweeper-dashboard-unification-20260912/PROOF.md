@@ -10,6 +10,7 @@ represents missing or stale telemetry truthfully.
 
 - base: `77c6fb150ff63a463929b83f86bc7510e83c93c6`
 - private-observer implementation head: `01f1254d423acaf634f7c3c73549f71bff369238`
+- lifecycle-truth repair head: `1ed54aa24bb2ddf57ef2ebaacffdd94eded0739b`
 - worktree: `/Users/cp-1/Developer/worktrees/clawsweeper-codex-clawsweeper-dashboard-unification-20260912`
 
 ## Proof log
@@ -75,6 +76,9 @@ represents missing or stale telemetry truthfully.
   failure remained the unrelated `apply-drift-refresh` fixture because this
   host resolves macOS Bash 3.2 without `mapfile`; GNU Bash is not installed on
   the host for an invocation-only rerun.
+- Cycle 3 was committed at `1ed54aa24bb2ddf57ef2ebaacffdd94eded0739b`
+  on top of the concurrently published, preserved documentation commit
+  `6029cb38c19781f8c706e1361718008e69421f1f`.
 - Full `pnpm run check`: static, all builds, all lint, 286 test files including
   the observer suite, and aggregate coverage passed. The only failure is the
   unchanged host fixture `test/apply-drift-refresh.test.ts`, which invokes
