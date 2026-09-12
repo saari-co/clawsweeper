@@ -9,7 +9,7 @@ represents missing or stale telemetry truthfully.
 ## Exact source
 
 - base: `77c6fb150ff63a463929b83f86bc7510e83c93c6`
-- implementation head: `c434d324a9ae52749c532f93577d141543479a5a`
+- private-observer implementation head: `01f1254d423acaf634f7c3c73549f71bff369238`
 - worktree: `/Users/cp-1/Developer/worktrees/clawsweeper-codex-clawsweeper-dashboard-unification-20260912`
 
 ## Proof log
@@ -26,9 +26,10 @@ represents missing or stale telemetry truthfully.
 - Full `pnpm run check`: one unrelated host-tooling failure remained in
   `test/apply-drift-refresh.test.ts`; the fixture invoked macOS Bash 3.2, where
   GNU Bash's `mapfile` builtin is unavailable. No dashboard assertion failed.
-- Source-blind local Playwright proof: All rendered 2 tenant rows; selecting
-  DinkusKit rendered exactly 1 DinkusKit row and no Saari row. Screenshots:
-  `all-view.png` and `dinkuskit-view.png`.
+- Initial source-blind local Playwright proof: All rendered 2 tenant rows;
+  selecting DinkusKit rendered exactly 1 DinkusKit row and no Saari row. Its
+  product-repository screenshots were superseded and removed under the proof
+  asset placement contract.
 - Hosted CI passed on PR head `a6a4463894bc7dc26b3cc0df720a1583f01693b0`:
   `pnpm check`, sparse repair build, and Windows launcher all succeeded.
 - Exact committed-range ClawSweeper review on that head returned `keep_open`
@@ -45,10 +46,18 @@ represents missing or stale telemetry truthfully.
   fields from serialized responses.
 - Authenticated source-blind local browser proof: All rendered exactly two
   tenant rows with executor/findings/progression; selecting DinkusKit rendered
-  one DinkusKit row and no Saari row. Local screenshots are staged outside the
-  product repository at
-  `/Users/cp-1/Developer/_machine-runs/clawsweeper-dashboard-unification-20260912/`;
-  immutable PR asset publication is pending the exact committed head.
+  one DinkusKit row and no Saari row. Sanitized immutable assets:
+  - [private-all-view.png](https://github.com/saari-co/swarm-pr-assets/releases/download/clawsweeper-pr-16-private-observer-01f1254d423a/private-all-view.png) —
+    95,791 bytes; SHA-256
+    `ecdc64a000e9f3ac56942b6bba2c387caa5a1551ff77c5ceda559ba778d52de0`.
+  - [private-dinkuskit-view.png](https://github.com/saari-co/swarm-pr-assets/releases/download/clawsweeper-pr-16-private-observer-01f1254d423a/private-dinkuskit-view.png) —
+    67,729 bytes; SHA-256
+    `f28fcb5533ce04d7a10928be1d05b21855418131ee498d26bbc535870e01fc52`.
+  - Provenance: local fixture Worker and system Chrome against source head
+    `01f1254d423acaf634f7c3c73549f71bff369238`. Redaction status: sanitized;
+    no production data, credentials, Access assertion, or private feeder
+    extensions. Destination: `saari-co/swarm-pr-assets`, resolved by the
+    `saari_co_owner` placement rule.
 - Review Conductor contract is staged at
   `plans/2026-09-12-review-conductor-observer-handoff.md`; it remains inactive.
 - Pre-commit Codex review repair cycle 2 fixed canonical public proof URL

@@ -14,3 +14,4 @@
 {"at":"2026-09-12T15:39:04Z","event":"authenticated_browser_proof_passed","all_rows":2,"dinkuskit_rows":1,"tenant_isolation":true,"screenshots":["private-all-view.png","private-dinkuskit-view.png"]}
 {"at":"2026-09-12T15:48:53Z","event":"repair_cycle_completed","cycle":2,"resolved":["canonical_public_proof_urls","missing_findings_remain_unknown","public_private_renderer_separation"],"focused_tests":14,"repair_limit_reached":true}
 {"at":"2026-09-12T15:48:53Z","event":"full_check_partial","passed":["static","build_all","lint_all","observer_tests","aggregate_coverage"],"unrelated_host_failure":"apply-drift-refresh invokes macOS Bash 3.2 without mapfile"}
+{"at":"2026-09-12T15:50:00Z","event":"proof_assets_published","source_head":"01f1254d423acaf634f7c3c73549f71bff369238","destination":"saari-co/swarm-pr-assets","release":"clawsweeper-pr-16-private-observer-01f1254d423a","sanitized":true,"product_repo_binaries_removed":true}

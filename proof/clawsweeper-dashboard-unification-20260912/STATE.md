@@ -6,7 +6,7 @@
 - mode: mutate source / review-only runtime proof
 - branch: `codex/clawsweeper-dashboard-unification-20260912`
 - base: `77c6fb150ff63a463929b83f86bc7510e83c93c6`
-- implementation_head: `c434d324a9ae52749c532f93577d141543479a5a`
+- implementation_head: `01f1254d423acaf634f7c3c73549f71bff369238`
 - repair_cycles: 2 / 2 (limit reached)
 - live_state: local worktree + GitHub exact heads + tenant state branch heads
 - approved_boundary: Cloudflare Access authenticated private observer; public API remains privacy-filtered
