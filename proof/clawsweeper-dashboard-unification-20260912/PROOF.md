@@ -9,7 +9,7 @@ represents missing or stale telemetry truthfully.
 ## Exact source
 
 - base: `77c6fb150ff63a463929b83f86bc7510e83c93c6`
-- head: pending first commit
+- implementation head: `c434d324a9ae52749c532f93577d141543479a5a`
 - worktree: `/Users/cp-1/Developer/worktrees/clawsweeper-codex-clawsweeper-dashboard-unification-20260912`
 
 ## Proof log
