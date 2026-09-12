@@ -1,0 +1,7 @@
+{"at":"2026-09-12T14:30:00Z","event":"inventory_started","source":"authenticated Bobby WebChat request","mode":"review-only dashboard implementation"}
+{"at":"2026-09-12T14:32:24Z","event":"live_edge_verified","url":"https://clawsweeper.ztoned.com","result":"302_cloudflare_access"}
+{"at":"2026-09-12T14:35:00Z","event":"worktree_created","branch":"codex/clawsweeper-dashboard-unification-20260912","base":"77c6fb150ff63a463929b83f86bc7510e83c93c6"}
+{"at":"2026-09-12T14:45:00Z","event":"implementation_started","contract":"clawsweeper.telemetry.v1","tenant_bindings":["SAARI_REVIEW_TELEMETRY","DINKUSKIT_REVIEW_TELEMETRY"]}
+{"at":"2026-09-12T14:53:00Z","event":"focused_verification_passed","dashboard_tests":6,"dashboard_build":"passed","changed_lint":"passed"}
+{"at":"2026-09-12T14:55:00Z","event":"full_check_partial","passed":["static","build_all","lint_all","dashboard_tests","aggregate_coverage"],"unrelated_host_failure":"apply-drift-refresh requires GNU Bash mapfile; host resolved /bin/bash 3.2"}
+{"at":"2026-09-12T14:56:00Z","event":"local_browser_proof_passed","all_rows":2,"dinkuskit_rows":1,"tenant_isolation":true,"screenshots":["all-view.png","dinkuskit-view.png"]}

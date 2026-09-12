@@ -1,0 +1,23 @@
+# Prepared deployment configuration. Deployment and binding creation remain human-gated.
+name = "clawsweeper-ztoned"
+main = "worker.ts"
+account_id = "cddb32366789cab1bdf4c25584dc1920"
+compatibility_date = "2026-05-11"
+workers_dev = false
+
+[[routes]]
+pattern = "clawsweeper.ztoned.com"
+custom_domain = true
+
+# Independent read-only projections retain their own App installation, queue,
+# state store, engine pin, and mutation owner. This Worker has no writer secret.
+[[services]]
+binding = "SAARI_REVIEW_TELEMETRY"
+service = "clawsweeper-telemetry-saari"
+
+[[services]]
+binding = "DINKUSKIT_REVIEW_TELEMETRY"
+service = "clawsweeper-telemetry-dinkuskit"
+
+[vars]
+DASHBOARD_HOME = "reviews"
