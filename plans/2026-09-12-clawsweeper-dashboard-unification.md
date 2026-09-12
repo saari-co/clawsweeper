@@ -46,6 +46,22 @@ Rows carry tenant, repository/PR, exact base/head, CI, OpenClaw, ClawSweeper,
 official rating, proof links, engine SHA, observation time, freshness, and source.
 Missing fields become `unknown`; unavailable sources use `row_count: null`.
 
+The approved private observer boundary has two distinct read surfaces:
+
+- `GET /api/reviews` is public-safe. It emits only rows whose repository is in
+  `PUBLIC_BAY_REPOS`, removes tenant lane details, rewrites source errors to a
+  generic unavailable state, and keeps only canonical GitHub proof links for
+  allowlisted public repositories.
+- `GET /api/private/reviews` verifies the existing Cloudflare Access JWT at the
+  Worker using the configured team issuer, application audience, expiry, and
+  Cloudflare JWKS. Only then does it query the tenant service bindings. The
+  browser receives the normalized read model, never feeder payload extensions,
+  GitHub credentials, App keys, or Access assertions.
+
+The normalized private row adds bounded finding totals and executor identity to
+the existing exact-head, CI, OpenClaw, ClawSweeper, rating, engine, freshness,
+source, and proof fields.
+
 ## Idempotency and mutation ownership
 
 - Read identity: `(tenant, repository, pr_number, head_sha)`.
@@ -61,7 +77,11 @@ Missing fields become `unknown`; unavailable sources use `row_count: null`.
 2. Local Worker/browser proof for All/Saari/DinkusKit, stale/unknown, and unavailable-source behavior.
 3. Safe sample PR exact-head CI → OpenClaw → ClawSweeper review-only proof; at most two repair cycles.
 4. Human gate: provision and verify both read-only feeder bindings.
-5. Human gate: deploy `dashboard/wrangler.ztoned.toml`; verify Access, routes,
+5. Human gate: configure the existing Access application issuer/audience as
+   `PRIVATE_OBSERVER_ACCESS_TEAM_DOMAIN` and `PRIVATE_OBSERVER_ACCESS_AUD`. This
+   is configuration of the selected boundary, not authority to change Access
+   policy, membership, or authentication methods.
+6. Human gate: deploy `dashboard/wrangler.ztoned.toml`; verify Access, routes,
    tenant isolation, freshness, and rollback.
 
 ## Gates and stop conditions
@@ -72,6 +92,8 @@ Missing fields become `unknown`; unavailable sources use `row_count: null`.
 - Stop on source-head drift, unknown asset destination, cross-tenant authority,
   credential-bearing telemetry, inability to prove exact base/head, stale
   terminal review, or after two repair cycles.
+- Stop if the ztoned route can bypass Access, Access does not inject a verifiable
+  assertion, or either feeder requires a shared App credential or write scope.
 - Review Conductor introduction is read-only contract work only.
 
 ## Rollback

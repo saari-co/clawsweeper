@@ -35,12 +35,33 @@ represents missing or stale telemetry truthfully.
   with high confidence and four findings. Repair cycle 1 added negative coverage
   and fixes for malformed-row fail-closed behavior, future timestamps, bounded
   feeder deadlines, and tenant-specific fetch isolation; 10 focused tests pass.
-- Remaining gate: choose whether the Saari/private-repository view becomes a
-  separately authenticated private observer or the route stays public-safe and
-  suppresses all non-`PUBLIC_BAY_REPOS` rows. No production service-binding
-  claim is made before that boundary is selected and proven.
+- Architecture gate: Bobby selected a separately authenticated private observer;
+  the public route suppresses all non-`PUBLIC_BAY_REPOS` rows.
+- Private observer focused proof: dashboard TypeScript build, focused lint, and
+  14 deterministic tests passed. Coverage includes valid RS256/JWKS Access
+  verification, issuer/audience/expiry claims, rejection before feeder access,
+  private Saari visibility, public repository/proof suppression, lane-detail
+  redaction, tenant-specific reads, and omission of credential-shaped feeder
+  fields from serialized responses.
+- Authenticated source-blind local browser proof: All rendered exactly two
+  tenant rows with executor/findings/progression; selecting DinkusKit rendered
+  one DinkusKit row and no Saari row. Local screenshots are staged outside the
+  product repository at
+  `/Users/cp-1/Developer/_machine-runs/clawsweeper-dashboard-unification-20260912/`;
+  immutable PR asset publication is pending the exact committed head.
+- Review Conductor contract is staged at
+  `plans/2026-09-12-review-conductor-observer-handoff.md`; it remains inactive.
+- Pre-commit Codex review repair cycle 2 fixed canonical public proof URL
+  validation, missing-finding-count truth, and public/private page renderer
+  separation. The repair limit is now reached.
+- Full `pnpm run check`: static, all builds, all lint, 286 test files including
+  the observer suite, and aggregate coverage passed. The only failure is the
+  unchanged host fixture `test/apply-drift-refresh.test.ts`, which invokes
+  macOS Bash 3.2 and requires the unavailable `mapfile` builtin.
 
 ## Gates
 
 No deploy, merge, App/config/credential change, automerge, auto-close, or
-Review Conductor activation performed.
+Review Conductor activation performed. Production still requires separately
+gated feeder provisioning, Access issuer/audience variables, verification that
+the existing Access application covers the private route, and Worker deploy.

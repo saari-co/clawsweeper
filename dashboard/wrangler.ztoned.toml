@@ -20,4 +20,9 @@ binding = "DINKUSKIT_REVIEW_TELEMETRY"
 service = "clawsweeper-telemetry-dinkuskit"
 
 [vars]
-DASHBOARD_HOME = "reviews"
+DASHBOARD_HOME = "private-reviews"
+# Human-gated deploy inputs (non-secret):
+PRIVATE_OBSERVER_ACCESS_TEAM_DOMAIN = ""
+PRIVATE_OBSERVER_ACCESS_AUD = ""
+PUBLIC_BAY_REPOS = ""
+# Empty prepared values fail closed. Populate them only at the production gate.

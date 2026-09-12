@@ -19,9 +19,14 @@
     { "path": "/api/triage", "method": "ANY" },
     { "path": "/api/pr-proof-triage", "method": "ANY" }
   ],
+  "authenticatedObserverRoutes": [
+    { "path": "/api/private/reviews", "method": "GET", "auth": "cloudflare-access-jwt" }
+  ],
   "auditedDashboardVariables": [
     "CLAWSWEEPER_REPO",
     "PUBLIC_BAY_REPOS",
+    "PRIVATE_OBSERVER_ACCESS_TEAM_DOMAIN",
+    "PRIVATE_OBSERVER_ACCESS_AUD",
     "WORKER_DETAIL_RUN_LIMIT",
     "WORKER_JOB_FETCH_CONCURRENCY",
     "WORKER_JOB_CACHE_TTL_SECONDS",
