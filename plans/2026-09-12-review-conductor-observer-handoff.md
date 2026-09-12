@@ -2,8 +2,9 @@
 
 ## Purpose
 
-Give Review Conductor a stable way to report exact-head orchestration progress
-to the ClawSweeper dashboard without activating Review Conductor or granting it
+Give one multi-tenant Review Conductor implementation a stable way to report
+exact-head orchestration progress to the ClawSweeper dashboard without activating
+Review Conductor or granting it
 merge, comment, repair, workflow-dispatch, App-management, or repository-write
 authority.
 
@@ -50,9 +51,17 @@ instruction channel.
 
 ## Isolation and activation gates
 
-- Saari and DinkusKit retain separate App installations, source identities,
-  queue/state namespaces, engine/executor provenance, and mutation owners.
+- The first tenant is `saari-co/openclaw-smcbd-suite`; `dinkuskit/blocks` follows
+  only after the SMCBD pilot and a separate enrollment decision.
+- Saari and DinkusKit share implementation and dashboard visibility while
+  retaining separate App installations, credentials, enrollment, queue/state
+  namespaces, engine/executor provenance, proof, and mutation owners.
 - Review Conductor never receives dashboard or tenant mutation authority.
+- OpenClaw and ClawSweeper retain their native detailed findings/comments.
+  Review Conductor alone publishes the authoritative `OpenClaw Review Rail` and
+  `ClawSweeper Review Rail` checks after exact-revision validation. Never operate
+  competing authoritative writers during cutover.
+- The dashboard is read-only and no observer state grants merge authority.
 - No webhook, deployment, credential, App permission, workflow dispatch,
   comment, merge, autofix, automerge, or auto-close activation is part of this
   handoff.
