@@ -8,18 +8,11 @@
       "community_url": "https://clawhub.ai/",
       "prompt_note": "Use the ClawHub source tree and current main branch. Review every issue and PR with the same evidence standard. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "bun",
-      "validation_commands": [
-        "bun run check"
-      ],
+      "validation_commands": ["bun run check"],
       "changed_gate": null
     },
     {
@@ -28,13 +21,8 @@
       "checkout_dir": "clawsweeper",
       "prompt_note": "Use the ClawSweeper source tree and current main branch. Review bot automation, workflow, and documentation changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -49,13 +37,8 @@
       "checkout_dir": "fs-safe",
       "prompt_note": "Use the fs-safe source tree and current main branch. Review filesystem-safety, path-handling, and package changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -257,6 +240,19 @@
       "changed_gate": null
     },
     {
+      "target_repo": "saari-co/openclaw-smcbd-suite",
+      "display_name": "OpenClaw SMCBD Suite",
+      "checkout_dir": "openclaw-smcbd-suite",
+      "prompt_note": "Use the openclaw-smcbd-suite source tree and current main branch. This is the private Saari standard-review-rails target. Review conservatively for exact-tuple identity, comprehensive native review scope, secret hygiene, and preservation of Conductor-owned scheduling. Do not auto-close issues or pull requests; this exact-tuple producer lane is proposal-only.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
+    },
+    {
       "target_repo": "saari-co/smokyproductco",
       "display_name": "Smoky Product Company",
       "checkout_dir": "smokyproductco",
@@ -266,29 +262,19 @@
         "pull_request": []
       },
       "package_manager": "pnpm",
-      "validation_commands": [
-        "pnpm test:acceptance"
-      ],
+      "validation_commands": ["pnpm test:acceptance"],
       "changed_gate": null
     }
   ],
   "generic_fallbacks": [
     {
       "owner": "openclaw",
-      "deny_repositories": [
-        "openclaw/clawsweeper-state",
-        "openclaw/.github"
-      ],
+      "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
       "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
       "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic OpenClaw onboarding profile, so keep review conservative: issues and pull requests may be auto-closed only when the exact change is certainly already implemented on the default branch; pull requests may also be age-gated mostly implemented there.",
       "apply_close_rules": {
-        "issue": [
-          "implemented_on_main"
-        ],
-        "pull_request": [
-          "implemented_on_main",
-          "mostly_implemented_on_main"
-        ]
+        "issue": ["implemented_on_main"],
+        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
       "package_manager": "pnpm",
       "validation_commands": [],
@@ -319,14 +305,8 @@
     }
   },
   "target_inventory": {
-    "owners": [
-      "openclaw",
-      "steipete"
-    ],
-    "deny_repositories": [
-      "openclaw/clawsweeper-state",
-      "openclaw/.github"
-    ],
+    "owners": ["openclaw", "steipete"],
+    "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
     "include_private": false,
     "include_archived": false,
     "include_forks": false,

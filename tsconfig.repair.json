@@ -21,6 +21,7 @@
     "src/codex-output-capture.ts",
     "src/codex-spawn.ts",
     "src/codex-app-server-worker.ts",
-    "src/codex-process-worker.ts"
+    "src/codex-process-worker.ts",
+    "src/saari-exact-tuple.ts"
   ]
 }

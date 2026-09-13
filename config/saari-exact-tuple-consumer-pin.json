@@ -1,0 +1,28 @@
+{
+  "schema": "saari.clawsweeper.exact-tuple-consumer-pin.v1",
+  "source_repository": "saari-co/review-conductor",
+  "source_commit": "2f5818cacdf84a72b22362f984d0c3d8c18af244",
+  "purpose": "Hash pin for an independently supplied parse_clawsweeper_bundle checkout. Not a substitute parser and not invoked at review runtime.",
+  "entry": "tools/review_conductor_userland.py",
+  "function": "parse_clawsweeper_bundle",
+  "proof_command": "pnpm run prove:saari-exact-tuple-consumer -- --consumer-checkout <checkout>",
+  "standard_tests": "portable pin and fail-closed command coverage only; they do not run the consumer",
+  "files": {
+    "tools/review_conductor.py": {
+      "sha256": "55ead91af7d9ff9e0c22fc361fa6744e6ebff167dbae27ad80e4a8a81f3c9790",
+      "bytes": 104063
+    },
+    "tools/review_conductor_runtime.py": {
+      "sha256": "b4b05dbe8af9a422cb9b262273dba2b7024c8c58971dd014198d354114e139c0",
+      "bytes": 93862
+    },
+    "tools/review_conductor_userland.py": {
+      "sha256": "8466b98518083cbc6e884fd77747fbaa5bb74e7ec792aed591cd09594cc4b95a",
+      "bytes": 90489
+    },
+    "tools/review_conductor_profiles.py": {
+      "sha256": "9d32531f25eaf3fc9b80b24c1312ed1287dc0935e097b60d33530e3088c9dff8",
+      "bytes": 5397
+    }
+  }
+}

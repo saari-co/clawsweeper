@@ -106,6 +106,13 @@ import {
   stringArg,
   type Args,
 } from "./clawsweeper-args.js";
+import {
+  bindSaariExactTupleIdentity,
+  comprehensiveExactTuplePrompt,
+  exactTupleFrontMatterLines,
+  renderExactTupleIdentitySection,
+  type SaariExactTupleIdentity,
+} from "./saari-exact-tuple.js";
 import { escapeRegExp, safeOutputTail, trimMiddle, truncateText } from "./clawsweeper-text.js";
 import {
   emptyMaintainerDecision,
@@ -700,6 +707,7 @@ interface ReviewPromptRuntimeHints {
   proofScratchDir?: string;
   mediaProofManifestPath?: string;
   mediaProofSummary?: string;
+  exactTuplePrompt?: string;
 }
 
 interface DashboardItem {
@@ -2484,6 +2492,7 @@ function reviewPolicyHash(options: {
   reasoningEffort?: string;
   sandboxMode?: string;
   serviceTier?: string;
+  reviewScope?: string;
 }): string {
   return sha256(
     stableJson({
@@ -2497,6 +2506,7 @@ function reviewPolicyHash(options: {
       repositoryProfile: targetProfile(),
       prompt: reviewPromptTemplate(),
       schema: reviewDecisionSchemaText(),
+      ...(options.reviewScope ? { reviewScope: options.reviewScope } : {}),
     }),
   ).slice(0, 16);
 }
@@ -7281,6 +7291,37 @@ export function prepareMediaProofArtifactsForTest(
   return prepareMediaProofArtifacts(context, proofScratchDir, runner);
 }
 
+function emptyPreparedMediaProof(): PreparedMediaProof {
+  return { manifestPath: null, summaryPath: null, artifacts: [] };
+}
+
+function skipMediaProofPreprocessing(args: Args, localRange = false): boolean {
+  return localRange || boolArg(args.disable_media_proof_preprocessing);
+}
+
+function resolvePreparedMediaProof(
+  context: ItemContext,
+  proofScratchDir: string,
+  skip: boolean,
+  runner?: MediaProofCommandRunner,
+): PreparedMediaProof {
+  if (skip) return emptyPreparedMediaProof();
+  return prepareMediaProofArtifacts(context, proofScratchDir, runner);
+}
+
+export function skipMediaProofPreprocessingForTest(args: Args, localRange = false): boolean {
+  return skipMediaProofPreprocessing(args, localRange);
+}
+
+export function resolvePreparedMediaProofForTest(
+  context: ItemContext,
+  proofScratchDir: string,
+  skip: boolean,
+  runner: MediaProofCommandRunner,
+): PreparedMediaProof {
+  return resolvePreparedMediaProof(context, proofScratchDir, skip, runner);
+}
+
 function buildReviewPrompt(
   item: Item,
   context: ItemContext,
@@ -7305,6 +7346,14 @@ function buildReviewPrompt(
 ## Maintainer Request
 
 ${additionalPrompt.trim()}
+`
+    : "";
+  const exactTuple = runtimeHints.exactTuplePrompt?.trim()
+    ? `
+
+## Bound exact-tuple review
+
+${runtimeHints.exactTuplePrompt.trim()}
 `
     : "";
   const text = `${prompt}
@@ -7337,7 +7386,7 @@ ${mediaProofPrompt}
 \`\`\`json
 ${contextJson}
 \`\`\`
-${extra}
+${exactTuple}${extra}
 `;
   return {
     text,
@@ -7762,7 +7811,7 @@ function runCodex(options: {
   ensureDir(proofScratchDir);
   prepareMaturityStableShortlistScript(proofScratchDir, options.openclawDir);
   const preparedMediaProof = options.prompt
-    ? { manifestPath: null, summaryPath: null, artifacts: [] }
+    ? emptyPreparedMediaProof()
     : prepareMediaProofArtifacts(options.context, proofScratchDir);
   const promptPath = join(options.workDir, `${options.item.number}.prompt.md`);
   const outputPath = join(options.workDir, `${options.item.number}.json`);
@@ -16944,6 +16993,7 @@ function markdownFor(options: {
   contentDigest: string;
   reviewPolicy: string;
   runtime: ReviewRuntime;
+  exactTupleIdentity?: SaariExactTupleIdentity;
 }): string {
   const labels = options.item.labels.length ? options.item.labels.join(", ") : "none";
   const reviewedAt = new Date().toISOString();
@@ -17044,7 +17094,7 @@ review_codex_elapsed_ms: ${reviewTelemetryNumber(options.runtime.codexElapsedMs)
 review_mode: ${options.reviewMode}
 review_status: ${options.decision.summary.startsWith("Codex review failed") ? "failed" : "complete"}
 review_terminal_failure: ${options.decision.codexTerminalFailure === true}
-local_checkout_access: verified
+${options.exactTupleIdentity ? `${exactTupleFrontMatterLines(options.exactTupleIdentity).join("\n")}\n` : ""}local_checkout_access: verified
 item_snapshot_hash: ${options.snapshotHash}
 review_content_digest: ${options.contentDigest}
 last_full_review_at: ${reviewedAt}
@@ -17127,7 +17177,7 @@ Updated at: ${formatTimestamp(options.item.updatedAt)}
 Reviewed against: ${linkedSha(options.git.mainSha)}
 
 Codex review: ${runtimeReviewText(options.runtime)}
-
+${options.exactTupleIdentity ? `\n${renderExactTupleIdentitySection(options.exactTupleIdentity)}\n` : ""}
 Latest release at review time: ${
     options.git.latestRelease?.tagName
       ? linkedRelease(options.git.latestRelease.tagName)
@@ -17419,6 +17469,53 @@ export function buildLocalRangeReviewForTest(
   return buildLocalRangeReview(targetDir, repo, baseRef);
 }
 
+function exactTupleIdentityFromReviewArgs(
+  args: Args,
+  targetRepoName: string,
+): SaariExactTupleIdentity | undefined {
+  const reviewEpoch = stringArg(args.review_epoch, "");
+  const reviewScope = stringArg(args.review_scope, "");
+  const reviewerActor = stringArg(args.reviewer_actor, "");
+  const expectedBaseSha = stringArg(args.expected_base_sha, "");
+  const expectedHeadSha = stringArg(args.expected_head_sha, "");
+  const supplied = [reviewEpoch, reviewScope, reviewerActor, expectedBaseSha, expectedHeadSha];
+  if (supplied.every((value) => !value)) return undefined;
+  if (supplied.some((value) => !value)) {
+    throw new UserFacingCommandError(
+      "exact-tuple review requires --review-epoch, --review-scope, --reviewer-actor, --expected-base-sha, and --expected-head-sha together",
+    );
+  }
+  return bindSaariExactTupleIdentity({
+    repository: targetRepoName,
+    targetRepository: targetRepoName,
+    targetRepositoryId: stringArg(args.target_repository_id, ""),
+    prNumber: stringArg(args.item_number, ""),
+    expectedBaseSha,
+    expectedHeadSha,
+    reviewEpoch,
+    reviewScope,
+    reviewerActor,
+  });
+}
+
+export function exactTupleIdentityFromReviewArgsForTest(
+  args: Args,
+  targetRepoName: string,
+): SaariExactTupleIdentity | undefined {
+  return exactTupleIdentityFromReviewArgs(args, targetRepoName);
+}
+
+export function reviewPromptWithExactTupleForTest(
+  item: Item,
+  context: ItemContext,
+  git: GitInfo,
+  identity: SaariExactTupleIdentity,
+): string {
+  return buildReviewPrompt(item, context, git, "", {
+    exactTuplePrompt: comprehensiveExactTuplePrompt(identity),
+  }).text;
+}
+
 function reviewCommand(args: Args): void {
   const profile = repoFromArgs(args);
   // `--local-range` is inherently a local, offline operation, so it implies `--local-only`
@@ -17483,6 +17580,7 @@ function reviewCommand(args: Args): void {
     args.additional_prompt,
     process.env.CLAWSWEEPER_ADDITIONAL_PROMPT ?? "",
   );
+  const exactTupleIdentity = exactTupleIdentityFromReviewArgs(args, profile.targetRepo);
   // Local-review extensions (spirit of the standalone local-review lane, folded in):
   // layer a repo-specific policy file, and/or substitute a hypothetical PR body (e.g.
   // to test the real-behavior-proof / mantis decision, or to give engines that cannot
@@ -17532,7 +17630,23 @@ function reviewCommand(args: Args): void {
     : checkout.gitTargetBranch
       ? gitInfo(openclawDir, { targetBranch: checkout.gitTargetBranch })
       : gitInfo(openclawDir);
-  const reviewPolicy = reviewPolicyHash({ model, reasoningEffort, sandboxMode, serviceTier });
+  const reviewPolicy = reviewPolicyHash({
+    model,
+    reasoningEffort,
+    sandboxMode,
+    serviceTier,
+    ...(exactTupleIdentity ? { reviewScope: exactTupleIdentity.reviewScope } : {}),
+  });
+  if (exactTupleIdentity) {
+    if (git.mainSha !== exactTupleIdentity.baseSha) {
+      throw new UserFacingCommandError(
+        `exact-tuple review base SHA ${git.mainSha} does not match admitted ${exactTupleIdentity.baseSha}`,
+      );
+    }
+    if (normalizeRepo(profile.targetRepo) !== exactTupleIdentity.repository) {
+      throw new UserFacingCommandError("exact-tuple review repository is not the admitted tenant");
+    }
+  }
   // Planned background shards receive exact item numbers from the planner, but they are not
   // user-requested exact reviews. Only the workflow may opt those batches into cache reuse.
   const plannedAutomaticReview = boolArg(args.planned_automatic_review);
@@ -17635,20 +17749,33 @@ function reviewCommand(args: Args): void {
       }
       const codexWorkDir = join(artifactDir, "codex");
       const proofScratchDir = join(codexWorkDir, "proof-scratch", String(item.number));
-      // --local-range is a pre-PR LOCAL code review — it has no telegram-visible-proof to
-      // capture, and prepareMediaProofArtifacts would host-side `curl` + `ffmpeg` any media URL
-      // in the synthetic body (commit message / --body-file). Skip it entirely for local-range:
-      // no host download, no transcode of body-supplied URLs.
-      const preparedMediaProof: PreparedMediaProof = localRangeData
-        ? { manifestPath: null, summaryPath: null, artifacts: [] }
-        : prepareMediaProofArtifacts(context, proofScratchDir);
-      const prompt = buildReviewPrompt(
-        item,
+      // --local-range has no telegram-visible-proof to capture. The trusted producer also
+      // passes --disable-media-proof-preprocessing so credentialed --local-only runs do not
+      // host-side curl/ffmpeg PR-supplied URLs. --local-only alone still preprocesses.
+      const preparedMediaProof = resolvePreparedMediaProof(
         context,
-        git,
-        additionalPrompt,
-        mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
+        proofScratchDir,
+        skipMediaProofPreprocessing(args, Boolean(localRangeData)),
       );
+      if (exactTupleIdentity) {
+        if (item.number !== exactTupleIdentity.itemNumber) {
+          throw new UserFacingCommandError(
+            "exact-tuple review item is not the admitted pull request",
+          );
+        }
+        const pullHeadSha = pullHeadShaFromContext(context);
+        if (pullHeadSha !== exactTupleIdentity.headSha) {
+          throw new UserFacingCommandError(
+            `exact-tuple review head SHA ${pullHeadSha ?? "unknown"} does not match admitted ${exactTupleIdentity.headSha}`,
+          );
+        }
+      }
+      const prompt = buildReviewPrompt(item, context, git, additionalPrompt, {
+        ...mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
+        ...(exactTupleIdentity
+          ? { exactTuplePrompt: comprehensiveExactTuplePrompt(exactTupleIdentity) }
+          : {}),
+      });
       const snapshotHash = itemSnapshotHash(item, context);
       if (skipStartComment) {
         if (!humanLocalReview) {
@@ -17755,6 +17882,7 @@ function reviewCommand(args: Args): void {
           contentDigest,
           reviewPolicy,
           runtime,
+          ...(exactTupleIdentity ? { exactTupleIdentity } : {}),
         }),
         "utf8",
       );

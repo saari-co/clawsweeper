@@ -95,7 +95,9 @@
     "crabbox:run": "crabbox run",
     "crabbox:stop": "crabbox stop",
     "crabbox:warmup": "crabbox warmup",
-    "repair:pr-intake": "node dist/repair/pr-repair-intake.js"
+    "repair:pr-intake": "node dist/repair/pr-repair-intake.js",
+    "repair:exact-review-bundle": "node dist/repair/exact-review-bundle-cli.js",
+    "prove:saari-exact-tuple-consumer": "pnpm run build:repair && node scripts/prove-saari-exact-tuple-consumer.mjs"
   },
   "dependencies": {
     "yaml": "^2.9.0"

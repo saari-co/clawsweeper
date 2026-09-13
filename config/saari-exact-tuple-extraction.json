@@ -1,0 +1,51 @@
+{
+  "schema": "saari.clawsweeper.exact-tuple-extraction.v1",
+  "license": "MIT",
+  "source_commit": "80cdeb241ab529008b1082749584be28a318e9ca",
+  "source_repository": "dinkuskit/clawsweeper",
+  "caller_reference": {
+    "repository": "dinkuskit/blocks",
+    "commit": "d6703543a6d94e531d75294406d8c3661a42ed59",
+    "path": ".github/workflows/clawsweeper-native-canary.yml",
+    "sha256": "142bb1578fb1d2802a6e4fbbc6f7de3d62448b49f4a0a59cccda1800956b8c12"
+  },
+  "adaptations": [
+    {
+      "source_path": ".github/workflows/dinkuskit-native-canary.yml",
+      "source_sha256": "9178bb4215d154702a297f0b6ce87a6fa64442b39e71d86392a2c82b9e5567d1",
+      "destination_path": ".github/workflows/saari-exact-tuple-review.yml",
+      "destination_sha256": "39fe9673ee5c0be803062fae07d73b893b8fa17b7fa232330c9c8e0b43815711",
+      "adaptation": "Replace DinkusKit public allowlist, shared clawsweeper-state writer, App credential minting, and Copilot runtime with a single private Saari suite tenant, github.token reads, existing Codex setup-codex, artifact-only publication, job.workflow_sha engine binding, and epoch/scope/actor binding."
+    },
+    {
+      "source_path": "src/repair/exact-review-bundle.ts",
+      "source_sha256": "2b1a1834ae7ab97be0605f4b6e363e97a9941e6f5eaa170a7851d580be634c85",
+      "destination_path": "src/repair/exact-review-bundle.ts",
+      "destination_sha256": "1f899cc8e252d6d520f40d7671d69ca6d9c78306c68bc1550e57ca83ee8c8c38",
+      "adaptation": "Keep the exact-PR bundle schema and digest, but admit only review/<pr>.md so the Conductor two-file contract cannot carry action-ledger side files. Add a stored zip writer for consumer proof."
+    },
+    {
+      "source_path": "src/repair/exact-review-bundle-cli.ts",
+      "source_sha256": "786bbc7efd4e97c702da946adb36599f19c331a8e815533d44976937c08e74f1",
+      "destination_path": "src/repair/exact-review-bundle-cli.ts",
+      "destination_sha256": "4faf2f8348442d41598318b3d416354984ef0de885b28b3b3541b90500233502",
+      "adaptation": "Preserve create/validate env contract and reject action-ledger roots."
+    },
+    {
+      "source_path": "scripts/validate-dinkuskit-canary-report.mjs",
+      "source_sha256": "c5041bc7c2f3dbe4f6511ad075cea0be3ad010548a858f35fabde6526b998e25",
+      "destination_path": "scripts/validate-saari-exact-tuple-report.mjs",
+      "destination_sha256": "d30704dcfa2e219e0f4bd1b3011efcbbed8f7a53fba1533a7e7750c616d31ee8",
+      "adaptation": "Keep native report identity checks and add required comprehensive epoch/actor fields plus the engine-authored Bound Review Identity section."
+    }
+  ],
+  "consumer_pin": {
+    "repository": "saari-co/review-conductor",
+    "commit": "2f5818cacdf84a72b22362f984d0c3d8c18af244",
+    "path": "tools/review_conductor_userland.py",
+    "sha256": "8466b98518083cbc6e884fd77747fbaa5bb74e7ec792aed591cd09594cc4b95a",
+    "pin_path": "config/saari-exact-tuple-consumer-pin.json",
+    "proof_command": "pnpm run prove:saari-exact-tuple-consumer -- --consumer-checkout <checkout>",
+    "adaptation": "Hash pin and explicit supplied-checkout proof only. The producer does not vendor or reimplement parse_clawsweeper_bundle, and standard tests stay portable."
+  }
+}

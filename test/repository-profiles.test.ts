@@ -67,6 +67,19 @@ test("repositoryProfileFor supports SwarmBar as review-only", () => {
   assert.deepEqual(profile.applyCloseRules.pull_request, []);
 });
 
+test("repositoryProfileFor supports OpenClaw SMCBD Suite as review-only", () => {
+  const profile = repositoryProfileFor("saari-co/openclaw-smcbd-suite");
+
+  assert.equal(profile.targetRepo, "saari-co/openclaw-smcbd-suite");
+  assert.equal(profile.slug, "saari-co-openclaw-smcbd-suite");
+  assert.equal(profile.displayName, "OpenClaw SMCBD Suite");
+  assert.equal(profile.checkoutDir, "openclaw-smcbd-suite");
+  assert.match(profile.promptNote, /exact-tuple identity/);
+  assert.match(profile.promptNote, /comprehensive native review scope/);
+  assert.deepEqual(profile.applyCloseRules.issue, []);
+  assert.deepEqual(profile.applyCloseRules.pull_request, []);
+});
+
 test("repositoryProfileFor supports RepoGlance as review-only", () => {
   const profile = repositoryProfileFor("saari-co/RepoGlance");
 
