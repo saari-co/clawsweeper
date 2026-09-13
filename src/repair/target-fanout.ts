@@ -24,6 +24,7 @@ import {
 } from "../hosted-target-admission.js";
 import { fetchExactReviewQueuePressure } from "../queue-pressure.js";
 import { coverageTrackedCountsFromManifest } from "../review-coverage-manifest.js";
+import { readTargetRepositoryConfigSource } from "../target-repository-config.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 export type FanoutMode = "hot-intake" | "normal-review" | "audit";
@@ -333,7 +334,7 @@ function candidateCapacityFor(repository: SelectedRepository): number | undefine
 export function readInventoryConfig(
   filePath = join(repoRoot(), "config", "target-repositories.json"),
 ): InventoryConfig {
-  const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+  const parsed = readTargetRepositoryConfigSource(filePath);
   const config = record(parsed, "target repository config");
   const inventory = record(config.target_inventory, "target_inventory");
   const hostedTargetPolicy = hostedTargetPolicyFromRegistry(parsed);

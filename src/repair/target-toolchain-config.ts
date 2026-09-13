@@ -1,7 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { normalizeRepo } from "../repository-profiles.js";
+import {
+  readTargetRepositoryConfigSource,
+  targetRepositoryConfigCacheKey,
+} from "../target-repository-config.js";
 import { repoRoot } from "./paths.js";
 
 export type TargetPackageManager = "pnpm" | "bun" | "npm";
@@ -51,7 +55,7 @@ interface ResolvedToolchainTable {
 }
 
 let cached: ResolvedToolchainTable | null = null;
-let cachedFilePath: string | null = null;
+let cachedConfigKey: string | null = null;
 
 export function resolveTargetRepoToolchain(
   targetRepo: string,
@@ -78,12 +82,21 @@ export function resolveTargetRepoToolchain(
 /** Test-only: drop the in-memory cache so a fresh config can be observed. */
 export function __resetTargetRepoToolchainCache(): void {
   cached = null;
-  cachedFilePath = null;
+  cachedConfigKey = null;
   warnedMessages.clear();
 }
 
 function loadTable(filePath: string): ResolvedToolchainTable {
-  if (cached && cachedFilePath === filePath) return cached;
+  let configKey: string;
+  try {
+    configKey = targetRepositoryConfigCacheKey(filePath);
+  } catch (error) {
+    warnOnce(
+      `failed to resolve ${filePath} overlay, falling back to default toolchain: ${formatError(error)}`,
+    );
+    return { byRepo: new Map(), byOwner: new Map() };
+  }
+  if (cached && cachedConfigKey === configKey) return cached;
   // Resolver MUST be a total function: any unexpected I/O or parse error here
   // would otherwise propagate up through requiredValidationCommands /
   // prepareTargetToolchain and block automerge across ALL target repositories.
@@ -100,7 +113,7 @@ function loadTable(filePath: string): ResolvedToolchainTable {
     table = { byRepo: new Map(), byOwner: new Map() };
   }
   cached = table;
-  cachedFilePath = filePath;
+  cachedConfigKey = configKey;
   return table;
 }
 
@@ -112,7 +125,7 @@ function readToolchainTable(filePath: string): ResolvedToolchainTable {
     return { byRepo, byOwner };
   }
 
-  const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
+  const parsed = readTargetRepositoryConfigSource(filePath);
 
   if (!isObject(parsed)) return { byRepo, byOwner };
 

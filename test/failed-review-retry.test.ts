@@ -27,6 +27,8 @@ import {
 import { tmpPrefix, withMockGh, workPlanCandidateReport } from "./helpers.ts";
 import { readAllSpooledActionEvents } from "../dist/action-ledger.js";
 
+const TEST_WORKFLOW_REPO = "openclaw/clawsweeper";
+
 function failedReviewReport(overrides = {}) {
   return `${workPlanCandidateReport({
     repository: "openclaw/openclaw",
@@ -130,6 +132,8 @@ function failedIssueRetryArgs(
     fixture.itemsDir,
     "--item-number",
     String(fixture.number),
+    "--workflow-repo",
+    TEST_WORKFLOW_REPO,
     "--workflow-ref",
     "main",
     "--report-path",
@@ -721,6 +725,8 @@ process.exit(1);
         itemsDir,
         "--item-number",
         "4343",
+        "--workflow-repo",
+        TEST_WORKFLOW_REPO,
         "--workflow-ref",
         "test-branch",
         "--report-path",
@@ -746,6 +752,8 @@ process.exit(1);
         itemsDir,
         "--item-number",
         "4343",
+        "--workflow-repo",
+        TEST_WORKFLOW_REPO,
         "--workflow-ref",
         "main",
         "--report-path",
@@ -960,6 +968,8 @@ process.exit(1);
         first.itemsDir,
         "--limit",
         "1",
+        "--workflow-repo",
+        TEST_WORKFLOW_REPO,
         "--workflow-ref",
         "main",
         "--report-path",
