@@ -32,6 +32,7 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
   const storage = new MemoryDurableStorage();
   const store = new GithubWebhookReadModelStore(storage);
   store.ensureSchemaSync();
+  const now = Date.parse("2026-08-14T10:06:00.000Z");
   const newer = requiredDelivery("issues", "guid-newer", "2026-08-14T10:05:00.000Z", {
     action: "labeled",
     repository,
@@ -42,13 +43,10 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
     repository,
     issue: issue(42, "old title", "2026-08-14T10:00:00.000Z"),
   });
-  assert.deepEqual(store.ingest(newer), { accepted: true, deduped: false, watermark: 1 });
-  assert.deepEqual(store.ingest(newer), { accepted: true, deduped: true, watermark: 1 });
-  assert.deepEqual(store.ingest(old), { accepted: true, deduped: false, watermark: 2 });
-  const itemSnapshot = await store.readItem(
-    { repository: "openclaw/openclaw", number: 42 },
-    Date.parse("2026-08-14T10:06:00.000Z"),
-  );
+  assert.deepEqual(store.ingest(newer, now), { accepted: true, deduped: false, watermark: 1 });
+  assert.deepEqual(store.ingest(newer, now), { accepted: true, deduped: true, watermark: 1 });
+  assert.deepEqual(store.ingest(old, now), { accepted: true, deduped: false, watermark: 2 });
+  const itemSnapshot = await store.readItem({ repository: "openclaw/openclaw", number: 42 }, now);
   assert.equal((itemSnapshot.item as Record<string, unknown>).title, "new title");
   assert.equal(itemSnapshot.watermark, 2);
   assert.equal(itemSnapshot.object_watermark, 1, "late delivery cannot regress the item");
@@ -71,6 +69,7 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
           user: { login: "clawsweeper[bot]", type: "Bot" },
         },
       }),
+      now,
     );
   }
   const comments = await store.readComments(
