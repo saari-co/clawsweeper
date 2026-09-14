@@ -323,6 +323,7 @@ export interface CreateReviewCommandWorkflowDependencies {
     reasoningEffort?: string;
     sandboxMode?: string;
     serviceTier?: string;
+    reviewScope?: string;
   }) => string;
   reviewStructuralPullStateFromContext: (context: ItemContext) => ReviewStructuralPullState | null;
   runReviewCheckoutInspection: (options: {

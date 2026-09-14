@@ -30,6 +30,7 @@
     "src/github-egress-descriptor.ts",
     "src/github-egress-observer.ts",
     "src/github-egress-telemetry-contract.ts",
-    "src/github-webhook-read-model-client.ts"
+    "src/github-webhook-read-model-client.ts",
+    "src/saari-exact-tuple.ts"
   ]
 }

@@ -10,6 +10,7 @@ import type {
   PreparedMediaProofArtifact,
   ReviewPromptRuntimeHints,
 } from "./clawsweeper-types.js";
+import { boolArg, type Args } from "./clawsweeper-args.js";
 const IMAGE_PROOF_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp"]);
 const VIDEO_PROOF_EXTENSIONS = new Set([".mov", ".mp4", ".m4v", ".webm", ".avi", ".mkv"]);
 const MEDIA_PROOF_EXTENSIONS = new Set([...IMAGE_PROOF_EXTENSIONS, ...VIDEO_PROOF_EXTENSIONS]);
@@ -510,6 +511,39 @@ export function mediaProofRuntimePrompt(
 - Assess screenshots directly from their downloaded image paths. If browser video playback fails but ffprobe metadata and ffmpeg contact sheets are readable, assess the video from those generated artifacts instead of treating it as uninspectable.
 - Only fall back to browser playback after checking the prepared local artifacts. If local preparation and browser playback both fail, report the exact failure from the manifest.
 `;
+}
+
+export function emptyPreparedMediaProof(): PreparedMediaProof {
+  return { manifestPath: null, summaryPath: null, artifacts: [] };
+}
+
+export function skipMediaProofPreprocessing(args: Args, localRange = false): boolean {
+  return localRange || boolArg(args.disable_media_proof_preprocessing);
+}
+
+export function resolvePreparedMediaProof(
+  context: ItemContext,
+  proofScratchDir: string,
+  skip: boolean,
+  runner?: MediaProofCommandRunner,
+  limits?: MediaProofLimits,
+  writeMetadata?: (path: string, content: string) => void,
+): PreparedMediaProof {
+  if (skip) return emptyPreparedMediaProof();
+  return prepareMediaProofArtifacts(context, proofScratchDir, runner, limits, writeMetadata);
+}
+
+export function skipMediaProofPreprocessingForTest(args: Args, localRange = false): boolean {
+  return skipMediaProofPreprocessing(args, localRange);
+}
+
+export function resolvePreparedMediaProofForTest(
+  context: ItemContext,
+  proofScratchDir: string,
+  skip: boolean,
+  runner: MediaProofCommandRunner,
+): PreparedMediaProof {
+  return resolvePreparedMediaProof(context, proofScratchDir, skip, runner);
 }
 
 export function mediaProofRuntimeHints(

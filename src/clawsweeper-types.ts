@@ -782,6 +782,7 @@ export interface ReviewPromptRuntimeHints {
   proofScratchDir?: string;
   mediaProofManifestPath?: string;
   mediaProofSummary?: string;
+  exactTuplePrompt?: string;
 }
 
 export interface DashboardItem {

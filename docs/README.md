@@ -70,6 +70,10 @@ everything else requires human comparison with current main.
   `pnpm run check:limits`
 - [Target repositories](target-repositories.md) — active; profiles, generic
   fallbacks, inventory, and apply membership
+- [Exact-tuple review producer](saari-exact-tuple.md) — active and inert;
+  reusable exact repo/PR/base/head/epoch producer with external tenant overlay
+- [Exact-tuple public export receipt](saari-exact-tuple-export.md) — active;
+  sanitized source qualification and export scan for this producer
 - [Target dispatcher](target-dispatcher.md) — active; exact-event integration
 - [OpenClaw event hooks](openclaw-event-hooks.md) — active; event routes
 - [Local branch review](commit-sweeper.md) — active local/GitHub-isolated

@@ -101,6 +101,13 @@ test("repositoryProfileFor supports fs-safe event reviews", () => {
   ]);
 });
 
+test("bundled profiles do not enroll the synthetic exact-tuple fixture tenant", () => {
+  assert.throws(
+    () => repositoryProfileFor("example-org/example-private-suite"),
+    /Unsupported target repo/,
+  );
+});
+
 test("generic OpenClaw fallback supports conservative event-only onboarding", () => {
   const profile = repositoryProfileFor("OpenClaw/example-tool");
 

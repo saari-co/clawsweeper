@@ -20,7 +20,12 @@ import {
   isMaintainerAuthorAssociation,
   labelNames,
 } from "./clawsweeper-item-policy.js";
-import { mediaProofRuntimeHints, prepareMediaProofArtifacts } from "./clawsweeper-media-proof.js";
+import {
+  mediaProofRuntimeHints,
+  resolvePreparedMediaProof,
+  skipMediaProofPreprocessing,
+} from "./clawsweeper-media-proof.js";
+import { comprehensiveExactTuplePrompt } from "./saari-exact-tuple.js";
 import type {
   AcquiredReviewStartLease,
   BulkFilerCountCache,
@@ -29,7 +34,6 @@ import type {
   FileModeSnapshot,
   Item,
   ItemContext,
-  PreparedMediaProof,
   ReviewActionLedger,
 } from "./clawsweeper-types.js";
 import { PUBLIC_CODEX_MODEL } from "./codex-env.js";
@@ -275,6 +279,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
       forcedLoginMethod,
       loadReviewGitInfo,
       reviewPolicy,
+      exactTupleIdentity,
       explicitDispatch,
       maintainerRequest,
       additionalPrompt,
@@ -608,6 +613,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 reviewLeaseOwner: suppliedReviewLease.owner,
                 reviewLeaseCommentId: suppliedReviewLease.commentId,
               } : {}),
+              ...(exactTupleIdentity ? { exactTupleIdentity } : {}),
             })));
             finishReviewActionLedgerItem({ ledger: reviewLedger, item,
               status: ACTION_EVENT_STATUSES.completed, reasonCode: ACTION_EVENT_REASON_CODES.completed,
@@ -1414,19 +1420,30 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         if (proofBinding) {
           assertCommandProofSubject(proofBinding, pullHeadShaFromContext(context), context.pullRequest ?? context.issue, asRecord(asRecord(context.pullRequest).base).ref, asRecord(asRecord(context.pullRequest).base).sha);
         }
-        // --local-range is a pre-PR LOCAL code review — it has no telegram-visible-proof to
-        // capture, and prepareMediaProofArtifacts would host-side download media URLs and transcode
-        // videos in the synthetic body (commit message / --body-file). Skip it entirely for
-        // local-range: no host download or transcode of body-supplied URLs.
-        const preparedMediaProof: PreparedMediaProof = localRangeData
-          ? { manifestPath: null, summaryPath: null, artifacts: [] }
-          : prepareMediaProofArtifacts(
-              context,
-              proofScratchDir,
-              undefined,
-              reviewOutputMediaLimits(outputBudget, proofScratchDir),
-              writeOutputMetadata,
+        // --local-range has no telegram-visible-proof to capture. The trusted producer also
+        // passes --disable-media-proof-preprocessing so credentialed --local-only runs do not
+        // host-side download or transcode PR-supplied URLs. --local-only alone still preprocesses.
+        if (exactTupleIdentity) {
+          if (item.number !== exactTupleIdentity.itemNumber) {
+            throw new UserFacingCommandError(
+              "exact-tuple review item is not the admitted pull request",
             );
+          }
+          const pullHeadSha = pullHeadShaFromContext(context);
+          if (pullHeadSha !== exactTupleIdentity.headSha) {
+            throw new UserFacingCommandError(
+              `exact-tuple review head SHA ${pullHeadSha ?? "unknown"} does not match admitted ${exactTupleIdentity.headSha}`,
+            );
+          }
+        }
+        const preparedMediaProof = resolvePreparedMediaProof(
+          context,
+          proofScratchDir,
+          skipMediaProofPreprocessing(args, Boolean(localRangeData)),
+          undefined,
+          reviewOutputMediaLimits(outputBudget, proofScratchDir),
+          writeOutputMetadata,
+        );
         const reviewEnv = reviewEnvironment(localOnly);
         const prompt = buildReviewPrompt(
           item,
@@ -1437,6 +1454,9 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             ...mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
             targetDir: reviewOpenclawDir,
             ...reviewNetworkCapability(sandboxMode, reviewEnv),
+            ...(exactTupleIdentity
+              ? { exactTuplePrompt: comprehensiveExactTuplePrompt(exactTupleIdentity) }
+              : {}),
           },
         );
         diagnosticPrompt = prompt.text;
@@ -1563,6 +1583,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                   reviewLeaseCommentId: acquiredReviewLease.commentId,
                 }
               : {}),
+            ...(exactTupleIdentity ? { exactTupleIdentity } : {}),
         }));
         writeOutputReport(item, reportPath, reportMarkdown);
         if (codexFailureError) {
