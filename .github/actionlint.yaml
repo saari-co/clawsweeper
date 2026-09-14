@@ -5,6 +5,8 @@ self-hosted-runner:
     - crabbox
     - openclaw
     - clawsweeper
+    - self-hosted
+    - spark-2
 
 config-variables: null
 

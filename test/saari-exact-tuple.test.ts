@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,13 +17,25 @@ import { validateSaariExactTupleReport } from "../scripts/validate-saari-exact-t
 import {
   SAARI_EXACT_TUPLE_ENGINE_REPOSITORY,
   SAARI_EXACT_TUPLE_WORKFLOW_PATH,
+  SAARI_SPARK_CODEX_HOME_RELATIVE,
+  SAARI_SPARK_CODEX_MODEL_ALIAS,
+  SAARI_SPARK_COMMAND_LOCK_RELATIVE,
+  SAARI_SPARK_LOGIN_METHOD,
   assertSaariExactTuplePublishBoundary,
+  assertSaariSparkHostReuseContract,
+  assertSaariSparkNoApiCredentialSetup,
+  assertSaariSparkNoGlobalAuthWrites,
   assertTrustedEngineIdentity,
   bindSaariExactTupleIdentity,
   comprehensiveExactTuplePrompt,
+  prepareSaariSparkExactTupleRun,
   renderExactTupleIdentitySection,
+  resolveSaariSparkKnownExecutable,
   saariExactTupleArtifactName,
   saariExactTupleTenant,
+  saariSparkCodexHomePath,
+  saariSparkCommandLockPath,
+  saariSparkIsolatedPaths,
 } from "../dist/saari-exact-tuple.js";
 
 const SUITE = "saari-co/openclaw-smcbd-suite";
@@ -288,7 +300,6 @@ test("reusable producer workflow stays tenant-isolated and artifact-only", () =>
   assert.match(workflow, /--review-scope comprehensive/);
   assert.match(workflow, /--reviewer-actor "\$REVIEWER_ACTOR"/);
   assert.match(workflow, /EXACT_REVIEW_WORKFLOW_REPOSITORY="\$TARGET_REPO"/);
-  assert.match(workflow, /uses: \.\/clawsweeper\/\.github\/actions\/setup-codex/);
   assert.match(workflow, /core\.hooksPath/);
   assert.match(workflow, /--disable-media-proof-preprocessing/);
   assert.match(workflow, /--readonly-openclaw/);
@@ -300,6 +311,7 @@ test("reusable producer workflow stays tenant-isolated and artifact-only", () =>
     /pnpm install --frozen-lockfile --ignore-scripts\n.*PRODUCER_TARGET/,
   );
   assertSaariExactTuplePublishBoundary(workflow);
+  assertSaariSparkHostReuseContract(workflow);
   assert.doesNotMatch(workflow, /uses: dinkuskit\/clawsweeper/);
 });
 
@@ -435,4 +447,222 @@ test("disable-media-proof-preprocessing is a live engine flag, not an inert work
   );
   assert.equal(localOnlyStillPrepares.artifacts.length, 1);
   assert.equal(localOnlyStillPrepares.artifacts[0]?.status, "prepared");
+});
+
+function writeExecutable(path: string, body: string): void {
+  writeFileSync(path, body, { mode: 0o755 });
+  chmodSync(path, 0o755);
+}
+
+function fakeSparkHome(): {
+  home: string;
+  runnerTemp: string;
+  envFile: string;
+} {
+  const root = mkdtempSync(join(tmpdir(), "saari-spark-home-"));
+  const home = join(root, "home");
+  const runnerTemp = join(root, "runner-temp");
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  mkdirSync(join(home, ".config", "clawsweeper", "codex-home"), { recursive: true });
+  mkdirSync(runnerTemp, { recursive: true });
+  writeFileSync(join(home, ".config", "clawsweeper", "codex-home", "auth.json"), "");
+  for (const name of ["node", "gh", "codex", "corepack", "flock"]) {
+    writeExecutable(
+      join(home, ".local", "bin", name),
+      name === "node" ? "#!/bin/sh\necho 24\n" : "#!/bin/sh\nexit 0\n",
+    );
+  }
+  return { home, runnerTemp, envFile: join(root, "github.env") };
+}
+
+test("Spark subscription reuse rejects API setup and host auth writes", () => {
+  const workflow = readText(".github/workflows/saari-exact-tuple-review.yml");
+  assertSaariSparkNoApiCredentialSetup(workflow);
+  assertSaariSparkNoGlobalAuthWrites(workflow);
+  assert.match(workflow, /CLAWSWEEPER_CODEX_LOGIN_METHOD: chatgpt/);
+  assert.match(workflow, /--codex-forced-login-method chatgpt/);
+  assert.match(workflow, /--codex-model internal/);
+  assert.match(workflow, /runs-on: \[self-hosted, spark-2\]/);
+  assert.match(workflow, /runs-on: ubuntu-latest/);
+  assert.doesNotMatch(workflow, /setup-codex/);
+  assert.doesNotMatch(workflow, /secrets\.OPENAI_API_KEY/);
+  assert.doesNotMatch(workflow, /secrets\.CLAWSWEEPER_MODEL/);
+  assert.throws(
+    () => assertSaariSparkNoApiCredentialSetup("uses: ./clawsweeper/.github/actions/setup-codex"),
+    /API credential setup/,
+  );
+  assert.throws(
+    () => assertSaariSparkNoGlobalAuthWrites('cp "$CODEX_HOME/auth.json" /tmp/auth.json'),
+    /write host auth/,
+  );
+});
+
+test("Spark isolated paths keep the shared lock and reject host checkout reuse", () => {
+  const fake = fakeSparkHome();
+  const paths = saariSparkIsolatedPaths({
+    runnerTemp: fake.runnerTemp,
+    runId: "801",
+    runAttempt: "2",
+  });
+  const lockFile = saariSparkCommandLockPath(fake.home);
+  const prepared = prepareSaariSparkExactTupleRun({
+    identity: admitted(),
+    engine: trustedEngine(),
+    host: {
+      home: fake.home,
+      runnerTemp: fake.runnerTemp,
+      runId: "801",
+      runAttempt: "2",
+      env: { PATH: join(fake.home, ".local", "bin") },
+    },
+  });
+  assert.equal(paths.engine, join(fake.runnerTemp, "saari-exact-tuple-801-2", "engine"));
+  assert.equal(lockFile, join(fake.home, SAARI_SPARK_COMMAND_LOCK_RELATIVE));
+  assert.equal(prepared.codexHome, join(fake.home, SAARI_SPARK_CODEX_HOME_RELATIVE));
+  assert.equal(prepared.lockFile, lockFile);
+  assert.equal(prepared.loginMethod, SAARI_SPARK_LOGIN_METHOD);
+  assert.equal(prepared.modelAlias, SAARI_SPARK_CODEX_MODEL_ALIAS);
+  assert.equal(prepared.executables.codex, join(fake.home, ".local", "bin", "codex"));
+  assert.ok(!lockFile.startsWith(paths.runRoot));
+  assert.ok(!prepared.codexHome.startsWith(paths.runRoot));
+  assert.doesNotMatch(paths.target, /targets\/spark-dgx|targets\/x-api/);
+  assert.throws(
+    () =>
+      resolveSaariSparkKnownExecutable("codex", {
+        home: join(fake.home, "empty"),
+        env: { PATH: "/no-such-spark-bin" },
+      }),
+    /absent from known paths/,
+  );
+  assert.throws(
+    () =>
+      resolveSaariSparkKnownExecutable("codex", {
+        home: fake.home,
+        env: { CODEX_BIN: join(fake.home, "missing-codex") },
+      }),
+    /not an executable/,
+  );
+});
+
+test("exact identity mismatches reject before any Spark host work", () => {
+  const hostTouched = (): boolean => {
+    throw new Error("host work started");
+  };
+  const host = {
+    home: "/should-not-touch",
+    runnerTemp: "/should-not-touch",
+    runId: "801",
+    runAttempt: "1",
+    exists: hostTouched,
+    isExecutable: hostTouched,
+  };
+
+  assert.throws(
+    () =>
+      prepareSaariSparkExactTupleRun({
+        identity: admitted({ reviewScope: "P0-only" }),
+        engine: trustedEngine(),
+        host,
+      }),
+    /comprehensive/,
+  );
+  assert.throws(
+    () =>
+      prepareSaariSparkExactTupleRun({
+        identity: admitted({ reviewerActor: "pr-author" }),
+        engine: trustedEngine(),
+        host,
+      }),
+    /enrolled producer identity/,
+  );
+  assert.throws(
+    () =>
+      prepareSaariSparkExactTupleRun({
+        identity: admitted({ expectedHeadSha: "3".repeat(40), reviewScope: "comprehensive" }),
+        engine: trustedEngine({ engineSha: CALLER_SHA }),
+        host,
+      }),
+    /defining-workflow commit/,
+  );
+
+  const workflow = readText(".github/workflows/saari-exact-tuple-review.yml");
+  const rejectScript = extractStepRunScript(
+    workflow,
+    "Reject stale exact-tuple identity before host work",
+  );
+  assert.doesNotMatch(rejectScript, /CODEX_HOME|clawsweeper-command\.lock|auth\.json/);
+  const rejected = runPinnedEngineScript(rejectScript, {
+    TARGET_REPOSITORY: "openclaw-smcbd-suite",
+    TARGET_REPOSITORY_ID: "1366416798",
+    TARGET_REPO: "saari-co/openclaw-smcbd-suite",
+    REVIEW_SCOPE: "P0-only",
+    REVIEWER_ACTOR: "saari-clawsweeper",
+    PR_NUMBER: "7",
+    REVIEW_EPOCH: "3",
+    REPOSITORY_ID: "1366416798",
+    BASE_SHA: BASE,
+    HEAD_SHA: HEAD,
+    MERGE_BASE_SHA: "3".repeat(40),
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.stderr, /comprehensive/);
+
+  const admittedIdentity = runPinnedEngineScript(rejectScript, {
+    TARGET_REPOSITORY: "openclaw-smcbd-suite",
+    TARGET_REPOSITORY_ID: "1366416798",
+    TARGET_REPO: "saari-co/openclaw-smcbd-suite",
+    REVIEW_SCOPE: "comprehensive",
+    REVIEWER_ACTOR: "saari-clawsweeper",
+    PR_NUMBER: "7",
+    REVIEW_EPOCH: "3",
+    REPOSITORY_ID: "1366416798",
+    BASE_SHA: BASE,
+    HEAD_SHA: HEAD,
+    MERGE_BASE_SHA: "3".repeat(40),
+  });
+  assert.equal(admittedIdentity.ok, true);
+});
+
+test("Spark host preflight reuses the existing profile and fails closed when tools are absent", () => {
+  const workflow = readText(".github/workflows/saari-exact-tuple-review.yml");
+  const preflight = extractStepRunScript(
+    workflow,
+    "Reuse the existing Spark subscription profile in place",
+  );
+  const fake = fakeSparkHome();
+  const ok = runPinnedEngineScript(preflight, {
+    HOME: fake.home,
+    PATH: `${join(fake.home, ".local", "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+    GITHUB_ENV: fake.envFile,
+  });
+  assert.equal(ok.ok, true);
+  const envText = readText(fake.envFile);
+  assert.ok(envText.includes(`CODEX_HOME=${saariSparkCodexHomePath(fake.home)}`));
+  assert.match(envText, /CLAWSWEEPER_COMMAND_LOCK=/);
+  assert.match(envText, /CODEX_BIN=/);
+  assert.doesNotMatch(envText, /OPENAI_API_KEY|CLAWSWEEPER_MODEL|sk-/);
+
+  const missingProfile = fakeSparkHome();
+  writeFileSync(join(missingProfile.home, ".config", "clawsweeper", "codex-home", "auth.json"), "");
+  const noAuth = runPinnedEngineScript(preflight, {
+    HOME: join(missingProfile.home, "missing"),
+    PATH: `${join(missingProfile.home, ".local", "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+    GITHUB_ENV: missingProfile.envFile,
+  });
+  assert.equal(noAuth.ok, false);
+  assert.match(noAuth.stderr, /subscription profile is absent/);
+
+  const noCodex = fakeSparkHome();
+  writeFileSync(join(noCodex.home, ".local", "bin", "codex"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o644,
+  });
+  chmodSync(join(noCodex.home, ".local", "bin", "codex"), 0o644);
+  const missingExec = runPinnedEngineScript(preflight, {
+    HOME: noCodex.home,
+    PATH: "/no-such-spark-bin:/usr/bin:/bin",
+    CODEX_BIN: join(noCodex.home, "not-codex"),
+    GITHUB_ENV: noCodex.envFile,
+  });
+  assert.equal(missingExec.ok, false);
+  assert.match(missingExec.stderr, /not an executable|absent from known paths/);
 });

@@ -24,33 +24,39 @@ The artifact name is `smcbd-suite-review-<run_id>-<attempt>` and contains only
 
 ## Runtime prerequisites
 
-Live review uses the existing Codex path (`setup-codex` + `OPENAI_API_KEY` +
-`CLAWSWEEPER_MODEL`). This producer does not consume Copilot and does not
-accept `COPILOT_GITHUB_TOKEN`.
+Hosted admission stays on `ubuntu-latest` and binds the exact suite tuple with
+the caller `github.token` read scope. Native execution runs on
+`[self-hosted, spark-2]` and reuses the existing host ChatGPT subscription
+profile in place (`CODEX_HOME` + `CLAWSWEEPER_CODEX_LOGIN_METHOD=chatgpt`).
+This producer does not use hosted API-proxy setup, does not require
+`OPENAI_API_KEY` or `CLAWSWEEPER_MODEL`, does not consume Copilot, and does
+not accept `COPILOT_GITHUB_TOKEN`.
 
-When the suite wrapper calls this reusable workflow it must pass those secrets
-through the reusable-workflow contract. `OPENAI_API_KEY`, `CLAWSWEEPER_MODEL`,
-and the GitHub read token (`github.token` or optional `ENGINE_CHECKOUT_TOKEN`)
-are unresolved existing runtime dependencies. Source authoring does not claim a
-usable hosted runtime and does not authorize new spend or credential
-attachment.
+The native job preserves the host-configured model through the public
+`internal` alias. It does not copy, write, or inspect host auth, config, env,
+or session files. Known host executables (`$HOME/.local/bin` and `CODEX_BIN`)
+must already exist; the job fails closed if they are absent. Actual native
+review holds the existing shared `~/.cache/clawsweeper/clawsweeper-command.lock`
+and writes engine, target, empty state, and artifacts only under a unique
+per-run `RUNNER_TEMP` tree. Shared Spark target checkouts and global defaults
+are left untouched.
 
-Read-only repository Actions secret metadata observed during source authoring
-showed 0 repository secrets on `saari-co/clawsweeper` and
-`saari-co/openclaw-smcbd-suite`. Organization secret availability was not
-verified. An optional `ENGINE_CHECKOUT_TOKEN` is needed only if the caller
-`github.token` cannot read `saari-co/clawsweeper`.
+An optional `ENGINE_CHECKOUT_TOKEN` is needed only if the caller
+`github.token` cannot read `saari-co/clawsweeper`. Suite runner-group
+eligibility and host App qualification remain operational gates for the
+existing deployment owner.
 
 The trusted engine identity is `job.workflow_sha` / `job.workflow_repository` /
 `job.workflow_file_path`, not the caller `github.sha`. Missing callee identity
-fails closed. Caller-supplied `engine_sha` must match that defining-workflow
-commit. The credentialed job passes `--disable-media-proof-preprocessing`, a
-live engine flag that skips host curl/ffmpeg of PR-supplied URLs. `--local-only`
-alone does not skip that preprocessor.
+or a stale exact tuple fails closed before host work. Caller-supplied
+`engine_sha` must match that defining-workflow commit. The native job passes
+`--disable-media-proof-preprocessing`, a live engine flag that skips host
+curl/ffmpeg of PR-supplied URLs. `--local-only` alone does not skip that
+preprocessor. Codex stays `--codex-sandbox read-only`.
 
-No new long-lived state service, App, webhook, or shared `clawsweeper-state`
-writer is added. Suite consumption uses the artifact only; comments, labels,
-and public state publication stay off.
+No new long-lived state service, App, webhook, or shared writer is added.
+Suite consumption uses the artifact only; comments, labels, and public state
+publication stay off.
 
 ## Consumer proof
 

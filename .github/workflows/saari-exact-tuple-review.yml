@@ -87,12 +87,6 @@ on:
         required: true
         type: boolean
     secrets:
-      OPENAI_API_KEY:
-        description: Existing Codex credential used only through setup-codex proxy
-        required: true
-      CLAWSWEEPER_MODEL:
-        description: Existing internal Codex model name
-        required: true
       ENGINE_CHECKOUT_TOKEN:
         description: Optional token that can read saari-co/clawsweeper when github.token cannot
         required: false
@@ -110,11 +104,6 @@ env:
   REVIEW_EPOCH: ${{ inputs.review_epoch }}
   REVIEW_SCOPE: ${{ inputs.review_scope }}
   ENGINE_SHA: ${{ inputs.engine_sha }}
-  PRODUCER_ROOT: /opt/saari-clawsweeper-exact-tuple
-  PRODUCER_ENGINE: /opt/saari-clawsweeper-exact-tuple/engine
-  PRODUCER_TARGET: /opt/saari-clawsweeper-exact-tuple/target
-  PRODUCER_ARTIFACTS: /opt/saari-clawsweeper-exact-tuple/review-artifacts
-  PRODUCER_EMPTY_STATE: /opt/saari-clawsweeper-exact-tuple/empty-state
 
 jobs:
   admit:
@@ -278,7 +267,7 @@ jobs:
     name: Native ClawSweeper review
     needs: admit
     if: ${{ inputs.publish }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, spark-2]
     timeout-minutes: 40
     permissions:
       contents: read
@@ -292,6 +281,8 @@ jobs:
       PR_NUMBER: ${{ needs.admit.outputs.item_number }}
       REPOSITORY_ID: ${{ needs.admit.outputs.repository_id }}
       REVIEWER_ACTOR: ${{ needs.admit.outputs.reviewer_actor }}
+      CLAWSWEEPER_CODEX_LOGIN_METHOD: chatgpt
+      CLAWSWEEPER_COMMAND_LOCK_TIMEOUT: "6000"
     steps:
       - name: Pin the defining-workflow engine identity
         shell: bash
@@ -326,23 +317,137 @@ jobs:
             exit 1
           fi
 
+      - name: Reject stale exact-tuple identity before host work
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET_REPOSITORY:$TARGET_REPOSITORY_ID:$TARGET_REPO" in
+            openclaw-smcbd-suite:1366416798:saari-co/openclaw-smcbd-suite) ;;
+            *)
+              echo "The target repository identity is not the admitted Saari suite tenant." >&2
+              exit 1
+              ;;
+          esac
+          if [ "$REVIEW_SCOPE" != "comprehensive" ]; then
+            echo "review_scope must be the admitted comprehensive native scope." >&2
+            exit 1
+          fi
+          if [ "$REVIEWER_ACTOR" != "saari-clawsweeper" ]; then
+            echo "reviewer_actor is not the enrolled producer identity." >&2
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pr_number must be a positive integer." >&2
+            exit 1
+          fi
+          if ! [[ "$REVIEW_EPOCH" =~ ^[0-9]+$ ]]; then
+            echo "review_epoch must be a non-negative integer." >&2
+            exit 1
+          fi
+          if ! [[ "$REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]] || [ "$REPOSITORY_ID" != "$TARGET_REPOSITORY_ID" ]; then
+            echo "target repository id does not match the admitted tenant." >&2
+            exit 1
+          fi
+          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "admitted base/head SHAs are invalid." >&2
+            exit 1
+          fi
+          if ! [[ "$MERGE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "admitted merge-base SHA is invalid." >&2
+            exit 1
+          fi
+
+      - name: Isolate unique per-run producer paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_root="$RUNNER_TEMP/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$run_root"
+          {
+            echo "PRODUCER_RUN_ROOT=$run_root"
+            echo "PRODUCER_CHECKOUT=$run_root/checkout"
+            echo "PRODUCER_ENGINE=$run_root/engine"
+            echo "PRODUCER_TARGET=$run_root/target"
+            echo "PRODUCER_ARTIFACTS=$run_root/review-artifacts"
+            echo "PRODUCER_EMPTY_STATE=$run_root/empty-state"
+          } >> "$GITHUB_ENV"
+
+      - name: Reuse the existing Spark subscription profile in place
+        shell: bash
+        run: |
+          set -euo pipefail
+          case ":$PATH:" in
+            *":$HOME/.local/bin:"*) ;;
+            *) PATH="$HOME/.local/bin:$PATH" ;;
+          esac
+          codex_home="${CODEX_HOME:-$HOME/.config/clawsweeper/codex-home}"
+          lock_file="${CLAWSWEEPER_COMMAND_LOCK:-$HOME/.cache/clawsweeper/clawsweeper-command.lock}"
+          if [ ! -d "$codex_home" ]; then
+            echo "existing Spark-2 Codex subscription profile is absent." >&2
+            exit 1
+          fi
+          if [ ! -e "$codex_home/auth.json" ]; then
+            echo "existing Spark-2 Codex subscription auth is absent." >&2
+            exit 1
+          fi
+          resolve_known() {
+            local name="$1"
+            if [ "$name" = "codex" ] && [ -n "${CODEX_BIN:-}" ]; then
+              if [ -x "$CODEX_BIN" ]; then
+                printf '%s\n' "$CODEX_BIN"
+                return 0
+              fi
+              echo "CODEX_BIN is set but is not an executable." >&2
+              exit 1
+            fi
+            if [ -x "$HOME/.local/bin/$name" ]; then
+              printf '%s\n' "$HOME/.local/bin/$name"
+              return 0
+            fi
+            if command -v "$name" >/dev/null 2>&1; then
+              command -v "$name"
+              return 0
+            fi
+            echo "required $name executable is absent from known paths." >&2
+            exit 1
+          }
+          node_bin="$(resolve_known node)"
+          gh_bin="$(resolve_known gh)"
+          codex_bin="$(resolve_known codex)"
+          if ! command -v corepack >/dev/null 2>&1; then
+            echo "required corepack executable is absent from known paths." >&2
+            exit 1
+          fi
+          if ! command -v flock >/dev/null 2>&1; then
+            echo "required flock executable is absent from known paths." >&2
+            exit 1
+          fi
+          node_major="$("$node_bin" -p 'process.versions.node.split(".")[0]')"
+          if ! [[ "$node_major" =~ ^[0-9]+$ ]] || [ "$node_major" -lt 24 ]; then
+            echo "node 24+ is required on the Spark-2 host." >&2
+            exit 1
+          fi
+          {
+            echo "PATH=$HOME/.local/bin:$PATH"
+            echo "CODEX_HOME=$codex_home"
+            echo "CLAWSWEEPER_COMMAND_LOCK=$lock_file"
+            echo "CODEX_BIN=$codex_bin"
+            echo "NODE_BIN=$node_bin"
+            echo "GH_BIN=$gh_bin"
+          } >> "$GITHUB_ENV"
+
       - name: Check out the trusted ClawSweeper engine
         uses: actions/checkout@v7
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           token: ${{ secrets.ENGINE_CHECKOUT_TOKEN || github.token }}
-          path: clawsweeper
+          path: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Node 24
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
       - name: Build the pinned native engine without shared caches
-        working-directory: clawsweeper
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
         shell: bash
         env:
           TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}
@@ -363,10 +468,8 @@ jobs:
           [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$ENGINE_SHA"
           test "$ENGINE_SHA" = "$TRUSTED_ENGINE_SHA"
-          corepack enable
-          corepack prepare pnpm@11.10.0 --activate
-          pnpm install --frozen-lockfile --ignore-scripts
-          pnpm run build:all
+          corepack pnpm@11.10.0 install --frozen-lockfile --ignore-scripts
+          corepack pnpm@11.10.0 run build:all
 
       - name: Prepare the exact target checkout as read-only data
         shell: bash
@@ -379,9 +482,8 @@ jobs:
         run: |
           set -euo pipefail
           target_dir="$PRODUCER_TARGET"
-          hooks_dir="$RUNNER_TEMP/disabled-git-hooks"
-          sudo install -d -o "$USER" -g "$(id -gn)" -m 0755 "$PRODUCER_ROOT"
-          mkdir -p "$hooks_dir"
+          hooks_dir="$PRODUCER_RUN_ROOT/disabled-git-hooks"
+          mkdir -p "$hooks_dir" "$(dirname "$target_dir")"
           gh repo clone "$TARGET_REPO" "$target_dir" -- --filter=blob:none --no-checkout
           git -C "$target_dir" config core.hooksPath "$hooks_dir"
           git -C "$target_dir" fetch --force --no-tags origin \
@@ -392,14 +494,14 @@ jobs:
           test "$(git -C "$target_dir" merge-base "$BASE_SHA" "$HEAD_SHA")" = "$MERGE_BASE_SHA"
           git -C "$target_dir" checkout --force -B "clawsweeper/pr-$PR_NUMBER" "$HEAD_SHA"
           test "$(git -C "$target_dir" rev-parse HEAD)" = "$HEAD_SHA"
-          chmod -R go-w "$target_dir" "$GITHUB_WORKSPACE/clawsweeper"
+          chmod -R go-w "$target_dir" "$PRODUCER_CHECKOUT"
 
       - name: Stage the trusted engine outside the runner home
         shell: bash
         run: |
           set -euo pipefail
           mkdir "$PRODUCER_ENGINE"
-          tar -C "$GITHUB_WORKSPACE/clawsweeper" \
+          tar -C "$PRODUCER_CHECKOUT" \
             --exclude=.git \
             --exclude=.artifacts \
             --exclude=artifacts \
@@ -413,14 +515,8 @@ jobs:
           test -f "$PRODUCER_ENGINE/config/saari-exact-tuple-tenants.json"
           test ! -f "$PRODUCER_ENGINE/scripts/run-copilot-codex-adapter.mjs"
 
-      - name: Set up Codex through the existing trusted action
-        uses: ./clawsweeper/.github/actions/setup-codex
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
-
       - name: Run the native ClawSweeper review
-        working-directory: /opt/saari-clawsweeper-exact-tuple/engine
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
         shell: bash
         env:
           GIT_ATTR_NOSYSTEM: "1"
@@ -428,35 +524,43 @@ jobs:
           GIT_CONFIG_NOSYSTEM: "1"
           GIT_TERMINAL_PROMPT: "0"
           GH_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
         run: |
           set -euo pipefail
-          mkdir -p "$PRODUCER_EMPTY_STATE/items" "$PRODUCER_ARTIFACTS"
-          node dist/clawsweeper.js review \
-            --local-only \
-            --target-repo "$TARGET_REPO" \
-            --target-dir "$PRODUCER_TARGET" \
-            --items-dir "$PRODUCER_EMPTY_STATE/items" \
-            --artifact-dir "$PRODUCER_ARTIFACTS" \
-            --batch-size 1 \
-            --max-pages 5 \
-            --item-number "$PR_NUMBER" \
-            --target-repository-id "$REPOSITORY_ID" \
-            --expected-base-sha "$BASE_SHA" \
-            --expected-head-sha "$HEAD_SHA" \
-            --review-epoch "$REVIEW_EPOCH" \
-            --review-scope comprehensive \
-            --reviewer-actor "$REVIEWER_ACTOR" \
-            --readonly-openclaw \
-            --disable-media-proof-preprocessing \
-            --codex-sandbox read-only \
-            --codex-timeout-ms 1200000 \
-            --shard-index 0 \
-            --shard-count 1
+          mkdir -p "$PRODUCER_EMPTY_STATE/items" "$PRODUCER_ARTIFACTS" "$(dirname "$CLAWSWEEPER_COMMAND_LOCK")"
+          (
+            flock -w "$CLAWSWEEPER_COMMAND_LOCK_TIMEOUT" 9
+            env -u OPENAI_API_KEY -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u CLAWSWEEPER_INTERNAL_MODEL \
+              CODEX_HOME="$CODEX_HOME" \
+              CLAWSWEEPER_CODEX_LOGIN_METHOD=chatgpt \
+              CODEX_BIN="$CODEX_BIN" \
+              GH_TOKEN="$GH_TOKEN" \
+              node dist/clawsweeper.js review \
+                --local-only \
+                --target-repo "$TARGET_REPO" \
+                --target-dir "$PRODUCER_TARGET" \
+                --items-dir "$PRODUCER_EMPTY_STATE/items" \
+                --artifact-dir "$PRODUCER_ARTIFACTS" \
+                --batch-size 1 \
+                --max-pages 5 \
+                --item-number "$PR_NUMBER" \
+                --target-repository-id "$REPOSITORY_ID" \
+                --expected-base-sha "$BASE_SHA" \
+                --expected-head-sha "$HEAD_SHA" \
+                --review-epoch "$REVIEW_EPOCH" \
+                --review-scope comprehensive \
+                --reviewer-actor "$REVIEWER_ACTOR" \
+                --readonly-openclaw \
+                --disable-media-proof-preprocessing \
+                --codex-model internal \
+                --codex-forced-login-method chatgpt \
+                --codex-sandbox read-only \
+                --codex-timeout-ms 1200000 \
+                --shard-index 0 \
+                --shard-count 1
+          ) 9>"$CLAWSWEEPER_COMMAND_LOCK"
 
       - name: Validate the exact native report and live tuple
-        working-directory: /opt/saari-clawsweeper-exact-tuple/engine
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
         shell: bash
         env:
           GIT_ATTR_NOSYSTEM: "1"
@@ -464,7 +568,6 @@ jobs:
           GIT_CONFIG_NOSYSTEM: "1"
           GIT_TERMINAL_PROMPT: "0"
           GH_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
           target_dir="$PRODUCER_TARGET"
@@ -489,13 +592,9 @@ jobs:
             echo "The native report contained its short-lived read token." >&2
             exit 1
           fi
-          if [ -n "${OPENAI_API_KEY:-}" ] && grep -Fq -- "$OPENAI_API_KEY" "$PRODUCER_ARTIFACTS/$PR_NUMBER.md"; then
-            echo "The native report contained the Codex credential." >&2
-            exit 1
-          fi
 
       - name: Create the bounded native review bundle
-        working-directory: /opt/saari-clawsweeper-exact-tuple/engine
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
         shell: bash
         run: |
           set -euo pipefail
@@ -533,7 +632,7 @@ jobs:
           export EXACT_REVIEW_TARGET_BRANCH="$BASE_REF"
           export EXACT_REVIEW_TARGET_REPO="$TARGET_REPO"
           export EXACT_REVIEW_WORKFLOW_REPOSITORY="$TARGET_REPO"
-          pnpm run --silent repair:exact-review-bundle create
+          corepack pnpm@11.10.0 run --silent repair:exact-review-bundle create
 
       - name: Upload the bounded native review bundle
         uses: actions/upload-artifact@v7
