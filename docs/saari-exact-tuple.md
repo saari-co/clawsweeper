@@ -85,6 +85,13 @@ global defaults are left untouched.
 An optional `ENGINE_CHECKOUT_TOKEN` is needed only if the caller
 `github.token` cannot read the producer repository.
 
+The reusable-workflow caller must grant `contents: read`, `pull-requests: read`,
+`issues: read`, `checks: read`, and `statuses: read`. Native PR hydration also
+uses the Issues API for metadata/discussion and the Checks/Statuses APIs for
+current CI context. The native job probes these read endpoints before engine
+checkout. It has no GitHub write permission; its token and process-local Git
+helper configuration are removed from the model environment.
+
 The trusted engine identity is `job.workflow_sha` / `job.workflow_repository` /
 `job.workflow_file_path`, not the caller `github.sha`. Missing callee identity
 or a stale exact tuple fails closed before host work. Caller-supplied
