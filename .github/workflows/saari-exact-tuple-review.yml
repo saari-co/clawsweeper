@@ -540,6 +540,13 @@ jobs:
           GIT_CONFIG_NOSYSTEM: "1"
           GIT_TERMINAL_PROMPT: "0"
           GH_TOKEN: ${{ github.token }}
+          # Trusted CLI preparation performs its own Git fetches. Keep the
+          # helper process-local; codexEnv removes this configuration before review.
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: ""
+          GIT_CONFIG_KEY_1: credential.helper
+          GIT_CONFIG_VALUE_1: "!gh auth git-credential"
         run: |
           set -euo pipefail
           mkdir -p "$PRODUCER_EMPTY_STATE/items" "$PRODUCER_ARTIFACTS" "$(dirname "$CLAWSWEEPER_COMMAND_LOCK")"

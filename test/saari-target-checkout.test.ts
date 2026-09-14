@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { parse } from "yaml";
 
 const run = promisify(execFile);
 
@@ -115,6 +116,63 @@ test("exact-tuple checkout authenticates private Git reads without persistent au
     const config = readFileSync(join(target, ".git", "config"), "utf8");
     assert.doesNotMatch(config, /credential|promisor|partialclonefilter|synthetic-fixture-only/i);
     assert.equal(git("-C", target, "status", "--porcelain"), "");
+
+    // Exercise the actual CLI preparation function, not only the outer clone.
+    // It performs a second fetch even when the supplied checkout is complete.
+    const nativeStep = parse(workflow).jobs.review.steps.find(
+      (candidate: { name: string }) => candidate.name === "Run the native ClawSweeper review",
+    );
+    const helperEnv = Object.fromEntries(
+      Object.entries(nativeStep.env as Record<string, string>).filter(([key]) =>
+        /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key),
+      ),
+    );
+    const inspectSource = `
+      import { execFileSync } from 'node:child_process';
+      import { createReviewRuntime } from ${JSON.stringify(new URL("../dist/clawsweeper-review-runtime.js", import.meta.url).href)};
+      import { codexEnv } from ${JSON.stringify(new URL("../dist/codex-env.js", import.meta.url).href)};
+      const runtime = createReviewRuntime({
+        run: (command, args, options) => execFileSync(command, args, {
+          cwd: options?.cwd, env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim(),
+        ghJson: () => [],
+      });
+      const result = runtime.gitInfo(process.env.PRODUCER_TARGET, { targetBranch: 'main' });
+      const modelEnv = codexEnv();
+      console.log(JSON.stringify({
+        result,
+        modelCredentialKeys: Object.keys(modelEnv).filter(key =>
+          /^(GH_TOKEN|GITHUB_TOKEN|GIT_CONFIG_COUNT|GIT_CONFIG_PARAMETERS|GIT_CONFIG_(KEY|VALUE)_\\d+)$/.test(key)),
+        globalConfig: modelEnv.GIT_CONFIG_GLOBAL,
+      }));
+    `;
+    await assert.rejects(
+      run(process.execPath, ["--input-type=module", "--eval", inspectSource], { env: jobEnv }),
+      /terminal prompts disabled/,
+    );
+    const inspected = await run(
+      process.execPath,
+      ["--input-type=module", "--eval", inspectSource],
+      {
+        env: { ...jobEnv, ...helperEnv, GH_TOKEN: "synthetic-fixture-only" },
+      },
+    );
+    const actual = JSON.parse(inspected.stdout);
+    assert.equal(actual.result.mainSha, base);
+    assert.deepEqual(actual.modelCredentialKeys, []);
+    assert.equal(actual.globalConfig, "/dev/null");
+    // gitInfo may annotate its filtered fetch, but it must not persist auth;
+    // the supplied exact revisions must remain fully present without a remote.
+    assert.doesNotMatch(
+      readFileSync(join(target, ".git", "config"), "utf8"),
+      /credential|synthetic-fixture-only/i,
+    );
+    const objects = git("-C", target, "rev-list", "--objects", "--missing=print", base, head);
+    assert.doesNotMatch(objects, /^\?/m);
+    assert.equal(
+      git("-C", target, "-c", "remote.origin.url=/nonexistent", "show", `${base}:file.txt`),
+      "base",
+    );
   } finally {
     if (server) await new Promise<void>((done) => server!.close(() => done()));
     rmSync(root, { recursive: true, force: true });
