@@ -520,6 +520,14 @@ export function createReviewRuntime({
 ${additionalPrompt.trim()}
 `
       : "";
+    const exactTuple = runtimeHints.exactTuplePrompt?.trim()
+      ? `
+
+## Bound exact-tuple review
+
+${runtimeHints.exactTuplePrompt.trim()}
+`
+      : "";
     const networkDescription =
       runtimeHints.networkCapability === "allowlisted-proxy"
         ? "Network egress uses a managed proxy limited to allowlisted GitHub, npm, Node, MDN, and OpenClaw documentation hosts; other hosts are blocked. A blocked request is not evidence about the PR."
@@ -562,7 +570,7 @@ Primary-body and discussion-comment \`bodyCoverage\` describes separate untruste
 \`\`\`json
 ${contextJson}
 \`\`\`
-${extra}
+${exactTuple}${extra}
 `;
     return {
       text,

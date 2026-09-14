@@ -1,0 +1,655 @@
+name: Saari exact-tuple review producer
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: Exact repository name
+        required: true
+        type: string
+      target_repository_id:
+        description: Exact numeric GitHub repository ID
+        required: true
+        type: string
+      repository:
+        description: Exact owner/name repository identity
+        required: true
+        type: string
+      pr_number:
+        description: Exact open pull request number to review
+        required: true
+        type: string
+      expected_base_sha:
+        description: Exact current default-branch SHA to review against
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact pull request head SHA to review
+        required: true
+        type: string
+      review_epoch:
+        description: Exact review epoch bound by Conductor
+        required: true
+        type: string
+      review_scope:
+        description: Native review scope; must remain comprehensive
+        required: true
+        type: string
+      engine_sha:
+        description: Exact trusted ClawSweeper workflow and engine commit SHA
+        required: true
+        type: string
+      publish:
+        description: Emit the bounded review artifact for Conductor consumption
+        required: true
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      target_repository:
+        description: Exact repository name
+        required: true
+        type: string
+      target_repository_id:
+        description: Exact numeric GitHub repository ID
+        required: true
+        type: string
+      repository:
+        description: Exact owner/name repository identity
+        required: true
+        type: string
+      pr_number:
+        description: Exact open pull request number to review
+        required: true
+        type: string
+      expected_base_sha:
+        description: Exact current default-branch SHA to review against
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact pull request head SHA to review
+        required: true
+        type: string
+      review_epoch:
+        description: Exact review epoch bound by Conductor
+        required: true
+        type: string
+      review_scope:
+        description: Native review scope; must remain comprehensive
+        required: true
+        type: string
+      engine_sha:
+        description: Exact trusted ClawSweeper workflow and engine commit SHA
+        required: true
+        type: string
+      publish:
+        description: Emit the bounded review artifact for Conductor consumption
+        required: true
+        type: boolean
+    secrets:
+      ENGINE_CHECKOUT_TOKEN:
+        description: Optional token that can read the producer repository when github.token cannot
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: saari-exact-tuple-${{ inputs.repository }}-${{ inputs.pr_number }}-${{ inputs.review_epoch }}
+  cancel-in-progress: false
+
+env:
+  TARGET_REPOSITORY: ${{ inputs.target_repository }}
+  TARGET_REPO: ${{ inputs.repository }}
+  TARGET_REPOSITORY_ID: ${{ inputs.target_repository_id }}
+  REVIEW_EPOCH: ${{ inputs.review_epoch }}
+  REVIEW_SCOPE: ${{ inputs.review_scope }}
+  ENGINE_SHA: ${{ inputs.engine_sha }}
+
+jobs:
+  admit:
+    name: Admit exact-tuple PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      base_ref: ${{ steps.binding.outputs.base_ref }}
+      base_sha: ${{ steps.binding.outputs.base_sha }}
+      head_repo: ${{ steps.binding.outputs.head_repo }}
+      head_sha: ${{ steps.binding.outputs.head_sha }}
+      item_number: ${{ steps.binding.outputs.item_number }}
+      merge_base_sha: ${{ steps.binding.outputs.merge_base_sha }}
+      repository_id: ${{ steps.binding.outputs.repository_id }}
+    env:
+      EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+      EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - name: Pin the defining-workflow engine identity
+        shell: bash
+        env:
+          # job.workflow_* is the defining reusable-workflow identity; caller SHA is not.
+          TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_ENGINE_SHA: ${{ job.workflow_sha }}
+          TRUSTED_ENGINE_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${TRUSTED_ENGINE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "defining-workflow SHA (job.workflow_sha) is unavailable." >&2
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ENGINE_REPOSITORY:-}" ]; then
+            echo "defining-workflow repository (job.workflow_repository) is unavailable." >&2
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ENGINE_FILE_PATH:-}" ]; then
+            echo "defining-workflow file path (job.workflow_file_path) is unavailable." >&2
+            exit 1
+          fi
+          if [ "$TRUSTED_ENGINE_FILE_PATH" != ".github/workflows/saari-exact-tuple-review.yml" ]; then
+            echo "The defining workflow file is not the Saari exact-tuple producer." >&2
+            exit 1
+          fi
+          if ! [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$ENGINE_SHA" != "$TRUSTED_ENGINE_SHA" ]; then
+            echo "engine_sha must be the trusted defining-workflow commit (job.workflow_sha)." >&2
+            exit 1
+          fi
+
+      - name: Validate immutable caller inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$REVIEW_SCOPE" != "comprehensive" ]; then
+            echo "review_scope must be the admitted comprehensive native scope." >&2
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pr_number must be a positive integer." >&2
+            exit 1
+          fi
+          if ! [[ "$REVIEW_EPOCH" =~ ^[0-9]+$ ]]; then
+            echo "review_epoch must be a non-negative integer." >&2
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_base_sha must be a lowercase 40-character SHA." >&2
+            exit 1
+          fi
+          if ! [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_head_sha must be a lowercase 40-character SHA." >&2
+            exit 1
+          fi
+
+      - name: Bind the live pull request tuple
+        id: binding
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TARGET_REPOSITORY" =~ ^[A-Za-z0-9_.-]+$ ]] \
+            || [ "$TARGET_REPO" != "${TARGET_REPO%%/*}/$TARGET_REPOSITORY" ]; then
+            echo "The target repository input is invalid." >&2
+            exit 1
+          fi
+
+          repo_json="$(gh api "repos/$TARGET_REPO")"
+          repository_id="$(jq -r '.id' <<<"$repo_json")"
+          repository_short_name="$(jq -r '.name' <<<"$repo_json")"
+          repository_name="$(jq -r '.full_name' <<<"$repo_json")"
+          default_branch="$(jq -r '.default_branch' <<<"$repo_json")"
+          archived="$(jq -r '.archived' <<<"$repo_json")"
+          visibility="$(jq -r '.visibility' <<<"$repo_json")"
+          if [ "$repository_id" != "$TARGET_REPOSITORY_ID" ] \
+            || [ "$repository_short_name" != "$TARGET_REPOSITORY" ] \
+            || [ "$repository_name" != "$TARGET_REPO" ] \
+            || [ -z "$default_branch" ] \
+            || [ "$archived" != "false" ] \
+            || [ "$visibility" != "private" ]; then
+            echo "Target repository identity or state is not admitted." >&2
+            exit 1
+          fi
+
+          pull_json="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER")"
+          state="$(jq -r '.state' <<<"$pull_json")"
+          base_repo="$(jq -r '.base.repo.full_name' <<<"$pull_json")"
+          base_ref="$(jq -r '.base.ref' <<<"$pull_json")"
+          head_repo="$(jq -r '.head.repo.full_name' <<<"$pull_json")"
+          head_sha="$(jq -r '.head.sha' <<<"$pull_json")"
+          if [ "$state" != "open" ] \
+            || [ "$base_repo" != "$TARGET_REPO" ] \
+            || [ "$base_ref" != "$default_branch" ]; then
+            echo "The admitted target must be an open pull request into the repository default branch." >&2
+            exit 1
+          fi
+          if ! [[ "$head_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The pull request head identity is invalid." >&2
+            exit 1
+          fi
+
+          base_sha="$(gh api "repos/$TARGET_REPO/git/ref/heads/$base_ref" --jq '.object.sha')"
+          if [ "$base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "The live pull request no longer matches the operator-supplied base/head tuple." >&2
+            exit 1
+          fi
+          merge_base_sha="$(gh api "repos/$TARGET_REPO/compare/$base_sha...$head_sha" --jq '.merge_base_commit.sha')"
+          if ! [[ "$merge_base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub did not return a valid merge-base SHA." >&2
+            exit 1
+          fi
+
+          {
+            echo "base_ref=$base_ref"
+            echo "base_sha=$base_sha"
+            echo "head_repo=$head_repo"
+            echo "head_sha=$head_sha"
+            echo "item_number=$PR_NUMBER"
+            echo "merge_base_sha=$merge_base_sha"
+            echo "repository_id=$repository_id"
+          } >> "$GITHUB_OUTPUT"
+
+  review:
+    name: Native ClawSweeper review
+    needs: admit
+    if: ${{ inputs.publish }}
+    runs-on: [self-hosted, spark-2]
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      BASE_REF: ${{ needs.admit.outputs.base_ref }}
+      BASE_SHA: ${{ needs.admit.outputs.base_sha }}
+      HEAD_REPO: ${{ needs.admit.outputs.head_repo }}
+      HEAD_SHA: ${{ needs.admit.outputs.head_sha }}
+      MERGE_BASE_SHA: ${{ needs.admit.outputs.merge_base_sha }}
+      PR_NUMBER: ${{ needs.admit.outputs.item_number }}
+      REPOSITORY_ID: ${{ needs.admit.outputs.repository_id }}
+      CLAWSWEEPER_CODEX_LOGIN_METHOD: chatgpt
+      CLAWSWEEPER_COMMAND_LOCK_TIMEOUT: "6000"
+    steps:
+      - name: Pin the defining-workflow engine identity
+        shell: bash
+        env:
+          TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_ENGINE_SHA: ${{ job.workflow_sha }}
+          TRUSTED_ENGINE_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${TRUSTED_ENGINE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "defining-workflow SHA (job.workflow_sha) is unavailable." >&2
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ENGINE_REPOSITORY:-}" ]; then
+            echo "defining-workflow repository (job.workflow_repository) is unavailable." >&2
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ENGINE_FILE_PATH:-}" ]; then
+            echo "defining-workflow file path (job.workflow_file_path) is unavailable." >&2
+            exit 1
+          fi
+          if [ "$TRUSTED_ENGINE_FILE_PATH" != ".github/workflows/saari-exact-tuple-review.yml" ]; then
+            echo "The defining workflow file is not the Saari exact-tuple producer." >&2
+            exit 1
+          fi
+          if ! [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$ENGINE_SHA" != "$TRUSTED_ENGINE_SHA" ]; then
+            echo "engine_sha must be the trusted defining-workflow commit (job.workflow_sha)." >&2
+            exit 1
+          fi
+
+      - name: Reject stale exact-tuple identity before host work
+        shell: bash
+        env:
+          TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}
+        run: |
+          set -euo pipefail
+          if [ "$REVIEW_SCOPE" != "comprehensive" ]; then
+            echo "review_scope must be the admitted comprehensive native scope." >&2
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "pr_number must be a positive integer." >&2
+            exit 1
+          fi
+          if ! [[ "$REVIEW_EPOCH" =~ ^[0-9]+$ ]]; then
+            echo "review_epoch must be a non-negative integer." >&2
+            exit 1
+          fi
+          if ! [[ "$REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]] || [ "$REPOSITORY_ID" != "$TARGET_REPOSITORY_ID" ]; then
+            echo "target repository id does not match the admitted tenant." >&2
+            exit 1
+          fi
+          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "admitted base/head SHAs are invalid." >&2
+            exit 1
+          fi
+          if ! [[ "$MERGE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "admitted merge-base SHA is invalid." >&2
+            exit 1
+          fi
+          config="${CLAWSWEEPER_EXACT_TUPLE_CONFIG:-}"
+          if [ -z "$config" ] || [ ! -f "$config" ]; then
+            echo "CLAWSWEEPER_EXACT_TUPLE_CONFIG must be an existing overlay file." >&2
+            exit 1
+          fi
+          tenant="$(jq -c --arg repo "$TARGET_REPO" --argjson id "$TARGET_REPOSITORY_ID" '
+            .tenants[]
+            | select((.repository | ascii_downcase) == ($repo | ascii_downcase) and .repository_id == $id)
+          ' "$config")"
+          if [ -z "$tenant" ]; then
+            echo "The target repository identity is not an admitted exact-tuple tenant." >&2
+            exit 1
+          fi
+          engine_repository="$(jq -r '.producer.engine_repository' "$config")"
+          workflow_path="$(jq -r '.producer.workflow_path' "$config")"
+          reviewer_actor="$(jq -r '.reviewer_actor' <<<"$tenant")"
+          artifact_prefix="$(jq -r '.artifact_prefix' <<<"$tenant")"
+          if [ "$engine_repository" != "${TRUSTED_ENGINE_REPOSITORY:-}" ] \
+            && [ -n "${TRUSTED_ENGINE_REPOSITORY:-}" ]; then
+            echo "defining-workflow repository is not the configured exact-tuple producer." >&2
+            exit 1
+          fi
+          if [ "$workflow_path" != ".github/workflows/saari-exact-tuple-review.yml" ]; then
+            echo "The defining workflow file is not the Saari exact-tuple producer." >&2
+            exit 1
+          fi
+          {
+            echo "REVIEWER_ACTOR=$reviewer_actor"
+            echo "EXACT_TUPLE_ARTIFACT_NAME=${artifact_prefix}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_ENV"
+
+      - name: Isolate unique per-run producer paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_WORKSPACE:-}" ]; then
+            echo "GITHUB_WORKSPACE is unavailable." >&2
+            exit 1
+          fi
+          run_root="$RUNNER_TEMP/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          checkout="$GITHUB_WORKSPACE/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/checkout"
+          mkdir -p "$run_root" "$(dirname "$checkout")"
+          {
+            echo "PRODUCER_RUN_ROOT=$run_root"
+            echo "PRODUCER_CHECKOUT=$checkout"
+            echo "PRODUCER_ENGINE=$run_root/engine"
+            echo "PRODUCER_TARGET=$run_root/target"
+            echo "PRODUCER_ARTIFACTS=$run_root/review-artifacts"
+            echo "PRODUCER_EMPTY_STATE=$run_root/empty-state"
+          } >> "$GITHUB_ENV"
+
+      - name: Reuse the existing Spark subscription profile in place
+        shell: bash
+        run: |
+          set -euo pipefail
+          case ":$PATH:" in
+            *":$HOME/.local/bin:"*) ;;
+            *) PATH="$HOME/.local/bin:$PATH" ;;
+          esac
+          codex_home="${CODEX_HOME:-$HOME/.config/clawsweeper/codex-home}"
+          lock_file="${CLAWSWEEPER_COMMAND_LOCK:-$HOME/.cache/clawsweeper/clawsweeper-command.lock}"
+          if [ ! -d "$codex_home" ]; then
+            echo "existing Spark-2 Codex subscription profile is absent." >&2
+            exit 1
+          fi
+          if [ ! -e "$codex_home/auth.json" ]; then
+            echo "existing Spark-2 Codex subscription auth is absent." >&2
+            exit 1
+          fi
+          resolve_known() {
+            local name="$1"
+            if [ "$name" = "codex" ] && [ -n "${CODEX_BIN:-}" ]; then
+              if [ -x "$CODEX_BIN" ]; then
+                printf '%s\n' "$CODEX_BIN"
+                return 0
+              fi
+              echo "CODEX_BIN is set but is not an executable." >&2
+              exit 1
+            fi
+            if [ -x "$HOME/.local/bin/$name" ]; then
+              printf '%s\n' "$HOME/.local/bin/$name"
+              return 0
+            fi
+            if command -v "$name" >/dev/null 2>&1; then
+              command -v "$name"
+              return 0
+            fi
+            echo "required $name executable is absent from known paths." >&2
+            exit 1
+          }
+          node_bin="$(resolve_known node)"
+          gh_bin="$(resolve_known gh)"
+          codex_bin="$(resolve_known codex)"
+          if ! command -v corepack >/dev/null 2>&1; then
+            echo "required corepack executable is absent from known paths." >&2
+            exit 1
+          fi
+          if ! command -v flock >/dev/null 2>&1; then
+            echo "required flock executable is absent from known paths." >&2
+            exit 1
+          fi
+          node_major="$("$node_bin" -p 'process.versions.node.split(".")[0]')"
+          if ! [[ "$node_major" =~ ^[0-9]+$ ]] || [ "$node_major" -lt 24 ]; then
+            echo "node 24+ is required on the Spark-2 host." >&2
+            exit 1
+          fi
+          {
+            echo "PATH=$HOME/.local/bin:$PATH"
+            echo "CODEX_HOME=$codex_home"
+            echo "CLAWSWEEPER_COMMAND_LOCK=$lock_file"
+            echo "CODEX_BIN=$codex_bin"
+            echo "NODE_BIN=$node_bin"
+            echo "GH_BIN=$gh_bin"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out the trusted ClawSweeper engine
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.ENGINE_CHECKOUT_TOKEN || github.token }}
+          path: saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
+          fetch-depth: 0
+          persist-credentials: false
+          set-safe-directory: false
+
+      - name: Build the pinned native engine without shared caches
+        working-directory: ${{ github.workspace }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
+        shell: bash
+        env:
+          TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}
+          TRUSTED_ENGINE_SHA: ${{ job.workflow_sha }}
+          TRUSTED_ENGINE_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${TRUSTED_ENGINE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "defining-workflow SHA (job.workflow_sha) is unavailable." >&2
+            exit 1
+          fi
+          if [ -z "${TRUSTED_ENGINE_REPOSITORY:-}" ] || [ -z "${TRUSTED_ENGINE_FILE_PATH:-}" ]; then
+            echo "defining-workflow repository or file path is unavailable." >&2
+            exit 1
+          fi
+          test "$TRUSTED_ENGINE_FILE_PATH" = ".github/workflows/saari-exact-tuple-review.yml"
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$ENGINE_SHA"
+          test "$ENGINE_SHA" = "$TRUSTED_ENGINE_SHA"
+          corepack pnpm@12.4.1 install --frozen-lockfile --ignore-scripts
+          corepack pnpm@12.4.1 run build:all
+
+      - name: Prepare the exact target checkout as read-only data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_ATTR_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          target_dir="$PRODUCER_TARGET"
+          hooks_dir="$PRODUCER_RUN_ROOT/disabled-git-hooks"
+          mkdir -p "$hooks_dir" "$(dirname "$target_dir")"
+          gh repo clone "$TARGET_REPO" "$target_dir" -- --filter=blob:none --no-checkout
+          git -C "$target_dir" config core.hooksPath "$hooks_dir"
+          git -C "$target_dir" fetch --force --no-tags origin \
+            "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/clawsweeper-pr-$PR_NUMBER"
+          test "$(git -C "$target_dir" rev-parse "refs/remotes/origin/$BASE_REF")" = "$BASE_SHA"
+          test "$(git -C "$target_dir" rev-parse "refs/remotes/origin/clawsweeper-pr-$PR_NUMBER")" = "$HEAD_SHA"
+          test "$(git -C "$target_dir" merge-base "$BASE_SHA" "$HEAD_SHA")" = "$MERGE_BASE_SHA"
+          git -C "$target_dir" checkout --force -B "clawsweeper/pr-$PR_NUMBER" "$HEAD_SHA"
+          test "$(git -C "$target_dir" rev-parse HEAD)" = "$HEAD_SHA"
+          chmod -R go-w "$target_dir" "$PRODUCER_CHECKOUT"
+
+      - name: Stage the trusted engine outside the runner home
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$PRODUCER_ENGINE"
+          tar -C "$PRODUCER_CHECKOUT" \
+            --exclude=.git \
+            --exclude=.artifacts \
+            --exclude=artifacts \
+            --exclude=.clawsweeper-repair \
+            --exclude=.npmrc \
+            --exclude='.env*' \
+            -cf - . \
+            | tar -C "$PRODUCER_ENGINE" -xf -
+          chmod -R go-w "$PRODUCER_ENGINE"
+          test -f "$PRODUCER_ENGINE/dist/clawsweeper.js"
+          test -f "$PRODUCER_ENGINE/dist/saari-exact-tuple.js"
+          test ! -f "$PRODUCER_ENGINE/scripts/run-copilot-codex-adapter.mjs"
+
+      - name: Run the native ClawSweeper review
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
+        shell: bash
+        env:
+          GIT_ATTR_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_TERMINAL_PROMPT: "0"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PRODUCER_EMPTY_STATE/items" "$PRODUCER_ARTIFACTS" "$(dirname "$CLAWSWEEPER_COMMAND_LOCK")"
+          (
+            flock -w "$CLAWSWEEPER_COMMAND_LOCK_TIMEOUT" 9
+            env -u OPENAI_API_KEY -u CODEX_API_KEY -u CODEX_ACCESS_TOKEN -u CLAWSWEEPER_INTERNAL_MODEL \
+              CODEX_HOME="$CODEX_HOME" \
+              CLAWSWEEPER_CODEX_LOGIN_METHOD=chatgpt \
+              CLAWSWEEPER_EXACT_TUPLE_CONFIG="$CLAWSWEEPER_EXACT_TUPLE_CONFIG" \
+              CODEX_BIN="$CODEX_BIN" \
+              GH_TOKEN="$GH_TOKEN" \
+              node dist/clawsweeper.js review \
+                --local-only \
+                --target-repo "$TARGET_REPO" \
+                --target-dir "$PRODUCER_TARGET" \
+                --items-dir "$PRODUCER_EMPTY_STATE/items" \
+                --artifact-dir "$PRODUCER_ARTIFACTS" \
+                --batch-size 1 \
+                --max-pages 5 \
+                --item-number "$PR_NUMBER" \
+                --target-repository-id "$REPOSITORY_ID" \
+                --expected-base-sha "$BASE_SHA" \
+                --expected-head-sha "$HEAD_SHA" \
+                --review-epoch "$REVIEW_EPOCH" \
+                --review-scope comprehensive \
+                --reviewer-actor "$REVIEWER_ACTOR" \
+                --readonly-openclaw \
+                --disable-media-proof-preprocessing \
+                --codex-model internal \
+                --codex-forced-login-method chatgpt \
+                --codex-sandbox read-only \
+                --codex-timeout-ms 1200000 \
+                --shard-index 0 \
+                --shard-count 1
+          ) 9>"$CLAWSWEEPER_COMMAND_LOCK"
+
+      - name: Validate the exact native report and live tuple
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
+        shell: bash
+        env:
+          GIT_ATTR_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_TERMINAL_PROMPT: "0"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target_dir="$PRODUCER_TARGET"
+          test -z "$(git -C "$target_dir" status --porcelain)"
+          test "$(git -C "$target_dir" rev-parse HEAD)" = "$HEAD_SHA"
+          live_head="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
+          live_base="$(gh api "repos/$TARGET_REPO/git/ref/heads/$BASE_REF" --jq '.object.sha')"
+          live_merge_base="$(gh api "repos/$TARGET_REPO/compare/$BASE_SHA...$HEAD_SHA" --jq '.merge_base_commit.sha')"
+          test "$live_head" = "$HEAD_SHA"
+          test "$live_base" = "$BASE_SHA"
+          test "$live_merge_base" = "$MERGE_BASE_SHA"
+          node scripts/validate-saari-exact-tuple-report.mjs \
+            --report "$PRODUCER_ARTIFACTS/$PR_NUMBER.md" \
+            --repository "$TARGET_REPO" \
+            --item-number "$PR_NUMBER" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --review-epoch "$REVIEW_EPOCH" \
+            --review-scope comprehensive \
+            --reviewer-actor "$REVIEWER_ACTOR"
+          if grep -Fq -- "$GH_TOKEN" "$PRODUCER_ARTIFACTS/$PR_NUMBER.md"; then
+            echo "The native report contained its short-lived read token." >&2
+            exit 1
+          fi
+
+      - name: Create the bounded native review bundle
+        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          decision="$(jq -nc \
+            --arg target_repo "$TARGET_REPO" \
+            --arg repository_id "$REPOSITORY_ID" \
+            --arg item_number "$PR_NUMBER" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            --arg head_repo "$HEAD_REPO" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg merge_base_sha "$MERGE_BASE_SHA" \
+            --arg engine_sha "$ENGINE_SHA" \
+            --arg review_epoch "$REVIEW_EPOCH" \
+            --arg review_scope "$REVIEW_SCOPE" \
+            --arg reviewer_actor "$REVIEWER_ACTOR" \
+            '{target_repo:$target_repo,repository_id:($repository_id|tonumber),item_number:($item_number|tonumber),base_ref:$base_ref,base_sha:$base_sha,head_repo:$head_repo,head_sha:$head_sha,merge_base_sha:$merge_base_sha,engine_sha:$engine_sha,review_epoch:($review_epoch|tonumber),review_scope:$review_scope,reviewer_actor:$reviewer_actor}')"
+          export EXACT_REVIEW_ACTION_LEDGER_ROOT=""
+          export EXACT_REVIEW_BUNDLE_DIR="$RUNNER_TEMP/exact-review-bundle"
+          export EXACT_REVIEW_CLAIM_GENERATION=""
+          export EXACT_REVIEW_DECISION="$decision"
+          export EXACT_REVIEW_GENERATION_ATTEMPT="$GITHUB_RUN_ATTEMPT"
+          export EXACT_REVIEW_ITEM_KEY="$TARGET_REPO#$PR_NUMBER"
+          export EXACT_REVIEW_ITEM_KIND="pull_request"
+          export EXACT_REVIEW_ITEM_NUMBER="$PR_NUMBER"
+          export EXACT_REVIEW_LEASE_REVISION=""
+          export EXACT_REVIEW_LIVE_GUARDED_OPEN="false"
+          export EXACT_REVIEW_LIVE_PROCEEDED="true"
+          export EXACT_REVIEW_LIVE_TERMINAL_MISSING="false"
+          export EXACT_REVIEW_LIVE_TERMINAL_NOOP="false"
+          export EXACT_REVIEW_PRODUCER_JOB="review"
+          export EXACT_REVIEW_PROTOCOL_VERSION="1"
+          export EXACT_REVIEW_REPORT_PATH="$PRODUCER_ARTIFACTS/$PR_NUMBER.md"
+          export EXACT_REVIEW_SOURCE_SHA="$ENGINE_SHA"
+          export EXACT_REVIEW_TARGET_BRANCH="$BASE_REF"
+          export EXACT_REVIEW_TARGET_REPO="$TARGET_REPO"
+          export EXACT_REVIEW_WORKFLOW_REPOSITORY="$TARGET_REPO"
+          export GITHUB_REPOSITORY="$TARGET_REPO"
+          export GITHUB_SHA="$ENGINE_SHA"
+          corepack pnpm@12.4.1 run --silent repair:exact-review-bundle create
+
+      - name: Upload the bounded native review bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.EXACT_TUPLE_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/exact-review-bundle
+          include-hidden-files: false
+          if-no-files-found: error
+          retention-days: 30

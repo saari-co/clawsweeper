@@ -10,6 +10,7 @@ import {
   createExactReviewBundle,
   exactReviewDecisionSha256,
   validateExactReviewBundle,
+  zipExactReviewBundle,
   type ExactReviewBundleContext,
 } from "../../dist/repair/exact-review-bundle.js";
 
@@ -296,4 +297,32 @@ test("bundle validation uses the producer workflow identity across runs", () => 
     },
   );
   assert.equal(result.status, 0, result.stderr);
+});
+
+test("zipExactReviewBundle admits a review-only two-file bundle", () => {
+  const value = fixture();
+  createExactReviewBundle({
+    bundleDir: value.bundleDir,
+    reviewPath: value.report,
+    createdAt: "2026-07-15T12:00:00Z",
+    context: value.context,
+  });
+  const zip = zipExactReviewBundle(value.bundleDir);
+  assert.ok(zip.length > 0);
+  assert.equal(zip.readUInt32LE(0), 0x04034b50);
+});
+
+test("zipExactReviewBundle rejects an action-ledger-bearing bundle", () => {
+  const value = fixture();
+  createExactReviewBundle({
+    bundleDir: value.bundleDir,
+    reviewPath: value.report,
+    actionLedgerRoot: value.ledgerRoot,
+    createdAt: "2026-07-15T12:00:00Z",
+    context: value.context,
+  });
+  assert.throws(
+    () => zipExactReviewBundle(value.bundleDir),
+    /only manifest.json and the review report/,
+  );
 });

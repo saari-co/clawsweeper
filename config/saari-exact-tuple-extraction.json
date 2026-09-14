@@ -1,0 +1,43 @@
+{
+  "schema": "saari.clawsweeper.exact-tuple-extraction.v1",
+  "license": "MIT",
+  "source_commit": "c1b106d723663d655b1404480ab6e640333970af",
+  "source_repository": "saari-co/clawsweeper",
+  "adaptations": [
+    {
+      "source_path": ".github/workflows/saari-exact-tuple-review.yml",
+      "destination_path": ".github/workflows/saari-exact-tuple-review.yml",
+      "adaptation": "Reusable inert producer. Tenant, engine-repository, actor, and artifact-prefix policy are read from CLAWSWEEPER_EXACT_TUPLE_CONFIG, not baked into the engine."
+    },
+    {
+      "source_path": "src/repair/exact-review-bundle.ts",
+      "destination_path": "src/repair/exact-review-bundle.ts",
+      "adaptation": "Keep the maintained upstream bundle API. Add only zipExactReviewBundle so consumer proof can emit the two-file manifest.json + review/<pr>.md zip. Do not restrict the default rail to review-only files."
+    },
+    {
+      "source_path": "scripts/validate-saari-exact-tuple-report.mjs",
+      "destination_path": "scripts/validate-saari-exact-tuple-report.mjs",
+      "adaptation": "Keep native report identity checks and add required comprehensive epoch/actor fields plus the engine-authored Bound Review Identity section."
+    }
+  ],
+  "consumer_pin": {
+    "repository": "saari-co/review-conductor",
+    "commit": "f42875beeeab4cc1e82b701a692ff38ec8ac4a64",
+    "path": "tools/review_conductor_userland.py",
+    "sha256": "c27d8c45e45ffa2b10c6f1680f425b7453775ef5af72d5e801d0048a937126a2",
+    "pin_path": "config/saari-exact-tuple-consumer-pin.json",
+    "proof_command": "pnpm run prove:saari-exact-tuple-consumer -- --consumer-checkout <checkout>",
+    "adaptation": "Hash pin and explicit supplied-checkout proof only. The producer does not vendor or reimplement parse_clawsweeper_bundle, and standard tests stay portable."
+  },
+  "external_overlay": {
+    "exact_tuple_config_env": "CLAWSWEEPER_EXACT_TUPLE_CONFIG",
+    "repository_profile_overlay_env": "CLAWSWEEPER_REPOSITORY_PROFILE_OVERLAY",
+    "must_add": [
+      "producer.engine_repository=saari-co/clawsweeper",
+      "producer.workflow_path=.github/workflows/saari-exact-tuple-review.yml",
+      "one or more overlay tenants with exact repository, repository_id, reviewer_actor, artifact_prefix, review_scope=comprehensive, visibility=private, and publish_side_effects=false",
+      "matching repository profile overlay entries (review-only, empty apply_close_rules)"
+    ],
+    "fixture_shape": "test/fixtures/saari-exact-tuple-overlay.json"
+  }
+}

@@ -38,6 +38,8 @@
         "action-ledger.md",
         "target-dispatcher.md",
         "target-repositories.md",
+        "saari-exact-tuple.md",
+        "saari-exact-tuple-export.md",
         "triage-dashboard.md",
         "related-issue-discovery.md",
         "spam-scanner.md",

@@ -169,6 +169,94 @@ export function createExactReviewBundle(
   return manifest;
 }
 
+export function zipExactReviewBundle(bundleDirInput: string): Buffer {
+  const bundleDir = path.resolve(bundleDirInput);
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(bundleDir, "manifest.json"), "utf8"),
+  ) as ExactReviewBundleManifest;
+  const files = new Map<string, Buffer>([
+    ["manifest.json", fs.readFileSync(path.join(bundleDir, "manifest.json"))],
+  ]);
+  for (const entry of manifest.files) {
+    files.set(entry.path, fs.readFileSync(path.join(bundleDir, ...entry.path.split("/"))));
+  }
+  if (files.size !== 2 || !files.has(`review/${manifest.target.item_number}.md`)) {
+    throw new Error("exact review zip must contain only manifest.json and the review report");
+  }
+  return createStoredZip(files);
+}
+
+function createStoredZip(files: Map<string, Buffer>): Buffer {
+  const encoder = new TextEncoder();
+  const chunks: Buffer[] = [];
+  const central: Buffer[] = [];
+  let offset = 0;
+  let index = 0;
+  for (const [name, data] of files) {
+    const nameBytes = Buffer.from(encoder.encode(name));
+    const crc = crc32(data);
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBytes.copy(local, 30);
+    chunks.push(local, data);
+    const header = Buffer.alloc(46 + nameBytes.length);
+    header.writeUInt32LE(0x02014b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(20, 6);
+    header.writeUInt16LE(0, 8);
+    header.writeUInt16LE(0, 10);
+    header.writeUInt16LE(0, 12);
+    header.writeUInt16LE(0, 14);
+    header.writeUInt32LE(crc, 16);
+    header.writeUInt32LE(data.length, 20);
+    header.writeUInt32LE(data.length, 24);
+    header.writeUInt16LE(nameBytes.length, 28);
+    header.writeUInt16LE(0, 30);
+    header.writeUInt16LE(0, 32);
+    header.writeUInt16LE(0, 34);
+    header.writeUInt16LE(0, 36);
+    header.writeUInt32LE(0, 38);
+    header.writeUInt32LE(offset, 42);
+    nameBytes.copy(header, 46);
+    central.push(header);
+    offset += local.length + data.length;
+    index += 1;
+  }
+  const centralDir = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(index, 8);
+  end.writeUInt16LE(index, 10);
+  end.writeUInt32LE(centralDir.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...chunks, centralDir, end]);
+}
+
+function crc32(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 export function validateExactReviewBundle(
   bundleDirInput: string,
   expected: ExactReviewBundleContext,

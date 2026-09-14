@@ -716,7 +716,10 @@ test("structural cache probes before hydration but acquires a lease before carry
     ),
   ];
   const hydration = reviewLoop.indexOf("collectItemContext(item");
-  const mediaPrep = reviewLoop.indexOf("prepareMediaProofArtifacts(", contentCache);
+  const mediaPrep = Math.max(
+    reviewLoop.indexOf("prepareMediaProofArtifacts(", contentCache),
+    reviewLoop.indexOf("resolvePreparedMediaProof(", contentCache),
+  );
 
   assert.ok(structuralEligibility >= 0);
   assert.ok(structuralProbe > structuralEligibility);

@@ -396,6 +396,7 @@ function reviewPolicyHash(options: {
   reasoningEffort?: string;
   sandboxMode?: string;
   serviceTier?: string;
+  reviewScope?: string;
 }): string {
   const policyTargetRepo = targetRepo();
   return sha256(
@@ -416,6 +417,7 @@ function reviewPolicyHash(options: {
       repositoryProfile: targetProfile(),
       prompt: reviewPromptTemplate(),
       schema: reviewDecisionSchemaText(),
+      ...(options.reviewScope ? { reviewScope: options.reviewScope } : {}),
     }),
   ).slice(0, 16);
 }
@@ -426,6 +428,7 @@ export function reviewPolicyHashForTest(
     reasoningEffort?: string;
     sandboxMode?: string;
     serviceTier?: string;
+    reviewScope?: string;
   } = {},
 ): string {
   return reviewPolicyHash(options);

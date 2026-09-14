@@ -32,6 +32,11 @@ import {
   type ReviewStructuralRecord,
 } from "./review-structural-cache.js";
 import type { CreateReportRenderingDependencies } from "./clawsweeper-report-rendering-dependencies.js";
+import {
+  exactTupleFrontMatterLines,
+  renderExactTupleIdentitySection,
+  type SaariExactTupleIdentity,
+} from "./saari-exact-tuple.js";
 import type { createReportContextRendering } from "./clawsweeper-report-context.js";
 import type { createReportCommentHelpers } from "./clawsweeper-report-comment-helpers.js";
 import {
@@ -467,6 +472,7 @@ export function createReportDocumentRendering(
     structuralRecord?: ReviewStructuralRecord | null;
     reviewLeaseOwner?: string;
     reviewLeaseCommentId?: number;
+    exactTupleIdentity?: SaariExactTupleIdentity;
   }): string {
     const labels = options.item.labels.length ? options.item.labels.join(", ") : "none";
     const reviewedAt = new Date().toISOString();
@@ -635,7 +641,7 @@ review_mode: ${options.reviewMode}
 review_status: ${reviewStatusForDecision(options.decision)}
 review_terminal_failure: ${options.decision.codexTerminalFailure === true}
 review_checkout_inspection_failed: ${options.decision.checkoutInspectionFailed === true}
-local_checkout_access: ${localCheckoutAccessForDecision(options.decision)}
+${options.exactTupleIdentity ? `${exactTupleFrontMatterLines(options.exactTupleIdentity).join("\n")}\n` : ""}local_checkout_access: ${localCheckoutAccessForDecision(options.decision)}
 local_checkout_access_source: ${localCheckoutAccessSourceForDecision(options.decision)}
 item_snapshot_hash: ${options.snapshotHash}
 review_content_digest: ${options.contentDigest}
@@ -745,7 +751,7 @@ Updated at: ${formatTimestamp(options.item.updatedAt)}
 Reviewed against: ${linkedSha(options.git.mainSha)}
 
 Codex review: ${runtimeReviewText(options.runtime)}
-
+${options.exactTupleIdentity ? `\n${renderExactTupleIdentitySection(options.exactTupleIdentity)}\n` : ""}
 Latest release at review time: ${
       options.git.latestRelease?.tagName
         ? linkedRelease(options.git.latestRelease.tagName)

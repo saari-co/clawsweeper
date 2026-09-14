@@ -173,20 +173,34 @@ test("every workflow job that runs the main bundle directly obtains it", () => {
       );
       if (restoresRuntime) continue;
 
-      const buildScripts = steps
+      const setupPnpmScripts = steps
         .filter((step) => String(step.uses ?? "").includes("actions/setup-pnpm"))
         .map((step) => String(step.with?.["build-script"] ?? ""));
+      const runScripts = steps.flatMap((step) =>
+        [...String(step.run ?? "").matchAll(/pnpm(?:@[\d.]+)? run (?:--silent )?([\w:.-]+)/g)].map(
+          (match) => match[1]!,
+        ),
+      );
+      const buildScripts = [...setupPnpmScripts, ...runScripts];
       assert.ok(
         buildScripts.some(buildScriptEmitsMainBundle),
         `${site} runs ${MAIN_BUNDLE} but no build-script emits it: ${JSON.stringify(buildScripts)}`,
       );
 
       // The main build reads tsconfig.json, so a curated checkout has to carry it.
-      const buildIndex = steps.findIndex(
-        (step) =>
+      const buildIndex = steps.findIndex((step) => {
+        if (
           String(step.uses ?? "").includes("actions/setup-pnpm") &&
-          buildScriptEmitsMainBundle(String(step.with?.["build-script"] ?? "")),
-      );
+          buildScriptEmitsMainBundle(String(step.with?.["build-script"] ?? ""))
+        ) {
+          return true;
+        }
+        return [
+          ...String(step.run ?? "").matchAll(/pnpm(?:@[\d.]+)? run (?:--silent )?([\w:.-]+)/g),
+        ]
+          .map((match) => match[1]!)
+          .some(buildScriptEmitsMainBundle);
+      });
       const checkout = steps
         .slice(0, buildIndex)
         .findLast((step) => String(step.uses ?? "").startsWith("actions/checkout@"));

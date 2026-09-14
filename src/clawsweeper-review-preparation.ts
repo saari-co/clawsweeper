@@ -24,6 +24,7 @@ import {
   writeExactReviewFailureDiagnostics,
 } from "./clawsweeper-review-failure-diagnostics.js";
 import { ReviewSourcePreparationError } from "./review-source-preparation.js";
+import { exactTupleIdentityFromReviewArgs } from "./saari-exact-tuple.js";
 import {
   createTransientReviewOutput,
   createReviewOutputBudget,
@@ -292,7 +293,24 @@ export function prepareReviewCommand(
       }
       throw error;
     }
-    const reviewPolicy = reviewPolicyHash({ model, reasoningEffort, sandboxMode, serviceTier });
+    let exactTupleIdentity;
+    try {
+      exactTupleIdentity = exactTupleIdentityFromReviewArgs(args, profile.targetRepo);
+    } catch (error) {
+      throw new UserFacingCommandError(error instanceof Error ? error.message : String(error));
+    }
+    if (exactTupleIdentity && git.mainSha !== exactTupleIdentity.baseSha) {
+      throw new UserFacingCommandError(
+        `exact-tuple review base SHA ${git.mainSha} does not match admitted ${exactTupleIdentity.baseSha}`,
+      );
+    }
+    const reviewPolicy = reviewPolicyHash({
+      model,
+      reasoningEffort,
+      sandboxMode,
+      serviceTier,
+      ...(exactTupleIdentity ? { reviewScope: exactTupleIdentity.reviewScope } : {}),
+    });
     const explicitDispatch = isExplicitReviewDispatch(
       args,
       itemNumber !== undefined || itemNumbers !== undefined,
@@ -334,6 +352,7 @@ export function prepareReviewCommand(
       loadReviewGitInfo,
       git,
       reviewPolicy,
+      exactTupleIdentity,
       explicitDispatch,
       maintainerRequest,
       outputSelection,
