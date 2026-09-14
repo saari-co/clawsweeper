@@ -38,8 +38,11 @@ or session files. Known host executables (`$HOME/.local/bin` and `CODEX_BIN`)
 must already exist; the job fails closed if they are absent. Actual native
 review holds the existing shared `~/.cache/clawsweeper/clawsweeper-command.lock`
 and writes engine, target, empty state, and artifacts only under a unique
-per-run `RUNNER_TEMP` tree. Shared Spark target checkouts and global defaults
-are left untouched.
+per-run `RUNNER_TEMP` tree. The trusted engine checkout is a unique path
+under `GITHUB_WORKSPACE` because `actions/checkout` input-helper rejects
+paths outside the workspace. `set-safe-directory: false` keeps checkout from
+writing `safe.directory` into global git config. Shared Spark target
+checkouts and global defaults are left untouched.
 
 An optional `ENGINE_CHECKOUT_TOKEN` is needed only if the caller
 `github.token` cannot read `saari-co/clawsweeper`. Suite runner-group

@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SAARI_EXACT_TUPLE_REVIEW_SCOPE = "comprehensive" as const;
@@ -73,6 +73,7 @@ export interface TrustedEngineIdentity {
 export interface SaariSparkHostContext {
   home: string;
   runnerTemp: string;
+  githubWorkspace: string;
   runId: string;
   runAttempt: string;
   env?: NodeJS.ProcessEnv;
@@ -265,23 +266,59 @@ export function saariSparkKnownBinDir(home: string): string {
 
 export function saariSparkIsolatedPaths(input: {
   runnerTemp: string;
+  githubWorkspace: string;
   runId: string;
   runAttempt: string;
 }): SaariSparkIsolatedPaths {
   const runnerTemp = requiredText(input.runnerTemp, "runner temp");
+  const githubWorkspace = requiredText(input.githubWorkspace, "github workspace");
   const runId = requiredText(String(input.runId), "run id");
   const runAttempt = requiredText(String(input.runAttempt), "run attempt");
   if (!/^\d{1,30}$/.test(runId)) throw new Error("run id is invalid");
   if (!/^[1-9]\d{0,29}$/.test(runAttempt)) throw new Error("run attempt is invalid");
-  const runRoot = join(runnerTemp, `saari-exact-tuple-${runId}-${runAttempt}`);
+  const uniqueLeaf = `saari-exact-tuple-${runId}-${runAttempt}`;
+  const runRoot = join(runnerTemp, uniqueLeaf);
+  const checkout = join(githubWorkspace, uniqueLeaf, "checkout");
+  assertActionsCheckoutPathUnderWorkspace(checkout, githubWorkspace);
   return {
     runRoot,
-    checkout: join(runRoot, "checkout"),
+    checkout,
     engine: join(runRoot, "engine"),
     target: join(runRoot, "target"),
     emptyState: join(runRoot, "empty-state"),
     artifacts: join(runRoot, "review-artifacts"),
   };
+}
+
+// Official actions/checkout input-helper: resolve(path) against GITHUB_WORKSPACE,
+// then require (resolved + sep).startsWith(workspace + sep).
+export function resolveActionsCheckoutRepositoryPath(
+  repositoryPath: string,
+  githubWorkspace: string,
+): string {
+  const workspace = resolve(requiredText(githubWorkspace, "github workspace"));
+  return resolve(workspace, requiredText(repositoryPath, "repository path"));
+}
+
+export function isActionsCheckoutPathUnderWorkspace(
+  repositoryPath: string,
+  githubWorkspace: string,
+): boolean {
+  const workspace = resolve(requiredText(githubWorkspace, "github workspace"));
+  const resolved = resolveActionsCheckoutRepositoryPath(repositoryPath, workspace);
+  return `${resolved}${sep}`.startsWith(`${workspace}${sep}`);
+}
+
+export function assertActionsCheckoutPathUnderWorkspace(
+  repositoryPath: string,
+  githubWorkspace: string,
+): string {
+  const workspace = resolve(requiredText(githubWorkspace, "github workspace"));
+  const resolved = resolveActionsCheckoutRepositoryPath(repositoryPath, workspace);
+  if (!`${resolved}${sep}`.startsWith(`${workspace}${sep}`)) {
+    throw new Error(`Repository path '${resolved}' is not under '${workspace}'`);
+  }
+  return resolved;
 }
 
 export function resolveSaariSparkKnownExecutable(
@@ -327,7 +364,11 @@ export function assertSaariSparkSubscriptionProfile(
   }
 }
 
-export function assertSaariSparkPathsIsolated(paths: SaariSparkIsolatedPaths, home: string): void {
+export function assertSaariSparkPathsIsolated(
+  paths: SaariSparkIsolatedPaths,
+  home: string,
+  locations: { githubWorkspace: string; runnerTemp: string },
+): void {
   const lockFile = saariSparkCommandLockPath(home);
   const shared = [
     join(requiredHome(home), ".cache", "clawsweeper", "targets", "spark-dgx"),
@@ -360,6 +401,23 @@ export function assertSaariSparkPathsIsolated(paths: SaariSparkIsolatedPaths, ho
     )
   ) {
     throw new Error("shared command lock must remain outside the per-run tree");
+  }
+  assertActionsCheckoutPathUnderWorkspace(paths.checkout, locations.githubWorkspace);
+  if (isActionsCheckoutPathUnderWorkspace(paths.checkout, locations.runnerTemp)) {
+    throw new Error("trusted checkout must not live under runner temp");
+  }
+  for (const staged of [
+    paths.runRoot,
+    paths.engine,
+    paths.target,
+    paths.emptyState,
+    paths.artifacts,
+  ]) {
+    if (
+      !isNestedPath(resolve(staged), resolve(requiredText(locations.runnerTemp, "runner temp")))
+    ) {
+      throw new Error("staged producer path must remain under runner temp");
+    }
   }
 }
 
@@ -416,6 +474,8 @@ export function assertSaariSparkHostReuseContract(source: string): void {
     "--codex-model internal",
     "flock",
     "Reject stale exact-tuple identity before host work",
+    "set-safe-directory: false",
+    "path: saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout",
   ];
   for (const token of required) {
     if (!source.includes(token)) {
@@ -443,7 +503,10 @@ export function prepareSaariSparkExactTupleRun(input: {
   const paths = saariSparkIsolatedPaths(input.host);
   const lockFile = saariSparkCommandLockPath(input.host.home);
   const codexHome = saariSparkCodexHomePath(input.host.home);
-  assertSaariSparkPathsIsolated(paths, input.host.home);
+  assertSaariSparkPathsIsolated(paths, input.host.home, {
+    githubWorkspace: input.host.githubWorkspace,
+    runnerTemp: input.host.runnerTemp,
+  });
   assertSaariSparkSubscriptionProfile(codexHome, input.host);
   const executables = {
     node: resolveSaariSparkKnownExecutable("node", input.host),

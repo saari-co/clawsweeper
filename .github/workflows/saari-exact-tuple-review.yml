@@ -361,11 +361,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ -z "${GITHUB_WORKSPACE:-}" ]; then
+            echo "GITHUB_WORKSPACE is unavailable." >&2
+            exit 1
+          fi
           run_root="$RUNNER_TEMP/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$run_root"
+          checkout="$GITHUB_WORKSPACE/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/checkout"
+          mkdir -p "$run_root" "$(dirname "$checkout")"
           {
             echo "PRODUCER_RUN_ROOT=$run_root"
-            echo "PRODUCER_CHECKOUT=$run_root/checkout"
+            echo "PRODUCER_CHECKOUT=$checkout"
             echo "PRODUCER_ENGINE=$run_root/engine"
             echo "PRODUCER_TARGET=$run_root/target"
             echo "PRODUCER_ARTIFACTS=$run_root/review-artifacts"
@@ -442,12 +447,13 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           token: ${{ secrets.ENGINE_CHECKOUT_TOKEN || github.token }}
-          path: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
+          path: saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
           fetch-depth: 0
           persist-credentials: false
+          set-safe-directory: false
 
       - name: Build the pinned native engine without shared caches
-        working-directory: ${{ runner.temp }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
+        working-directory: ${{ github.workspace }}/saari-exact-tuple-${{ github.run_id }}-${{ github.run_attempt }}/checkout
         shell: bash
         env:
           TRUSTED_ENGINE_REPOSITORY: ${{ job.workflow_repository }}

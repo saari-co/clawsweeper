@@ -22,10 +22,12 @@ import {
   SAARI_SPARK_COMMAND_LOCK_RELATIVE,
   SAARI_SPARK_LOGIN_METHOD,
   assertSaariExactTuplePublishBoundary,
+  assertActionsCheckoutPathUnderWorkspace,
   assertSaariSparkHostReuseContract,
   assertSaariSparkNoApiCredentialSetup,
   assertSaariSparkNoGlobalAuthWrites,
   assertTrustedEngineIdentity,
+  isActionsCheckoutPathUnderWorkspace,
   bindSaariExactTupleIdentity,
   comprehensiveExactTuplePrompt,
   prepareSaariSparkExactTupleRun,
@@ -304,6 +306,15 @@ test("reusable producer workflow stays tenant-isolated and artifact-only", () =>
   assert.match(workflow, /--disable-media-proof-preprocessing/);
   assert.match(workflow, /--readonly-openclaw/);
   assert.match(workflow, /--codex-sandbox read-only/);
+  assert.match(
+    workflow,
+    /path: saari-exact-tuple-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\/checkout/,
+  );
+  assert.match(workflow, /set-safe-directory: false/);
+  assert.match(
+    workflow,
+    /working-directory: \$\{\{ github\.workspace \}\}\/saari-exact-tuple-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}\/checkout/,
+  );
   assert.doesNotMatch(workflow, /\$\{\{\s*github\.sha\s*\}\}/);
   assert.doesNotMatch(workflow, /working-directory: .*PRODUCER_TARGET/);
   assert.doesNotMatch(
@@ -457,14 +468,17 @@ function writeExecutable(path: string, body: string): void {
 function fakeSparkHome(): {
   home: string;
   runnerTemp: string;
+  githubWorkspace: string;
   envFile: string;
 } {
   const root = mkdtempSync(join(tmpdir(), "saari-spark-home-"));
   const home = join(root, "home");
   const runnerTemp = join(root, "runner-temp");
+  const githubWorkspace = join(root, "workspace");
   mkdirSync(join(home, ".local", "bin"), { recursive: true });
   mkdirSync(join(home, ".config", "clawsweeper", "codex-home"), { recursive: true });
   mkdirSync(runnerTemp, { recursive: true });
+  mkdirSync(githubWorkspace, { recursive: true });
   writeFileSync(join(home, ".config", "clawsweeper", "codex-home", "auth.json"), "");
   for (const name of ["node", "gh", "codex", "corepack", "flock"]) {
     writeExecutable(
@@ -472,7 +486,7 @@ function fakeSparkHome(): {
       name === "node" ? "#!/bin/sh\necho 24\n" : "#!/bin/sh\nexit 0\n",
     );
   }
-  return { home, runnerTemp, envFile: join(root, "github.env") };
+  return { home, runnerTemp, githubWorkspace, envFile: join(root, "github.env") };
 }
 
 test("Spark subscription reuse rejects API setup and host auth writes", () => {
@@ -501,6 +515,7 @@ test("Spark isolated paths keep the shared lock and reject host checkout reuse",
   const fake = fakeSparkHome();
   const paths = saariSparkIsolatedPaths({
     runnerTemp: fake.runnerTemp,
+    githubWorkspace: fake.githubWorkspace,
     runId: "801",
     runAttempt: "2",
   });
@@ -511,11 +526,13 @@ test("Spark isolated paths keep the shared lock and reject host checkout reuse",
     host: {
       home: fake.home,
       runnerTemp: fake.runnerTemp,
+      githubWorkspace: fake.githubWorkspace,
       runId: "801",
       runAttempt: "2",
       env: { PATH: join(fake.home, ".local", "bin") },
     },
   });
+  assert.equal(paths.checkout, join(fake.githubWorkspace, "saari-exact-tuple-801-2", "checkout"));
   assert.equal(paths.engine, join(fake.runnerTemp, "saari-exact-tuple-801-2", "engine"));
   assert.equal(lockFile, join(fake.home, SAARI_SPARK_COMMAND_LOCK_RELATIVE));
   assert.equal(prepared.codexHome, join(fake.home, SAARI_SPARK_CODEX_HOME_RELATIVE));
@@ -544,6 +561,72 @@ test("Spark isolated paths keep the shared lock and reject host checkout reuse",
   );
 });
 
+test("official checkout containment admits unique workspace path and rejects runner temp", () => {
+  const githubWorkspace = "/home/runner/work/clawsweeper/clawsweeper";
+  const runnerTemp = "/home/runner/work/_temp";
+  const relativeCheckout = "saari-exact-tuple-801-2/checkout";
+  const workspaceCheckout = `${githubWorkspace}/${relativeCheckout}`;
+  const runnerTempCheckout = `${runnerTemp}/saari-exact-tuple-801-2/checkout`;
+
+  assert.equal(isActionsCheckoutPathUnderWorkspace(relativeCheckout, githubWorkspace), true);
+  assert.equal(isActionsCheckoutPathUnderWorkspace(workspaceCheckout, githubWorkspace), true);
+  assert.equal(
+    assertActionsCheckoutPathUnderWorkspace(relativeCheckout, githubWorkspace),
+    workspaceCheckout,
+  );
+  assert.equal(isActionsCheckoutPathUnderWorkspace(runnerTempCheckout, githubWorkspace), false);
+  assert.throws(
+    () => assertActionsCheckoutPathUnderWorkspace(runnerTempCheckout, githubWorkspace),
+    /Repository path '\/home\/runner\/work\/_temp\/saari-exact-tuple-801-2\/checkout' is not under '\/home\/runner\/work\/clawsweeper\/clawsweeper'/,
+  );
+
+  const paths = saariSparkIsolatedPaths({
+    githubWorkspace,
+    runnerTemp,
+    runId: "801",
+    runAttempt: "2",
+  });
+  assert.equal(paths.checkout, workspaceCheckout);
+  assert.equal(paths.engine, `${runnerTemp}/saari-exact-tuple-801-2/engine`);
+  assert.equal(paths.target, `${runnerTemp}/saari-exact-tuple-801-2/target`);
+  assert.equal(paths.emptyState, `${runnerTemp}/saari-exact-tuple-801-2/empty-state`);
+  assert.equal(paths.artifacts, `${runnerTemp}/saari-exact-tuple-801-2/review-artifacts`);
+  assert.equal(isActionsCheckoutPathUnderWorkspace(paths.checkout, githubWorkspace), true);
+  assert.equal(isActionsCheckoutPathUnderWorkspace(paths.engine, githubWorkspace), false);
+
+  const workflow = readText(".github/workflows/saari-exact-tuple-review.yml");
+  const isolate = extractStepRunScript(workflow, "Isolate unique per-run producer paths");
+  const fake = fakeSparkHome();
+  const isolated = runPinnedEngineScript(isolate, {
+    GITHUB_WORKSPACE: fake.githubWorkspace,
+    RUNNER_TEMP: fake.runnerTemp,
+    GITHUB_RUN_ID: "801",
+    GITHUB_RUN_ATTEMPT: "2",
+    GITHUB_ENV: fake.envFile,
+  });
+  assert.equal(isolated.ok, true);
+  const envText = readText(fake.envFile);
+  assert.match(
+    envText,
+    new RegExp(`PRODUCER_CHECKOUT=${fake.githubWorkspace}/saari-exact-tuple-801-2/checkout`),
+  );
+  assert.match(
+    envText,
+    new RegExp(`PRODUCER_ENGINE=${fake.runnerTemp}/saari-exact-tuple-801-2/engine`),
+  );
+  assert.doesNotMatch(envText, /PRODUCER_CHECKOUT=.*runner-temp/);
+
+  const missingWorkspace = runPinnedEngineScript(isolate, {
+    GITHUB_WORKSPACE: "",
+    RUNNER_TEMP: fake.runnerTemp,
+    GITHUB_RUN_ID: "801",
+    GITHUB_RUN_ATTEMPT: "2",
+    GITHUB_ENV: fake.envFile,
+  });
+  assert.equal(missingWorkspace.ok, false);
+  assert.match(missingWorkspace.stderr, /GITHUB_WORKSPACE is unavailable/);
+});
+
 test("exact identity mismatches reject before any Spark host work", () => {
   const hostTouched = (): boolean => {
     throw new Error("host work started");
@@ -551,6 +634,7 @@ test("exact identity mismatches reject before any Spark host work", () => {
   const host = {
     home: "/should-not-touch",
     runnerTemp: "/should-not-touch",
+    githubWorkspace: "/should-not-touch-workspace",
     runId: "801",
     runAttempt: "1",
     exists: hostTouched,

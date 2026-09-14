@@ -14,7 +14,7 @@
       "source_path": ".github/workflows/dinkuskit-native-canary.yml",
       "source_sha256": "9178bb4215d154702a297f0b6ce87a6fa64442b39e71d86392a2c82b9e5567d1",
       "destination_path": ".github/workflows/saari-exact-tuple-review.yml",
-      "destination_sha256": "c78e6b4578ef7548d5d83c01f6d6aff03ebe98b37f172fe24ce843299eb3a123",
+      "destination_sha256": "ce7e91acf90cadeccc700182774cc2338393bd312c6cca6d7dd3c757986680c9",
       "adaptation": "Replace DinkusKit public allowlist, shared writer, App credential minting, and Copilot runtime with a single private Saari suite tenant, hosted admission, Spark-2 subscription reuse in place, github.token reads, artifact-only publication, job.workflow_sha engine binding, and epoch/scope/actor binding."
     },
     {
