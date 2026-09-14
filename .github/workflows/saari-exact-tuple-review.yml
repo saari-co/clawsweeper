@@ -259,6 +259,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
     env:
       BASE_REF: ${{ needs.admit.outputs.base_ref }}
       BASE_SHA: ${{ needs.admit.outputs.base_sha }}
@@ -443,6 +446,31 @@ jobs:
             echo "NODE_BIN=$node_bin"
             echo "GH_BIN=$gh_bin"
           } >> "$GITHUB_ENV"
+
+      - name: Verify native review context access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Native context hydration reads issue metadata even for a PR, plus
+          # its discussion, review history, check runs, and commit statuses.
+          # Check the real job token before expensive checkout/model work;
+          # discard response bodies and never print the token.
+          for resource in \
+            "issues/$PR_NUMBER" \
+            "issues/$PR_NUMBER/comments" \
+            "issues/$PR_NUMBER/timeline" \
+            "pulls/$PR_NUMBER" \
+            "pulls/$PR_NUMBER/files" \
+            "pulls/$PR_NUMBER/commits" \
+            "pulls/$PR_NUMBER/comments" \
+            "pulls/$PR_NUMBER/reviews" \
+            "commits/$HEAD_SHA/check-runs" \
+            "commits/$HEAD_SHA/status"; do
+            gh api "repos/$TARGET_REPO/$resource" --jq empty > /dev/null
+          done
+          echo "Native review context read access verified."
 
       - name: Check out the trusted ClawSweeper engine
         uses: actions/checkout@v7
