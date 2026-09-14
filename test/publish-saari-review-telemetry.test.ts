@@ -175,17 +175,44 @@ test("absent OpenClaw record stays unknown and is never success", () => {
   assert.equal(normalized.rows[0]?.clawsweeper, "success");
 });
 
-test("completed without review_clean does not infer OpenClaw success", () => {
+test("completed with an error or watchdog exit does not infer OpenClaw success", () => {
+  const queueRoot = fixtureRoot();
+  const reviewRoot = fixtureRoot();
+  writeDoneRecord(queueRoot, {
+    review_clean: undefined,
+    review_finding_count: undefined,
+    exit_code: 2,
+  });
+  const envelope = publish({ queueRoot, reviewRoot });
+  const normalized = normalizeTenantFeed("saari", envelope, NOW);
+  assert.equal(normalized.rows[0]?.openclaw, "unknown");
+  const watchdog = fixtureRoot();
+  writeDoneRecord(watchdog, { review_clean: undefined, review_finding_count: undefined, exit_code: 75 });
+  const watchdogRows = normalizeTenantFeed("saari", publish({ queueRoot: watchdog, reviewRoot }), NOW);
+  assert.equal(watchdogRows.rows[0]?.openclaw, "unknown");
+});
+
+test("a clean runner exit is terminal success even when review_clean is absent on the host", () => {
+  // Spark-2 done records carry only the runner exit code (0=clean, 10=recovered
+  // clean); review_clean is a downstream derivation and is not written there.
   const queueRoot = fixtureRoot();
   const reviewRoot = fixtureRoot();
   writeDoneRecord(queueRoot, {
     review_clean: undefined,
     review_finding_count: undefined,
     exit_code: 0,
+    base: "e".repeat(40),
   });
   const envelope = publish({ queueRoot, reviewRoot });
   const normalized = normalizeTenantFeed("saari", envelope, NOW);
-  assert.equal(normalized.rows[0]?.openclaw, "unknown");
+  assert.equal(normalized.rows[0]?.openclaw, "success");
+  assert.equal(normalized.rows[0]?.base_sha, "e".repeat(40));
+  const recovered = fixtureRoot();
+  writeDoneRecord(recovered, { review_clean: undefined, exit_code: 11 });
+  assert.equal(
+    normalizeTenantFeed("saari", publish({ queueRoot: recovered, reviewRoot }), NOW).rows[0]?.openclaw,
+    "failure",
+  );
 });
 
 test("completed with findings is an explicit OpenClaw failure", () => {

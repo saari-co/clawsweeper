@@ -282,11 +282,16 @@ function openclawFromRecord(record, directoryStatus) {
   const findingCount = integerish(record.review_finding_count);
   const completed = ["completed", "done", "needs-human", "failed"].includes(statusText);
   if (!completed) return { openclaw: "unknown", openclaw_conclusion: null };
-  if (exitCode === 0 && reviewClean === true) {
-    return { openclaw: "completed", openclaw_conclusion: "success" };
-  }
-  if (reviewClean === false || (findingCount !== null && findingCount > 0) || exitCode === 1) {
+  // autoreview-run exit legend: 0=clean, 1=findings, 2=error,
+  // 10/11=recovered clean/findings, 75/76=watchdog gave up. Only a clean
+  // exit is terminal success; error/watchdog exits stay unknown.
+  const cleanExit = exitCode === 0 || exitCode === 10;
+  const findingsExit = exitCode === 1 || exitCode === 11;
+  if (reviewClean === false || (findingCount !== null && findingCount > 0) || findingsExit) {
     return { openclaw: "completed", openclaw_conclusion: "failure" };
+  }
+  if (cleanExit && reviewClean !== false) {
+    return { openclaw: "completed", openclaw_conclusion: "success" };
   }
   if (statusText === "failed" && exitCode !== null && exitCode !== 0) {
     return { openclaw: "completed", openclaw_conclusion: "failure" };
@@ -581,7 +586,7 @@ export function buildSaariReviewTelemetry(options) {
       repository: identity.repository,
       pr_number: identity.prNumber,
       head_sha: headSha,
-      base_sha: sha(record.base_sha) ?? sha(record.submitted_base),
+      base_sha: sha(record.base_sha) ?? sha(record.submitted_base) ?? sha(record.base),
       ...openclaw,
       observed_at: isoDate(record.submitted_at_utc ?? record.observed_at, now),
       prUrl: identity.prUrl,
