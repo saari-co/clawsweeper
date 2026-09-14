@@ -187,8 +187,16 @@ test("completed with an error or watchdog exit does not infer OpenClaw success",
   const normalized = normalizeTenantFeed("saari", envelope, NOW);
   assert.equal(normalized.rows[0]?.openclaw, "unknown");
   const watchdog = fixtureRoot();
-  writeDoneRecord(watchdog, { review_clean: undefined, review_finding_count: undefined, exit_code: 75 });
-  const watchdogRows = normalizeTenantFeed("saari", publish({ queueRoot: watchdog, reviewRoot }), NOW);
+  writeDoneRecord(watchdog, {
+    review_clean: undefined,
+    review_finding_count: undefined,
+    exit_code: 75,
+  });
+  const watchdogRows = normalizeTenantFeed(
+    "saari",
+    publish({ queueRoot: watchdog, reviewRoot }),
+    NOW,
+  );
   assert.equal(watchdogRows.rows[0]?.openclaw, "unknown");
 });
 
@@ -210,7 +218,8 @@ test("a clean runner exit is terminal success even when review_clean is absent o
   const recovered = fixtureRoot();
   writeDoneRecord(recovered, { review_clean: undefined, exit_code: 11 });
   assert.equal(
-    normalizeTenantFeed("saari", publish({ queueRoot: recovered, reviewRoot }), NOW).rows[0]?.openclaw,
+    normalizeTenantFeed("saari", publish({ queueRoot: recovered, reviewRoot }), NOW).rows[0]
+      ?.openclaw,
     "failure",
   );
 });
