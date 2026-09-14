@@ -492,9 +492,17 @@ jobs:
           target_dir="$PRODUCER_TARGET"
           hooks_dir="$PRODUCER_RUN_ROOT/disabled-git-hooks"
           mkdir -p "$hooks_dir" "$(dirname "$target_dir")"
-          gh repo clone "$TARGET_REPO" "$target_dir" -- --filter=blob:none --no-checkout
+          # The job intentionally ignores global Git configuration. Route only
+          # these Git reads through gh's helper and the inherited read token;
+          # never persist the helper or token in the target or host config.
+          target_git() {
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"
+          }
+          # Fetch full objects: later read-only review must not lazy-fetch
+          # missing base blobs after this credential-scoped setup ends.
+          target_git clone --no-checkout "https://github.com/$TARGET_REPO.git" "$target_dir"
           git -C "$target_dir" config core.hooksPath "$hooks_dir"
-          git -C "$target_dir" fetch --force --no-tags origin \
+          target_git -C "$target_dir" fetch --force --no-tags origin \
             "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
             "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/clawsweeper-pr-$PR_NUMBER"
           test "$(git -C "$target_dir" rev-parse "refs/remotes/origin/$BASE_REF")" = "$BASE_SHA"
