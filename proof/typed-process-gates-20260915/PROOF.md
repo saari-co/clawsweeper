@@ -41,3 +41,35 @@ base `790fd23f6bd70298c4ad63ad951fe715a8d389c0`:
 No baseline source was changed to conceal these results. Final fresh full-check
 and hosted exact-head CI results are recorded in the PR handoff. Committed-source
 review is a separate gate; no live reviewer or deployment result is claimed here.
+
+## Comprehensive-review bounded repairs
+
+The recovered comprehensive P3 review of `78a49b1` identified two accepted
+findings. Both are `required_fix`:
+
+- Runner check lookup now requests `filter=all`, paginates the entire check set,
+  and evaluates exact-tuple uniqueness only after collecting it. Truncation,
+  changing counts, invalid/repeated IDs and exhaustion of the 1,000-page safety
+  bound abort rather than qualifying incomplete evidence. Regression fixtures
+  exercise an enrolled check after 100 unrelated checks and an older duplicate
+  on the later page.
+- Decision JSON Schema enumerates the five valid unique gate arrays, matching
+  the existing runtime parser. The requested `uniqueItems` keyword is forbidden
+  by the Codex strict-output contract; full validation caught that incompatibility,
+  so an equivalent finite enum is used without weakening schema checks.
+
+Fresh `pnpm run build` and all nine process-gate tests passed. The actual
+producer/report/ZIP-to-Conductor serialization command above passed again with
+unchanged consumer identity. These are controlled source/protocol exercises,
+not a claim of live GitHub completeness or deployed review success. No Bay
+surface, runtime configuration, credential, or live check was changed.
+
+The parent-routed bounded precommit reviewer inspected all five repair files and
+found no actionable findings. Nine process-gate regressions, the actual Codex
+strict-output compatibility check, and whitespace validation passed. Review
+accepted the finite enum rather than the unsupported `uniqueItems` keyword.
+
+Final fresh `pnpm run check` completed successfully after the compatibility
+correction, including full coverage reporting. The first attempt failed only
+the existing strict-output-keyword contract on `uniqueItems`; that failure was
+fixed at the schema source, not bypassed or relabeled.

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { parseDecision } from "../dist/clawsweeper.js";
 import {
+  fetchProcessGateChecks,
   parseProcessGates,
   qualifyOwnCurrentCheck,
   validateDecisionProcessGates,
@@ -195,4 +196,77 @@ test("real decision parser and report renderer preserve qualified process eviden
   assert.match(report, /^review_epoch: 3$/m);
   assert.match(report, /^local_checkout_access: verified$/m);
   assert.equal(reportProcessGates(processGateReport()), undefined);
+});
+
+test("complete check lookup includes older attempts beyond the first 100", () => {
+  const unrelated = Array.from({ length: 100 }, (_, n) => ({ ...check, id: n + 1000, name: "CI" }));
+  for (const duplicate of [false, true]) {
+    const all = [...unrelated, check, ...(duplicate ? [{ ...check, id: 2000 }] : [])];
+    const paths: string[] = [];
+    const fetched = fetchProcessGateChecks(
+      (args) => {
+        paths.push(args[1]!);
+        const page = Number(new URL(`https://api.github.com/${args[1]}`).searchParams.get("page"));
+        return { total_count: all.length, check_runs: all.slice((page - 1) * 100, page * 100) };
+      },
+      identity.repository,
+      identity.headSha,
+    );
+    assert.equal(paths.length, 2);
+    for (const path of paths) assert.match(path, /filter=all&per_page=100&page=[12]$/);
+    assert.equal(qualifyOwnCurrentCheck(identity, tenant, pull, fetched), !duplicate);
+  }
+});
+
+test("check pagination rejects truncated, drifting, malformed and repeated pages", () => {
+  const first = Array.from({ length: 100 }, (_, n) => ({ ...check, id: n + 1000 }));
+  for (const second of [
+    { total_count: 101, check_runs: [] },
+    { total_count: 102, check_runs: [{ ...check, id: 2000 }] },
+    { total_count: 101, check_runs: [first[0]] },
+    { total_count: 101, check_runs: [{ ...check, id: "2000" }] },
+  ]) {
+    let calls = 0;
+    assert.throws(
+      () =>
+        fetchProcessGateChecks(
+          () => (++calls === 1 ? { total_count: 101, check_runs: first } : second),
+          identity.repository,
+          identity.headSha,
+        ),
+      /pagination/,
+    );
+  }
+  assert.throws(
+    () =>
+      fetchProcessGateChecks(
+        () => ({ total_count: 2, check_runs: [check] }),
+        identity.repository,
+        identity.headSha,
+      ),
+    /pagination/,
+  );
+});
+
+test("decision schema requires the same unique process gates as the runtime parser", () => {
+  const schema = JSON.parse(
+    readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url), "utf8"),
+  );
+  const allowed = schema.properties.processGates.enum;
+  assert.deepEqual(allowed, [
+    [],
+    ["own_current_check"],
+    ["owner_merge_authority"],
+    ["own_current_check", "owner_merge_authority"],
+    ["owner_merge_authority", "own_current_check"],
+  ]);
+  for (const gates of allowed) assert.deepEqual(parseProcessGates(gates), gates);
+  assert.equal(
+    allowed.some((gates: string[]) => new Set(gates).size !== gates.length),
+    false,
+  );
+  assert.throws(
+    () => parseProcessGates(["owner_merge_authority", "owner_merge_authority"]),
+    /unique/,
+  );
 });

@@ -66,6 +66,13 @@
   "properties": {
     "processGates": {
       "type": "array",
+      "enum": [
+        [],
+        ["own_current_check"],
+        ["owner_merge_authority"],
+        ["own_current_check", "owner_merge_authority"],
+        ["owner_merge_authority", "own_current_check"]
+      ],
       "items": { "type": "string", "enum": ["own_current_check", "owner_merge_authority"] },
       "maxItems": 2
     },

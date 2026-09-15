@@ -26,7 +26,7 @@ import {
   skipMediaProofPreprocessing,
 } from "./clawsweeper-media-proof.js";
 import { comprehensiveExactTuplePrompt, saariExactTupleTenant } from "./saari-exact-tuple.js";
-import { qualifyOwnCurrentCheck } from "./review-process-gates.js";
+import { fetchProcessGateChecks, qualifyOwnCurrentCheck } from "./review-process-gates.js";
 import type {
   AcquiredReviewStartLease,
   BulkFilerCountCache,
@@ -1451,7 +1451,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           ? qualifyOwnCurrentCheck(
               exactTupleIdentity, processGateTenant,
               dependencies.ghJson(["api", `repos/${item.repo}/pulls/${item.number}`]),
-              dependencies.ghJson(["api", `repos/${item.repo}/commits/${exactTupleIdentity.headSha}/check-runs?per_page=100`]),
+              fetchProcessGateChecks(dependencies.ghJson, item.repo, exactTupleIdentity.headSha),
             ) : false;
         const reviewEnv = reviewEnvironment(localOnly);
         const prompt = buildReviewPrompt(

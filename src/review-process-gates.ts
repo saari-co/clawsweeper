@@ -24,6 +24,50 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/** Fetch all check attempts; never qualify a truncated or drifting page set. */
+export function fetchProcessGateChecks(
+  ghJson: (args: string[]) => unknown,
+  repository: string,
+  headSha: string,
+): { total_count: number; check_runs: unknown[] } {
+  const runs: unknown[] = [];
+  const ids = new Set<number>();
+  let total: number | undefined;
+  for (let page = 1; page <= 1000; page++) {
+    const response = record(
+      ghJson([
+        "api",
+        `repos/${repository}/commits/${headSha}/check-runs?filter=all&per_page=100&page=${page}`,
+      ]),
+    );
+    const count = response.total_count;
+    const entries = response.check_runs;
+    if (
+      !Number.isSafeInteger(count) ||
+      (count as number) < 0 ||
+      !Array.isArray(entries) ||
+      entries.length > 100 ||
+      (total !== undefined && total !== count)
+    ) {
+      throw new Error("process-gate check pagination is incomplete or changed");
+    }
+    total = count as number;
+    for (const entry of entries) {
+      const id = record(entry).id;
+      if (!Number.isSafeInteger(id) || (id as number) <= 0 || ids.has(id as number)) {
+        throw new Error("process-gate check pagination has invalid or repeated IDs");
+      }
+      ids.add(id as number);
+      runs.push(entry);
+    }
+    if (runs.length > total || (runs.length < total && entries.length !== 100)) {
+      throw new Error("process-gate check pagination is incomplete or changed");
+    }
+    if (runs.length === total) return { total_count: total, check_runs: runs };
+  }
+  throw new Error("process-gate check pagination exceeded its safe bound");
+}
+
 /** Inputs must come from the runner's GitHub API, never PR text or model output. */
 export function qualifyOwnCurrentCheck(
   identity: SaariExactTupleIdentity,
@@ -52,11 +96,7 @@ export function qualifyOwnCurrentCheck(
   )
     return false;
   const checks = record(checksValue);
-  if (
-    !Array.isArray(checks.check_runs) ||
-    checks.total_count !== checks.check_runs.length ||
-    checks.check_runs.length > 100
-  )
+  if (!Array.isArray(checks.check_runs) || checks.total_count !== checks.check_runs.length)
     return false;
   const externalId =
     "review-conductor:" +
