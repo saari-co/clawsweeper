@@ -1282,3 +1282,20 @@ explain the blocker in `workReason`. For fix-PR candidates, use
 Always fill the vision-fit fields too. For older/non-applicable paths use
 `visionFit: "not_applicable"`, `implementationComplexity: "not_applicable"`,
 `autoImplementationCandidate: "none"`, a short reason, and empty evidence.
+
+## Process waiting versus patch content
+
+Optional `processGates` is a unique array containing only `own_current_check`
+and/or `owner_merge_authority`. Omit it or use [] when no affirmative reason
+is established. Never infer gates from `keep_open`, a grade, or review prose.
+Only claim `own_current_check` when the runner's exact-tuple prompt explicitly
+qualifies it. It describes this review's own in-flight check, not other CI.
+Assess and grade patch content independently of that circular check; owner
+merge approval is not a code defect. Neither gate waives findings, unavailable
+tools, inadequate proof, contributor work, or a real maintainer/product/policy
+decision. Keep those failures and decisions explicit in their existing fields.
+These gates never authorize merge and are only valid for `keep_open`.
+
+Routine owner merge approval alone is not `maintainerDecision.required`: record
+it as `owner_merge_authority` without inventing a product, security, or proof
+question. A real unresolved maintainer question must still set that field.

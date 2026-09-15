@@ -59,6 +59,7 @@ import {
   isTerminalCodexErrorMessage,
 } from "./codex-transient.js";
 import { UserFacingCommandError } from "./command.js";
+import { validateDecisionProcessGates } from "./review-process-gates.js";
 import { emptyMaintainerDecision } from "./decision-packets.js";
 import {
   openClawCodexSourcePreparationFailureRetryable,
@@ -1033,6 +1034,7 @@ ${exactTuple}${extra}
     streamFileBytes?: number;
     quietLogs?: boolean;
     extraCodexConfig?: string[];
+    qualifiedOwnCurrentCheck?: boolean;
   }): Decision {
     if (!Number.isSafeInteger(options.resultFileBytes) || options.resultFileBytes <= 0) {
       throw new UserFacingCommandError("Review result output requires a positive byte limit.");
@@ -1190,6 +1192,11 @@ ${exactTuple}${extra}
         const decision = parseDecision(
           JSON.parse(readBoundedReviewResult(outputPath, options.resultFileBytes).trim()),
           options.item,
+        );
+        validateDecisionProcessGates(
+          decision,
+          options.qualifiedOwnCurrentCheck === true,
+          result.status === 0,
         );
         if (result.status !== 0) {
           if (!options.quietLogs) {

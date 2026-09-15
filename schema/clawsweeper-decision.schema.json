@@ -64,6 +64,11 @@
     "workLikelyFiles"
   ],
   "properties": {
+    "processGates": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["own_current_check", "owner_merge_authority"] },
+      "maxItems": 2
+    },
     "decision": {
       "type": "string",
       "enum": ["close", "keep_open"]
