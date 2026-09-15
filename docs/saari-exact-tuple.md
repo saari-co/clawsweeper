@@ -75,8 +75,11 @@ status, and the Conductor external ID hashing repository/PR/base/head/epoch/name
 Model-provided identity, unrelated CI, a stale epoch, or a copied marker from
 another App cannot qualify the gate.
 
-The optional model `processGates` array accepts only `own_current_check` and
-`owner_merge_authority`, without duplicates. Runtime rejects an unqualified
+The generation schema requires `processGates` (`[]` when none). Legacy stored
+reports may still omit it; omission conveys no gate evidence. The array accepts only `own_current_check` and
+`owner_merge_authority`. The generation schema bounds item values and count;
+the parser enforces uniqueness because the native schema consumer rejects
+array-valued enums and `uniqueItems`. Runtime rejects an unqualified
 own-check claim and process claims on nonzero terminal exit. Reports serialize
 validated reasons as JSON `process_gates` frontmatter. The field does not change
 grades or findings and never grants merge authority. The model must assess

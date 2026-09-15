@@ -248,25 +248,41 @@ test("check pagination rejects truncated, drifting, malformed and repeated pages
   );
 });
 
-test("decision schema requires the same unique process gates as the runtime parser", () => {
+test("generation requires explicit supported gates; parser enforces semantic uniqueness", () => {
   const schema = JSON.parse(
     readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url), "utf8"),
   );
-  const allowed = schema.properties.processGates.enum;
-  assert.deepEqual(allowed, [
+  assert.ok(schema.required.includes("processGates"), "generation requires an explicit gate array");
+  assert.equal(schema.properties.processGates.type, "array");
+  assert.equal(schema.properties.processGates.maxItems, 2);
+  assert.equal(
+    schema.properties.processGates.enum,
+    undefined,
+    "array-valued enums are not accepted by Codex",
+  );
+  assert.equal(schema.properties.processGates.uniqueItems, undefined);
+  assert.deepEqual(schema.properties.processGates.items.enum, [
+    "own_current_check",
+    "owner_merge_authority",
+  ]);
+  const allowed = [
     [],
     ["own_current_check"],
     ["owner_merge_authority"],
     ["own_current_check", "owner_merge_authority"],
     ["owner_merge_authority", "own_current_check"],
-  ]);
-  for (const gates of allowed) assert.deepEqual(parseProcessGates(gates), gates);
+  ];
+  for (const gates of allowed) {
+    assert.deepEqual(parseProcessGates(gates), gates);
+    assert.deepEqual(parseDecision(closeDecision({ processGates: gates })).processGates, gates);
+  }
+  for (const gate of schema.properties.processGates.items.enum) {
+    assert.throws(() => parseProcessGates([gate, gate]), /unique/);
+    assert.throws(() => parseDecision(closeDecision({ processGates: [gate, gate] })), /unique/);
+  }
   assert.equal(
-    allowed.some((gates: string[]) => new Set(gates).size !== gates.length),
-    false,
-  );
-  assert.throws(
-    () => parseProcessGates(["owner_merge_authority", "owner_merge_authority"]),
-    /unique/,
+    parseDecision(closeDecision()).processGates,
+    undefined,
+    "legacy omission remains unknown",
   );
 });

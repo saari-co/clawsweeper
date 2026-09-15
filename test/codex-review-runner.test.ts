@@ -150,7 +150,7 @@ ${fakeManagedDecision}
   });
 }
 
-test("Codex decision schema avoids unsupported strict-output keywords recursively", () => {
+test("Codex decision schema enforces strict-output object contracts and supported keywords recursively", () => {
   const schema = JSON.parse(
     readFileSync(join(process.cwd(), "schema", "clawsweeper-decision.schema.json"), "utf8"),
   ) as unknown;
@@ -162,6 +162,25 @@ test("Codex decision schema avoids unsupported strict-output keywords recursivel
     if (Array.isArray(value)) {
       value.forEach((entry, index) => visit(entry, `${path}[${index}]`));
       return;
+    }
+    const node = value as Record<string, unknown>;
+    const types = Array.isArray(node.type) ? node.type : [node.type];
+    if (Array.isArray(node.enum)) {
+      assert.ok(
+        node.enum.every(
+          (entry) => entry === null || ["string", "number", "boolean"].includes(typeof entry),
+        ),
+        `${path}: enum values must be scalar for the native strict-output consumer`,
+      );
+    }
+    if (types.includes("object") || node.properties) {
+      assert.equal(node.additionalProperties, false, `${path}: objects must be closed`);
+      assert.ok(Array.isArray(node.required), `${path}: objects must declare required fields`);
+      assert.deepEqual(
+        [...(node.required as string[])].sort(),
+        Object.keys((node.properties ?? {}) as object).sort(),
+        `${path}: every property must be required (nullable objects included)`,
+      );
     }
     for (const [key, child] of Object.entries(value)) {
       const childPath = `${path}.${key}`;
