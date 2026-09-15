@@ -1,0 +1,11 @@
+{
+  "result": "fail",
+  "exit_code": 1,
+  "schema_sha256": "d5fdd4da1b25623c1885b77c58bf2a6de722abe72b62d931aab3bc7162b95a2e",
+  "proof_kind": "synthetic_complete_schema_acceptance",
+  "review_performed": false,
+  "error_markers": [
+    "invalid_json_schema",
+    "Invalid schema"
+  ]
+}

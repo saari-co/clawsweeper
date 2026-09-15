@@ -3,6 +3,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "processGates",
     "decision",
     "closeReason",
     "confidence",
@@ -65,14 +66,8 @@
   ],
   "properties": {
     "processGates": {
+      "description": "Explicit process-only gates supported by host evidence. Use [] when no gate applies; never infer clean content or merge permission from a process gate.",
       "type": "array",
-      "enum": [
-        [],
-        ["own_current_check"],
-        ["owner_merge_authority"],
-        ["own_current_check", "owner_merge_authority"],
-        ["owner_merge_authority", "own_current_check"]
-      ],
       "items": { "type": "string", "enum": ["own_current_check", "owner_merge_authority"] },
       "maxItems": 2
     },
