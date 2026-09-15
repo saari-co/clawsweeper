@@ -60,6 +60,34 @@ come from the overlay. Caller or PR stamps are rejected.
 The artifact name is `<artifact_prefix>-<run_id>-<attempt>` and contains only
 `manifest.json` plus `review/<pr>.md`.
 
+## Optional process-gate evidence
+
+A tenant may additionally enroll its Conductor check with
+`"process_gate_check": {"app_id": 123, "name": "Native Review"}`. These are
+synthetic values: use the actual trusted App ID and exact check name in the
+private host overlay. Omission preserves legacy behavior and cannot qualify
+`own_current_check`.
+
+Before invoking the model, the credentialed runner reads the live PR and
+exact-head check list. It requires an open matching repository ID/PR/base/head,
+a complete check response, exactly one enrolled-issuer/name match, pending
+status, and the Conductor external ID hashing repository/PR/base/head/epoch/name.
+Model-provided identity, unrelated CI, a stale epoch, or a copied marker from
+another App cannot qualify the gate.
+
+The optional model `processGates` array accepts only `own_current_check` and
+`owner_merge_authority`, without duplicates. Runtime rejects an unqualified
+own-check claim and process claims on nonzero terminal exit. Reports serialize
+validated reasons as JSON `process_gates` frontmatter. The field does not change
+grades or findings and never grants merge authority. The model must assess
+patch content independently of its own pending check; missing/empty evidence
+or owner authority alone does not explain a non-ready grade. Findings, proof
+deficiencies and explicit policy decisions continue to block in Conductor.
+
+Controlled report/bundle consumer proof is available with
+`node scripts/prove-process-gates.ts <current-conductor-checkout>` after build.
+It is source/protocol proof, not deployment or a live-review claim.
+
 ## Runtime prerequisites
 
 Hosted admission stays on `ubuntu-latest` and binds the live GitHub tuple with

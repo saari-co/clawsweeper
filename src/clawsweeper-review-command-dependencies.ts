@@ -357,6 +357,7 @@ export interface CreateReviewCommandWorkflowDependencies {
     streamFileBytes?: number;
     quietLogs?: boolean;
     extraCodexConfig?: string[];
+    qualifiedOwnCurrentCheck?: boolean;
   }) => Decision;
   selectCandidates: (options: {
     batchSize: number;

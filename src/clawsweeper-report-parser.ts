@@ -1,3 +1,4 @@
+import { parseProcessGates, type ProcessGate } from "./review-process-gates.js";
 import {
   derivedPrRating,
   normalizePrRating,
@@ -128,6 +129,16 @@ const parseRecordedLiveProofPlan = createDecisionParser({
   neutralizeOwnedSectionSpoofing: neutralizeLiveProofText,
   sanitizeArchitectureDiagram: (value) => value,
 }).parseLiveProofPlan;
+
+/** Preserve explicit process evidence; malformed and duplicate fields fail closed. */
+export function reportProcessGates(markdown: string): ProcessGate[] | undefined {
+  const front = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (front === undefined) return undefined;
+  const fields = front.split(/\r?\n/).filter((line) => line.startsWith("process_gates:"));
+  if (fields.length === 0) return undefined;
+  if (fields.length !== 1) throw new Error("duplicate process_gates frontmatter");
+  return parseProcessGates(JSON.parse(fields[0]!.slice("process_gates:".length).trim()));
+}
 
 export function reportLiveProofPlan(markdown: string): LiveProofPlan {
   const section = reportSectionValue(markdown, LIVE_PROOF_SECTION_HEADING);

@@ -20,6 +20,7 @@ const ACTOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{1,199}$/;
 const ARTIFACT_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/;
 
 export interface SaariExactTupleTenant {
+  processGateCheck?: { appId: number; name: string };
   repository: string;
   repositoryId: number;
   visibility: "private";
@@ -662,7 +663,30 @@ function parseTenant(entry: unknown, index: number): SaariExactTupleTenant {
     reviewScope: EXACT_TUPLE_REVIEW_SCOPE,
     artifactPrefix,
     publishSideEffects: false,
+    ...(record.process_gate_check === undefined
+      ? {}
+      : {
+          processGateCheck: parseProcessGateCheck(record.process_gate_check),
+        }),
   };
+}
+
+function parseProcessGateCheck(value: unknown): { appId: number; name: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("process_gate_check must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).some((key) => !["app_id", "name"].includes(key)) ||
+    !Number.isSafeInteger(record.app_id) ||
+    Number(record.app_id) < 1 ||
+    typeof record.name !== "string" ||
+    !record.name.trim() ||
+    record.name !== record.name.trim()
+  ) {
+    throw new Error("process_gate_check requires a positive app_id and exact check name");
+  }
+  return { appId: Number(record.app_id), name: record.name };
 }
 
 function normalizeRepo(value: string): string {

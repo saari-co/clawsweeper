@@ -25,7 +25,8 @@ import {
   resolvePreparedMediaProof,
   skipMediaProofPreprocessing,
 } from "./clawsweeper-media-proof.js";
-import { comprehensiveExactTuplePrompt } from "./saari-exact-tuple.js";
+import { comprehensiveExactTuplePrompt, saariExactTupleTenant } from "./saari-exact-tuple.js";
+import { fetchProcessGateChecks, qualifyOwnCurrentCheck } from "./review-process-gates.js";
 import type {
   AcquiredReviewStartLease,
   BulkFilerCountCache,
@@ -1444,6 +1445,14 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           reviewOutputMediaLimits(outputBudget, proofScratchDir),
           writeOutputMetadata,
         );
+        const processGateTenant = exactTupleIdentity
+          ? saariExactTupleTenant(exactTupleIdentity.repository) : undefined;
+        const qualifiedOwnCurrentCheck = exactTupleIdentity && processGateTenant?.processGateCheck
+          ? qualifyOwnCurrentCheck(
+              exactTupleIdentity, processGateTenant,
+              dependencies.ghJson(["api", `repos/${item.repo}/pulls/${item.number}`]),
+              fetchProcessGateChecks(dependencies.ghJson, item.repo, exactTupleIdentity.headSha),
+            ) : false;
         const reviewEnv = reviewEnvironment(localOnly);
         const prompt = buildReviewPrompt(
           item,
@@ -1455,7 +1464,9 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             targetDir: reviewOpenclawDir,
             ...reviewNetworkCapability(sandboxMode, reviewEnv),
             ...(exactTupleIdentity
-              ? { exactTuplePrompt: comprehensiveExactTuplePrompt(exactTupleIdentity) }
+              ? { exactTuplePrompt: comprehensiveExactTuplePrompt(exactTupleIdentity) +
+                  `\nRunner-qualified own_current_check: ${qualifiedOwnCurrentCheck}. ` +
+                  "Only when true may processGates include own_current_check. Assess content/proof independently; never infer a clean grade from this gate." }
               : {}),
           },
         );
@@ -1509,6 +1520,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             additionalPrompt,
             proofScratchDir,
             prompt: prompt.text,
+            qualifiedOwnCurrentCheck,
             reviewEnv,
             promptFileBytes: itemOutputBudget.promptFileBytes,
             resultFileBytes: itemOutputBudget.resultFileBytes,

@@ -88,6 +88,7 @@ import type {
 } from "./clawsweeper-types.js";
 import { derivedPrRating, normalizePrRating } from "./clawsweeper-rating.js";
 import { parseNextStep } from "./clawsweeper-next-step.js";
+import { parseProcessGates } from "./review-process-gates.js";
 import { parseMaintainerDecision } from "./decision-packets.js";
 import { DEFAULT_TARGET_REPO, normalizeRepo } from "./repository-profiles.js";
 
@@ -1030,6 +1031,9 @@ export function createDecisionParser({
         ? undefined
         : parseNextStep(record.nextStep, "decision.nextStep");
     const decision: Decision = {
+      ...(record.processGates === undefined
+        ? {}
+        : { processGates: parseProcessGates(record.processGates)! }),
       decision: requireEnum(record.decision, DECISIONS, "decision.decision"),
       closeReason: requireEnum(record.closeReason, ALL_REASONS, "decision.closeReason"),
       confidence: requireEnum(record.confidence, CONFIDENCES, "decision.confidence"),
