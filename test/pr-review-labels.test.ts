@@ -873,3 +873,169 @@ Full review comments:
   );
   assert.doesNotMatch(comment, /remove `status: 📣 needs proof`/);
 });
+
+const PUBLISHED_LABEL_DETAILS =
+  /<details>\s*<summary>\s*Label changes\s*<\/summary>(.*?)<\/details>/gi;
+const PUBLISHED_LABEL_HEADING = /^### Labels\s*$/gim;
+const PUBLISHED_LABEL_END = /^#{1,3}\s|<\/details>|^<!--\s*clawsweeper-/im;
+const PUBLISHED_LABEL_TRANSITION = /^-\s+(add|remove)\s+`([^`\r\n]+)`\s*:\s*\S.*$/i;
+const PUBLISHED_LABEL_NO_CHANGES = /^(?:No label changes(?: needed| required)?|None)\.?$/i;
+
+function publishedLabelSections(body: string): string[] {
+  const sections = [...body.matchAll(PUBLISHED_LABEL_DETAILS)].map((match) => match[1] ?? "");
+  for (const heading of body.matchAll(PUBLISHED_LABEL_HEADING)) {
+    const tail = body.slice((heading.index ?? 0) + heading[0].length);
+    const end = tail.search(PUBLISHED_LABEL_END);
+    sections.push(end >= 0 ? tail.slice(0, end) : tail);
+  }
+  return sections;
+}
+
+function publishedLabelTransitions(body: string): { additions: string[]; removals: string[] } {
+  const sections = publishedLabelSections(body);
+  if (sections.length !== 1) {
+    throw new Error("label_section_missing_or_ambiguous");
+  }
+  const instructionBlock = (sections[0] ?? "")
+    .replace(/^Label justifications:\s*$[\s\S]*/im, "")
+    .trim();
+  const lines = instructionBlock
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines[0]?.toLowerCase() === "label changes:") lines.shift();
+  if (lines.length === 1 && PUBLISHED_LABEL_NO_CHANGES.test(lines[0] ?? "")) {
+    return { additions: [], removals: [] };
+  }
+  if (!lines.length) throw new Error("label_instructions_missing");
+  const additions = new Map<string, string>();
+  const removals = new Map<string, string>();
+  for (const line of lines) {
+    const match = PUBLISHED_LABEL_TRANSITION.exec(line);
+    if (!match?.[2]?.trim()) throw new Error("label_instructions_malformed");
+    const label = match[2].trim();
+    const target = match[1]?.toLowerCase() === "add" ? additions : removals;
+    if (!target.has(label.toLowerCase())) target.set(label.toLowerCase(), label);
+  }
+  if ([...additions.keys()].some((label) => removals.has(label))) {
+    throw new Error("label_instructions_conflicting");
+  }
+  return { additions: [...additions.values()], removals: [...removals.values()] };
+}
+
+function classifyExactLabelSync(
+  body: string,
+  liveLabels: readonly string[],
+): {
+  label_sync: "matched" | "mismatch" | "unverifiable";
+  blockers: string[];
+  additions: string[];
+  removals: string[];
+} {
+  const liveKeys = new Set(liveLabels.map((label) => label.toLowerCase()));
+  try {
+    const { additions, removals } = publishedLabelTransitions(body);
+    const missingAdditions = additions.filter((label) => !liveKeys.has(label.toLowerCase()));
+    const retainedRemovals = removals.filter((label) => liveKeys.has(label.toLowerCase()));
+    return {
+      label_sync: missingAdditions.length || retainedRemovals.length ? "mismatch" : "matched",
+      blockers: [],
+      additions,
+      removals,
+    };
+  } catch (error) {
+    return {
+      label_sync: "unverifiable",
+      blockers: ["label_contract_invalid", String(error instanceof Error ? error.message : error)],
+      additions: [],
+      removals: [],
+    };
+  }
+}
+
+test("zero-transition durable comments emit an explicit no-op label contract", () => {
+  const currentLabels = [
+    "merge-risk: 🚨 security-boundary",
+    "proof: sufficient",
+    "rating: 🐚 platinum hermit",
+    "status: 👀 ready for maintainer look",
+  ];
+  const report = `${reportFrontMatter({
+    type: "pull_request",
+    number: "180",
+    decision: "keep_open",
+    close_reason: "none",
+    review_status: "complete",
+    confidence: "high",
+    author: "contributor",
+    author_association: "CONTRIBUTOR",
+    labels: JSON.stringify(currentLabels),
+    work_candidate: "none",
+    triage_priority: "none",
+    impact_labels: JSON.stringify([]),
+    merge_risk_labels: JSON.stringify(["merge-risk: 🚨 security-boundary"]),
+    label_justifications: JSON.stringify([
+      {
+        label: "merge-risk: 🚨 security-boundary",
+        reason: "The default engine can use GitHub App authority after merge.",
+      },
+    ]),
+  })}
+
+## Summary
+
+Keep this PR open for maintainer review.
+
+## What This Changes
+
+Pins a ClawSweeper review-lane engine after a proposal-only canary.
+
+## Best Possible Solution
+
+Keep the pin change gated on explicit owner approval.
+
+## Risks
+
+Merging changes the default review engine.
+
+${realBehaviorProofReportSection({
+  status: "sufficient",
+  evidenceKind: "linked_artifact",
+  needsContributorAction: false,
+  summary: "Staged build, source-pin, and proposal-only canary proof cover the engine pin change.",
+})}
+
+${prRatingReportSection({
+  overallTier: "B",
+  proofTier: "A",
+  patchTier: "B",
+})}
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`;
+
+  const comment = renderReviewCommentFromReport(report, "none", {
+    previousLabels: currentLabels,
+    prStatusKind: "ready_for_maintainer_look",
+  });
+  const labelDetails = detailsBody(comment, "Label changes");
+
+  assert.match(labelDetails, /### Labels/);
+  assert.match(labelDetails, /Label changes:\n\nNo label changes\./);
+  assert.match(labelDetails, /Label justifications:/);
+  assert.doesNotMatch(labelDetails, /^- add |^- remove /m);
+
+  const publication = classifyExactLabelSync(comment, currentLabels);
+  assert.deepEqual(publication.additions, []);
+  assert.deepEqual(publication.removals, []);
+  assert.equal(publication.label_sync, "matched");
+  assert.deepEqual(publication.blockers, []);
+});
