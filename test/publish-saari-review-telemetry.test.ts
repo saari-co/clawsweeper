@@ -9,6 +9,7 @@ import { normalizeTenantFeed } from "../dashboard/unified-review-dashboard.ts";
 import {
   buildSaariReviewTelemetry,
   CLAWSWEEPER_RANKS,
+  MAX_ROWS,
   parsePublisherArgs,
   SAARI_LANE,
   writeSaariReviewTelemetry,
@@ -269,6 +270,48 @@ test("proof links stay https-only and never include tokens or local paths", () =
     serialized,
     /ghs_must_never_escape|\/tmp\/secret-proof|TELEMETRY_SOURCE_TOKEN|HOME=/,
   );
+});
+
+test("selects the published row cap before per-row GitHub CI enrichment", () => {
+  const queueRoot = fixtureRoot();
+  const reviewRoot = fixtureRoot();
+  const doneDir = join(queueRoot, "done");
+  mkdirSync(doneDir, { recursive: true });
+  const overflow = MAX_ROWS + 3;
+  for (let number = 1; number <= overflow; number += 1) {
+    const headSha = number.toString(16).padStart(40, "0");
+    writeFileSync(
+      join(doneDir, `req-${number}.json`),
+      `${JSON.stringify({
+        submitted_head: headSha,
+        pr_url: `https://github.com/saari-co/x-api/pull/${number}`,
+        review_clean: true,
+        review_finding_count: 0,
+        status: "completed",
+        exit_code: 0,
+        repo: "saari-co/x-api",
+        submitted_at_utc: "2026-09-13T17:50:00Z",
+      })}\n`,
+    );
+  }
+  const calls: string[] = [];
+  const envelope = publish({
+    queueRoot,
+    reviewRoot,
+    ciSource: "gh",
+    ghExec: (repository, headSha) => {
+      calls.push(`${repository}:${headSha}`);
+      return { check_runs: [{ status: "completed", conclusion: "success" }] };
+    },
+  });
+  assert.equal(envelope.rows.length, MAX_ROWS);
+  assert.equal(calls.length, MAX_ROWS);
+  assert.deepEqual(
+    envelope.rows.map((row) => row.pr_number),
+    Array.from({ length: MAX_ROWS }, (_, index) => index + 1),
+  );
+  assert.equal(calls.at(-1), `saari-co/x-api:${MAX_ROWS.toString(16).padStart(40, "0")}`);
+  assert.ok(!envelope.rows.some((row) => row.pr_number === overflow));
 });
 
 test("gh check-runs populate explicit CI conclusions and empty checks stay unknown", () => {

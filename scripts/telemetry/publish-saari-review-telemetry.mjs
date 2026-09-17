@@ -607,9 +607,18 @@ export function buildSaariReviewTelemetry(options) {
     });
   }
 
+  // Cap first so --ci-source=gh cannot issue unbounded per-row check-runs lookups.
+  const selected = [...rowsByKey.values()]
+    .sort((left, right) => {
+      const repo = left.repository.localeCompare(right.repository);
+      if (repo !== 0) return repo;
+      return left.pr_number - right.pr_number;
+    })
+    .slice(0, MAX_ROWS);
+
   const ghExec = options.ghExec ?? defaultGhExec;
   const rows = [];
-  for (const row of rowsByKey.values()) {
+  for (const row of selected) {
     if (options.ciSource === "gh") {
       const payload = ghExec(row.repository, row.head_sha);
       const ci = payload ? summarizeCheckRuns(payload) : { ci: "unknown", ci_conclusion: null };
@@ -625,19 +634,13 @@ export function buildSaariReviewTelemetry(options) {
     rows.push(row);
   }
 
-  rows.sort((left, right) => {
-    const repo = left.repository.localeCompare(right.repository);
-    if (repo !== 0) return repo;
-    return left.pr_number - right.pr_number;
-  });
-
   return {
     schema_version: SCHEMA_VERSION,
     tenant: TENANT,
     generated_at: generatedAt,
     stale_after_seconds: options.staleAfterSeconds ?? DEFAULT_STALE_AFTER_SECONDS,
     lane: { ...SAARI_LANE },
-    rows: rows.slice(0, MAX_ROWS),
+    rows,
   };
 }
 
