@@ -10,8 +10,19 @@ test("repair workflow and executor share coherent production timeout defaults", 
     path.join(process.cwd(), ".github/workflows/repair-cluster-worker.yml"),
   );
 
-  assert.match(source, /repairTimeoutBudgetFromEnv\(\s*process\.env,?\s*\)/);
+  assert.match(
+    source,
+    /repairTimeoutBudgetFromEnv\(\s*process\.env,\s*resolveTargetRepoToolchain\(job\.frontmatter\.repo\)\.validationTimeoutMs/,
+  );
   assert.match(source, /currentCodexTimeoutMs\(true\)/);
+  assert.match(
+    source,
+    /repairTargetValidationTimeoutMs\(\s*process\.env,\s*resolveTargetRepoToolchain\(job\.frontmatter\.repo\)\.validationTimeoutMs/,
+  );
+  assert.match(
+    workflow,
+    /CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS: \$\{\{ inputs\.target_validation_timeout_ms \|\| vars\.CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS \|\| '' \}\}/,
+  );
   assert.match(workflow, /timeout-minutes: 120/);
   assert.match(
     workflow,
@@ -19,13 +30,31 @@ test("repair workflow and executor share coherent production timeout defaults", 
   );
   assert.match(
     workflow,
-    /CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS \|\| '4200000' \}\}/,
+    /CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS \|\| '' \}\}/,
   );
   assert.match(
     workflow,
     /CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: \$\{\{ vars\.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS \|\| '1800000' \}\}/,
   );
-  assert.match(workflow, /name: Execute credited fix artifact[\s\S]*timeout-minutes: 70/);
+  assert.match(
+    workflow,
+    /run: node scripts\/resolve-repair-timeout-budget\.mjs "\$CLUSTER_JOB_PATH"/,
+  );
+  assert.match(
+    workflow,
+    /name: Execute credited fix artifact[\s\S]*timeout-minutes: \$\{\{ fromJSON\(steps\.repair_budget\.outputs\.timeout_minutes\) \}\}/,
+  );
+});
+
+test("validation-fix and review-fix workers defer full acceptance to the executor", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  for (const name of ["runCodexReviewFix", "runCodexValidationFix"]) {
+    const start = source.indexOf(`function ${name}({`);
+    const end = source.indexOf("\nfunction ", start + 1);
+    const worker = source.slice(start, end);
+    assert.match(worker, /renderWorkerValidationGuidance\(\)/);
+    assert.doesNotMatch(worker, /run it before returning|rerun the failed validation command/);
+  }
 });
 
 test("repair review preserves the checkout accepted by changed-surface validation", () => {
@@ -321,6 +350,24 @@ test("replacement recovery materializes the fetched commit before branch attachm
   assert.match(recovery, /expectedHeadSha: recoveredHeadSha/);
 });
 
+test("replacement final-base sync hydrates from the materialized pre-edit head", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const replacementStart = source.indexOf("function executeReplacementBranch(");
+  const replacementEnd = source.indexOf("function mergedReplacementSourcePr(", replacementStart);
+  const replacement = source.slice(replacementStart, replacementEnd);
+  const recoveryStart = source.indexOf("function checkoutRecoverableReplacementBranch(");
+  const recoveryEnd = source.indexOf(
+    "function materializeFetchedReplacementCommit(",
+    recoveryStart,
+  );
+  const recovery = source.slice(recoveryStart, recoveryEnd);
+
+  assert.match(replacement, /sourceHead: branchState\.source_head/);
+  assert.match(recovery, /source_head: recoveredHeadSha/);
+  assert.match(recovery, /source_head: currentHead\(targetDir\)/);
+  assert.match(recovery, /source_head: fetchedBaseSha/);
+});
+
 test("final publication rebase uses the verified isolated Git path", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   const reconcileStart = source.indexOf("function reconcileLatestBaseBeforePush(");
@@ -337,15 +384,7 @@ test("final publication rebase uses the verified isolated Git path", () => {
   assert.match(codexReconcile, /completeTargetRebaseWithIsolation\(\{/);
   assert.match(codexReconcile, /expectedBaseRef: baseSha/);
   assert.match(codexReconcile, /requireInProgress: true/);
-  assert.match(
-    codexReconcile,
-    /do not run git rebase --continue, git rebase --skip, or git rebase --abort/,
-  );
-  assert.match(codexReconcile, /leave the rebase pending/);
-  assert.match(
-    codexReconcile,
-    /prompt\.replace\(NORMAL_REBASE_COMPLETION_RULE, FINAL_REBASE_HANDOFF_RULE\)/,
-  );
+  assert.match(codexReconcile, /rewriteFinalBaseReconcilePrompt\(prompt\)/);
   assert.doesNotMatch(
     codexReconcile,
     /Resolve this final rebase so the branch is mergeable on current main, then leave the checkout in a normal non-rebasing state/,

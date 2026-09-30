@@ -44,6 +44,64 @@ import {
   exactReviewDecisionFrom,
   mergePendingExactReviewDecision,
 } from "../dashboard/exact-review-decision.ts";
+import { COMMAND_PROOF_SOURCE_ACTION } from "../src/command-proof-contract.ts";
+
+test("ordinary successors do not inherit proof-only review context", () => {
+  const commandStatusMarker =
+    "<!-- clawsweeper-command-status:72:request_proof:" + "a".repeat(64) + " -->";
+  const proofDecision = {
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 72,
+    itemKind: "pull_request" as const,
+    sourceEvent: "pull_request" as const,
+    sourceAction: COMMAND_PROOF_SOURCE_ACTION,
+    supersedesInProgress: false,
+    sourceHeadSha: "b".repeat(40),
+    sourceCommentId: 7200,
+    sourceCommentUpdatedAt: "2026-09-23T01:00:00Z",
+    commandBodyDigest: "c".repeat(64),
+    commandOrigin: "comment_router" as const,
+    sourceCommentVerified: true,
+    sourceDeliveryId: "command-proof-72",
+    additionalPrompt: "Verified proof context.",
+    commandStatusMarker,
+  };
+  const successor = {
+    targetRepo: proofDecision.targetRepo,
+    targetBranch: proofDecision.targetBranch,
+    itemNumber: proofDecision.itemNumber,
+    itemKind: proofDecision.itemKind,
+    sourceEvent: proofDecision.sourceEvent,
+    sourceAction: "synchronize",
+    supersedesInProgress: true,
+    sourceHeadSha: "b".repeat(40),
+    sourceHeadVerified: true,
+    sourceAuthoritySeq: 1,
+  };
+
+  const merged = mergePendingExactReviewDecision(proofDecision, successor);
+  assert.equal(merged.sourceAction, "synchronize");
+  assert.equal(merged.additionalPrompt, undefined);
+  assert.equal(merged.commandStatusMarker, commandStatusMarker);
+  assert.equal(merged.sourceCommentId, proofDecision.sourceCommentId);
+
+  const explicitPrompt = "Review the authoritative successor without prior proof context.";
+  assert.equal(
+    mergePendingExactReviewDecision(proofDecision, {
+      ...successor,
+      additionalPrompt: explicitPrompt,
+    }).additionalPrompt,
+    explicitPrompt,
+  );
+  assert.equal(
+    mergePendingExactReviewDecision(proofDecision, {
+      ...successor,
+      sourceAction: COMMAND_PROOF_SOURCE_ACTION,
+    }).additionalPrompt,
+    proofDecision.additionalPrompt,
+  );
+});
 
 test("manual queue policy cannot be widened by coalescing or ambiguous decision fields", async () => {
   const decision = {
@@ -8321,16 +8379,9 @@ test("exact-review admission requeue_latest resets failures instead of parking a
   assert.equal(state.items[publication.key].parkedReason, undefined);
 });
 
-test("exact-review queue can use the global capacity for one target", async () => {
-  const originalFetch = globalThis.fetch;
-  const storage = new MemoryDurableStorage();
-  const dispatched: Record<string, unknown>[] = [];
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  });
-  globalThis.fetch = async (input, init) => {
+const exactReviewDispatchFetch =
+  (dispatched: Record<string, unknown>[]) =>
+  async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/workflows/sweep.yml")
       return jsonResponse({ state: "active" });
@@ -8346,6 +8397,17 @@ test("exact-review queue can use the global capacity for one target", async () =
     }
     throw new Error(`unexpected fetch ${url}`);
   };
+
+test("exact-review queue can use the global capacity for one target", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new MemoryDurableStorage();
+  const dispatched: Record<string, unknown>[] = [];
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  globalThis.fetch = exactReviewDispatchFetch(dispatched);
 
   try {
     const queue = new ExactReviewQueue(
@@ -8666,22 +8728,7 @@ test("exact-review queue wakes while target capacity remains", async () => {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/actions/workflows/sweep.yml")
-      return jsonResponse({ state: "active" });
-    if (/^\/repos\/openclaw\/(?:clawsweeper|gogcli|openclaw)\/installation$/.test(url.pathname))
-      return jsonResponse({ id: 999 });
-    if (/^\/repos\/openclaw\/(?:clawsweeper|gogcli|openclaw)\/issues\/\d+$/.test(url.pathname))
-      return jsonResponse({ state: "open" });
-    if (url.pathname === "/app/installations/999/access_tokens")
-      return jsonResponse({ token: "dispatch-token" });
-    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      dispatched.push(JSON.parse(String(init?.body)));
-      return new Response(null, { status: 204 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
+  globalThis.fetch = exactReviewDispatchFetch(dispatched);
 
   try {
     const queue = new ExactReviewQueue(
@@ -8717,22 +8764,7 @@ test("exact-review queue defers retained backlog until a paused dispatcher retry
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/actions/workflows/sweep.yml")
-      return jsonResponse({ state: "active" });
-    if (/^\/repos\/openclaw\/(?:clawsweeper|gogcli|openclaw)\/installation$/.test(url.pathname))
-      return jsonResponse({ id: 999 });
-    if (/^\/repos\/openclaw\/(?:clawsweeper|gogcli|openclaw)\/issues\/\d+$/.test(url.pathname))
-      return jsonResponse({ state: "open" });
-    if (url.pathname === "/app/installations/999/access_tokens")
-      return jsonResponse({ token: "dispatch-token" });
-    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      dispatched.push(JSON.parse(String(init?.body)));
-      return new Response(null, { status: 204 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
+  globalThis.fetch = exactReviewDispatchFetch(dispatched);
 
   try {
     const queue = new ExactReviewQueue(
@@ -12919,7 +12951,7 @@ for (const retryKind of ["coordination", "throttle"] as const) {
   });
 }
 
-test("exact-review queue terminates deterministic refusals only for the unchanged revision", async () => {
+test("exact-review queue holds scanner refusals across automatic revisions", async () => {
   const storage = new MemoryDurableStorage();
   const terminal = leasedExactReviewQueueItem(709, "7090");
   const transient = leasedExactReviewQueueItem(710, "7100");
@@ -12964,7 +12996,7 @@ test("exact-review queue terminates deterministic refusals only for the unchange
 
   const newerResponse = await complete(711, "7110", "incomplete_source");
   assert.equal(newerResponse.status, 200);
-  assert.deepEqual(await newerResponse.json(), { ok: true, requeued: true });
+  assert.deepEqual(await newerResponse.json(), { ok: true, requeued: false });
 
   const findingsResponse = await complete(712, "7120", "findings");
   assert.equal(findingsResponse.status, 200);
@@ -12973,13 +13005,13 @@ test("exact-review queue terminates deterministic refusals only for the unchange
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<string, Record<string, unknown>>;
   };
-  assert.equal(state.items["openclaw/openclaw#709"], undefined);
+  assert.equal(state.items["openclaw/openclaw#709"].parkedReason, "scanner_refused");
   assert.equal(state.items["openclaw/openclaw#710"].state, "pending");
   assert.equal(state.items["openclaw/openclaw#710"].reviewFailureAttempts, 1);
-  assert.equal(state.items["openclaw/openclaw#711"].state, "pending");
+  assert.equal(state.items["openclaw/openclaw#711"].state, "parked");
   assert.equal(state.items["openclaw/openclaw#711"].revision, 2);
-  assert.equal(state.items["openclaw/openclaw#711"].reviewFailureAttempts, 0);
-  assert.equal(state.items["openclaw/openclaw#712"], undefined);
+  assert.equal(state.items["openclaw/openclaw#711"].parkedReason, "scanner_refused");
+  assert.equal(state.items["openclaw/openclaw#712"].parkedReason, "scanner_refused");
   const failureStats = await (
     await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
   ).json();
@@ -13093,7 +13125,7 @@ test("exact-review queue terminates every scanner refusal and retries missing te
       items: Record<string, { state: string; reviewFailureAttempts: number }>;
     };
     if (reason) {
-      assert.equal(state.items[item.key], undefined, reason);
+      assert.equal(state.items[item.key].state, "parked", reason);
     } else {
       assert.equal(state.items[item.key].state, "pending");
       assert.equal(state.items[item.key].reviewFailureAttempts, 1);
@@ -13142,7 +13174,7 @@ test("terminal PR refusals retain a verified explanation receipt without retryin
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<string, unknown>;
   };
-  assert.equal(state.items[item.key], undefined);
+  assert.equal(state.items[item.key].parkedReason, "scanner_refused");
 
   const stats = await (
     await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))

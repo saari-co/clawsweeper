@@ -78,8 +78,22 @@ GitHub deploys use `.github/workflows/dashboard.yml`. Configure either
 Workers Scripts edit permission before enabling the workflow as the production
 deploy path. The deploy workflow injects the `CLAWSWEEPER_STATUS_INGEST_TOKEN`
 GitHub secret into a temporary Wrangler config as the Worker `INGEST_TOKEN`.
-Its smoke test also verifies the durable exact-review queue binding, not only
-the dashboard response.
+The smoke test waits for the expected deployment revision and a successful
+exact-review queue response within the same default 180-second readiness budget. It then
+verifies the signed review-admission capability contract, queue schema,
+unsigned-request rejection, Bay policy, and assets. An exact-revision smoke run
+requires the existing `CLAWSWEEPER_WEBHOOK_SECRET`; it sends a signed empty JSON
+object without following redirects and validates scheduled pacing, replay, and
+manual publication policy. A valid disabled manual-publication policy passes.
+Local smoke runs without `CLAWSWEEPER_EXPECTED_DEPLOY_SHA` explicitly report this
+signed check as skipped. A persistently unavailable queue still fails readiness.
+
+A status contract failure keeps its original error and nonzero smoke exit, with
+one bounded diagnostic summary: projection completeness, freshness, cache state,
+Bay tide classification, and validated numeric tide, diagnostic count, and fetch
+duration. It excludes response text, timestamps, and diagnostic error messages.
+These are observed fields; an unavailable projection does not identify which
+upstream request or cache entry caused it. The smoke adds no status retry.
 
 When a change updates both the Worker and a GitHub Actions workflow, keep the
 cross-component protocol compatible in both deployment orders. The exact-review
@@ -222,7 +236,7 @@ twenty-way fanout and caches error/recovery telemetry for 120 seconds. That leav
 enough distinct completed-item evidence to drive a 20-outcome tide despite
 repeated targets or excluded runs while still bounding telemetry pressure.
 This bounds
-telemetry pressure without changing the 32-worker fleet budget. Worker details
+telemetry pressure independently of the 128-worker fleet budget. Worker details
 paginate up to 300 jobs per workflow run so retained large matrix runs contribute to a
 complete internal census. Titles, job names, raw URLs, opaque target keys, and
 raw errors are removed before the status snapshot is persisted or returned.
@@ -260,6 +274,13 @@ Public observer routes validate a fixed response schema rather than forwarding
 their backing store. Unsupported identifying query parameters are ignored; a
 malformed or inconsistent backing document fails closed with a fixed
 unavailable response.
+
+Run-level observer writes validate and retain the first terminal tuple per run
+attempt without reading queue items or rescheduling work. Their existing 30-day
+retention cleanup runs on telemetry writes and queue status computation; actual
+queue and auxiliary work retain ownership of alarm scheduling.
+The [controlled local proof](../scripts/proof-review-run-telemetry.mjs) exercises
+the signed HTTP route and file-backed SQLite after `pnpm run build:node`.
 
 - `/api/review-observability` returns the four closed review lanes and global
   health, completeness, run counts, item counts, and timestamps for a normalized
@@ -380,7 +401,7 @@ Do not move these into the dashboard:
 
 The dashboard Worker owns durable exact-review admission only: it deduplicates
 webhook deliveries, coalesces each repository/item pair, and leases at most
-32 Actions executors, with up to 24 active leases per target repository. It does
+80 Actions executors, with up to 64 active leases per target repository. It does
 not decide review outcomes or perform target repository mutations. For
 command-triggered reviews, the queue retains the bounded review prompt and
 command-status identifiers so the leased GitHub Actions executor can update the
@@ -511,6 +532,14 @@ Only completed snapshots whose mutation generation and storage change counter
 remain unchanged are memoized; polls waiting on invalidated work recompute.
 This only bounds observation freshness: the public projection's fields and
 meaning, admission, publication fences, and Bay behavior are unchanged.
+
+The composed status response retains the dedicated closed queue projection
+through every cache and store read. Its parked-reason counts, including
+`source_incompatible` and the aggregate `unknown` bucket, must survive together
+with the parked total. Dropping a reason during a second generic sanitation pass
+makes a valid queue appear malformed on the next read and hides Bay's live cards
+and timing. The dedicated projector remains the privacy boundary; no private
+queue fields or mutation controls are exposed.
 
 The object's lifecycle Bay response has a 30-second TTL-only memo
 (`EXACT_REVIEW_LIFECYCLE_BAY_CACHE_MS`; set `0` to disable). Production explicitly
@@ -903,17 +932,40 @@ is serving that route.
 
 ## Exhausted command review records in Bay
 
-Repair Cove counts retained exception records, not running repair workers. Its
+Repair & attention counts retained exception records alongside live repair
+activity, not running repair workers alone. Its
 public references may carry the bounded `queue_disposition` values
-`parked_exhausted`, `parked`, or `retry_scheduled`. Both the server and browser
+`parked_exhausted`, `parked`, or `retry_scheduled`. `parked_exhausted` is reserved
+for exhausted review attempts; dispatch-rejected work uses neutral `parked`
+attention even after its recovery budget ends, because no review may have run. Both the server and browser
 sanitizers retain only these values, and only for queue references. Exhausted
 records show operator attention instead of an increasing queued-worker clock;
 the sampled header separates live references from queue/attention records.
 This remains an observer-only surface with the existing public repository
 allowlist and sampling/freshness limits.
 
+Terminal scanner holds retain a `scanner_refused` queue reason count, but do
+not contribute an active or waiting Bay review card. The failed review remains
+in the existing terminal lifecycle projection. A fresh explicit retry or an
+intentional scanner-policy epoch change is required; ordinary source changes
+do not revive it. Bay exposes no release control.
+
 The queue's globally bounded parked-terminal check also observes exhausted
-command producers. An explicit closed GitHub item, observed twice with the same
+command producers. An eligible still-open exhausted review may receive a
+separate, acknowledgement-only stopped-status explanation. Its producer stays
+parked and visible for operator attention after that receipt; acknowledgement
+settlement does not reset the budget, dispatch another review or repair, or
+claim that review succeeded. Current command, revision and canonical source
+(title/body/review labels/lock plus PR head/base/draft) fences apply before the
+comment update. Repeated settlement is idempotent despite bot-comment timestamp
+churn. Missing recorded source identity or live source drift keeps the legacy
+record parked without a status write; it is not guessed or backfilled. New
+commands capture that canonical source identity during verified command intake;
+clients cannot supply those server-owned identity fields. A stored
+closed failure category can explain the observed failure; legacy records without
+it retain an explicit unavailable historical reason.
+
+Closed-target cleanup remains distinct. An explicit closed GitHub item, observed twice with the same
 node/head/closure identity, may create a separate acknowledgement-only driver.
 The producer remains parked until its own receipt is observed or its trusted
 receipt is explicitly missing/locked. The driver rechecks the live closed
@@ -924,8 +976,9 @@ Closed failed commands retain a failure acknowledgement, not a fabricated
 successful review. Ordinary reconciliation now includes command exclusions
 in its bounded skip-reason accounting.
 
-The local Worker/SQLite/HTTP and Chromium proof is documented in
-`docs/proof/parked-command-finalization/README.md`.
+The current stopped-review, source-fenced acknowledgement and Bay proof uses
+real local Worker/SQLite/HTTP and Chromium; see
+`docs/proof/review-failure-attention/README.md`.
 
 Parked-command finalizers reserve status-write ownership while their receipt is
 looked up, then re-fence immediately before the status PATCH. A successor may be

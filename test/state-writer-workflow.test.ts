@@ -21,7 +21,7 @@ const workerUrl =
   "${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}";
 const workerSecret = "${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}";
 
-test("every state hydration uses the canonical Worker with an explicit git-state decision", () => {
+test("state hydration retains canonical defaults with an explicit operational-only publisher", () => {
   const setups: Array<{ site: string; step: WorkflowStep }> = [];
   for (const { file, workflow } of workflows()) {
     for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
@@ -31,10 +31,22 @@ test("every state hydration uses the canonical Worker with an explicit git-state
     }
   }
 
-  assert.equal(setups.length, 21, "setup-state site count is an audited invariant");
+  assert.equal(setups.length, 20, "setup-state site count is an audited invariant");
+  assert.deepEqual(
+    setups.filter(({ step }) => step.with?.["hydrate-records"] === "false").map(({ site }) => site),
+    [".github/workflows/repair-publish-results.yml:publish"],
+  );
   for (const { site, step } of setups) {
-    assert.equal(step.with?.["records-url"], workerUrl, site);
-    assert.equal(step.with?.["records-secret"], workerSecret, site);
+    if (step.with?.["hydrate-records"] === "false") {
+      assert.equal(step.with?.["records-url"], undefined, site);
+      assert.equal(step.with?.["records-secret"], undefined, site);
+      assert.equal(step.with?.["hydrate-state-blobs"], "false", site);
+      assert.notEqual(step.with?.["hydrate-git-state"], "false", site);
+      assert.equal(step.with?.["coordinator-url"], workerUrl, site);
+    } else {
+      assert.equal(step.with?.["records-url"], workerUrl, site);
+      assert.equal(step.with?.["records-secret"], workerSecret, site);
+    }
     assert.equal(step.with?.["records-source"], undefined, site);
     assert.equal(step.with?.["ledger-source"], undefined, site);
     assert.equal(step.with?.["coordinator-enabled"], undefined, site);
@@ -81,7 +93,6 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
       ".github/workflows/sweep.yml:event-review-apply",
       ".github/workflows/sweep.yml:event-review-publish",
       ".github/workflows/sweep.yml:plan",
-      ".github/workflows/sweep.yml:publish",
       ".github/workflows/sweep.yml:retry-failed-reviews",
       ".github/workflows/sweep.yml:apply-proof",
       ".github/workflows/sweep.yml:apply-existing",
@@ -128,13 +139,14 @@ test("setup-state checks out only the remaining operational git tree", () => {
   assert.equal(action.inputs?.["ledger-source"], undefined);
   assert.equal(action.inputs?.["coordinator-enabled"], undefined);
   assert.ok(action.inputs?.["hydrate-git-state"]);
+  assert.ok(action.inputs?.["hydrate-records"]);
   assert.ok(action.inputs?.["records-item-number"]);
   const snapshot = action.runs?.steps?.find(
     (step) => step.name === "Resolve canonical record snapshot cache key",
   );
   assert.equal(
     (snapshot as WorkflowStep & { if?: string })?.if,
-    "${{ inputs.records-item-number == '' }}",
+    "${{ inputs.hydrate-records == 'true' && inputs.records-item-number == '' }}",
   );
   assert.match(source, /--records-item-number "\$RECORDS_ITEM_NUMBER"/);
   assert.match(source, /CLAWSWEEPER_STATE_COORDINATOR_ENABLED=1/);
@@ -172,7 +184,7 @@ test("all remaining git publishers join setup-state and receive a step-scoped co
       }
     }
   }
-  assert.equal(publishers, 21, "git publisher count is an audited invariant");
+  assert.equal(publishers, 18, "git publisher count is an audited invariant");
 });
 
 test("post-side-effect git bookkeeping is non-fatal while durability fences stay strict", () => {
@@ -233,7 +245,7 @@ test("every immutable action-event publisher targets R2 without a state-repo tok
       }
     }
   }
-  assert.equal(publishers.length, 8);
+  assert.equal(publishers.length, 5);
 });
 
 test("retired migration and Git recovery surfaces stay deleted", () => {

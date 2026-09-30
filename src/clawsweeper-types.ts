@@ -405,11 +405,14 @@ export interface SecurityReview {
   concerns: SecurityConcern[];
 }
 
+export type DataModelCompatibility = "sufficient" | "insufficient" | "not_applicable";
+
 export interface RealBehaviorProof {
   status: RealBehaviorProofStatus;
   summary: string;
   evidenceKind: RealBehaviorProofEvidenceKind;
   needsContributorAction: boolean;
+  dataModelCompatibility?: DataModelCompatibility;
 }
 
 export interface PrRating {
@@ -973,6 +976,7 @@ export interface ApplyResult {
   activeReviewLeaseVerified?: boolean;
   activeReviewLeaseExpiresAt?: string;
   terminalPolicyNoopVerified?: boolean;
+  oversizedClosePolicyDeferred?: "comments_only" | "close_gate_disabled" | "close_reason_disabled";
   sourceDriftVerified?: boolean;
   newerReviewTupleVerified?: boolean;
 }
@@ -1109,7 +1113,20 @@ export interface GitHubRuntimeBudget {
   yieldReason?: string;
 }
 
-export type GitHubRetryOptions = {
+export type GitHubDeadlineOptions = {
+  deadlineAt?: number | undefined;
+};
+
+export type GitHubRequestReservation = {
+  onDispatch: () => void;
+  releaseIfUndispatched: () => boolean;
+};
+
+export type GitHubFallbackClaim = GitHubRequestReservation & {
+  env: NodeJS.ProcessEnv;
+};
+
+export type GitHubRetryOptions = GitHubDeadlineOptions & {
   request?: ((args: string[], attempt: number) => string) | undefined;
   sleepBeforeRetry?: ((waitMs: number) => void) | undefined;
 };

@@ -679,7 +679,7 @@ export class ExactReviewLifecycleProjectionStore {
         !projection.admission.commandOriginated ||
         projection.acknowledgement.observed ||
         (projection.terminalDisposition &&
-          !["target_closed", "requeue"].includes(projection.terminalDisposition.kind))
+          !["target_closed", "requeue", "failure"].includes(projection.terminalDisposition.kind))
       ) {
         throw new Error("invalid parked command closure cancellation");
       }
@@ -1033,6 +1033,12 @@ export class ExactReviewLifecycleProjectionStore {
           for (const card of lifecycleJourneyCards(projections, now)) {
             lanes[card.lane] += 1;
             const cards = cardsByLane.get(card.lane)!;
+            // Keep first-seen ties without sorting cards outside the bounded sample.
+            if (
+              cards.length === EXACT_REVIEW_LIFECYCLE_BAY_SAMPLE_LIMIT &&
+              compareAuditInventoryRecords(card, cards[cards.length - 1]!) >= 0
+            )
+              continue;
             cards.push(card);
             cards.sort(compareAuditInventoryRecords);
             if (cards.length > EXACT_REVIEW_LIFECYCLE_BAY_SAMPLE_LIMIT) cards.pop();

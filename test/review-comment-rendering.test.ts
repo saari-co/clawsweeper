@@ -34,7 +34,12 @@ import { createReportParser } from "../dist/clawsweeper-report-parser.js";
 import { createRecordMetadata } from "../dist/clawsweeper-record-metadata.js";
 import { createReportHelpers } from "../dist/clawsweeper-report-helpers.js";
 import { normalizeRepo, repositoryProfileFor } from "../dist/repository-profiles.js";
-import type { DecisionKind, Evidence, NextStepAssessment } from "../dist/clawsweeper-types.js";
+import type {
+  Decision,
+  DecisionKind,
+  Evidence,
+  NextStepAssessment,
+} from "../dist/clawsweeper-types.js";
 
 function markdownLinkDestinations(markdown: string): Set<string> {
   const destinations = new Set<string>();
@@ -91,6 +96,7 @@ function evidenceReport(
   evidence: Evidence[],
   decisionKind: DecisionKind = "close",
   nextStep?: NextStepAssessment,
+  overrides: Partial<Decision> = {},
 ) {
   const document = createReportDocumentRendering({
     ...evidenceLinks,
@@ -117,6 +123,7 @@ function evidenceReport(
           decision: decisionKind,
           closeReason: decisionKind === "close" ? "implemented_on_main" : "none",
           ...(nextStep === undefined ? {} : { nextStep }),
+          ...overrides,
         }),
       ),
       // The host stamps checkout access after parsing model output.
@@ -130,6 +137,8 @@ function evidenceReport(
     contentDigest: "synthetic-content",
     reviewPolicy: "synthetic-policy",
     runtime: { model: "Codex", reasoningEffort: "high" },
+    reviewLeaseOwner: "github-run-123456-1",
+    reviewLeaseCommentId: 123456,
   } as Parameters<typeof document.markdownFor>[0]);
 }
 
@@ -238,6 +247,91 @@ test("canonical next-step report round-trip preserves explicit intent and legacy
     if (nextStep?.kind === "required")
       assert.match(publicSection(comment, "Before merge"), /Owner approval\./);
   }
+});
+
+test("accepted labeled risk survives decision and report parsing without reopening a blocker", () => {
+  const accepted = "The maintainer accepted the documented fresh-ref requirement for this change.";
+  const decision: Partial<Decision> = {
+    mergeRiskLabels: ["merge-risk: 🚨 compatibility"],
+    mergeRiskOptions: [],
+    risks: [],
+    labelJustifications: [
+      { label: "P2", reason: "Bounded compatibility correction." },
+      { label: "merge-risk: 🚨 compatibility", reason: accepted },
+    ],
+    overallCorrectness: "patch is correct",
+    realBehaviorProof: {
+      status: "sufficient",
+      evidenceKind: "terminal",
+      needsContributorAction: false,
+      summary: "The actual browser path rejected stale refs and accepted newly captured refs.",
+    },
+    prRating: {
+      proofTier: "B",
+      patchTier: "B",
+      overallTier: "B",
+      summary: "The corrected behavior has direct runtime proof.",
+      nextSteps: [],
+    },
+  };
+  const evidence: Evidence[] = [
+    {
+      repo: "openclaw/openclaw",
+      label: "Accepted compatibility tradeoff",
+      detail: accepted,
+      file: null,
+      line: null,
+      command: null,
+      sha: "c".repeat(40),
+    },
+  ];
+  const report = evidenceReport(evidence, "keep_open", { kind: "none", text: "" }, decision);
+  const comment = renderReviewCommentFromReport(report, "none");
+  assert.match(report, /^merge_risk_labels: .*compatibility/m);
+  assert.match(report, /^merge_risk_options: \[\]$/m);
+  assert.ok(comment.includes(accepted));
+  assert.equal(publicSection(comment, "Before merge"), "None.");
+  assert.match(comment, /clawsweeper-review-state:ready/);
+  assert.doesNotMatch(comment, /### Merge-risk options/);
+
+  const unresolved = "The new requirement also affects an unreviewed second workflow.";
+  const unresolvedDecision = { ...decision, risks: [unresolved] };
+  assert.throws(
+    () => evidenceReport(evidence, "keep_open", { kind: "none", text: "" }, unresolvedDecision),
+    /mergeRiskOptions must include 1-3 options/,
+  );
+  const blockedReport = evidenceReport(
+    evidence,
+    "keep_open",
+    { kind: "none", text: "" },
+    {
+      ...unresolvedDecision,
+      mergeRiskOptions: [
+        {
+          title: "Prove the second workflow",
+          body: "Exercise the second workflow before deciding whether to accept its impact.",
+          category: "fix_before_merge",
+          recommended: true,
+          automergeInstruction: "",
+        },
+      ],
+    },
+  );
+  const blocked = renderReviewCommentFromReport(blockedReport, "none");
+  assert.ok(publicSection(blocked, "Before merge").includes(unresolved));
+  assert.match(blocked, /clawsweeper-review-state:blocked/);
+
+  const independent = renderReviewCommentFromReport(
+    evidenceReport(
+      evidence,
+      "keep_open",
+      { kind: "required", text: "Resolve the separate owner decision." },
+      decision,
+    ),
+    "none",
+  );
+  assert.match(publicSection(independent, "Before merge"), /Resolve the separate owner decision/);
+  assert.doesNotMatch(independent, /clawsweeper-review-state:ready/);
 });
 
 test("absent, malformed, duplicate and spoofed next-step metadata cannot suppress legacy action", () => {
@@ -790,11 +884,6 @@ test("structural cache probes before hydration but acquires a lease before carry
   assert.match(source, /coordination-held\.json/);
   assert.match(source, /coordinationHeldRetryAt = startComment\.retryAt/);
   assert.match(source, /review-cache-metrics\.json/);
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  assert.match(
-    workflow,
-    /review-artifacts\/shard-\$\{\{ matrix\.shard \}\}\/review-cache-metrics\.json/,
-  );
 });
 
 test("review comment patching only targets ClawSweeper-owned comments", () => {
@@ -1852,7 +1941,45 @@ test("pull request close comments emit close-required automation markers", () =>
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
-test("issue keep-open review comments suggest concrete reproduction help", () => {
+test("design issue reviews preserve the model's decision without inventing reproduction requests", () => {
+  const comment = renderReviewCommentFromReport(
+    `${reportFrontMatter({
+      type: "issue",
+      number: "1624",
+      decision: "keep_open",
+      close_reason: "none",
+      work_candidate: "manual_review",
+      reproduction_status: "not_applicable",
+      reproduction_confidence: "high",
+    })}
+
+## Summary
+
+The external artifact contract needs a maintainer design decision.
+
+## Reproduction Assessment
+
+Not applicable. This proposes a new integration contract and reports no broken existing behavior.
+
+## Work Candidate
+
+Candidate: manual_review
+
+Reason: Decide whether to support the external artifact contract.
+`,
+    "none",
+  );
+
+  assert.match(comment, /The external artifact contract needs a maintainer design decision\./);
+  assert.match(comment, /Not applicable\. This proposes a new integration contract/);
+  assert.match(
+    comment,
+    /\*\*Next step\*\*\nDecide whether to support the external artifact contract\./,
+  );
+  assert.doesNotMatch(comment, /Ways to help us reproduce|screenshot|expected vs actual/);
+});
+
+test("issue reviews retain specific model-authored reproduction requests", () => {
   const comment = renderReviewCommentFromReport(
     `${reportFrontMatter({
       type: "issue",
@@ -1872,20 +1999,21 @@ Keep open. The app sometimes does the wrong thing.
 
 Unclear. The report describes an intermittent visible failure but does not include enough information to reproduce it.
 
-## Best Possible Solution
+## Work Candidate
 
-Ask for enough details to reproduce the issue before planning a fix.
+Candidate: manual_review
+
+Reason: Provide the failing command and redacted error output.
 `,
     "none",
   );
 
-  assert.match(comment, /\*\*Ways to help us reproduce this\*\*/);
-  assert.match(comment, /- Add a screenshot or short recording showing the behavior\./);
-  assert.match(comment, /- Include the exact command, prompt, or workflow that triggered it\./);
-  assert.match(comment, /- Add expected vs actual behavior\./);
-  assert.ok(
-    comment.indexOf("**Ways to help us reproduce this**") < comment.indexOf("**Next step**"),
+  assert.match(
+    comment,
+    /\*\*Next step\*\*\nProvide the failing command and redacted error output\./,
   );
+  assert.match(comment, /does not include enough information to reproduce it/);
+  assert.doesNotMatch(comment, /Ways to help us reproduce|screenshot|expected vs actual/);
 });
 
 test("pull request review comments include dedicated security review", () => {

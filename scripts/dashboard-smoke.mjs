@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHmac } from "node:crypto";
 import { realpathSync } from "node:fs";
 
 const cliUrl = process.argv.find((arg, index) => index > 1 && arg !== "--");
@@ -15,6 +16,10 @@ const deploymentReadyIntervalMs = positiveInteger(
 );
 
 async function main() {
+  const webhookSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
+  if (expectedDeploySha && !webhookSecret) {
+    throw new Error("deployment smoke requires CLAWSWEEPER_WEBHOOK_SECRET");
+  }
   const health = expectedDeploySha
     ? await waitForDashboardDeployment({
         baseUrl,
@@ -24,6 +29,9 @@ async function main() {
       })
     : await fetchJson(`${baseUrl}/api/health`);
   if (health.ok !== true) throw new Error("health endpoint did not return ok");
+  const reviewAdmission = expectedDeploySha
+    ? await verifyReviewAdmission(webhookSecret)
+    : { state: "skipped", reason: "no_expected_deployment" };
 
   const statusStartedAt = Date.now();
   const statusResponse = await fetch(`${baseUrl}/api/status`);
@@ -33,24 +41,13 @@ async function main() {
   const status = await statusResponse.json();
   const statusFetchMs = Date.now() - statusStartedAt;
   const cacheState = statusResponse.headers.get("x-clawsweeper-cache") || "unknown";
-  if (status.schema_version !== 1) throw new Error("unexpected status schema");
-  if (!status.fleet || typeof status.fleet.active_workflow_runs !== "number") {
-    throw new Error("status response is missing fleet metrics");
-  }
-  if (!Array.isArray(status.workers)) throw new Error("status response is missing worker details");
-  if (!Array.isArray(status.pipeline)) throw new Error("status response is missing pipeline rows");
-  if (!status.bay || status.bay.tide_threshold !== 20) {
-    throw new Error("status response is missing the bounded Bay tide contract");
-  }
-  if (!Array.isArray(status.bay.terminal_buffer) || !Array.isArray(status.bay.recently_washed)) {
-    throw new Error("status response is missing Bay terminal outcome arrays");
-  }
-  if (
-    status.bay.timings?.sample_kind !== "completed_review_journeys" ||
-    status.bay.timings?.source !== "durable_exact_review_lifecycles" ||
-    status.bay.timings?.completion_source !== "verified_final_review_receipts"
-  ) {
-    throw new Error("status response is missing the durable Bay timing provenance");
+  try {
+    validateStatus(status);
+  } catch (error) {
+    console.error(
+      `status diagnostic: ${JSON.stringify(statusDiagnostic(status, cacheState, statusFetchMs))}`,
+    );
+    throw error;
   }
 
   const exactReviewQueue = await fetchJson(`${baseUrl}/api/exact-review-queue`);
@@ -90,7 +87,8 @@ async function main() {
   const bayCsp = bayResponse.headers.get("content-security-policy") || "";
   if (
     !bayCsp.includes("connect-src 'self' https://*.openclaw.ai") ||
-    !bayCsp.includes("frame-ancestors 'none'")
+    !bayCsp.includes("frame-ancestors https://team.openclaw.ai;") ||
+    bayResponse.headers.get("x-frame-options") !== null
   ) {
     throw new Error("Bay is missing its expected content security policy");
   }
@@ -138,6 +136,7 @@ async function main() {
         ok: true,
         url: baseUrl,
         deployment_sha: health.deployment_sha || null,
+        review_admission: reviewAdmission,
         active_workflow_runs: status.fleet.active_workflow_runs,
         active_codex_jobs: status.fleet.active_codex_jobs,
         worker_details: status.workers.length,
@@ -159,6 +158,91 @@ async function main() {
       2,
     ),
   );
+}
+
+async function verifyReviewAdmission(secret) {
+  // Verify the producer contract before a Worker-first rollout can enable new producers.
+  // Redirects must never forward the signed request to another endpoint.
+  const body = "{}";
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/internal/exact-review/admission-capabilities`, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(20_000),
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+      },
+      body,
+    });
+  } catch (error) {
+    throw new Error("review admission capability request failed", { cause: error });
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`review admission capabilities returned HTTP ${response.status}`);
+  }
+  const capability = await response.json().catch(() => null);
+  const feed = capability?.scheduled_feed;
+  const manual = capability?.manual_publication;
+  if (
+    !Number.isSafeInteger(feed?.target_rate_per_hour) ||
+    feed.target_rate_per_hour <= 0 ||
+    feed.enqueue_replay !== "scheduled_disposition_v1" ||
+    manual?.policy !== "record_comment_only" ||
+    typeof manual.enabled !== "boolean"
+  ) {
+    throw new Error("review admission capability contract is invalid");
+  }
+  return {
+    state: "verified",
+    target_rate_per_hour: feed.target_rate_per_hour,
+    manual_publication_enabled: manual.enabled,
+  };
+}
+
+function validateStatus(status) {
+  if (status.schema_version !== 1) throw new Error("unexpected status schema");
+  if (!status.fleet || typeof status.fleet.active_workflow_runs !== "number") {
+    throw new Error("status response is missing fleet metrics");
+  }
+  if (!Array.isArray(status.workers)) throw new Error("status response is missing worker details");
+  if (!Array.isArray(status.pipeline)) throw new Error("status response is missing pipeline rows");
+  if (!status.bay || status.bay.tide_threshold !== 20) {
+    throw new Error("status response is missing the bounded Bay tide contract");
+  }
+  if (!Array.isArray(status.bay.terminal_buffer) || !Array.isArray(status.bay.recently_washed)) {
+    throw new Error("status response is missing Bay terminal outcome arrays");
+  }
+  if (
+    status.bay.timings?.sample_kind !== "completed_review_journeys" ||
+    status.bay.timings?.source !== "durable_exact_review_lifecycles" ||
+    status.bay.timings?.completion_source !== "verified_final_review_receipts"
+  ) {
+    throw new Error("status response is missing the durable Bay timing provenance");
+  }
+}
+
+function statusDiagnostic(status, cacheState, statusFetchMs) {
+  const complete = status?.public_projection_complete;
+  const freshness = status?.freshness?.state;
+  const tide = status?.bay?.tide_threshold;
+  // Match the bounded Bay metric and diagnostic counts; never copy response text.
+  const boundedTide = Number.isSafeInteger(tide) && tide >= 0 && tide <= 100;
+  const errorCount = status?.diagnostics?.error_count;
+  return {
+    projection: complete === true ? "complete" : complete === false ? "unavailable" : "invalid",
+    freshness: ["fresh", "stale", "unavailable"].includes(freshness) ? freshness : "invalid",
+    cache_state: ["fresh", "stale", "miss"].includes(cacheState) ? cacheState : "unknown",
+    tide:
+      tide === 20 ? "valid" : tide === undefined ? "missing" : boundedTide ? "mismatch" : "invalid",
+    tide_threshold: boundedTide ? tide : null,
+    diagnostic_error_count:
+      Number.isSafeInteger(errorCount) && errorCount >= 0 && errorCount <= 20 ? errorCount : null,
+    status_fetch_ms:
+      Number.isSafeInteger(statusFetchMs) && statusFetchMs >= 0 ? statusFetchMs : null,
+  };
 }
 
 export async function waitForDashboardDeployment({
@@ -184,8 +268,17 @@ export async function waitForDashboardDeployment({
         lastObserved = `HTTP ${response.status}`;
       } else {
         const health = await response.json();
-        if (health.ok === true && health.deployment_sha === expectedSha) return health;
-        lastObserved = `deployment ${String(health.deployment_sha || "unknown")}`;
+        if (health.ok === true && health.deployment_sha === expectedSha) {
+          const queueResponse = await fetchImpl(`${baseUrl}/api/exact-review-queue`, {
+            cache: "no-store",
+            signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, deadline - now()))),
+          });
+          await queueResponse.body?.cancel();
+          if (queueResponse.ok) return health;
+          lastObserved = `queue HTTP ${queueResponse.status}`;
+        } else {
+          lastObserved = `deployment ${String(health.deployment_sha || "unknown")}`;
+        }
       }
     } catch (error) {
       lastObserved = error instanceof Error ? error.message : String(error);

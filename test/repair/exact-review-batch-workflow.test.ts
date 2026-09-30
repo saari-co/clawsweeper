@@ -158,8 +158,7 @@ test("manual publication proof preserves isolated toolchain settings without inh
 test("manual publication stays queue-owned and excludes router and implementation hooks", () => {
   assert.match(sweepSource, /name: Admit explicit manual reviews/);
   assert.match(sweepSource, /manual-review-enqueue\.js/);
-  assert.match(sweepSource, /apply_existing != 'true'.*inputs\.item_number != ''/);
-  assert.match(sweepSource, /manual_explicit.*true.*queue_feed=true/);
+  assert.match(sweepSource, /if: \$\{\{ steps\.mode\.outputs\.manual_explicit == 'true' \}\}/);
   assert.match(prepareSource, /EXACT_REVIEW_DECISION: JSON\.stringify\(producer\)/);
   assert.match(source, /publication_policy.*record_comment_only.*failed_review_shard_recovery/);
   assert.match(source, /AUTO_IMPLEMENT_ISSUES.*\n\s*\[ -z "\$publication_policy" \]/);
@@ -264,7 +263,7 @@ test("batch publisher is event-driven and queue-bounded instead of workflow-seri
     "dispatched_at",
   ]);
   assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_MAX_ITEMS, "50");
-  assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_PREPARE_CONCURRENCY, "1");
+  assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_PREPARE_CONCURRENCY, "2");
   assert.equal(workflow.jobs.publish!.env.CLAWSWEEPER_APP_CLIENT_ID, "Iv23liOECG0slfuhz093");
   assert.equal(workflow.concurrency, undefined);
   assert.deepEqual(workflow.permissions, { actions: "write", contents: "read" });
@@ -578,10 +577,12 @@ test("exact publication records the Actions reset before one bounded App fallbac
       .trim()
       .split(/\r?\n/)
       .map((line) => JSON.parse(line));
-    assert.deepEqual(observations, [
+    assert.equal(observations[0].provenance, "fallback");
+    assert.equal(observations[0].authoritative, false);
+    assert.deepEqual(observations.slice(1), [
       {
         scope: "repository_actions",
-        observed_at: observations[0].observed_at,
+        observed_at: observations[1].observed_at,
         retry_at: new Date(reset * 1_000).toISOString(),
         provenance: "rate_limit_status",
         authoritative: true,
@@ -648,10 +649,12 @@ test("inherited GitHub Actions credentials open the repository quota circuit", (
       .trim()
       .split(/\r?\n/)
       .map((line) => JSON.parse(line));
-    assert.deepEqual(observations, [
+    assert.equal(observations[0].provenance, "fallback");
+    assert.equal(observations[0].authoritative, false);
+    assert.deepEqual(observations.slice(1), [
       {
         scope: "repository_actions",
-        observed_at: observations[0].observed_at,
+        observed_at: observations[1].observed_at,
         retry_at: new Date(reset * 1_000).toISOString(),
         provenance: "rate_limit_status",
         authoritative: true,

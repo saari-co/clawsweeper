@@ -1,5 +1,17 @@
 import { stableJson } from "../src/stable-json.ts";
+import { exactReviewSourceRevisionMaterial } from "./exact-review-source-revision.ts";
 import {
+  normalizePublicReviewFailure,
+  reviewFailureExplanation,
+  type PublicReviewFailure,
+} from "../src/review-failure-explanation.ts";
+import {
+  clearStaleReviewFailure,
+  currentReviewFailure,
+  reviewFailureDecisionFingerprint,
+} from "./exact-review-observed-failure.ts";
+import {
+  agentInputScanFailureReason,
   terminalReviewFailureReason,
   type TerminalReviewFailureReason as ExactReviewFailureReason,
 } from "../src/exact-review-failure-reason.ts";
@@ -18,6 +30,7 @@ import {
   decisionPublicationPolicy,
   MANUAL_REVIEW_SOURCE_ACTION,
   manualPublicationOwnerFrom,
+  RECORD_COMMENT_ONLY,
   reportPublicationPolicy,
 } from "../src/manual-publication-policy.ts";
 import { parseAuditWaveState, type AuditWaveState } from "../src/audit-wave-state.ts";
@@ -282,6 +295,8 @@ type ExactReviewParkedReason =
   | "dead_letter_capacity"
   | "dispatch_rejected"
   | "review_retry_exhausted"
+  | "source_incompatible"
+  | "scanner_refused"
   | "direct_publication";
 type ExactReviewLifecycleProjectionIdentity = {
   canonicalTargetKey: string;
@@ -308,7 +323,15 @@ type ExactReviewTerminalFinalization = {
       nextAttemptAt: number;
       backoffReason?: ExactReviewBackoffReason;
     };
-    target: { nodeId: string; headSha: string | null; closedAt: string };
+    target: {
+      nodeId: string;
+      headSha: string | null;
+      closedAt: string | null;
+      state?: "open" | "closed";
+      sourceContentRevision?: string;
+      baseSha?: string;
+      isDraft?: boolean;
+    };
   };
 };
 type PublicationSuccessorWitness = {
@@ -362,7 +385,10 @@ export type ExactReviewQueueItem = {
   publicationFailureAttempts?: number;
   publicationSuccessorWitness?: PublicationSuccessorWitness;
   reviewFailureAttempts?: number;
+  reviewFailure?: PublicReviewFailure;
+  reviewFailureDecisionFingerprint?: string;
   reviewRetryPolicyEpoch?: string;
+  scannerRefusal?: { observedAt: number; runId: string };
   reviewRecoveryReason?: ExactReviewReviewRecoveryReason;
   reviewRecoveryAt?: number;
   /**
@@ -709,7 +735,7 @@ type ExactReviewScheduledDisposition =
       deduped: true;
       item_key: string;
       dedupe_scope: "scheduled_queue_item";
-      dedupe_reason: "item_already_pending_or_active";
+      dedupe_reason: "item_already_pending_or_active" | "source_incompatible" | "scanner_refused";
     }
   | {
       ok: true;
@@ -1078,6 +1104,9 @@ export class ExactReviewQueue {
     }
     await this.ensureReady();
     this.cleanupLegacyCompatibilitySync();
+    if (request.method === "POST" && url.pathname === "/admission-capabilities") {
+      return json(this.reviewAdmissionCapabilities());
+    }
     if (
       request.method === "POST" &&
       (url.pathname === "/review-proof/producer-record" || url.pathname === "/review-proof/redeem")
@@ -1725,6 +1754,7 @@ export class ExactReviewQueue {
       }
       if (!decision) return json({ error: "invalid_exact_review_item" }, 400);
       const manualAdmission = decision.sourceAction === MANUAL_REVIEW_SOURCE_ACTION;
+      if (manualAdmission) decision.sourceDeliveryId = deliveryId;
       if (
         manualAdmission &&
         String(this.env.EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED ?? "") !== "1"
@@ -1911,7 +1941,13 @@ export class ExactReviewQueue {
           exactReviewHeartbeatGraceMs(this.env),
           this.env,
         );
-        const key = exactReviewItemKey(decision);
+        const scannerHold = !decision.publication
+          ? Object.keys(state.items)
+              .filter((key) => key.toLowerCase() === exactReviewItemKey(decision).toLowerCase())
+              .map((key) => state.items[key])
+              .find((item) => item.parkedReason === "scanner_refused")
+          : undefined;
+        const key = scannerHold?.key ?? exactReviewItemKey(decision);
         const currentIngressItem = state.items[key];
         // A counterpart receipt is conclusive only after its own route reached
         // queue state. Preserve the one live fallback-first item for a verified
@@ -2110,18 +2146,41 @@ export class ExactReviewQueue {
           }
         }
         const current = state.items[key];
-        if (current && scheduledLane) {
+        const releasesScannerHold = Boolean(
+          scannerHold &&
+          (freshScannerRefusalRetry(
+            decision,
+            deliveryId,
+            scannerHold.scannerRefusal,
+            scannerHold.decision,
+          ) ||
+            ((scannerHold.reviewRetryPolicyEpoch || DEFAULT_EXACT_REVIEW_RETRY_POLICY_EPOCH) !==
+              exactReviewRetryPolicyEpoch(this.env) &&
+              !exactReviewDecisionHasCommandContext(decision) &&
+              decision.sourceAction !== "re_review" &&
+              !manualAdmission)),
+        );
+        if (scannerHold && !releasesScannerHold && !scheduledLane) {
+          this.writeStateSync(state);
+          return { scannerRefused: true as const, state };
+        }
+        if (current && scheduledLane && !releasesScannerHold) {
           this.writeStateSync(state);
           const disposition: ExactReviewScheduledDisposition = {
             ok: true,
             deduped: true,
             item_key: key,
             dedupe_scope: "scheduled_queue_item",
-            dedupe_reason: "item_already_pending_or_active",
+            dedupe_reason:
+              current.parkedReason === "source_incompatible" ||
+              current.parkedReason === "scanner_refused"
+                ? current.parkedReason
+                : "item_already_pending_or_active",
           };
           return {
             deduped: true as const,
             scheduled: true as const,
+            scheduledDedupeReason: disposition.dedupe_reason,
             key,
             state,
             scheduledDispositionJson: this.recordScheduledDispositionSync(
@@ -2134,7 +2193,7 @@ export class ExactReviewQueue {
         let supersededRunId: string | null = null;
         let supersessionAudit: ExactReviewSupersessionAudit | null = null;
         let ingressAdmitted = false;
-        if (current) {
+        if (current && !releasesScannerHold) {
           const ignoredRecovery = isLowPriorityExactReviewDecision(decision);
           // A recovery is only a one-shot repair of a failed shard. It may create a queue item,
           // but must never supersede an existing pending, dispatching, or leased decision: doing
@@ -2249,6 +2308,11 @@ export class ExactReviewQueue {
               decision.supersedesInProgress &&
               current.leasePhase !== "status" &&
               (current.state === "dispatching" || current.state === "leased");
+            const preservesActiveCommand =
+              supersedesActiveReview &&
+              current.decision.itemKind === "pull_request" &&
+              decision.itemKind === "pull_request" &&
+              exactReviewDecisionHasCommandContext(current.decision);
             if (supersedesActiveReview) {
               const priorRevision = current.revision;
               supersededRunId = current.claimedRunId || null;
@@ -2278,15 +2342,18 @@ export class ExactReviewQueue {
             // carrying publication/directLifecycle into the successor would make
             // the successor look like it owns the old fenced finalization.
             const followUpMergeBase =
-              (queuesCommandFollowUp || pendingTerminalFinalizer) &&
+              (queuesCommandFollowUp || pendingTerminalFinalizer || preservesActiveCommand) &&
               exactReviewQueueIsPublication(current)
                 ? (current.decision.publication?.producerDecision ?? current.decision)
                 : current.decision;
-            const nextDecision = supersedesActiveReview
-              ? decision
-              : mergeable || queuesCommandFollowUp
-                ? mergePendingExactReviewDecision(followUpMergeBase, decision)
-                : decision;
+            // Revoke the active lease, but carry a still-current pull request command
+            // onto its authoritative pull request successor just as pending coalescing does.
+            const nextDecision =
+              supersedesActiveReview && !preservesActiveCommand
+                ? decision
+                : mergeable || queuesCommandFollowUp
+                  ? mergePendingExactReviewDecision(followUpMergeBase, decision)
+                  : decision;
             const preserveReviewRetryBudget =
               mergeable &&
               !exactReviewQueueIsPublication(current) &&
@@ -2429,8 +2496,8 @@ export class ExactReviewQueue {
             ...(ingress ? { ingressFingerprint: ingress.fingerprint } : {}),
             state: "pending",
             revision: exactReviewDecisionHasCommandContext(decision)
-              ? this.nextExactReviewCommandRevisionSync(key, 1)
-              : this.nextExactReviewItemRevisionSync(key),
+              ? this.nextExactReviewCommandRevisionSync(key, (scannerHold?.revision ?? 0) + 1)
+              : this.nextExactReviewItemRevisionSync(key, (scannerHold?.revision ?? 0) + 1),
             createdAt: now,
             updatedAt: now,
             ...exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env, true),
@@ -2507,6 +2574,9 @@ export class ExactReviewQueue {
         };
       });
       if (deferredBayLifecycle) this.syncBayLifecycle(deferredBayLifecycle);
+      if ("scannerRefused" in accepted) {
+        return json({ ok: true, accepted: false, reason: "scanner_refused" }, 202);
+      }
       if ("conflict" in accepted && accepted.conflict) {
         return json({ error: "exact_review_delivery_conflict" }, 409);
       }
@@ -2549,7 +2619,7 @@ export class ExactReviewQueue {
             ...("scheduled" in accepted && accepted.scheduled
               ? {
                   dedupe_scope: "scheduled_queue_item",
-                  dedupe_reason: "item_already_pending_or_active",
+                  dedupe_reason: accepted.scheduledDedupeReason,
                 }
               : {}),
             ...("staleSource" in accepted && accepted.staleSource ? { stale_source: true } : {}),
@@ -3269,6 +3339,12 @@ export class ExactReviewQueue {
         item.revision > leaseRevision
           ? false
           : completionResult.requeued;
+      // A pinned-source refusal remains discoverable for source recovery, but
+      // retaining its queue row must not turn its terminal failure into a retry.
+      const parkedForRetry =
+        Boolean(completionResult.parked) &&
+        item.parkedReason !== "source_incompatible" &&
+        item.parkedReason !== "scanner_refused";
       const lifecycleIdentity: ExactReviewLifecycleProjectionIdentity = {
         canonicalTargetKey: `${lifecycleItem.decision.targetRepo}#${lifecycleItem.decision.itemNumber}`,
         fenceKey: lifecycleItem.key,
@@ -3286,7 +3362,7 @@ export class ExactReviewQueue {
         outcome,
         publicationCompletion,
         requeued: lifecycleRequeued,
-        parked: Boolean(completionResult.parked),
+        parked: parkedForRetry,
         deadLetter: Boolean(completionResult.deadLetter),
         lifecycleTerminal,
       });
@@ -3395,7 +3471,7 @@ export class ExactReviewQueue {
           outcome,
           publicationCompletion,
           requeued: lifecycleRequeued,
-          parked: Boolean(completionResult.parked),
+          parked: parkedForRetry,
           deadLetter: Boolean(completionResult.deadLetter),
           lifecycleTerminal,
           now,
@@ -4969,10 +5045,7 @@ export class ExactReviewQueue {
         },
       },
       delivery_receipts: this.deliveryReceiptCountSync(),
-      manual_publication: {
-        policy: "record_comment_only",
-        enabled: String(this.env.EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED ?? "") === "1",
-      },
+      manual_publication: this.reviewAdmissionCapabilities().manual_publication,
       scheduled_feed: { ...stats.scheduled_feed, ...this.scheduledReviewFeedStatusSync(now) },
       reservation_claim_observability: reservationClaimObservability,
       state_writer: { ...stateWriter, coordinator: stateWriterCoordinator },
@@ -5679,8 +5752,8 @@ export class ExactReviewQueue {
         continue;
       }
       if (item.state === "parked" && exactReviewQueueHasCommandContext(item)) {
-        // Operator deletion/recovery remains forbidden. Only a closed-target
-        // observation may schedule a separate, fenced acknowledgement driver.
+        // Operator deletion/recovery remains forbidden. A stable target
+        // observation may schedule only a separate, fenced acknowledgement driver.
         if (
           candidate.queueState !== "parked" ||
           !("updatedAt" in candidate) ||
@@ -5749,6 +5822,15 @@ export class ExactReviewQueue {
         }
         supersessionAudits.push(audit);
         continue;
+      }
+      if (
+        item.state === "pending" &&
+        candidate.state.state === "open" &&
+        candidate.state.sourceIdentity
+      ) {
+        // Scheduled intake has no PR source tuple. Bind the live read before
+        // taking the lease snapshot so completion and recovery share one identity.
+        item.decision = { ...item.decision, ...candidate.state.sourceIdentity };
       }
       if (candidate.state.state === "unavailable") {
         if (item.state === "parked") {
@@ -6304,14 +6386,40 @@ export class ExactReviewQueue {
       ) as Iterable<Record<string, unknown>>,
     );
     const page = rows.slice(0, limit);
-    const state = this.readStateSync();
+    const candidates = page.map((row) => {
+      const item = exactReviewDeadLetterItem(String(row.item_json || ""));
+      return {
+        row,
+        item,
+        recovery: item ? exactReviewFreshRecoveryFromPublicationItem(item) : null,
+      };
+    });
+    // Inventory needs only two membership checks per row, not every active
+    // item's retained artifact/decision payload. Keep work bounded by this page.
+    const keys = [
+      ...new Set(
+        candidates.flatMap(({ item, recovery }) =>
+          [item?.key, recovery?.key].filter((key): key is string => Boolean(key)),
+        ),
+      ),
+    ];
+    const activeKeys = new Set(
+      keys.length
+        ? Array.from(
+            this.storage.sql.exec(
+              `SELECT item_key FROM ${EXACT_REVIEW_QUEUE_ITEM_TABLE}
+          WHERE item_key IN (SELECT value FROM json_each(?))`,
+              JSON.stringify(keys),
+            ) as Iterable<{ item_key: string }>,
+            (row) => row.item_key,
+          )
+        : [],
+    );
     return json({
       ok: true,
-      dead_letters: page.map((row) => {
-        const item = exactReviewDeadLetterItem(String(row.item_json || ""));
-        const recovery = item ? exactReviewFreshRecoveryFromPublicationItem(item) : null;
-        const activePublication = item ? state.items[item.key] : undefined;
-        const activeRecovery = recovery ? state.items[recovery.key] : undefined;
+      dead_letters: candidates.map(({ row, item, recovery }) => {
+        const activePublication = item && activeKeys.has(item.key);
+        const activeRecovery = recovery && activeKeys.has(recovery.key);
         const recoveryReason = !item
           ? "invalid_dead_letter_item"
           : !recovery
@@ -7014,7 +7122,7 @@ export class ExactReviewQueue {
     });
   }
 
-  private async recordReviewRunTelemetry(value: unknown) {
+  private recordReviewRunTelemetry(value: unknown) {
     const record = normalizeReviewRunTelemetry(value);
     if (!record) return json({ error: "invalid_review_run_telemetry" }, 400);
     const completedAt = Date.parse(record.completed_at);
@@ -7036,7 +7144,6 @@ export class ExactReviewQueue {
         JSON.stringify(record),
       );
     });
-    await this.scheduleNext(this.readStateSync(), Date.now());
     return json({ ok: true });
   }
 
@@ -7098,6 +7205,26 @@ export class ExactReviewQueue {
         ...(options.status ? { status: options.status } : {}),
       });
       const sourceDecision = options.item.leaseDecision ?? options.item.decision;
+      // Keep only observed, closed vocabulary attached to the completing producer.
+      // An old lease must never lend its cause to a newer command or source.
+      if (
+        (options.supplied || options.terminalReason) &&
+        options.item.revision === options.revision &&
+        !exactReviewInputIdentityChanged(sourceDecision, options.item.decision)
+      ) {
+        const publicFailure = normalizePublicReviewFailure({
+          stage: ["agent_input_scan", "source_preparation", "workflow"].includes(failure.stage)
+            ? failure.stage
+            : "provider_or_model",
+          reason: failure.reasonCode,
+        });
+        if (publicFailure) {
+          options.item.reviewFailure = publicFailure;
+          options.item.reviewFailureDecisionFingerprint = reviewFailureDecisionFingerprint(
+            options.item.decision,
+          );
+        }
+      }
       const source = exactReviewFailureSource(sourceDecision);
       const sourceFingerprint = exactReviewFailureSourceFingerprint(sourceDecision);
       const failureFingerprint = stableExactReviewFailureFingerprint(
@@ -8939,6 +9066,20 @@ export class ExactReviewQueue {
             item.backoffReason = undefined;
             item.updatedAt = now;
           }
+          // Accepted membership owns exactly-once recovery in this transaction.
+          // Quota feedback for this envelope must reduce the pre-recovery ceiling.
+          if (
+            completion.terminalOutcome === "published" &&
+            !result.requeued &&
+            !result.parked &&
+            !rateLimitObservations?.length
+          ) {
+            this.applyPublicationFeedbackSync({
+              at: now,
+              capacity: this.publicationControlSync().capacityCeiling,
+              outcome: "success",
+            });
+          }
           if (!result.requeued) completed += 1;
           if (completion.terminalOutcome === "published") published += 1;
           else if (completion.terminalOutcome === "superseded") superseded += 1;
@@ -9875,10 +10016,20 @@ export class ExactReviewQueue {
     target: NonNullable<ExactReviewTerminalFinalization["parkedCommand"]>["target"],
     now: number,
   ) {
+    if (target.state === "open" && item.parkedReason !== "review_retry_exhausted") return;
     let projection = this.recordLifecycleAdmission(item, item.decision, now);
-    if (parkedCommandClosureCancelled(projection) && !projection.acknowledgement.observed) {
-      // A new stable closure observation may settle the same exhausted command,
-      // but never revive the cancelled projection or authorize its old receipts.
+    const settledStoppedReviewNowClosed =
+      target.state !== "open" &&
+      projection.terminalDisposition?.kind === "failure" &&
+      ["observed", "skipped_locked", "skipped_missing_comment"].includes(
+        commandAcknowledgementState(projection),
+      );
+    if (
+      (parkedCommandClosureCancelled(projection) && !projection.acknowledgement.observed) ||
+      settledStoppedReviewNowClosed
+    ) {
+      // A later closure after a stopped receipt, or after cancelled closure,
+      // gets fresh lifecycle ownership. Never reuse an old acknowledgement.
       // Advance only lifecycle ownership; keep the stopped producer and budgets.
       item.revision = this.nextExactReviewCommandRevisionSync(item.key, item.revision + 1);
       item.updatedAt = now;
@@ -9887,7 +10038,7 @@ export class ExactReviewQueue {
     // Do not repurpose an unrelated terminal fact or completed receipt.
     if (
       projection.terminalDisposition &&
-      !["requeue", "target_closed"].includes(projection.terminalDisposition.kind)
+      !["requeue", "target_closed", "failure"].includes(projection.terminalDisposition.kind)
     )
       return;
     const identity = {
@@ -9901,7 +10052,7 @@ export class ExactReviewQueue {
       !this.ensureLifecycleTerminalFinalizationDriver({
         state,
         projection,
-        terminalDisposition: "target_closed",
+        terminalDisposition: target.state === "open" ? "failure" : "target_closed",
         now,
       })
     )
@@ -9911,7 +10062,11 @@ export class ExactReviewQueue {
       ...driver.terminalFinalization!,
       statusState: "Failed",
       statusDetail:
-        "The review exhausted its retry budget and the item is now closed. No review or repair was restarted.",
+        target.state === "open"
+          ? "Stopped: the review exhausted its retry budget and needs operator attention. No review or repair was restarted. " +
+            (reviewFailureExplanation(currentReviewFailure(item)) ??
+              "Detailed historical reason unavailable; no specific failure cause is established.")
+          : "The review exhausted its retry budget and the item is now closed. No review or repair was restarted.",
       parkedCommand: {
         itemKey: item.key,
         revision: item.revision,
@@ -11915,13 +12070,25 @@ export class ExactReviewQueue {
     };
   }
 
+  private reviewAdmissionCapabilities() {
+    return {
+      scheduled_feed: {
+        target_rate_per_hour: exactReviewScheduledRatePerHour(this.env, "global"),
+        enqueue_replay: "scheduled_disposition_v1",
+      },
+      manual_publication: {
+        policy: RECORD_COMMENT_ONLY,
+        enabled: String(this.env.EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED ?? "") === "1",
+      },
+    };
+  }
+
   private scheduledReviewFeedStatusSync(now: number) {
     const global = this.scheduledReviewBucketSync("global", now);
     const hot = this.scheduledReviewBucketSync("hot_intake", now);
     const normal = this.scheduledReviewBucketSync("normal_backfill", now);
     return {
-      target_rate_per_hour: global.ratePerHour,
-      enqueue_replay: "scheduled_disposition_v1",
+      ...this.reviewAdmissionCapabilities().scheduled_feed,
       burst: global.burst,
       token_balance: Math.floor(global.tokens),
       ...(global.throttleObservedAt
@@ -13008,6 +13175,7 @@ export class ExactReviewQueue {
         continue;
       }
       const item = state.items[itemKey]!;
+      clearStaleReviewFailure(item);
       const itemJson = JSON.stringify(item);
       nextItems.set(itemKey, itemJson);
       if (baseline.items.get(itemKey) === itemJson) continue;
@@ -13620,7 +13788,20 @@ export class ExactReviewQueue {
       );
       return null;
     }
+    const revisionMaterial = exactReviewSourceRevisionMaterial(item);
+    if (!revisionMaterial) throw new Error("live review source metadata is incomplete");
+    decision = {
+      ...decision,
+      sourceContentRevision: await sha256Hex(
+        new TextEncoder().encode(JSON.stringify(revisionMaterial)),
+      ),
+    };
     if (decision.itemKind === "pull_request") {
+      const baseSha = String(objectValue(item.base).sha || "")
+        .trim()
+        .toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(baseSha) || typeof item.draft !== "boolean")
+        throw new Error("live pull request base or draft identity is invalid");
       const headSha = String(objectValue(item.head).sha || "")
         .trim()
         .toLowerCase();
@@ -13650,6 +13831,8 @@ export class ExactReviewQueue {
       decision = {
         ...decision,
         sourceHeadSha: headSha,
+        sourceBaseSha: baseSha,
+        sourceIsDraft: item.draft,
         sourceHeadVerified: true,
         sourceAuthoritySeq,
         ...(Number.isFinite(Date.parse(sourceUpdatedAt)) ? { sourceUpdatedAt } : {}),
@@ -15450,6 +15633,51 @@ function exactReviewRetryIdentityChanged(
   return priorEpoch !== activeEpoch || exactReviewInputIdentityChanged(priorDecision, nextDecision);
 }
 
+function freshScannerRefusalRetry(
+  decision: ExactReviewDecision,
+  deliveryId: string | undefined,
+  refusal: ExactReviewQueueItem["scannerRefusal"],
+  refusedDecision: ExactReviewDecision,
+) {
+  if (!refusal) return false;
+  if (decision.sourceAction === "re_review") {
+    const requestedAt = Date.parse(decision.sourceCommentUpdatedAt || "");
+    const failedCommandAt = Date.parse(refusedDecision.sourceCommentUpdatedAt || "");
+    return (
+      decision.sourceCommentVerified === true &&
+      Boolean(
+        decision.commandStatusMarker &&
+        decision.sourceCommentId &&
+        decision.commandBodyDigest &&
+        decision.commandOrigin,
+      ) &&
+      // GitHub truncates timestamps to seconds; a tie cannot prove that the
+      // command followed the refusal, regardless of comment ID or producer.
+      requestedAt >
+        Math.max(refusal.observedAt, Number.isFinite(failedCommandAt) ? failedCommandAt : 0)
+    );
+  }
+  // Manual workflow reruns retain their run id; only a newly dispatched,
+  // explicitly selected item may release a refusal from an older run. Opaque
+  // API request IDs instead identify a new explicit request; retain the failed
+  // delivery on its decision so replay stays blocked after receipt expiry.
+  const manualRun = deliveryId?.match(/^manual:([A-Za-z0-9_.:-]{1,150}):([1-9]\d*)$/);
+  return (
+    decision.sourceAction === MANUAL_REVIEW_SOURCE_ACTION &&
+    decisionPublicationPolicy(decision) === RECORD_COMMENT_ONLY &&
+    Boolean(
+      manualRun &&
+      manualRun[2] === String(decision.itemNumber) &&
+      deliveryId !== refusedDecision.sourceDeliveryId &&
+      (/^\d+$/.test(manualRun[1])
+        ? /^\d+$/.test(refusal.runId) && BigInt(manualRun[1]) > BigInt(refusal.runId)
+        : refusedDecision.sourceAction !== MANUAL_REVIEW_SOURCE_ACTION ||
+          (Boolean(refusedDecision.sourceDeliveryId) &&
+            deliveryId !== refusedDecision.sourceDeliveryId)),
+    )
+  );
+}
+
 function finishExactReviewQueueItem(
   state: ExactReviewQueueState,
   item: ExactReviewQueueItem,
@@ -15462,8 +15690,40 @@ function finishExactReviewQueueItem(
   random: () => number = Math.random,
   env: unknown = {},
 ) {
+  if (outcome === "success") {
+    delete item.reviewFailure;
+    delete item.reviewFailureDecisionFingerprint;
+  }
   const retryingFailure = outcome !== "success" && reviewFailureReason === undefined;
   const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
+  if (outcome !== "success" && agentInputScanFailureReason(reviewFailureReason)) {
+    const refusal = { observedAt: now, runId: item.claimedRunId || "" };
+    const freshSuccessor =
+      hasNewerRevision &&
+      freshScannerRefusalRetry(
+        item.decision,
+        item.admissionDeliveryId,
+        refusal,
+        item.leaseDecision ?? item.decision,
+      );
+    if (!freshSuccessor) {
+      // Automatic source drift cannot escape a terminal refusal. Keep the
+      // failed source for diagnosis; release replaces it instead of merging
+      // its command authority into the next review.
+      item.decision = item.leaseDecision ?? item.decision;
+      item.scannerRefusal = refusal;
+      clearExactReviewLease(item);
+      item.state = "parked";
+      item.parkedReason = "scanner_refused";
+      item.parkedRecoveryAt = undefined;
+      item.backoffReason = undefined;
+      item.firstFailureAt ??= now;
+      item.updatedAt = now;
+      item.reviewFailure = { stage: "agent_input_scan", reason: reviewFailureReason! };
+      item.reviewFailureDecisionFingerprint = reviewFailureDecisionFingerprint(item.decision);
+      return { requeued: false, parked: true };
+    }
+  }
   const activeRetryPolicyEpoch = exactReviewRetryPolicyEpoch(env);
   const retryPolicyChanged =
     (item.reviewRetryPolicyEpoch || DEFAULT_EXACT_REVIEW_RETRY_POLICY_EPOCH) !==
@@ -15496,6 +15756,25 @@ function finishExactReviewQueueItem(
     (retryingFailure && retryPolicyChanged) ||
     requeueLatest;
   if (!requeued) {
+    if (
+      reviewFailureReason === "source_incompatible" &&
+      item.decision.itemKind === "pull_request" &&
+      /^[0-9a-f]{40}$/.test(item.decision.sourceHeadSha ?? "") &&
+      !exactReviewQueueHasCommandContext(item)
+    ) {
+      // The missing/invalid Codex pin belongs to this immutable PR head. Keep
+      // the existing queue slot so scheduled intake cannot recreate it; fresh
+      // source reconciliation and explicit commands retain their recovery paths.
+      clearExactReviewLease(item);
+      item.state = "parked";
+      item.parkedReason = "source_incompatible";
+      item.parkedRecoveryAt = undefined;
+      item.parkedTerminalCheckedAt = now;
+      item.backoffReason = undefined;
+      item.firstFailureAt ??= now;
+      item.updatedAt = now;
+      return { requeued: false, parked: true };
+    }
     delete state.items[item.key];
     return { requeued: false, parked: false };
   }
@@ -16830,14 +17109,16 @@ function exactReviewScheduledDispositionFromJson(
       typeof body.item_key === "string" &&
       /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(body.item_key) &&
       body.dedupe_scope === "scheduled_queue_item" &&
-      body.dedupe_reason === "item_already_pending_or_active"
+      (body.dedupe_reason === "item_already_pending_or_active" ||
+        body.dedupe_reason === "source_incompatible" ||
+        body.dedupe_reason === "scanner_refused")
     ) {
       disposition = {
         ok: true,
         deduped: true,
         item_key: body.item_key,
         dedupe_scope: "scheduled_queue_item",
-        dedupe_reason: "item_already_pending_or_active",
+        dedupe_reason: body.dedupe_reason,
       };
     } else if (
       body.ok === true &&
@@ -17343,11 +17624,17 @@ function removeAcknowledgedParkedCommandProducer(
 ) {
   releaseParkedCommandWrite(state, driver, Date.now());
   const producer = exactReviewParkedCommandProducer(state, driver);
-  if (producer) delete state.items[producer.key];
+  if (producer && driver.terminalFinalization?.parkedCommand?.target.state !== "open")
+    delete state.items[producer.key];
 }
 
-// Unlike ordinary missing-target pruning, command cleanup requires an explicit
-// closed item and stable GitHub identity. 404/410/partial responses are not proof.
+// Unlike ordinary missing-target pruning, acknowledgement settlement requires a
+// stable GitHub identity. Open targets bind the head and current command, not
+// updated_at: writing this acknowledgement can advance that timestamp itself.
+// Canonical title/body/review-label/lock material and PR base/draft are bound
+// separately, so source drift still revokes authority without treating the
+// acknowledgement itself as a new source revision.
+// 404/410/partial responses are never proof of a settleable command.
 async function exactReviewClosedCommandTarget(
   token: string,
   decision: ExactReviewDecision,
@@ -17364,7 +17651,8 @@ async function exactReviewClosedCommandTarget(
       errorLabel: "parked command terminal target",
     }),
   );
-  if (item.state !== "closed") return null;
+  if (item.state !== "closed" && item.state !== "open") return null;
+  const open = item.state === "open";
   const nodeId = String(item.node_id || "");
   const closedAt = String(item.closed_at || "");
   const headSha = pull ? String(objectValue(item.head).sha || "").toLowerCase() : null;
@@ -17372,11 +17660,37 @@ async function exactReviewClosedCommandTarget(
     Number(item.number) !== decision.itemNumber ||
     !nodeId ||
     nodeId.length > 200 ||
-    !Number.isFinite(Date.parse(closedAt)) ||
-    (pull && !/^[0-9a-f]{40}$/.test(headSha!))
+    (open ? item.closed_at != null : !Number.isFinite(Date.parse(closedAt))) ||
+    (pull && !/^[0-9a-f]{40}$/.test(headSha!)) ||
+    (open && pull && headSha !== decision.sourceHeadSha?.toLowerCase())
   )
     return null;
-  return { nodeId, headSha, closedAt };
+  if (!open) return { nodeId, headSha, closedAt };
+  // Fail closed for legacy identity gaps. Cause may be unknown, but status
+  // writes still require the recorded review-relevant source to match.
+  const material = exactReviewSourceRevisionMaterial(item);
+  if (!material || !/^[0-9a-f]{64}$/.test(String(decision.sourceContentRevision || "")))
+    return null;
+  const sourceContentRevision = await sha256Hex(new TextEncoder().encode(JSON.stringify(material)));
+  if (sourceContentRevision !== decision.sourceContentRevision) return null;
+  const baseSha = pull ? String(objectValue(item.base).sha || "").toLowerCase() : undefined;
+  const isDraft = pull ? item.draft : undefined;
+  if (
+    pull &&
+    (!/^[0-9a-f]{40}$/.test(baseSha!) ||
+      baseSha !== decision.sourceBaseSha?.toLowerCase() ||
+      typeof isDraft !== "boolean" ||
+      isDraft !== decision.sourceIsDraft)
+  )
+    return null;
+  return {
+    nodeId,
+    headSha,
+    closedAt: null,
+    state: "open" as const,
+    sourceContentRevision,
+    ...(pull ? { baseSha, isDraft: isDraft as boolean } : {}),
+  };
 }
 
 async function exactReviewTargetItemState(
@@ -17387,7 +17701,14 @@ async function exactReviewTargetItemState(
   try {
     const isPullRequest = decision.itemKind === "pull_request";
     const queuedHeadSha = String(decision.sourceHeadSha || "").toLowerCase();
-    const readPullHead = isPullRequest && /^[0-9a-f]{40}$/.test(queuedHeadSha);
+    const bindScheduledSource =
+      isPullRequest &&
+      !queuedHeadSha &&
+      Boolean(exactReviewScheduledLane(decision)) &&
+      !decision.publication &&
+      !exactReviewDecisionHasCommandContext(decision);
+    const readPullHead =
+      isPullRequest && (/^[0-9a-f]{40}$/.test(queuedHeadSha) || bindScheduledSource);
     const item = await githubTokenJson({
       env,
       token,
@@ -17404,6 +17725,33 @@ async function exactReviewTargetItemState(
         .toLowerCase();
       if (!/^[0-9a-f]{40}$/.test(headSha)) {
         throw new Error("live pull request response missing head SHA");
+      }
+      if (bindScheduledSource) {
+        const baseSha = String(objectValue(item.base).sha || "").toLowerCase();
+        const material = exactReviewSourceRevisionMaterial(item);
+        const updatedAt = String(item.updated_at || "");
+        if (
+          !/^[0-9a-f]{40}$/.test(baseSha) ||
+          typeof item.draft !== "boolean" ||
+          !material ||
+          !Number.isFinite(Date.parse(updatedAt))
+        ) {
+          throw new Error("live scheduled pull request source identity is incomplete");
+        }
+        return {
+          state: "open",
+          headSha,
+          sourceIdentity: {
+            sourceHeadSha: headSha,
+            sourceHeadVerified: true,
+            sourceBaseSha: baseSha,
+            sourceIsDraft: item.draft,
+            sourceUpdatedAt: updatedAt,
+            sourceContentRevision: await sha256Hex(
+              new TextEncoder().encode(JSON.stringify(material)),
+            ),
+          },
+        };
       }
       return { state: "open", headSha };
     }

@@ -19,6 +19,7 @@ import {
   isBulkFilerExemptRepositoryPermission as isVerifiedMaintainerRepositoryPermission,
   isMaintainerAuthorAssociation,
   labelNames,
+  verifiedMaintainerAuthorAssociation,
 } from "./clawsweeper-item-policy.js";
 import {
   mediaProofRuntimeHints,
@@ -38,6 +39,7 @@ import type {
   ReviewActionLedger,
 } from "./clawsweeper-types.js";
 import { PUBLIC_CODEX_MODEL } from "./codex-env.js";
+import { codexItemProfile } from "./codex-item-profile.js";
 import { UserFacingCommandError } from "./command.js";
 import { LOCAL_REVIEW_WEB_SEARCH_CONFIG } from "./commit-sweeper.js";
 import { isReviewedPrActivityCursor } from "./review-activity-cursor.js";
@@ -62,6 +64,7 @@ import type { CreateReviewCommandWorkflowDependencies } from "./clawsweeper-revi
 import { prepareReviewCommand } from "./clawsweeper-review-preparation.js";
 import { parsePrHydrationSnapshot } from "./pr-hydration-snapshot.js";
 import { ReviewSourcePreparationError } from "./review-source-preparation.js";
+import { validationRecoveryRequired } from "./repair/validation-recovery.js";
 import { commandProofBinding, assertCommandProofSubject } from "./command-proof-assessment.js";
 import { COMMAND_PROOF_SOURCE_ACTION } from "./command-proof-contract.js";
 import {
@@ -143,16 +146,11 @@ export function localExactBootstrapReviewCommentBody(
   return renderReviewCommentFromReport(markdown, "none");
 }
 
-export function restoreVerifiedMaintainerPullRequestAuthorAssociation(
-  item: Pick<Item, "kind" | "author" | "authorAssociation" | "labels">,
+export function restoreVerifiedMaintainerAuthorAssociation(
+  item: Pick<Item, "author" | "authorAssociation">,
   repositoryPermission: (author: string) => string | null,
 ): boolean {
-  if (
-    item.kind !== "pull_request" ||
-    !item.author.trim() ||
-    isMaintainerAuthorAssociation(item.authorAssociation) ||
-    !item.labels.some((label) => label.trim().toLowerCase() === "maintainer")
-  ) {
+  if (!item.author.trim() || isMaintainerAuthorAssociation(item.authorAssociation)) {
     return false;
   }
   let permission: string | null;
@@ -162,7 +160,10 @@ export function restoreVerifiedMaintainerPullRequestAuthorAssociation(
     return false;
   }
   if (!isVerifiedMaintainerRepositoryPermission(permission)) return false;
-  item.authorAssociation = "MEMBER";
+  item.authorAssociation = verifiedMaintainerAuthorAssociation({
+    authorAssociation: item.authorAssociation,
+    repositoryPermission: permission,
+  });
   return true;
 }
 
@@ -262,9 +263,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
       batchSize,
       maxPages,
       model,
-      reasoningEffort,
       sandboxMode,
-      serviceTier,
       timeoutMs,
       expectedSourceRevision,
       allowClosed,
@@ -562,7 +561,17 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             const inspection = runReviewCheckoutInspection({
               // Structural reuse has no model payload. Hydrated reuse scans the
               // current context too, including source comments.
-              initialPrompt: serializeReviewContext(context ?? item),
+              initialPrompt: serializeReviewContext(
+                context ?? item,
+                item.kind === "pull_request"
+                  ? [
+                      ...(context?.pullFiles ?? []),
+                      ...(context?.prHydrationSnapshot?.version === 3
+                        ? context.prHydrationSnapshot.files.items
+                        : []),
+                    ]
+                  : [],
+              ),
               scanSource: item.kind === "pull_request"
                 ? { kind: "committed", baseSha: typeof baseSha === "string" ? baseSha : "", headSha: headSha ?? "" }
                 : { kind: "prompt" },
@@ -579,13 +588,9 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           );
           return cachePreflightState === "passed";
         };
-        const restoredMaintainerAssociation =
-          !localOnly &&
-          restoreVerifiedMaintainerPullRequestAuthorAssociation(item, (author) =>
-            bulkFilerRepositoryPermission(author, bulkFilerRepositoryPermissionCache),
-          );
         activeReviewItem = item;
         let reviewItemFailed = false;
+        let itemRecoveryRequired = false;
         const previousReviewMutationRunner = dependencies.activeReviewMutationRunner;
         try {
         startReviewActionLedgerItem(reviewLedger, item);
@@ -630,6 +635,12 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             continue;
           }
         }
+        const restoredMaintainerAssociation =
+          !localOnly &&
+          restoreVerifiedMaintainerAuthorAssociation(item, (author) =>
+            bulkFilerRepositoryPermission(author, bulkFilerRepositoryPermissionCache),
+          );
+        const itemCodexProfile = codexItemProfile(item.authorAssociation);
         const bulkFilerDetection =
           !localOnly && item.kind === "issue"
             ? detectBulkFiler({
@@ -1510,9 +1521,9 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             model,
             openclawDir: reviewOpenclawDir,
             reviewTreeRoot: reviewTreesDir,
-            reasoningEffort,
+            reasoningEffort: itemCodexProfile.reasoningEffort,
             sandboxMode,
-            serviceTier,
+            serviceTier: itemCodexProfile.serviceTier,
             forcedLoginMethod,
             preserveCodexAuth: localOnly,
             timeoutMs,
@@ -1567,9 +1578,9 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         decision = verifyRegressionProvenance(decision, item, context, reviewOpenclawDir, git);
         const runtime = {
           model: PUBLIC_CODEX_MODEL,
-          reasoningEffort,
+          reasoningEffort: itemCodexProfile.reasoningEffort,
           sandboxMode,
-          serviceTier,
+          serviceTier: itemCodexProfile.serviceTier,
           ...prompt.telemetry,
           contextElapsedMs,
           codexElapsedMs,
@@ -1671,6 +1682,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         pruneItemOutput(reportPath);
         } catch (error) {
           reviewItemFailed = true;
+          itemRecoveryRequired = validationRecoveryRequired(error) !== null;
           if (error instanceof AgentInputScanError || error instanceof ReviewSourcePreparationError) {
             recordFailureDiagnostics(error);
           }
@@ -1703,6 +1715,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               restoreTreeModes(itemReadonlyModeSnapshots);
               if (
                 pullRequestReviewTreeDir &&
+                !itemRecoveryRequired &&
                 !removePullRequestReviewTree({
                   targetDir: openclawDir,
                   worktreeDir: pullRequestReviewTreeDir,
@@ -1848,7 +1861,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           );
       } finally {
         try {
-          cleanupReviewOutput();
+          cleanupReviewOutput(commandError);
         } catch (error) {
           if (commandError === undefined && finalizationError === undefined) {
             finalizationError = error;

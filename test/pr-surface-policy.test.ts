@@ -272,6 +272,9 @@ for (const [name, fixturePath, normalizationTruncates] of [
   ["worker input layout fields", "./fixtures/persistence-classifier-132839-workers.json", true],
   ["hovercard promise cancellation", "./fixtures/persistence-classifier-136772.json", false],
   ["SQLite worker diagnostic suffix", "./fixtures/persistence-classifier-138520.json", true],
+  ["script source parser routing", "./fixtures/persistence-classifier-151772.json", true],
+  ["Console stream routing", "./fixtures/persistence-classifier-152888.json", true],
+  ["tool construction read routing", "./fixtures/persistence-classifier-156686.json", true],
   [
     "JSON Schema value validation",
     "./fixtures/persistence-classifier-131624-json-schema.json",
@@ -354,6 +357,263 @@ test("transient JSON and serialized variables do not establish storage or trunca
         assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
       }
     }
+  }
+});
+
+test("plain file reads do not establish a persisted format or truncated-patch uncertainty", () => {
+  for (const api of ["readFile", "readFileSync"]) {
+    for (const patch of [
+      `@@\n+const source = fs.${api}(filePath, "utf8");`,
+      `@@\n-parseSource(fs.${api}(filePath, "utf8"));\n+parser.parseSource(fs.${api}(filePath, "utf8"));`,
+      `@@\n const source = fs.${api}(filePath, "utf8");\n const diagnostic = {\n+  message: detail,\n };`,
+      `@@\n+const source = fs.${api}(filePath, "utf8");\n@@\n+const response = JSON.parse(stdout);`,
+    ]) {
+      for (const evidence of [patch, `${patch}\n\n[truncated 90 chars]`]) {
+        const detection = dataModelChangeFromPullFilesForTest({
+          pullFiles: [{ filename: "src/runtime/source-checker.ts", patch: evidence }],
+        });
+        assert.deepEqual(detection, { change: false, surfaces: [] }, evidence);
+      }
+    }
+  }
+});
+
+test("file readers retain migration gates with same-hunk decoding or persistence ownership", () => {
+  for (const api of ["readFile", "readFileSync"]) {
+    for (const file of [
+      {
+        filename: "src/runtime/codec.ts",
+        patch: `@@\n-const value = JSON.parse(fs.${api}(target, "utf8"));\n+const value = JSON.parse(fs.${api}(target, "utf8"), revive);`,
+      },
+      {
+        filename: "src/runtime/codec.ts",
+        patch: `@@\n-const raw = fs.${api}(oldTarget, "utf8");\n+const raw = fs.${api}(target, "utf8");\n const value = JSON.parse(raw);`,
+      },
+      {
+        filename: "src/persistence/reader.ts",
+        patch: `@@\n+const raw = fs.${api}(target, "utf8");`,
+      },
+      {
+        filename: "src/storage/binary-reader.ts",
+        patch: `@@\n+const value = decodeBinary(fs.${api}(target));`,
+      },
+      {
+        filename: "src/runtime/reader.ts",
+        patch: `@@\n const persisted = parseYaml(\n-  fs.${api}(oldTarget, "utf8"),\n+  fs.${api}(target, "utf8"),\n );`,
+      },
+      ...[
+        "statePath",
+        "options.statePath",
+        "this.statePath",
+        "options?.statePath",
+        "await options.statePath",
+        "(this.statePath)",
+        "(await options.statePath)",
+        'options["statePath"]',
+        "this['statePath']",
+        'options?.["statePath"]',
+        'paths[current]["statePath"]',
+        'path.resolve(root, options["statePath"])',
+        'await resolvePath(options["statePath"])',
+        'path.resolve(root.replace(/\\)/g, ""), statePath)',
+      ].map((input) => ({
+        filename: "src/runtime/reader.ts",
+        patch: `@@\n+const value = decodeBinary(fs.${api}(${input}));`,
+      })),
+      {
+        filename: "src/runtime/reader.ts",
+        patch: `@@\n+const value = decodeBinary(fs["${api}"](options["statePath"]));`,
+      },
+      {
+        filename: "src/runtime/reader.ts",
+        patch: `@@\n const value = decodeBinary(fs.${api}(\n-  oldPath,\n+  statePath,\n ));`,
+      },
+    ]) {
+      const report = renderPersistenceReport([file], "a".repeat(40));
+      assert.match(
+        renderReviewCommentFromReport(report, "none"),
+        /Add data-model compatibility proof/,
+      );
+      assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+    }
+  }
+});
+
+test("state-path stream and descriptor access retains compatibility holds", () => {
+  for (const expression of [
+    'fs.createReadStream(options["statePath"])',
+    "createWriteStream(options.statePath)",
+    'await fs.promises.open(statePath, "r")',
+    'fs["openSync"](options["statePath"], "r")',
+    "fs.readSync(stateFds.get(statePath), buffer, 0, buffer.length, 0)",
+    "fs.readv(stateFds.get(statePath), buffers, 0, done)",
+    "fs.writeSync(stateFds.get(statePath), payload)",
+    "fs.writevSync(stateFds.get(statePath), buffers)",
+    "fs.appendFileSync(statePath, payload)",
+    "fs.truncateSync(statePath, 0)",
+  ]) {
+    const report = renderPersistenceReport(
+      [{ filename: "src/runtime/records.ts", patch: `@@\n+${expression};` }],
+      "a".repeat(40),
+    );
+    assert.match(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+  }
+  const pullFiles = [
+    {
+      filename: "src/runtime/source.ts",
+      patch:
+        '@@\n+const handle = await open(sourcePath, "r");\n+const result = JSON.parse(stdout);',
+    },
+  ];
+  assert.match(
+    reviewAutomationMarkersFromReport(renderPersistenceReport(pullFiles, "a".repeat(40))),
+    /clawsweeper-verdict:pass/,
+  );
+});
+
+test("unchanged state-path context guards changed I/O operations", () => {
+  for (const expression of [
+    "fs.createReadStream(file)",
+    "fs.createWriteStream(file)",
+    'fs.openSync(file, "r")',
+    "fs.readSync(fd, buffer, 0, buffer.length, 0)",
+    "fs.writeSync(fd, payload)",
+    "fs.appendFileSync(file, payload)",
+    "fs.truncateSync(file, 0)",
+  ]) {
+    const patch = `@@\n const statePath = options.databasePath;\n const file = statePath;\n const fd = stateFds.get(statePath);\n+${expression};`;
+    const report = renderPersistenceReport(
+      [{ filename: "src/runtime/records.ts", patch }],
+      "a".repeat(40),
+    );
+    assert.match(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+  }
+});
+
+test("qualified filesystem and handle operations retain compatibility holds", () => {
+  for (const patch of [
+    ' const handle = await fs.promises.open(statePath, "r");\n+await handle.read(buffer);',
+    ' import { open as openFile } from "node:fs/promises";\n+await openFile(statePath, "r");',
+    '+await fs["open"](statePath, "r");',
+    '+await fs?.open(statePath, "r");',
+    '+await fs?.promises.open(statePath, "r");',
+    ' import * as nodeFs from "node:fs";\n+nodeFs.write(statePath, payload, done);',
+    ' import disk from "node:fs/promises";\n+await disk.open(statePath, "r");',
+    ' import { promises as disk } from "node:fs";\n+await disk.open(statePath, "r");',
+    ' import disk, * as nodeFs from "node:fs";\n+await disk.open(statePath, "r");',
+    ' import disk, * as nodeFs from "node:fs";\n+nodeFs.write(statePath, payload, done);',
+  ]) {
+    const report = renderPersistenceReport(
+      [{ filename: "src/runtime/records.ts", patch: "@@\n" + patch }],
+      "a".repeat(40),
+    );
+    assert.match(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+  }
+});
+
+test("persistence-owner state-file relocations retain compatibility holds", () => {
+  for (const format of ["json", "bin"]) {
+    const report = renderPersistenceReport(
+      [
+        {
+          filename: "src/persistence/reader.ts",
+          patch: `@@\n-const statePath = path.join(root, "v1.${format}");\n+const statePath = path.join(root, "v2.${format}");`,
+        },
+      ],
+      "a".repeat(40),
+    );
+    assert.match(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+      format,
+    );
+    assert.match(
+      reviewAutomationMarkersFromReport(report),
+      /clawsweeper-verdict:needs-human/,
+      format,
+    );
+  }
+});
+
+test("changed existing statePath declarations retain compatibility holds", () => {
+  const declaration = "const statePath = path.resolve(cwd, resolveOpenClawStateSqlitePath(env));";
+  for (const patch of [
+    ...[
+      'const statePath = path.resolve(cwd, "alternate.sqlite");',
+      "const statePath = path.resolve(cwd, resolveOpenClawStateSqlitePath(alternateEnv));",
+      "const statePath = (path.resolve(cwd, resolveOpenClawStateSqlitePath(env)));",
+      "const statePath: string = path.resolve(cwd, resolveOpenClawStateSqlitePath(env));",
+    ].map((replacement) => `@@\n-${declaration}\n+${replacement}`),
+    `@@\n-${declaration}`,
+    `@@\n-${declaration}\n@@\n+const statePath = "alternate.sqlite";`,
+  ]) {
+    const report = renderPersistenceReport(
+      [
+        {
+          filename: "src/agents/tool-construction-preparation.ts",
+          patch,
+        },
+      ],
+      "a".repeat(40),
+    );
+    assert.match(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+  }
+});
+
+test("new, unchanged, moved, and reference-only routing captures stay clear", () => {
+  const declaration = "const statePath = path.resolve(cwd, resolveOpenClawStateSqlitePath(env));";
+  for (const patch of [
+    `@@\n ${declaration}\n+const diagnosticsEnabled = true;`,
+    `@@\n+${declaration}`,
+    "@@\n-await observe(statePath);\n+await observe(statePath, options);",
+    `@@\n-${declaration}\n+  ${declaration}`,
+    `@@\n-${declaration}\n@@\n+${declaration}`,
+    `@@\n-const previousFlag = false;\n+${declaration}`,
+  ]) {
+    const report = renderPersistenceReport(
+      [{ filename: "src/agents/tool-construction-preparation.ts", patch }],
+      "a".repeat(40),
+    );
+    assert.doesNotMatch(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
+  }
+});
+
+test("generic non-file calls cannot establish storage beside unchanged state paths", () => {
+  for (const patch of [
+    ...["window.open(url)", "reader.read()", "writer.write(value)", "reader.READSYNC(value)"].map(
+      (expression) => `@@\n const statePath = options.databasePath;\n+${expression};`,
+    ),
+    '@@\n import * as disk from "node:fs";\n const Disk = memoryReader;\n+Disk.read(statePath);',
+  ]) {
+    const report = renderPersistenceReport(
+      [{ filename: "src/runtime/view.ts", patch }],
+      "a".repeat(40),
+    );
+    assert.doesNotMatch(
+      renderReviewCommentFromReport(report, "none"),
+      /Add data-model compatibility proof/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
   }
 });
 
@@ -497,6 +757,26 @@ test("runtime state names and typed parameters alone do not establish stored dat
   }
 });
 
+test("state paths need file-read evidence in the same hunk", () => {
+  for (const sameHunk of [false, true]) {
+    const patch = [
+      "@@\n+const statePath = options.databasePath;",
+      ...(sameHunk ? [] : ["@@"]),
+      "+const source = readFileSync(sourcePath, 'utf8');",
+    ].join("\n");
+    for (const evidence of [patch, `${patch}\n\n[truncated 90 chars]`]) {
+      const pullFiles = [{ filename: "src/runtime/source-reader.ts", patch: evidence }];
+      const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+      const comment = renderReviewCommentFromReport(report, "none");
+      assert.equal(comment.includes("Add data-model compatibility proof"), sameHunk);
+      assert.equal(
+        reviewAutomationMarkersFromReport(report).includes("clawsweeper-verdict:pass"),
+        !sameHunk,
+      );
+    }
+  }
+});
+
 for (const [name, patch] of [
   ["missing", undefined],
   ["empty", ""],
@@ -552,10 +832,53 @@ test("generic metadata, cache keys, versions, and TTL do not warn or gate withou
 
 test("storage evidence still warns and gates browser, runtime, and schema changes", () => {
   const cases = [
+    ...[
+      {
+        filename: "src/runtime/console.ts",
+        patch:
+          '@@\n import { Console } from "./console.js";\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });\n writeFileSync(target, raw);',
+      },
+      ...[
+        '-import { Console } from "node:console";\n+import { Console } from "./console.js";\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+        '-import { Console } from "./console.js";\n+import { Console } from "node:console";\n-const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+        ' import { Console } from "node:console";\n function route(Console) {\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+        ' import { Console } from "node:console";\n@@ -10,2 +10,3 @@ function route(Console) {\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+        ' import { Console } from "node:console";\n const { Console } = plugin;\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+      ].map((bindingPatch) => ({
+        filename: "src/runtime/console.ts",
+        patch: `@@\n${bindingPatch}\n writeFileSync(target, raw);`,
+      })),
+      {
+        filename: "src/runtime/console.ts",
+        patch:
+          "@@\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });\n writeFileSync(target, raw);",
+      },
+      {
+        filename: "src/runtime/console.ts",
+        patch:
+          '@@\n import { Console } from "node:console";\n+const output = new Console({ stdout: outputStream, stderr: errorStream });\n writeFileSync(target, raw);',
+      },
+      {
+        filename: "src/persistence/console.ts",
+        patch:
+          '@@\n import { Console } from "node:console";\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });',
+      },
+      ...[
+        " writeFileSync(target, JSON.stringify({\n+  revision: 2,\n }));",
+        " const raw = JSON.stringify({\n+  revision: 2,\n });\n writeFileSync(target, raw);",
+        "+writeFileSync(target, raw);",
+        "-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);\n writeFileSync(target, raw);",
+      ].map((storagePatch) => ({
+        filename: "src/runtime/console.ts",
+        patch:
+          '@@\n import { Console } from "node:console";\n+const output = new Console({ stdout: process.stdout, stderr: process.stderr });\n' +
+          storagePatch,
+      })),
+    ].map((file) => ({ ...file, surface: "serialized state" })),
     ...["readFile", "readFileSync", "writeFile", "writeFileSync"].flatMap((api) => {
       const call = api.endsWith("Sync") ? `fs.${api}` : `await fs.promises.${api}`;
       const boundary = api.startsWith("read")
-        ? `const raw = ${call}(target, "utf8");`
+        ? `const raw = ${call}(statePath, "utf8");`
         : `${call}(target, raw);`;
       return [
         `@@\n+${boundary}`,
@@ -815,7 +1138,7 @@ test("strong persistence evidence remains unknown when production normalization 
     { filename: "ui/src/display.ts", patch: '@@\n localStorage.getItem("preferences");\n' },
     ...["readFile", "readFileSync", "writeFile", "writeFileSync"].map((api) => ({
       filename: "src/runtime/conversion.ts",
-      patch: `@@\n ${api}(target);\n`,
+      patch: `@@\n ${api}(${api.startsWith("read") ? "statePath" : "target"});\n`,
     })),
     { filename: "src/vector/records.ts" },
     { filename: "src/embedding/records.ts" },
@@ -842,6 +1165,96 @@ test("strong persistence evidence remains unknown when production normalization 
       /clawsweeper-verdict:needs-human/,
     );
   }
+});
+
+test("memory prompt contracts need patch evidence for vector persistence", () => {
+  const filename = "extensions/memory-core/src/memory-tool-contract.ts";
+  assert.deepEqual(dataModelChangeFromPullFilesForTest({ pullFiles: [{ filename }] }), {
+    change: false,
+    surfaces: [],
+  });
+  assert.deepEqual(dataModelChangeFromPullFilesForTest({ pullFiles: [{ filename, patch: "" }] }), {
+    change: false,
+    surfaces: [],
+  });
+
+  const normalizedPullFiles = hydratePrimaryBody("", "pull_request", {
+    pullFiles: [
+      {
+        filename,
+        patch: `@@\n${" // retained context\n".repeat(110)}+  return memoryToolContract;`,
+      },
+    ],
+  }).context.pullFiles;
+  assert.match(normalizedPullFiles[0]?.patch ?? "", /\[truncated \d+ chars\]$/);
+  assert.deepEqual(dataModelChangeFromPullFilesForTest({ pullFiles: normalizedPullFiles }), {
+    change: false,
+    surfaces: [],
+  });
+});
+
+test("explicit vector and embedding owners override memory contract basename exemptions", () => {
+  for (const filename of [
+    "src/vector/memory-tool-contract.ts",
+    "src/embedding/memory-prompt-contract.ts",
+    "extensions/memory-core/src/vector/tool-contract.ts",
+    "extensions/memory-core/src/embedding/prompt-contract.ts",
+  ]) {
+    for (const patch of [undefined, "", "@@\n+  refresh();\n\n[truncated 99 chars]"]) {
+      const pullFiles = [patch === undefined ? { filename } : { filename, patch }];
+      assert.deepEqual(
+        dataModelChangeFromPullFilesForTest({ pullFiles }),
+        {
+          change: true,
+          surfaces: [`unknown-data-model-change: ${filename}`],
+        },
+        `${filename}: ${patch === undefined ? "missing" : patch === "" ? "empty" : "truncated"} patch`,
+      );
+    }
+  }
+});
+
+test("memory persistence owners remain blocked when patch content is unavailable", () => {
+  for (const filename of [
+    "src/memory/vector-store.ts",
+    "extensions/memory-lancedb/lancedb-store.ts",
+    "extensions/memory-core/src/dreaming-state.ts",
+    "extensions/memory-core/src/standing-intents.ts",
+    "extensions/memory-core/src/dreaming-dreams-file.ts",
+    "extensions/memory-core/src/memory-entry-origins.ts",
+    "extensions/memory-core/src/short-term-promotion-types.ts",
+    "extensions/memory-core/src/dreaming-consolidation-artifacts.ts",
+    "extensions/memory-core/src/memory-tool-contract-state.ts",
+    "extensions/memory-core/src/memory-prompt-description-history.ts",
+    "extensions/memory-wiki/src/source-sync-state.ts",
+    "extensions/memory-core/src/memory-session-tombstones.ts",
+    "extensions/memory-wiki/src/compiled-cache.ts",
+  ]) {
+    for (const patch of [undefined, "", "@@\n+  refresh();\n\n[truncated 99 chars]"]) {
+      const file = patch === undefined ? { filename } : { filename, patch };
+      const detection = dataModelChangeFromPullFilesForTest({ pullFiles: [file] });
+      assert.deepEqual(detection, {
+        change: true,
+        surfaces: [`unknown-data-model-change: ${filename}`],
+      });
+      const report = persistenceReport(detection, "a".repeat(40));
+      assert.match(
+        renderReviewCommentFromReport(report, "none"),
+        /Add data-model compatibility proof/,
+      );
+      assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
+    }
+  }
+});
+
+test("semantic vector metadata remains detectable under a non-owner memory subsystem path", () => {
+  const filename = "extensions/memory-core/src/memory-tool-contract.ts";
+  assert.deepEqual(
+    dataModelChangeFromPullFilesForTest({
+      pullFiles: [{ filename, patch: "@@\n+  embeddingDimension: row.embedding_dimension," }],
+    }),
+    { change: true, surfaces: [`vector/embedding metadata: ${filename}`] },
+  );
 });
 
 test("config surface reports force human review instead of automerge pass", () => {
@@ -1197,6 +1610,158 @@ test("Markdown persistence contracts and structured frontmatter remain detectabl
 });
 
 for (const { name, file, surfaces, pullFilesTruncated, sqliteSchemaChange } of [
+  ...[
+    ["extensions/qa-lab/src/lab-server-capture.ts", "QA capture"],
+    ["extensions/qa-lab/src/live-transports/slack/adapter.runtime.ts", "Slack QA"],
+  ].map(([filename, operation]) => ({
+    name: `upgrade guidance without persistence evidence in ${filename}`,
+    file: {
+      filename,
+      patch: `@@\n+throw new Error("${operation} requires async proxy capture support. Upgrade the OpenClaw host.");`,
+    },
+    surfaces: [],
+  })),
+  {
+    name: "upgrade invocation in a generic runtime caller",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: "@@\n+await upgrade(existingRows);",
+    },
+    surfaces: ["migration/backfill/repair: src/runtime/startup.ts"],
+  },
+  {
+    name: "upgrade invocation in a dynamic error message",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: "@@\n+throw new Error(`Upgrade result: ${upgrade(existingRows)}`);",
+    },
+    surfaces: ["migration/backfill/repair: src/runtime/startup.ts"],
+  },
+  {
+    name: "upgrade invocation after a static error message",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: '@@\n+throw new Error("Upgrade the host.", { cause: upgrade(existingRows) });',
+    },
+    surfaces: ["migration/backfill/repair: src/runtime/startup.ts"],
+  },
+  {
+    name: "upgrade call mentioned only in a static error message",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: '@@\n+throw new Error("Call upgrade() to update the host.");',
+    },
+    surfaces: [],
+  },
+  {
+    name: "upgrade guidance in a static template error message",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: "@@\n+throw new Error(`Upgrade the host.`);",
+    },
+    surfaces: [],
+  },
+  {
+    name: "upgrade guidance with an unchanged multiline Error constructor",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: '@@\n throw new Error(\n-  "Host unsupported.",\n+  "Upgrade the host.",\n );',
+    },
+    surfaces: [],
+  },
+  {
+    name: "upgrade guidance in callable Error",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: '@@\n+throw Error("Upgrade the host.");',
+    },
+    surfaces: [],
+  },
+  {
+    name: "upgrade invocation with same-hunk persistence evidence",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: "@@\n const state = JSON.parse(readFile(statePath));\n+await upgrade(state);",
+    },
+    surfaces: ["migration/backfill/repair: src/runtime/startup.ts"],
+  },
+  {
+    name: "upgrade implementation with explicit migration ownership",
+    file: {
+      filename: "src/migrations/upgrade.ts",
+      patch: "@@\n+await upgrade(records);",
+    },
+    surfaces: ["migration/backfill/repair: src/migrations/upgrade.ts"],
+  },
+  {
+    name: "upgrade persistence documentation",
+    file: {
+      filename: "docs/reference/runtime.md",
+      patch: "@@\n+The database schema now requires an upgrade of existing rows.",
+    },
+    surfaces: ["migration/backfill/repair: docs/reference/runtime.md"],
+  },
+  {
+    name: "doctor persistence documentation",
+    file: {
+      filename: "docs/reference/runtime.md",
+      patch: "@@\n+The database schema now requires `doctor` to rewrite existing rows.",
+    },
+    surfaces: ["migration/backfill/repair: docs/reference/runtime.md"],
+  },
+  {
+    name: "doctor diagnostic documentation",
+    file: {
+      filename: "docs/reference/runtime.md",
+      patch: "@@\n+Run `doctor` to inspect browser status.",
+    },
+    surfaces: [],
+  },
+  {
+    name: "doctor endpoint dispatch without persistence evidence",
+    file: {
+      filename: "extensions/browser/src/browser-tool.lifecycle.ts",
+      patch:
+        '@@ -103,8 +103,3 @@\n     case "doctor":\n-      return jsonResult(\n-        proxyRequest\n-          ? await proxyRequest({ method: "GET", path: "/doctor", profile })\n-          : await browserDoctor(baseUrl, { profile, signal }),\n-      );\n+      return jsonResult(await browserDoctor(proxyRequest ?? baseUrl, { profile, signal }));',
+    },
+    surfaces: [],
+  },
+  {
+    name: "doctor dispatch beside persistence in a different hunk",
+    file: {
+      filename: "src/runtime/diagnostics.ts",
+      patch:
+        "@@ -1,3 +1,3 @@\n const state = JSON.parse(readFile(statePath));\n-refresh();\n+refresh(true);\n@@ -40,1 +40,1 @@\n-return doctor();\n+return doctor({ verbose: true });",
+    },
+    surfaces: [],
+  },
+  {
+    name: "doctor invocation with same-hunk persistence evidence",
+    file: {
+      filename: "src/runtime/startup.ts",
+      patch: "@@\n const state = JSON.parse(readFile(statePath));\n+await doctor(state);",
+    },
+    surfaces: ["migration/backfill/repair: src/runtime/startup.ts"],
+  },
+  {
+    name: "doctor invocation under a persistence owner",
+    file: {
+      filename: "src/storage/startup.ts",
+      patch: "@@\n+await doctor(state);",
+    },
+    surfaces: [
+      "durable storage schema: src/storage/startup.ts",
+      "migration/backfill/repair: src/storage/startup.ts",
+    ],
+  },
+  {
+    name: "doctor implementation with explicit migration ownership",
+    file: {
+      filename: "src/doctor/backfill.ts",
+      patch: "@@\n+await doctor(records);",
+    },
+    surfaces: ["migration/backfill/repair: src/doctor/backfill.ts"],
+  },
   ...[
     { filename: "src/cache/sqlite-store.ts" },
     { filename: "src/cache/sqlite.ts" },
@@ -1764,6 +2329,27 @@ test("SQLite retains directly changed table declarations in a separate hunk", ()
   }
 });
 
+test("test-role directories do not turn synthetic writes into stored-data changes", () => {
+  const patch = "@@\n+  writeFileSync(statePath, JSON.stringify(store));";
+  for (const role of namedTestRoles) {
+    const filename = `src/agents/${role}/prepared-model-catalog-credential-only-fixture.ts`;
+    const detection = dataModelChangeFromPullFilesForTest({ pullFiles: [{ filename, patch }] });
+    assert.deepEqual(detection, { change: false, surfaces: [] }, filename);
+    assert.doesNotMatch(
+      renderReviewCommentFromReport(persistenceReport(detection, "a".repeat(40)), "none"),
+      /Add data-model compatibility proof/,
+    );
+    const production = "src/agents/auth-profile-store.ts";
+    for (const file of [
+      { filename: production, patch },
+      { filename, previous_filename: production, status: "renamed", patch },
+      { filename: production, previous_filename: filename, status: "renamed", patch },
+    ]) {
+      assert.equal(dataModelChangeFromPullFilesForTest({ pullFiles: [file] }).change, true);
+    }
+  }
+});
+
 test("production path classification preserves test segment and basename boundaries", () => {
   const cases = [
     ["test/schema.sql", false],
@@ -1777,7 +2363,9 @@ test("production path classification preserves test segment and basename boundar
     ["src/cache/store.test-support.", true],
     ["src/store.test-support.ts/schema.sql", true],
     ["src/spec/schema.sql", true],
-    ["src/test-fixtures/schema.sql", true],
+    ["src/test-fixtures/schema.sql", false],
+    ["src/TEST-HELPERS/schema.sql", false],
+    ["src/test-fixtures-production/schema.sql", true],
     ["src/cache/store.spec.", true],
     ["src/cache/store.spec.unit.spec.", false],
     ["scripts/translation/records_test.go", false],
@@ -2028,6 +2616,7 @@ test("data model reports can pass when migration proof is recorded", () => {
     repository: "openclaw/openclaw",
     type: "pull_request",
     number: "74458",
+    real_behavior_proof_data_model_compatibility: "sufficient",
     decision: "keep_open",
     close_reason: "none",
     review_status: "complete",
@@ -2074,11 +2663,126 @@ Full review comments:
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
+test("typed compatibility is independent of general proof metadata and override", () => {
+  for (const [labels, proofStatus, proofStatusLine] of [
+    [["clawsweeper:automerge"], undefined, "Status: sufficient"],
+    [["clawsweeper:automerge", "proof: override"], undefined, "Status: sufficient"],
+    [["clawsweeper:automerge", "proof: override"], "sufficient", ""],
+  ] as const) {
+    const report = `${reportFrontMatter({
+      repository: "openclaw/openclaw",
+      type: "pull_request",
+      number: "74464",
+      real_behavior_proof_data_model_compatibility: "sufficient",
+      decision: "keep_open",
+      close_reason: "none",
+      review_status: "complete",
+      confidence: "high",
+      labels: JSON.stringify(labels),
+      work_candidate: "none",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      ...(proofStatus ? { real_behavior_proof_status: proofStatus } : {}),
+      data_model_change: "true",
+      data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
+    })}
+
+## Summary
+
+Keep this data-model PR open for automerge.
+
+## What This Changes
+
+Adds a stored database column.
+
+## Real Behavior Proof
+
+${proofStatusLine}
+
+Evidence kind: terminal
+
+Needs contributor action: false
+
+Summary: Upgrade compatibility is verified against an existing database.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`;
+
+    const comment = renderReviewCommentFromReport(report, "none");
+
+    assert.match(comment, /Codex review: passed\./);
+    assert.match(comment, /Migration or upgrade compatibility proof is recorded/);
+    assert.match(comment, /clawsweeper-verdict:pass/);
+    assert.doesNotMatch(comment, /Add data-model compatibility proof/);
+  }
+});
+
+test("proof override alone does not satisfy the data model compatibility gate", () => {
+  const report = `${reportFrontMatter({
+    repository: "openclaw/openclaw",
+    type: "pull_request",
+    number: "74465",
+    decision: "keep_open",
+    close_reason: "none",
+    review_status: "complete",
+    confidence: "high",
+    labels: JSON.stringify(["clawsweeper:automerge", "proof: override"]),
+    work_candidate: "none",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+    real_behavior_proof_status: "missing",
+    data_model_change: "true",
+    data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
+  })}
+
+## Summary
+
+Keep this data-model PR open for automerge.
+
+## What This Changes
+
+Adds a stored database column.
+
+## Real Behavior Proof
+
+Status: missing
+
+Evidence kind: none
+
+Needs contributor action: false
+
+Summary: Upgrade compatibility is verified against an existing database.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`;
+
+  const comment = renderReviewCommentFromReport(report, "none");
+
+  assert.match(comment, /Confirm migration or upgrade compatibility proof before merge\./);
+  assert.match(comment, /clawsweeper-verdict:needs-human/);
+  assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
+});
+
 test("data model reports can pass when no migration is required and compatibility is verified", () => {
   const report = `${reportFrontMatter({
     repository: "openclaw/openclaw",
     type: "pull_request",
     number: "74460",
+    real_behavior_proof_data_model_compatibility: "sufficient",
     decision: "keep_open",
     close_reason: "none",
     review_status: "complete",

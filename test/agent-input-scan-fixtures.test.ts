@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { devNull, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import {
+  classifyReviewedFixtureScan,
+  serializeReviewContext,
+  type ReviewedAttribution,
+  type StagedScanInput,
+} from "../dist/agent-input-scan-fixtures.js";
 
 test("WebVNC fixture policy retains both exact native identities and source witnesses", () => {
   // Inspect only the static policy data, without copying credential-shaped fixture values.
@@ -50,3 +60,1705 @@ test("WebVNC fixture policy retains both exact native identities and source witn
     },
   ]);
 });
+
+function autoreviewFixtures(): {
+  raw: string;
+  rawV2?: string;
+  line: string;
+  decoders: readonly ("PLAIN" | "HTML" | "ESCAPED_UNICODE")[];
+}[] {
+  // Assemble synthetic values so this regression does not introduce new scan literals.
+  const uri = (user: string, password: string, host: string) =>
+    ["http://", user, ":", password, "@", host].join("");
+  const quoted = (raw: string) => `            "${raw}",`;
+  const review = uri("review-user", "review-password", "proxy.example.invalid:8080");
+  const proxy = uri("user", "password", "proxy.example.invalid:8080");
+  const transport = uri("fixture", "transport-password", "127.0.0.1:8080");
+  const newline = uri("user", "p%0Ass", "host");
+  const nul = uri("user", "p%00ss", "host");
+  const malformedLine = `            ${[newline, nul, uri("user", "p%zz", "host")].map((value) => `"${value}"`).join(", ")},`;
+  const emptyUser = uri("", "password", "proxy.example.invalid");
+  const original = [
+    { raw: review, line: quoted(review) },
+    { raw: proxy, line: quoted(proxy) },
+    {
+      raw: newline,
+      line: malformedLine,
+    },
+    { raw: transport, line: `            proxy = "${transport}"` },
+  ];
+  return [
+    ...original.map((entry) => ({ ...entry, decoders: ["PLAIN", "HTML"] as const })),
+    { raw: emptyUser, line: quoted(emptyUser), decoders: ["PLAIN"] },
+    { raw: nul, line: malformedLine, decoders: ["PLAIN"] },
+  ];
+}
+
+function fixturePatch(
+  t: test.TestContext,
+  source: string,
+  entries: ReturnType<typeof autoreviewFixtures>,
+  change: "add" | "remove" | "context" = "add",
+  companions: { source: string; entries: ReturnType<typeof autoreviewFixtures> }[] = [],
+) {
+  const cwd = mkdtempSync(join(tmpdir(), "clawsweeper-reviewed-fixtures-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd, timeout: 30_000 });
+  git("init", "-q");
+  git("config", "user.name", "Scanner fixture");
+  git("config", "user.email", "scanner@example.invalid");
+  git("config", "commit.gpgsign", "false");
+  git("config", "core.autocrlf", "false");
+  git("config", "core.hooksPath", devNull);
+  const fixtures = [{ source, entries }, ...companions];
+  const contentFor = (rows: ReturnType<typeof autoreviewFixtures>) =>
+    `# fixture\n${[...new Set(rows.map(({ line }) => line))].join("\n")}\n`;
+  const content = fixtures.map(({ entries }) => contentFor(entries)).join("");
+  const revisions = [0, 1].map((index) => {
+    for (const fixture of fixtures) {
+      const path = join(cwd, fixture.source);
+      mkdirSync(dirname(path), { recursive: true });
+      const body = contentFor(fixture.entries);
+      const bytes =
+        change === "context"
+          ? `${body}# ${index === 0 ? "before" : "after"}\n`
+          : (change === "add") === (index === 1)
+            ? body
+            : "# fixture\n";
+      writeFileSync(path, bytes, { mode: 0o644 });
+      git("add", "--", fixture.source);
+    }
+    git("commit", "-qm", "fixture");
+    return git("rev-parse", "HEAD").toString().trim();
+  });
+  const [from, to] = revisions as [string, string];
+  const patchFile = "/scanner/patch";
+  const patch = git(
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--binary",
+    "--full-index",
+    from,
+    to,
+  );
+  const inputs = new Map<string, StagedScanInput>([
+    [patchFile, { kind: "patch", id: "patch", bytes: patch, from, to }],
+  ]);
+  const role = change === "remove" ? "base" : "head";
+  const revision = change === "remove" ? from : to;
+  const blobIds = new Map<string, string>();
+  for (const fixture of fixtures) {
+    blobIds.set(
+      fixture.source,
+      git("rev-parse", `${revision}:${fixture.source}`).toString().trim(),
+    );
+    for (const [index, ref] of revisions.entries()) {
+      const id = git("rev-parse", `${ref}:${fixture.source}`).toString().trim();
+      const file = `/scanner/${id}`;
+      const previous = inputs.get(file);
+      inputs.set(file, {
+        kind: "blob",
+        id,
+        bytes: git("show", `${ref}:${fixture.source}`),
+        references: [
+          ...(previous?.kind === "blob" ? previous.references : []),
+          {
+            source: fixture.source,
+            mode: "100644",
+            revision: ref,
+            role: index === 0 ? "base" : "head",
+          },
+        ],
+      });
+    }
+  }
+  inputs.set("/scanner/raw", {
+    kind: "raw_diff",
+    id: "raw",
+    from,
+    to,
+    bytes: git(
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--raw",
+      "--no-abbrev",
+      "-z",
+      from,
+      to,
+      "--",
+    ),
+  });
+  const classify = (
+    decoder: "PLAIN" | "HTML" | "ESCAPED_UNICODE",
+    overrides: Record<string, unknown> = {},
+    options: {
+      duplicate?: boolean;
+      complete?: boolean;
+      blobOnly?: boolean;
+      scannerLine?: number;
+      reviewedAttributions?: readonly ReviewedAttribution[];
+    } = {},
+  ) => {
+    const findings = fixtures.flatMap((fixture) =>
+      fixture.entries
+        .filter((entry) => entry.decoders.includes(decoder))
+        .flatMap(({ raw, rawV2 = raw }) => {
+          const url = new URL(rawV2);
+          const blobFile = `/scanner/${blobIds.get(fixture.source)!}`;
+          return (options.blobOnly ? [blobFile] : [patchFile, blobFile]).map((file) => ({
+            SourceType: 15,
+            DetectorType: 17,
+            DetectorName: "URI",
+            DecoderName: decoder,
+            Verified: false,
+            VerificationError: "synthetic verification error",
+            Raw: raw,
+            RawV2: rawV2,
+            SourceMetadata: {
+              Data: {
+                Filesystem: {
+                  file,
+                  line:
+                    options.scannerLine ??
+                    inputs
+                      .get(file)!
+                      .bytes!.toString()
+                      .split("\n")
+                      .findIndex((line) => line.includes(rawV2)) + 1,
+                },
+              },
+            },
+            SecretParts: {
+              // Native URI metadata retains explicit default ports.
+              host: rawV2.split("/")[2]!.split("@").at(-1),
+              username: url.username,
+              password: url.password,
+            },
+            ExtraData: null,
+            StructuredData: null,
+            ...overrides,
+          }));
+        }),
+    );
+    if (options.duplicate) findings.push(findings[0]!);
+    return classifyReviewedFixtureScan(
+      183,
+      Buffer.from(findings.map((finding) => JSON.stringify(finding)).join("\n") + "\n"),
+      Buffer.from(
+        options.complete === false
+          ? ""
+          : JSON.stringify({
+              level: "info-0",
+              logger: "trufflehog",
+              msg: "finished scanning",
+              trufflehog_version: "3.97.4",
+              chunks: 1,
+              bytes: content.length,
+              verified_secrets: findings.filter((finding) => finding.Verified === true).length,
+              unverified_secrets: findings.filter((finding) => finding.Verified !== true).length,
+            }) + "\n",
+      ),
+      inputs,
+      options.reviewedAttributions,
+    );
+  };
+  return { classify, role, inputs };
+}
+
+for (const source of [
+  "skills/autoreview/tests/test_autoreview_hardening.py",
+  ".agents/skills/autoreview/tests/test_autoreview_hardening.py",
+]) {
+  for (const change of ["add", "remove"] as const) {
+    test(`autoreview fixtures admit exact Git-generated ${change} lines at ${source}`, (t) => {
+      const patch = fixturePatch(t, source, autoreviewFixtures(), change);
+      for (const decoder of ["PLAIN", "HTML"] as const) {
+        const result = patch.classify(decoder);
+        assert.equal(result.kind, "classified", JSON.stringify(result));
+        if (result.kind !== "classified") continue;
+        const count = autoreviewFixtures().filter((entry) =>
+          entry.decoders.includes(decoder),
+        ).length;
+        assert.equal(result.notices.length, count * 2);
+        assert.ok(result.notices.every((notice) => notice.source === source));
+        const findings = result.notices.flatMap((notice) => notice.findings);
+        assert.ok(
+          findings.every((finding) => finding.decoder === decoder && finding.role === patch.role),
+        );
+        assert.equal(findings.filter((finding) => finding.patch).length, count);
+      }
+    });
+  }
+
+  test(`autoreview fixtures refuse each one-byte literal change at ${source}`, (t) => {
+    for (const [index, entry] of autoreviewFixtures().entries()) {
+      const password = new URL(entry.raw).password;
+      const changed = entry.raw.replace(`:${password}@`, `:${password.slice(0, -1)}x@`);
+      assert.equal(changed.length, entry.raw.length);
+      const entries = autoreviewFixtures().map((value, candidate) => ({
+        ...value,
+        raw: candidate === index ? changed : value.raw,
+        line: value.line.replace(entry.raw, changed),
+      }));
+      const patch = fixturePatch(t, source, entries);
+      for (const decoder of entry.decoders) {
+        assert.equal(patch.classify(decoder).kind, "refused", `${index}/${decoder}`);
+      }
+    }
+  });
+
+  test(`autoreview exact lines supersede legacy value-only admission at ${source}`, (t) => {
+    const entries = autoreviewFixtures();
+    entries[0]!.line += " ";
+    const patch = fixturePatch(t, source, entries);
+    for (const decoder of ["PLAIN", "HTML"] as const) {
+      const result = patch.classify(decoder);
+      assert.equal(result.kind, "refused");
+      if (result.kind === "refused") assert.equal(result.diagnostic.reason, "literal_mismatch");
+    }
+  });
+}
+
+function questionPromptFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://", "operator", ":", "password", "@", "example.test"].join("");
+  const rawV2 = `${raw}/sign`;
+  return { raw, rawV2, line: `    "${rawV2}-in",`, decoders: ["PLAIN", "HTML"] };
+}
+
+const questionPromptSource = "ui/src/app/question-prompt.test.ts";
+
+for (const change of ["add", "remove", "context"] as const) {
+  test(`question URL rejection fixture admits exact Git-generated ${change} attribution`, (t) => {
+    const patch = fixturePatch(t, questionPromptSource, [questionPromptFixture()], change);
+    for (const decoder of ["PLAIN", "HTML"] as const) {
+      const result = patch.classify(decoder);
+      assert.equal(result.kind, "classified", JSON.stringify(result));
+      if (result.kind !== "classified") continue;
+      assert.ok(result.notices.every((notice) => notice.source === questionPromptSource));
+      const findings = result.notices.flatMap((notice) => notice.findings);
+      assert.ok(findings.some((finding) => finding.patch));
+      assert.ok(findings.every((finding) => finding.decoder === decoder));
+      if (change === "context") {
+        assert.ok(findings.some((finding) => finding.role === "base"));
+        assert.ok(findings.some((finding) => finding.role === "head"));
+      } else {
+        assert.ok(findings.every((finding) => finding.role === patch.role));
+      }
+    }
+  });
+}
+
+for (const variant of ["literal", "line", "path", "mode", "verified", "decoder"] as const) {
+  test(`question URL rejection fixture still refuses changed ${variant}`, (t) => {
+    const entry = questionPromptFixture();
+    if (variant === "literal") {
+      entry.raw = entry.raw.replace("password", "passwore");
+      entry.rawV2 = entry.rawV2!.replace("password", "passwore");
+      entry.line = entry.line.replace("password", "passwore");
+    } else if (variant === "line") {
+      entry.line += " ";
+    }
+    const patch = fixturePatch(
+      t,
+      variant === "path" ? "ui/src/app/another-question.test.ts" : questionPromptSource,
+      [entry],
+    );
+    if (variant === "mode") {
+      for (const [file, input] of patch.inputs) {
+        if (input.kind === "blob") {
+          patch.inputs.set(file, {
+            ...input,
+            references: input.references.map((reference) => ({ ...reference, mode: "100755" })),
+          });
+        }
+      }
+    }
+    const result = patch.classify(
+      "HTML",
+      variant === "verified"
+        ? { Verified: true }
+        : variant === "decoder"
+          ? { DecoderName: "BASE64" }
+          : {},
+    );
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+  });
+}
+
+function readinessPrivacyFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["http://", "fixture-user", ":", "fixture-secret", "@", "proxy.invalid"].join("");
+  return {
+    raw,
+    rawV2: raw,
+    line: "      const privateDetail = `" + raw + '/${"x".repeat(2_048)}`;',
+    decoders: ["PLAIN", "HTML"],
+  };
+}
+
+const readinessPrivacySource = "test/helpers/openclaw-test-instance.test.ts";
+
+test("cron FTP fixture binds the exact committed source and native finding", async (t) => {
+  const source = "src/gateway/server-cron-notifications.test.ts";
+  const raw = ["ftp://", "user", ":", "secret", "@", "example.invalid"].join("");
+  const entry = {
+    raw,
+    line: `          to: "${raw}/hook?token=secret",`,
+    decoders: ["PLAIN", "HTML"] as const,
+  };
+  const fixture = fixturePatch(t, source, [entry], "context");
+  const originalInputs = new Map(fixture.inputs);
+  const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const sourceSha256s = [...originalInputs.values()]
+    .filter((input) => input.kind === "blob")
+    .map((input) => hash(input.bytes!));
+  const reviewedAttributions: ReviewedAttribution[] = entry.decoders.map((decoder) => [
+    899,
+    "FTP",
+    decoder,
+    hash(raw),
+    hash(""),
+    hash(entry.line),
+    source,
+    "100644",
+    sourceSha256s,
+  ]);
+  const native = {
+    DetectorType: 899,
+    DetectorName: "FTP",
+    RawV2: "",
+    SecretParts: { key: raw },
+  };
+  for (const decoder of entry.decoders) {
+    await t.test("accepts the exact " + decoder + " finding", () => {
+      const result = fixture.classify(decoder, native, { blobOnly: true, reviewedAttributions });
+      assert.equal(result.kind, "classified", JSON.stringify(result));
+      if (result.kind === "classified") {
+        assert.equal(result.notices.length, 1);
+        assert.equal(result.notices[0]?.source, source);
+        assert.equal(result.notices[0]?.detector, "FTP");
+      }
+    });
+  }
+  await t.test("production policy refuses a line-only replica of the reviewed source", () => {
+    const result = fixture.classify("HTML", native, { blobOnly: true });
+    assert.equal(result.kind, "refused");
+    if (result.kind === "refused") assert.equal(result.diagnostic.reason, "source_not_reviewed");
+  });
+  for (const sourcePins of [undefined, [], ["not a SHA256"]]) {
+    await t.test(
+      "rejects missing or malformed FTP source pins " + JSON.stringify(sourcePins),
+      () => {
+        const [detector, name, decoder, raw, rawV2, line, source, mode] = reviewedAttributions[0]!;
+        assert.throws(() =>
+          fixture.classify("PLAIN", native, {
+            blobOnly: true,
+            reviewedAttributions: [
+              [detector, name, decoder, raw, rawV2, line, source, mode, sourcePins],
+            ],
+          }),
+        );
+      },
+    );
+  }
+  const mutations: [string, Record<string, unknown>][] = [
+    ["host", { Raw: raw.replace("example.invalid", "other.invalid") }],
+    ["credential", { Raw: raw.replace("secret", "changed") }],
+    ["rawV2", { RawV2: raw }],
+    ["Unicode decoder", { DecoderName: "ESCAPED_UNICODE" }],
+    ["base64 decoder", { DecoderName: "BASE64" }],
+    ["detector", { DetectorType: 17, DetectorName: "URI" }],
+    ["verified", { Verified: true }],
+    ["verification error", { VerificationError: "" }],
+    ["source type", { SourceType: 16 }],
+    ["secret parts", { SecretParts: { key: raw + "/changed" } }],
+    ["extra data", { ExtraData: { host: "other.invalid" } }],
+    ["path", {}],
+    ["mode", {}],
+    ["role", {}],
+    ["source kind", {}],
+    ["complete line", {}],
+    ["query", {}],
+    ["additional source occurrence", {}],
+    ["HTML-encoded source occurrence", {}],
+    ["unrelated source byte", {}],
+    ["duplicate finding", {}],
+    ["incomplete scan", {}],
+    ["patch material", {}],
+  ];
+  for (const [scenario, overrides] of mutations) {
+    await t.test("rejects changed " + scenario, () => {
+      fixture.inputs.clear();
+      for (const [file, input] of originalInputs) {
+        if (input.kind !== "blob" || !input.bytes) {
+          fixture.inputs.set(file, input);
+          continue;
+        }
+        fixture.inputs.set(
+          file,
+          scenario === "source kind"
+            ? { kind: "prompt", id: input.id, bytes: input.bytes }
+            : {
+                ...input,
+                bytes: Buffer.from(
+                  input.bytes
+                    .toString()
+                    .replace(entry.line, entry.line + (scenario === "complete line" ? " " : ""))
+                    .replace(
+                      "token=secret",
+                      scenario === "query" ? "token=changed" : "token=secret",
+                    ) +
+                    (scenario === "additional source occurrence"
+                      ? "\n" + entry.line.replace("/hook", "/other") + "\n"
+                      : scenario === "HTML-encoded source occurrence"
+                        ? '\n<a href="' + raw.replace("ftp:", "ftp&#58;") + '/other">link</a>\n'
+                        : scenario === "unrelated source byte"
+                          ? "\n"
+                          : ""),
+                ),
+                references: input.references.map((reference) => ({
+                  ...reference,
+                  source: scenario === "path" ? "src/gateway/other.test.ts" : reference.source,
+                  mode: scenario === "mode" ? "100755" : reference.mode,
+                  role: scenario === "role" ? ("worktree" as const) : reference.role,
+                })),
+              },
+        );
+      }
+      const result = fixture.classify(
+        "HTML",
+        { ...native, ...overrides },
+        {
+          blobOnly: scenario !== "patch material",
+          duplicate: scenario === "duplicate finding",
+          complete: scenario !== "incomplete scan",
+          reviewedAttributions,
+        },
+      );
+      assert.equal(result.kind, "refused", scenario);
+      if (
+        result.kind === "refused" &&
+        (scenario === "HTML-encoded source occurrence" || scenario === "unrelated source byte")
+      )
+        assert.equal(result.diagnostic.reason, "source_not_reviewed");
+    });
+  }
+});
+
+for (const change of ["add", "remove", "context"] as const) {
+  test("readiness privacy fixture admits exact Git-generated " + change + " attribution", (t) => {
+    const patch = fixturePatch(t, readinessPrivacySource, [readinessPrivacyFixture()], change);
+    for (const decoder of ["PLAIN", "HTML"] as const) {
+      const result = patch.classify(decoder);
+      assert.equal(result.kind, "classified", JSON.stringify(result));
+      if (result.kind !== "classified") continue;
+      assert.ok(result.notices.every((notice) => notice.source === readinessPrivacySource));
+      const findings = result.notices.flatMap((notice) => notice.findings);
+      assert.ok(findings.some((finding) => finding.patch));
+      assert.ok(findings.every((finding) => finding.decoder === decoder));
+      if (change === "context") {
+        assert.ok(findings.some((finding) => finding.role === "base"));
+        assert.ok(findings.some((finding) => finding.role === "head"));
+      } else {
+        assert.ok(findings.every((finding) => finding.role === patch.role));
+      }
+    }
+  });
+}
+for (const variant of [
+  "literal",
+  "line",
+  "path",
+  "mode",
+  "role",
+  "verified",
+  "decoder",
+  "surrounding-expression",
+  "extra-occurrence",
+] as const) {
+  test("readiness privacy fixture refuses changed " + variant, (t) => {
+    const entry = readinessPrivacyFixture();
+    if (variant === "literal") {
+      const original = entry.raw;
+      entry.raw = original.replace("proxy.invalid", "proxz.invalid");
+      entry.rawV2 = entry.raw;
+      entry.line = entry.line.replace(original, entry.raw);
+    } else if (variant === "line") {
+      entry.line += " ";
+    } else if (variant === "surrounding-expression") {
+      entry.line = entry.line.replace("2_048", "2_049");
+    }
+    const entries =
+      variant === "extra-occurrence"
+        ? [entry, { ...entry, line: entry.line + " // additional occurrence" }]
+        : [entry];
+    const patch = fixturePatch(
+      t,
+      variant === "path" ? "test/helpers/another-instance.test.ts" : readinessPrivacySource,
+      entries,
+    );
+    if (variant === "mode" || variant === "role") {
+      for (const [file, input] of patch.inputs) {
+        if (input.kind !== "blob") continue;
+        patch.inputs.set(file, {
+          ...input,
+          references: input.references.map((reference) =>
+            variant === "mode"
+              ? { ...reference, mode: "100755" }
+              : { ...reference, role: "worktree" as const },
+          ),
+        });
+      }
+    }
+    for (const decoder of ["PLAIN", "HTML"] as const) {
+      const result = patch.classify(
+        decoder,
+        variant === "verified"
+          ? { Verified: true }
+          : variant === "decoder"
+            ? { DecoderName: "BASE64" }
+            : {},
+      );
+      assert.equal(result.kind, "refused", JSON.stringify(result));
+    }
+  });
+}
+
+function githubCheckLinkFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  // Match the approved external fixture without adding another scan literal here.
+  const raw = ["https://", "user", ":", "password", "@", "ci.example.com"].join("");
+  const rawV2 = raw + "/log";
+  return { raw, rawV2, line: '    "' + rawV2 + '",', decoders: ["PLAIN", "HTML"] };
+}
+
+function browserSessionFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = [
+    "https://",
+    "browser-user",
+    ":",
+    "browser-password",
+    "@",
+    "browserless.example",
+  ].join("");
+  const rawV2 = raw + "/cdp";
+  return { raw, rawV2, line: '    const cdpUrl = "' + rawV2 + '";', decoders: ["PLAIN", "HTML"] };
+}
+
+function exactUriFixtureTests(
+  name: string,
+  source: string,
+  makeFixture: () => ReturnType<typeof autoreviewFixtures>[number],
+) {
+  for (const change of ["add", "remove", "context"] as const) {
+    test(name + " fixture admits exact Git-generated " + change + " attribution", (t) => {
+      const patch = fixturePatch(t, source, [makeFixture()], change);
+      for (const decoder of makeFixture().decoders) {
+        const result = patch.classify(decoder);
+        assert.equal(result.kind, "classified", JSON.stringify(result));
+        if (result.kind !== "classified") continue;
+        assert.ok(result.notices.every((notice) => notice.source === source));
+        const findings = result.notices.flatMap((notice) => notice.findings);
+        assert.ok(findings.some((finding) => finding.patch));
+        assert.ok(findings.every((finding) => finding.decoder === decoder));
+        if (change === "context") {
+          assert.ok(findings.some((finding) => finding.role === "base"));
+          assert.ok(findings.some((finding) => finding.role === "head"));
+        } else {
+          assert.ok(findings.every((finding) => finding.role === patch.role));
+        }
+      }
+    });
+  }
+  for (const variant of [
+    "literal",
+    "line",
+    "path",
+    "mode",
+    "role",
+    "revision",
+    "verified",
+    "decoder",
+    "extra-occurrence",
+  ] as const) {
+    test(name + " fixture refuses changed " + variant, (t) => {
+      const entry = makeFixture();
+      if (variant === "literal") {
+        const original = entry.raw;
+        entry.raw = original.replace("://", "://x");
+        entry.rawV2 = entry.rawV2!.replace(original, entry.raw);
+        entry.line = entry.line.replace(original, entry.raw);
+      } else if (variant === "line") {
+        entry.line += " ";
+      }
+      const entries =
+        variant === "extra-occurrence"
+          ? [entry, { ...entry, line: entry.line + " // extra" }]
+          : [entry];
+      const patch = fixturePatch(t, variant === "path" ? source + ".other" : source, entries);
+      if (variant === "mode" || variant === "role" || variant === "revision") {
+        for (const [file, input] of patch.inputs) {
+          if (input.kind !== "blob") continue;
+          patch.inputs.set(file, {
+            ...input,
+            references: input.references.map((reference) => ({
+              ...reference,
+              ...(variant === "mode"
+                ? { mode: "100755" }
+                : variant === "revision"
+                  ? { revision: "f".repeat(40) }
+                  : { role: "worktree" as const }),
+            })),
+          });
+        }
+      }
+      for (const decoder of entry.decoders) {
+        const result = patch.classify(
+          decoder,
+          variant === "verified"
+            ? { Verified: true }
+            : variant === "decoder"
+              ? { DecoderName: "BASE64" }
+              : {},
+        );
+        assert.equal(result.kind, "refused", JSON.stringify(result));
+      }
+    });
+  }
+}
+
+test("SDK browser CDP fixtures bind native identities and complete source lines", (t) => {
+  const entries = [9222, 80].map((port) => {
+    const raw = ["http://", "user", ":", "pass", "@", `127.0.0.1:${port}`].join("");
+    return {
+      raw,
+      rawV2: port === 80 ? raw + "/path" : raw,
+      line:
+        port === 80
+          ? '    "' + raw + '/path@name",'
+          : '    const parsed = parseBrowserHttpUrl("' + raw + '/", "browser.cdpUrl");',
+      decoders: ["PLAIN"] as const,
+    };
+  });
+  const patch = fixturePatch(t, "src/plugin-sdk/browser-subpaths.test.ts", entries);
+  const originalInputs = new Map(patch.inputs);
+  assert.equal(patch.classify("PLAIN").kind, "classified");
+  for (const variant of ["line", "path"] as const) {
+    for (const [file, input] of originalInputs) {
+      if (input.kind !== "blob") continue;
+      patch.inputs.set(file, {
+        ...input,
+        ...(variant === "line"
+          ? { bytes: Buffer.from(input.bytes!.toString().replace("path@name", "path@namo")) }
+          : {
+              references: input.references.map((reference) => ({
+                ...reference,
+                source: "src/plugin-sdk/other-browser-subpaths.test.ts",
+              })),
+            }),
+      });
+    }
+    const result = patch.classify("PLAIN", {}, { blobOnly: true });
+    assert.equal(result.kind, "refused");
+    if (result.kind === "refused")
+      assert.equal(
+        result.diagnostic.reason,
+        variant === "line" ? "literal_mismatch" : "source_not_reviewed",
+      );
+  }
+  for (const [file, input] of originalInputs) patch.inputs.set(file, input);
+  assert.equal(patch.classify("PLAIN", { DecoderName: "HTML" }).kind, "refused");
+  assert.equal(patch.classify("PLAIN", { Verified: true }).kind, "refused");
+});
+
+function gitSourceRedactionFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://", "fixture-user", ":", "fixture-password", "@", "example.invalid"].join(
+    "",
+  );
+  return {
+    raw,
+    rawV2: raw + "/missing",
+    // The whole-line witness retains the suffix beyond the native URI match.
+    line: '      const unsafeRef = "' + raw + '/missing\\u001b[31m";',
+    decoders: ["PLAIN", "HTML", "ESCAPED_UNICODE"],
+  };
+}
+
+exactUriFixtureTests(
+  "Git-source redaction",
+  "src/infra/git-source.test.ts",
+  gitSourceRedactionFixture,
+);
+
+test("Git-source fixture requires literal bytes despite shifted decoder coordinates", (t) => {
+  for (const encodedOnly of [false, true]) {
+    const entry = gitSourceRedactionFixture();
+    if (encodedOnly) {
+      entry.line = entry.line.replace(entry.rawV2!, Buffer.from(entry.rawV2!).toString("base64"));
+    }
+    const patch = fixturePatch(t, "src/infra/git-source.test.ts", [entry]);
+    for (const decoder of entry.decoders) {
+      const result = patch.classify(decoder, {}, { scannerLine: 1 });
+      assert.equal(result.kind, encodedOnly ? "refused" : "classified");
+      if (result.kind === "refused") {
+        assert.equal(result.diagnostic.reason, "material_not_reviewed");
+      }
+    }
+  }
+});
+
+function proxyCliRedactionFixture(
+  redacted: boolean,
+): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = [
+    "http://",
+    redacted ? "redacted:redacted" : "user:secret",
+    "@",
+    "proxy.example:3128",
+  ].join("");
+  const input = '        proxyUrl: "' + raw + '?token=secret#fragment",';
+  const lines = redacted
+    ? ['        "  URL:    ' + raw + '/\\n",', '            proxyUrl: "' + raw + '/",']
+    : [input, input];
+  return { raw, rawV2: raw, line: lines.join("\n"), decoders: ["PLAIN", "HTML"] };
+}
+
+const proxyCliSource = "src/cli/proxy-cli.runtime.test.ts";
+for (const redacted of [false, true]) {
+  const name = `proxy CLI redaction ${redacted ? "output" : "input"}`;
+  const makeFixture = () => proxyCliRedactionFixture(redacted);
+  exactUriFixtureTests(name, proxyCliSource, makeFixture);
+  const variants = [
+    "missing",
+    "extra",
+    "raw",
+    "raw-v2",
+    "mixed",
+    "duplicate",
+    "incomplete",
+    ...(redacted ? ["reordered", "suffix"] : ["query", "fragment"]),
+  ];
+  for (const variant of variants) {
+    test(`${name} refuses ${variant}`, (t) => {
+      const entry = makeFixture();
+      const lines = entry.line.split("\n");
+      if (variant === "missing") entry.line = lines[0]!;
+      if (variant === "extra") entry.line += "\n" + lines[0]!;
+      if (variant === "reordered") entry.line = lines.reverse().join("\n");
+      if (variant === "suffix") entry.line = entry.line.replace("/\\n", "/changed\\n");
+      if (variant === "query") entry.line = entry.line.replace("token=secret", "token=changed");
+      if (variant === "fragment") entry.line = entry.line.replace("#fragment", "#changed");
+      const entries = [entry];
+      if (variant === "mixed") {
+        const raw = entry.raw.replace("://", "://unreviewed");
+        entries.push({ raw, rawV2: raw, line: '"' + raw + '"', decoders: ["PLAIN", "HTML"] });
+      }
+      const patch = fixturePatch(t, proxyCliSource, entries);
+      for (const decoder of entry.decoders) {
+        const result = patch.classify(
+          decoder,
+          variant === "raw"
+            ? { Raw: entry.raw + "x" }
+            : variant === "raw-v2"
+              ? { RawV2: entry.rawV2 + "x" }
+              : {},
+          { duplicate: variant === "duplicate", complete: variant !== "incomplete" },
+        );
+        assert.equal(result.kind, "refused", JSON.stringify(result));
+      }
+    });
+  }
+}
+
+function malformedProxyFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["http://", "review-user", ":", "review-password", "@", "proxy.example.invalid"].join(
+    "",
+  );
+  return {
+    raw,
+    rawV2: raw,
+    // The native match stops before the invalid port and also prefixes the valid proxy.
+    line: [`            "${raw}:8080",`, `                    "${raw}:bad"`].join("\n"),
+    decoders: ["PLAIN"],
+  };
+}
+
+for (const source of [
+  "skills/autoreview/tests/test_autoreview_hardening.py",
+  ".agents/skills/autoreview/tests/test_autoreview_hardening.py",
+]) {
+  const name = `autoreview malformed proxy at ${source}`;
+  exactUriFixtureTests(name, source, malformedProxyFixture);
+  for (const variant of [
+    "missing-first",
+    "missing-second",
+    "reordered",
+    "first-suffix",
+    "second-suffix",
+    "raw-only",
+    "raw-v2-only",
+    "html",
+    "mixed-finding",
+  ] as const) {
+    test(`${name} refuses ${variant}`, (t) => {
+      const entry = malformedProxyFixture();
+      const lines = entry.line.split("\n");
+      if (variant === "missing-first") entry.line = lines[1]!;
+      if (variant === "missing-second") entry.line = lines[0]!;
+      if (variant === "reordered") entry.line = lines.reverse().join("\n");
+      if (variant === "first-suffix") entry.line = entry.line.replace(":8080", ":8081");
+      if (variant === "second-suffix") entry.line = entry.line.replace(":bad", ":badx");
+      const entries = [entry];
+      if (variant === "mixed-finding") {
+        const raw = entry.raw.replace("review-user", "unreviewed-user");
+        entries.push({ raw, rawV2: raw, line: `"${raw}"`, decoders: ["PLAIN"] });
+      }
+      const patch = fixturePatch(t, source, entries);
+      const result = patch.classify(
+        "PLAIN",
+        variant === "raw-only"
+          ? { Raw: entry.raw + "x" }
+          : variant === "raw-v2-only"
+            ? { RawV2: entry.rawV2 + "x" }
+            : variant === "html"
+              ? { DecoderName: "HTML" }
+              : {},
+      );
+      assert.equal(result.kind, "refused", JSON.stringify(result));
+    });
+  }
+}
+
+function acpxOldBaseProxyFixture(prefix: boolean): ReturnType<typeof autoreviewFixtures>[number] {
+  const full = autoreviewFixtures()[0]!.raw;
+  const raw = prefix ? full.slice(0, full.lastIndexOf(":")) : full;
+  return {
+    raw,
+    rawV2: raw,
+    line: ['            "' + full + '",', '                    "' + full + '"'].join("\n"),
+    decoders: ["PLAIN"],
+  };
+}
+
+function acpxOldBaseServiceFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https", "review-user:review-password@example.invalid"].join("://");
+  const rawV2 = raw + "/api";
+  return {
+    raw,
+    rawV2,
+    line: '                    "' + rawV2 + '"',
+    decoders: ["PLAIN"],
+  };
+}
+
+const acpxOldBaseSource = ".agents/skills/autoreview/tests/test_autoreview_hardening.py";
+for (const [name, makeFixture] of [
+  ["full proxy", () => acpxOldBaseProxyFixture(false)],
+  ["proxy prefix", () => acpxOldBaseProxyFixture(true)],
+  ["service URL", acpxOldBaseServiceFixture],
+] as const) {
+  exactUriFixtureTests(`acpx old-base ${name}`, acpxOldBaseSource, makeFixture);
+  for (const variant of [
+    "non-vendored-path",
+    "html",
+    "raw-only",
+    "raw-v2-only",
+    "mixed-reference",
+    "duplicate-finding",
+    "incomplete-scan",
+  ] as const) {
+    test(`acpx old-base ${name} refuses ${variant}`, (t) => {
+      const entry = makeFixture();
+      const source =
+        variant === "non-vendored-path" ? acpxOldBaseSource.slice(8) : acpxOldBaseSource;
+      const patch = fixturePatch(t, source, [entry], "remove");
+      if (variant === "mixed-reference") {
+        for (const [file, input] of patch.inputs) {
+          if (input.kind !== "blob") continue;
+          patch.inputs.set(file, {
+            ...input,
+            references: [
+              ...input.references,
+              { ...input.references[0]!, source: source + ".other" },
+            ],
+          });
+        }
+      }
+      const result = patch.classify(
+        "PLAIN",
+        variant === "html"
+          ? { DecoderName: "HTML" }
+          : variant === "raw-only"
+            ? { Raw: entry.raw + "x" }
+            : variant === "raw-v2-only"
+              ? { RawV2: entry.rawV2 + "x" }
+              : {},
+        { duplicate: variant === "duplicate-finding", complete: variant !== "incomplete-scan" },
+      );
+      assert.equal(result.kind, "refused", JSON.stringify(result));
+      if (result.kind !== "refused") return;
+      if (variant === "mixed-reference")
+        assert.equal(result.diagnostic.reason, "source_not_reviewed");
+      if (variant === "duplicate-finding")
+        assert.equal(result.diagnostic.reason, "duplicate_finding");
+      if (variant === "incomplete-scan") assert.equal(result.diagnostic.reason, "incomplete_scan");
+    });
+  }
+}
+
+for (const prefix of [false, true]) {
+  const name = prefix ? "proxy prefix" : "full proxy";
+  for (const variant of [
+    "missing-first",
+    "missing-second",
+    "reordered",
+    "duplicate-occurrence",
+    "first-suffix",
+    "second-suffix",
+  ] as const) {
+    // The full proxy's first line alone remains a separately approved historical witness.
+    if (!prefix && variant === "missing-second") continue;
+    test(`acpx old-base ${name} refuses ${variant}`, (t) => {
+      const entry = acpxOldBaseProxyFixture(prefix);
+      const lines = entry.line.split("\n");
+      if (variant === "missing-first") entry.line = lines[1]!;
+      if (variant === "missing-second") entry.line = lines[0]!;
+      if (variant === "reordered") entry.line = lines.reverse().join("\n");
+      if (variant === "duplicate-occurrence") entry.line += "\n" + lines[0]!;
+      if (variant === "first-suffix") entry.line = [lines[0] + " ", lines[1]].join("\n");
+      if (variant === "second-suffix") entry.line = [lines[0], lines[1] + " "].join("\n");
+      const patch = fixturePatch(t, acpxOldBaseSource, [entry], "remove");
+      const result = patch.classify("PLAIN");
+      assert.equal(result.kind, "refused", JSON.stringify(result));
+      if (result.kind === "refused") assert.equal(result.diagnostic.reason, "literal_mismatch");
+    });
+  }
+}
+
+const autoreviewBase64Cases = [
+  ["canonical single witness", acpxOldBaseSource.slice(8), () => autoreviewFixtures()[0]!],
+  ["vendored single witness", acpxOldBaseSource, () => autoreviewFixtures()[0]!],
+  ["vendored historical witnesses", acpxOldBaseSource, () => acpxOldBaseProxyFixture(false)],
+] as const;
+
+for (const [name, source, makeFixture] of autoreviewBase64Cases) {
+  for (const change of ["add", "remove"] as const) {
+    test(`autoreview BASE64 ${name} admits the exact ${change} blob`, (t) => {
+      const patch = fixturePatch(t, source, [makeFixture()], change);
+      const result = patch.classify("PLAIN", { DecoderName: "BASE64" }, { blobOnly: true });
+      assert.equal(result.kind, "classified", JSON.stringify(result));
+      if (result.kind !== "classified") return;
+      assert.equal(result.notices.length, 1);
+      assert.equal(result.notices[0]!.source, source);
+      const findings = result.notices[0]!.findings;
+      assert.equal(findings.length, 1);
+      assert.equal(findings[0]!.decoder, "BASE64");
+      assert.equal(findings[0]!.role, patch.role);
+      assert.equal(findings[0]!.literalLine, 2);
+      assert.equal(findings[0]!.patch, undefined);
+    });
+  }
+
+  test(`autoreview BASE64 ${name} preserves exact finding and source guards`, (t) => {
+    const entry = makeFixture();
+    const patch = fixturePatch(t, source, [entry]);
+    const [file, input] = [...patch.inputs].find(
+      ([, input]) => input.kind === "blob" && input.bytes!.includes(entry.raw),
+    )!;
+    assert.ok(input.kind === "blob");
+    const classify = (overrides: Record<string, unknown> = {}) =>
+      patch.classify("PLAIN", { DecoderName: "BASE64", ...overrides }, { blobOnly: true });
+    const refuses = (result: ReturnType<typeof classify>, scenario: string) => {
+      assert.equal(result.kind, "refused", scenario);
+      assert.equal("notices" in result, false, scenario);
+      // BASE64 remains outside the public diagnostic decoder vocabulary.
+      if (result.kind === "refused" && result.diagnostic.kind === "unclassified_finding")
+        assert.equal(result.diagnostic.decoder, "OTHER", scenario);
+    };
+    for (const [scenario, overrides] of [
+      ["raw", { Raw: entry.raw + "x" }],
+      ["rawV2", { RawV2: entry.raw + "x" }],
+      ["both raw values", { Raw: entry.raw + "x", RawV2: entry.raw + "x" }],
+      ["verified", { Verified: true }],
+      ["unknown decoder", { DecoderName: "UNKNOWN" }],
+      ["wrong detector type", { DetectorType: 895 }],
+      ["wrong detector name", { DetectorName: "MongoDB" }],
+      ["wrong source type", { SourceType: 16 }],
+      ["no verification error", { VerificationError: "" }],
+      ["wrong secret parts", { SecretParts: { host: "other" } }],
+      ["extra data", { ExtraData: {} }],
+      ["structured data", { StructuredData: {} }],
+    ] as const)
+      refuses(classify(overrides), scenario);
+    for (const [scenario, reference] of [
+      ["path", { ...input.references[0]!, source: source + ".other" }],
+      ["mode", { ...input.references[0]!, mode: "100755" }],
+      ...(["index", "tree", "worktree"] as const).map(
+        (role) => [role, { ...input.references[0]!, role }] as const,
+      ),
+    ] as const) {
+      for (const references of [[reference], [...input.references, reference]]) {
+        patch.inputs.set(file, { ...input, references });
+        refuses(classify(), scenario);
+      }
+    }
+    patch.inputs.set(file, { ...input, references: [] });
+    refuses(classify(), "missing references");
+    for (const [scenario, bytes] of [
+      ["changed line", Buffer.from(entry.line + " \n")],
+      ["extra occurrence", Buffer.from(entry.line + "\n" + entry.line + "\n")],
+      ["missing literal", Buffer.from("# no literal\n")],
+      ["encoded only", Buffer.from(Buffer.from(entry.line).toString("base64") + "\n")],
+    ] as const) {
+      patch.inputs.set(file, { ...input, bytes });
+      refuses(classify({ SourceMetadata: { Data: { Filesystem: { file, line: 1 } } } }), scenario);
+    }
+    patch.inputs.set(file, input);
+    for (const kind of ["prompt", "schema", "additional", "patch", "raw_diff"] as const) {
+      const materialFile = "/scanner/unreviewed-material";
+      patch.inputs.set(materialFile, {
+        kind,
+        id: "unreviewed-material",
+        bytes: input.bytes!,
+        from: "a".repeat(40),
+        to: "b".repeat(40),
+      });
+      refuses(
+        classify({ SourceMetadata: { Data: { Filesystem: { file: materialFile, line: 2 } } } }),
+        kind,
+      );
+      patch.inputs.delete(materialFile);
+    }
+    for (const options of [{ duplicate: true }, { complete: false }]) {
+      const result = patch.classify(
+        "PLAIN",
+        { DecoderName: "BASE64" },
+        { blobOnly: true, ...options },
+      );
+      refuses(result, JSON.stringify(options));
+      if (result.kind === "refused")
+        assert.equal(
+          result.diagnostic.reason,
+          options.duplicate ? "duplicate_finding" : "incomplete_scan",
+        );
+    }
+  });
+
+  for (const change of ["add", "remove", "context"] as const) {
+    test(`autoreview BASE64 ${name} retains ${change} patch refusal`, (t) => {
+      const patch = fixturePatch(t, source, [makeFixture()], change);
+      const result = patch.classify("PLAIN", { DecoderName: "BASE64" });
+      assert.equal(result.kind, "refused");
+      if (result.kind === "refused")
+        assert.equal(result.diagnostic.reason, "material_not_reviewed");
+    });
+  }
+
+  test(`autoreview BASE64 ${name} refuses the unlisted native prefix`, (t) => {
+    const entry = makeFixture();
+    entry.raw = entry.raw.slice(0, entry.raw.lastIndexOf(":"));
+    entry.rawV2 = entry.raw;
+    const patch = fixturePatch(t, source, [entry]);
+    const result = patch.classify("PLAIN", { DecoderName: "BASE64" }, { blobOnly: true });
+    assert.equal(result.kind, "refused");
+    if (result.kind === "refused") assert.equal(result.diagnostic.reason, "finding_not_reviewed");
+  });
+}
+
+test("autoreview BASE64 single witness admits every approved shared reference and shifted scanner line", (t) => {
+  const entry = autoreviewFixtures()[0]!;
+  const patch = fixturePatch(t, acpxOldBaseSource, [entry]);
+  const [file, input] = [...patch.inputs].find(
+    ([, input]) => input.kind === "blob" && input.bytes!.includes(entry.raw),
+  )!;
+  assert.ok(input.kind === "blob");
+  patch.inputs.set(file, {
+    ...input,
+    references: [acpxOldBaseSource, acpxOldBaseSource.slice(8)].flatMap((source) =>
+      (["base", "head"] as const).map((role) => ({ ...input.references[0]!, source, role })),
+    ),
+  });
+  const result = patch.classify(
+    "PLAIN",
+    { DecoderName: "BASE64", SourceMetadata: { Data: { Filesystem: { file, line: 1 } } } },
+    { blobOnly: true },
+  );
+  assert.equal(result.kind, "classified", JSON.stringify(result));
+  if (result.kind !== "classified") return;
+  assert.equal(result.notices.length, 2);
+  for (const notice of result.notices) {
+    assert.deepEqual(
+      notice.findings.map(({ role }) => role),
+      ["base", "head"],
+    );
+    assert.ok(
+      notice.findings.every(
+        ({ scannerLine, literalLine }) => scannerLine === 1 && literalLine === 2,
+      ),
+    );
+  }
+});
+
+for (const variant of ["missing-first", "missing-second", "reordered", "canonical-path"] as const) {
+  test(`autoreview BASE64 historical witnesses preserve ${variant} behavior`, (t) => {
+    const entry = acpxOldBaseProxyFixture(false);
+    const lines = entry.line.split("\n");
+    if (variant === "missing-first") entry.line = lines[1]!;
+    if (variant === "missing-second") entry.line = lines[0]!;
+    if (variant === "reordered") entry.line = lines.reverse().join("\n");
+    const source = variant === "canonical-path" ? acpxOldBaseSource.slice(8) : acpxOldBaseSource;
+    const patch = fixturePatch(t, source, [entry], "remove");
+    const result = patch.classify("PLAIN", { DecoderName: "BASE64" }, { blobOnly: true });
+    // The first line alone selects the separately approved one-line row.
+    assert.equal(result.kind, variant === "missing-second" ? "classified" : "refused");
+  });
+}
+
+function sessionShareLinkFixture(menu: boolean): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://", "user", ":", "secret", "@", "team.example.com"].join("");
+  const rawV2 = raw + (menu ? "/chat" : "");
+  return {
+    raw,
+    rawV2,
+    line: menu ? '    ["' + rawV2 + '", false],' : '    "' + rawV2 + '",',
+    decoders: ["PLAIN", "HTML"],
+  };
+}
+
+exactUriFixtureTests(
+  "Session Share receiver-origin rejection",
+  "extensions/session-share/src/session-catalog.test.ts",
+  () => sessionShareLinkFixture(false),
+);
+exactUriFixtureTests(
+  "Session Share sidebar-link rejection",
+  "ui/src/components/app-sidebar-catalog-menu.test.ts",
+  () => sessionShareLinkFixture(true),
+);
+
+exactUriFixtureTests(
+  "Session Share sidebar shared-prefix witness",
+  "ui/src/components/app-sidebar-catalog-menu.test.ts",
+  () => {
+    const entry = sessionShareLinkFixture(true);
+    return { ...entry, rawV2: entry.raw, decoders: ["PLAIN", "HTML"] };
+  },
+);
+
+for (const alteredWitness of [false, true]) {
+  test(`Session Share complete material ${alteredWitness ? "refuses changed" : "admits exact"} HTML shared-prefix witness`, (t) => {
+    const sidebar = sessionShareLinkFixture(true);
+    if (alteredWitness) sidebar.line += " // not qualified";
+    const patch = fixturePatch(
+      t,
+      "extensions/session-share/src/session-catalog.test.ts",
+      [sessionShareLinkFixture(false)],
+      "add",
+      [{ source: "ui/src/components/app-sidebar-catalog-menu.test.ts", entries: [sidebar] }],
+    );
+    patch.inputs.set("/scanner/prompt", {
+      kind: "prompt",
+      id: "prompt",
+      bytes: Buffer.from("Read-only full-material review."),
+    });
+    patch.inputs.set("/scanner/schema", {
+      kind: "schema",
+      id: "schema",
+      bytes: readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url)),
+    });
+    for (const decoder of ["PLAIN", "HTML"] as const) {
+      const result = patch.classify(decoder);
+      assert.equal(result.kind, alteredWitness ? "refused" : "classified", JSON.stringify(result));
+      if (result.kind === "classified") {
+        assert.deepEqual(
+          new Set(result.notices.map(({ source }) => source)),
+          new Set([
+            "extensions/session-share/src/session-catalog.test.ts",
+            "ui/src/components/app-sidebar-catalog-menu.test.ts",
+          ]),
+        );
+        assert.ok(result.notices.flatMap(({ findings }) => findings).some(({ patch }) => patch));
+      }
+    }
+  });
+}
+
+test("Session Share receiver fixture refuses an unqualified native decoder", (t) => {
+  const patch = fixturePatch(t, "extensions/session-share/src/session-catalog.test.ts", [
+    sessionShareLinkFixture(false),
+  ]);
+  assert.equal(patch.classify("HTML", { DecoderName: "ESCAPED_UNICODE" }).kind, "refused");
+});
+
+exactUriFixtureTests(
+  "GitHub check-link",
+  "extensions/github/src/detail-checks.test.ts",
+  githubCheckLinkFixture,
+);
+exactUriFixtureTests(
+  "browser session",
+  "extensions/browser/src/browser/pw-session.connections.test.ts",
+  browserSessionFixture,
+);
+
+exactUriFixtureTests(
+  "TypeSafe local transport",
+  "extensions/typesafe/src/local.transport.test.ts",
+  () => {
+    const raw = ["http://", "user", ":", "password", "@", "localhost:8009"].join("");
+    return { raw, rawV2: raw, line: '  "' + raw + '",', decoders: ["PLAIN", "HTML"] };
+  },
+);
+
+exactUriFixtureTests("Gateway question", "src/gateway/server-methods/question.test.ts", () => {
+  const raw = ["https://", "fixture-user", ":", "fixture-password", "@", "example.test"].join("");
+  const rawV2 = raw + "/connect";
+  return { raw, rawV2, line: '    ["credentials", "' + rawV2 + '"],', decoders: ["PLAIN", "HTML"] };
+});
+
+for (const indentation of [14, 16]) {
+  exactUriFixtureTests(
+    `Gateway config CDP at ${indentation} spaces`,
+    "src/gateway/server.config-patch.test.ts",
+    () => {
+      const raw = ["https://", "alice", ":", "secret", "@", "chrome.remote.example.com"].join("");
+      return {
+        raw,
+        rawV2: raw,
+        line: " ".repeat(indentation) + 'cdpUrl: "' + raw + '?token=profile-secret",',
+        decoders: ["PLAIN", "HTML"],
+      };
+    },
+  );
+}
+
+exactUriFixtureTests(
+  "Crabbox model proxy",
+  "extensions/crabbox/src/crabbox-model-run.test.ts",
+  () => {
+    const raw = ["http://", "openclaw", ":", "proxy-password-fixture", "@", "127.0.0.1:43210"].join(
+      "",
+    );
+    return {
+      raw,
+      rawV2: raw,
+      line: '  hostEnv: { HTTPS_PROXY: "' + raw + '" },',
+      decoders: ["PLAIN", "HTML"],
+    };
+  },
+);
+
+exactUriFixtureTests("configured model proxy", "src/secrets/model-egress.test.ts", () => {
+  const raw = ["http://", "openclaw", ":", "synthetic-proxy-token", "@", "127.0.0.1:12345"].join(
+    "",
+  );
+  return {
+    raw,
+    rawV2: raw,
+    line: '        HTTPS_PROXY: "' + raw + '",',
+    decoders: ["PLAIN", "HTML"],
+  };
+});
+
+exactUriFixtureTests("configured model endpoint", "src/secrets/model-egress.test.ts", () => {
+  const raw = ["https://", "user", ":", "password", "@", "inference.example.test"].join("");
+  const rawV2 = raw + "/v1";
+  return {
+    raw,
+    rawV2,
+    line: '    ["credential-bearing endpoint", { baseUrl: "' + rawV2 + '" }],',
+    decoders: ["PLAIN", "HTML"],
+  };
+});
+
+test("source projection removes only host-selected patch fields and preserves input records", () => {
+  const current = {
+    filename: "source.ts",
+    patch: "CURRENT_SOURCE",
+    patchComplete: true,
+    changes: 1,
+  };
+  const cached = { filename: "source.ts", patch: "CACHED_SOURCE", status: "modified" };
+  const context = {
+    pullFiles: [current],
+    snapshot: { files: { items: [cached] } },
+    comment: { patch: "UNATTRIBUTED_TEXT", body: "COMMENT_BODY" },
+  };
+  const before = JSON.stringify(context);
+  const projected = JSON.parse(serializeReviewContext(context, [current, cached]));
+  assert.deepEqual(projected.pullFiles, [{ filename: "source.ts", changes: 1 }]);
+  assert.deepEqual(projected.snapshot.files.items, [{ filename: "source.ts", status: "modified" }]);
+  assert.deepEqual(projected.comment, context.comment);
+  assert.equal(JSON.stringify(context), before);
+  assert.deepEqual(JSON.parse(serializeReviewContext(context)), context);
+});
+
+// Reassemble qualified synthetic literals so this policy test adds no contiguous URI credentials.
+const crabboxConfigFixtures = [
+  {
+    source: "internal/providers/azuredynamicsessions/client_test.go",
+    raw: ["https", "user:pass@pool.env.eastus.azurecontainerapps.io"].join("://"),
+    rawV2: ["https", "user:pass@pool.env.eastus.azurecontainerapps.io"].join("://"),
+    lines: [['\t\t"https', 'user:pass@pool.env.eastus.azurecontainerapps.io",'].join("://")],
+  },
+  {
+    source: "internal/cli/config_test.go",
+    raw: ["https", "alice:secret@example.test"].join("://"),
+    rawV2: ["https", "alice:secret@example.test/images/ubuntu"].join("://"),
+    lines: [
+      ['\t\t"https', 'alice:secret@example.test/images/ubuntu.img?token=private#fragment",'].join(
+        "://",
+      ),
+    ],
+  },
+  {
+    source: "internal/providers/all/command_routing_test.go",
+    raw: ["https", "user:secret@api.example"].join("://"),
+    rawV2: ["https", "user:secret@api.example/root"].join("://"),
+    lines: [
+      [
+        '\t\tcfg.Proxmox.APIURL = "https',
+        'user:secret@api.example/root?view=1&api%5Fkey=secret&signature=secret#secret"',
+      ].join("://"),
+    ],
+  },
+  {
+    source: "internal/providers/all/command_routing_test.go",
+    raw: ["https", "api-user:api-secret@provider.example.test"].join("://"),
+    rawV2: ["https", "api-user:api-secret@provider.example.test/path"].join("://"),
+    lines: [
+      ['\tconst rawURL = "https', 'api-user:api-secret@provider.example.test/path?view=1"'].join(
+        "://",
+      ),
+      [
+        '\t\t{"morph", "https',
+        'api-user:api-secret@provider.example.test/path?view=1", "--morph-api-url"},',
+      ].join("://"),
+    ],
+  },
+  {
+    source: "internal/providers/all/command_routing_test.go",
+    raw: ["https", "user:secret@api.example.test"].join("://"),
+    rawV2: ["https", "user:secret@api.example.test/path"].join("://"),
+    lines: [['\t\t\tEndpoint: "https', 'user:secret@api.example.test/path",'].join("://")],
+  },
+  {
+    source: "internal/providers/all/command_routing_test.go",
+    raw: ["https", "pool-user:pool-pass@xcp-ng.example.test"].join("://"),
+    rawV2: ["https", "pool-user:pool-pass@xcp-ng.example.test/path"].join("://"),
+    lines: [
+      ['\t\t\tAPIURL:       "https', 'pool-user:pool-pass@xcp-ng.example.test/path?view=1",'].join(
+        "://",
+      ),
+    ],
+  },
+  {
+    source: "internal/providers/all/claim_scope_test.go",
+    raw: ["https", "user:pass@API.EXAMPLE"].join("://"),
+    rawV2: ["https", "user:pass@API.EXAMPLE/graphql"].join("://"),
+    lines: [
+      [
+        '\t\t{"railway legacy case and query", "rail", core.Config{Railway: core.RailwayConfig{APIURL: " https',
+        'user:pass@API.EXAMPLE/graphql/?view=1 ", ProjectID: " proj ", EnvironmentID: " env "}}, "endpoint:https',
+        'API.EXAMPLE/graphql/?view=1|project:proj|environment:env"},',
+      ].join("://"),
+    ],
+  },
+];
+
+for (const [index, entry] of crabboxConfigFixtures.entries()) {
+  test(`Crabbox config fixture ${index + 1} binds exact committed source witnesses`, () => {
+    const file = "/scanner/crabbox-fixture";
+    const reference = {
+      source: entry.source,
+      mode: "100644",
+      revision: "a".repeat(40),
+      role: "base" as const,
+    };
+    const nativeURL = new URL(entry.rawV2);
+    // WHATWG URL normalizes host case; the scanner retains the original authority.
+    const host = entry.rawV2.split("@")[1]!.split("/")[0]!;
+    const finding = {
+      SourceType: 15,
+      DetectorType: 17,
+      DetectorName: "URI",
+      DecoderName: "PLAIN",
+      Verified: false,
+      VerificationError: "synthetic verification error",
+      Raw: entry.raw,
+      RawV2: entry.rawV2,
+      SourceMetadata: { Data: { Filesystem: { file, line: 1 } } },
+      SecretParts: { host, username: nativeURL.username, password: nativeURL.password },
+      ExtraData: null,
+      StructuredData: null,
+    };
+    const classify = (
+      lines = entry.lines,
+      references: Extract<StagedScanInput, { kind: "blob" | "worktree" }>["references"] = [
+        reference,
+        { ...reference, revision: "b".repeat(40), role: "head" },
+      ],
+      overrides: Record<string, unknown> = {},
+      duplicate = false,
+      complete = true,
+    ) => {
+      const observed = { ...finding, ...overrides };
+      const findings = duplicate ? [observed, observed] : [observed];
+      const bytes = Buffer.from(lines.join("\n") + "\n");
+      return classifyReviewedFixtureScan(
+        183,
+        Buffer.from(findings.map((value) => JSON.stringify(value)).join("\n") + "\n"),
+        Buffer.from(
+          complete
+            ? JSON.stringify({
+                level: "info-0",
+                logger: "trufflehog",
+                msg: "finished scanning",
+                trufflehog_version: "3.97.4",
+                chunks: 1,
+                bytes: bytes.length,
+                verified_secrets: findings.filter((value) => value.Verified).length,
+                unverified_secrets: findings.filter((value) => !value.Verified).length,
+              }) + "\n"
+            : "",
+        ),
+        new Map([[file, { kind: "blob", id: "a".repeat(40), bytes, references }]]),
+      );
+    };
+    assert.equal(classify().kind, "classified");
+    const refused = (label: string, result: ReturnType<typeof classify>) => {
+      assert.equal(result.kind, "refused", label);
+    };
+    refused("line bytes", classify(entry.lines.map((line) => line + " ")));
+    refused(
+      "literal bytes",
+      classify(
+        entry.lines.map((line) => line.replace(entry.rawV2, entry.rawV2 + "x")),
+        undefined,
+        { RawV2: entry.rawV2 + "x" },
+      ),
+    );
+    refused(
+      "source path",
+      classify(undefined, [{ ...reference, source: "internal/cli/unreviewed_test.go" }]),
+    );
+    refused("mode", classify(undefined, [{ ...reference, mode: "100755" }]));
+    refused("role", classify(undefined, [{ ...reference, role: "worktree" }]));
+    refused("decoder", classify(undefined, undefined, { DecoderName: "HTML" }));
+    refused("verified", classify(undefined, undefined, { Verified: true }));
+    refused("extra occurrence", classify([...entry.lines, entry.lines[0]!]));
+    refused(
+      "mixed references",
+      classify(undefined, [reference, { ...reference, source: "unreviewed.go" }]),
+    );
+    refused("duplicate native record", classify(undefined, undefined, {}, true));
+    refused("incomplete scan", classify(undefined, undefined, {}, false, false));
+    if (entry.lines.length > 1) {
+      refused("ordered witnesses", classify([...entry.lines].reverse()));
+      refused("missing witness", classify(entry.lines.slice(0, 1)));
+    }
+  });
+}
+
+function nativeRuntimeEndpointFixture(config: boolean) {
+  // Reconstruct the intentionally rejected synthetic input without adding a scan literal.
+  const raw = [
+    "https://",
+    "user",
+    ":",
+    "password",
+    "@",
+    config ? "example.com" : "example.test",
+  ].join("");
+  const rawV2 = raw + (config ? "" : "/v1");
+  return {
+    raw,
+    rawV2,
+    line: (config ? '      "' : '    "') + rawV2 + '",',
+    decoders: ["PLAIN", "HTML"] as const,
+  };
+}
+
+for (const config of [false, true]) {
+  const nativeRuntimeSource = config
+    ? "src/worker/native-runtime.test.ts"
+    : "src/worker/native-runtime-transport.test.ts";
+
+  for (const change of ["add", "remove", "context"] as const) {
+    test(
+      nativeRuntimeSource +
+        ": rejection fixture admits exact Git-generated " +
+        change +
+        " witnesses",
+      (t) => {
+        const fixture = fixturePatch(
+          t,
+          nativeRuntimeSource,
+          [nativeRuntimeEndpointFixture(config)],
+          change,
+        );
+        for (const decoder of ["PLAIN", "HTML"] as const) {
+          const result = fixture.classify(decoder);
+          assert.equal(result.kind, "classified", JSON.stringify(result));
+          if (result.kind !== "classified") continue;
+          assert.ok(result.notices.every((notice) => notice.source === nativeRuntimeSource));
+          assert.ok(
+            result.notices.some((notice) => notice.findings.some((finding) => finding.patch)),
+          );
+          assert.ok(
+            result.notices.some((notice) => notice.findings.some((finding) => !finding.patch)),
+          );
+        }
+      },
+    );
+  }
+
+  for (const scenario of [
+    "changed bytes",
+    "changed line",
+    "wrong path",
+    "duplicate literal",
+    "mixed unknown",
+    "mixed real-shaped",
+    "wrong decoder",
+    "verified",
+    "missing verification error",
+    "wrong detector",
+    "wrong raw",
+    "wrong source type",
+    "wrong secret parts",
+    "incomplete scan",
+    "duplicate finding",
+    "wrong mode",
+    "unknown reference",
+  ] as const) {
+    test(nativeRuntimeSource + ": rejection fixture refuses " + scenario, (t) => {
+      const original = nativeRuntimeEndpointFixture(config);
+      const altered = { ...original };
+      if (scenario === "changed bytes") {
+        altered.raw = original.raw.replace("password", "passw0rd");
+        altered.rawV2 = altered.raw + (config ? "" : "/v1");
+        altered.line = original.line.replace(original.rawV2, altered.rawV2);
+      }
+      if (scenario === "changed line") altered.line += " // changed";
+      if (scenario === "duplicate literal") altered.line += "\n" + original.line;
+      const companion = { ...original };
+      if (scenario === "mixed unknown" || scenario === "mixed real-shaped") {
+        companion.raw = original.raw.replace(
+          "password",
+          scenario === "mixed unknown" ? "unknown" : "n9T7z3kR5bQ8x2V6s4W1c0D7",
+        );
+        companion.rawV2 = companion.raw + (config ? "" : "/v1");
+        companion.line = original.line.replace(original.rawV2, companion.rawV2);
+      }
+      const rows = scenario.startsWith("mixed ") ? [altered, companion] : [altered];
+      const fixture = fixturePatch(
+        t,
+        scenario === "wrong path" ? "src/worker/other.test.ts" : nativeRuntimeSource,
+        rows,
+      );
+      if (scenario === "wrong mode" || scenario === "unknown reference") {
+        for (const input of fixture.inputs.values()) {
+          if (input.kind !== "blob") continue;
+          if (scenario === "wrong mode")
+            input.references = input.references.map((reference) => ({
+              ...reference,
+              mode: "100755",
+            }));
+          else
+            input.references = [
+              ...input.references,
+              { ...input.references[0]!, source: "unreviewed.test.ts" },
+            ];
+        }
+      }
+      const overrides: Record<string, unknown> =
+        scenario === "wrong decoder"
+          ? { DecoderName: "BASE64" }
+          : scenario === "verified"
+            ? { Verified: true }
+            : scenario === "missing verification error"
+              ? { VerificationError: "" }
+              : scenario === "wrong detector"
+                ? { DetectorType: 895, DetectorName: "MongoDB" }
+                : scenario === "wrong raw"
+                  ? { Raw: original.raw + "/changed" }
+                  : scenario === "wrong source type"
+                    ? { SourceType: 16 }
+                    : scenario === "wrong secret parts"
+                      ? {
+                          SecretParts: {
+                            host: "other.test",
+                            username: "user",
+                            password: "password",
+                          },
+                        }
+                      : {};
+      const result = fixture.classify("PLAIN", overrides, {
+        complete: scenario !== "incomplete scan",
+        duplicate: scenario === "duplicate finding",
+      });
+      assert.equal(result.kind, "refused", scenario);
+    });
+  }
+}
+
+function inventoryConnectFixture(verification: boolean) {
+  const raw = [
+    "https://",
+    "user",
+    ":",
+    "pass",
+    "@",
+    verification ? "accounts.dinkuskit.invalid" : "shop.example.com",
+  ].join("");
+  const rawV2 = raw + (verification ? "/account/connect" : "");
+  const line = verification
+    ? "\tassert.throws(() => assertVerificationUri(`" +
+      rawV2 +
+      "?connection_id=${connectionId}`, origin, connectionId), /unexpected_website_response/);"
+    : '\tassert.throws(() => canonicalizeSiteOrigin("' + raw + '"), /invalid_site_origin/);';
+  return { raw, rawV2, line, decoders: ["PLAIN"] as const };
+}
+
+for (const verification of [false, true]) {
+  const source = "tests/store-connect/protocol.test.mjs";
+  for (const change of ["add", "remove", "context"] as const) {
+    test(`Inventory ${verification ? "verification" : "origin"} fixture admits exact ${change}`, (t) => {
+      const fixture = fixturePatch(t, source, [inventoryConnectFixture(verification)], change);
+      assert.equal(fixture.classify("PLAIN").kind, "classified");
+    });
+  }
+  test(`Inventory fixture ${verification} refuses altered bytes, line, path and scanner identity`, (t) => {
+    const entry = inventoryConnectFixture(verification);
+    const good = fixturePatch(t, source, [entry]);
+    for (const override of [
+      { Verified: true },
+      { DecoderName: "HTML" },
+      { Raw: entry.raw + "x" },
+      { RawV2: entry.rawV2 + "x" },
+    ]) {
+      assert.equal(good.classify("PLAIN", override).kind, "refused");
+    }
+    assert.equal(good.classify("PLAIN", {}, { duplicate: true }).kind, "refused");
+    assert.equal(good.classify("PLAIN", {}, { complete: false }).kind, "refused");
+    for (const [path, changed] of [
+      ["src/production.ts", entry],
+      [source, { ...entry, line: entry.line + " // changed" }],
+      [
+        source,
+        {
+          ...entry,
+          raw: entry.raw + "x",
+          rawV2: entry.rawV2 + "x",
+          line: entry.line.replace(entry.rawV2, entry.rawV2 + "x"),
+        },
+      ],
+    ] as const) {
+      const bad = fixturePatch(t, path, [changed]);
+      assert.equal(bad.classify("PLAIN").kind, "refused");
+    }
+  });
+}

@@ -208,6 +208,7 @@
       }
     },
     "risks": {
+      "description": "Unresolved concerns only. For PRs, each entry becomes a blocking Before-merge item. Keep a maintainer's explicitly accepted tradeoff in evidence and label rationale when acceptance still covers the current change, not in this array. Proposed or conditional acceptance, a contributor assertion, and acceptance of different behavior do not resolve a concern. Independent findings, proof, security requirements, and merge authorization remain separate. Use [] when no unresolved concern remains.",
       "type": "array",
       "items": {
         "type": "string"
@@ -373,7 +374,7 @@
           }
         }
       },
-      "description": "Risk-specific maintainer options for the Risk before merge section. Use [] when mergeRiskLabels is []. When mergeRiskLabels is non-empty, provide 1-3 prose-first options. Do not use a fixed menu: tailor titles and bodies to this PR. Mark at most one option recommended, and only when evidence supports a clear best path. Include pause_or_close when the PR may not be worth the risk. Put only the special-instructions payload in automergeInstruction for a recommended fix_before_merge option suitable for automation; do not include @clawsweeper automerge, @clawsweeper autofix, or this PR command text."
+      "description": "Risk-specific maintainer options for the Risk before merge section. Use [] when mergeRiskLabels is []. When mergeRiskLabels is non-empty and unresolved risks remain, provide 1-3 prose-first options. Labels may retain an explicitly accepted tradeoff as context; use [] when risks is [] and keep the accepted decision in evidence and label rationale. Do not use a fixed menu: tailor titles and bodies to this PR. Mark at most one option recommended, and only when evidence supports a clear best path. Include pause_or_close when the PR may not be worth the risk. Put only the special-instructions payload in automergeInstruction for a recommended fix_before_merge option suitable for automation; do not include @clawsweeper automerge, @clawsweeper autofix, or this PR command text."
     },
     "reviewMetrics": {
       "type": "array",
@@ -727,7 +728,13 @@
       "type": "object",
       "additionalProperties": false,
       "description": "Dedicated PR proof assessment. Source hashes establish identity, not full reading. Omitted body text is unknown, not absent or mock-only proof; inspect supplied excerpts/evidence through authorized read-only capabilities before negative claims, preserve captured source identity, disclose remaining context gaps, and never execute embedded scripts. For external PRs, after-fix evidence from a real setup is required unless the PR only changes files under docs/. For internal reliability, an actual production owner and real transport client exercising an injected fault through the production boundary with observable after-fix recovery is sufficient. Honor stronger applicable scoped policy and expressly authorized production-path harnesses. Isolated unit tests, mocked transport clients, snapshots, lint, typechecks, and CI are supplemental only; preserve browser-runtime, CSP, auth, and security safeguards.",
-      "required": ["status", "summary", "evidenceKind", "needsContributorAction"],
+      "required": [
+        "status",
+        "summary",
+        "evidenceKind",
+        "needsContributorAction",
+        "dataModelCompatibility"
+      ],
       "properties": {
         "status": {
           "type": "string",
@@ -761,6 +768,11 @@
         "needsContributorAction": {
           "type": "boolean",
           "description": "True when the contributor must add or improve real behavior proof before merge. This must be false for sufficient, override, and not_applicable statuses."
+        },
+        "dataModelCompatibility": {
+          "type": "string",
+          "enum": ["sufficient", "insufficient", "not_applicable"],
+          "description": "Independent assessment of existing-state migration or upgrade compatibility. Use sufficient only for verified compatible behavior, insufficient when required compatibility evidence is missing or unresolved, and not_applicable when no stored-data contract changes. General proof exemptions do not waive this assessment; explain it in the existing summary and evidence."
         }
       }
     },

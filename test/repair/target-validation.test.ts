@@ -2624,7 +2624,7 @@ test("repair execution provisions pinned Bun before target validation can invoke
   assert.match(runtime, /if error\.errno not in \{errno\.ENOSYS, errno\.EOPNOTSUPP\}/);
   const setupBunStep = workflow.slice(setupBunIndex, executeFixIndex);
   assert.match(setupBunStep, /uses: oven-sh\/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6/);
-  assert.match(setupBunStep, /bun-version: 1\.3\.14/);
+  assert.match(setupBunStep, /bun-version: 1\.4\.2/);
 });
 
 test("bun-based target toolchain installs deps and runs configured validation", () => {
@@ -5381,6 +5381,107 @@ test("changed gates preserve existing receipts and ownership records", () => {
   }
 });
 
+test("OpenClaw timing summaries retain only typecheck and lint durations", (t) => {
+  const cwd = gitPackageFixture({ "check:changed": "node scripts/check-changed.mjs" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+  const binDir = makeFixtureDir("clawsweeper-timed-gate-");
+  writeNodeCommandShim(
+    binDir,
+    "pnpm",
+    [
+      'if (!process.argv.includes("--timed")) process.exit(2);',
+      'console.log("  99s ok typecheck core");',
+      'console.error("[check:changed] summary\\n  1.25s ok typecheck core\\n  40ms ok typecheck core tests\\n  2.50s ok lint core changed files\\n  3ms ok lint core changed file\\n  4.75s ok lint core\\n  99s ok unrelated output\\n unrelated text");',
+    ].join("\n"),
+  );
+  const messages: string[] = [];
+  t.mock.method(console, "log", (message: string) => messages.push(message));
+  const result = withPathOnlyPrefix(binDir, () =>
+    runAllowedValidationCommands(
+      ["pnpm check:changed"],
+      cwd,
+      validationOptions("openclaw/openclaw", {
+        pinnedBaseRef: "origin/main",
+        logOpenClawTimingSummary: true,
+      }),
+    ),
+  );
+  assert.deepEqual(result, ["pnpm check:changed"]);
+  assert.deepEqual(messages, [
+    "[target-validation] 1.25s ok typecheck core",
+    "[target-validation] 40ms ok typecheck core tests",
+    "[target-validation] 2.50s ok lint core changed files",
+    "[target-validation] 3ms ok lint core changed file",
+    "[target-validation] 4.75s ok lint core",
+  ]);
+});
+
+test("confirmed changed-gate timeouts remove new ownership but preserve identity guards", () => {
+  for (const scenario of ["new", "existing", "mutation"] as const) {
+    const cwd = gitPackageFixture({ "check:changed": "node scripts/check-changed.mjs" });
+    fs.appendFileSync(path.join(cwd, ".gitignore"), ".artifacts/\n");
+    fs.writeFileSync(path.join(cwd, "source.txt"), "original\n");
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+    const owner = path.join(cwd, ".artifacts/dist-artifacts.lock");
+    fs.mkdirSync(path.join(cwd, ".artifacts"));
+    fs.writeFileSync(path.join(cwd, ".artifacts/retained"), "protected");
+    if (scenario === "existing") {
+      fs.mkdirSync(owner);
+      fs.writeFileSync(path.join(owner, "owner.json"), "previous ownership");
+    }
+    const binDir = makeFixtureDir("clawsweeper-timeout-ownership-");
+    writeNodeCommandShim(
+      binDir,
+      "pnpm",
+      [
+        'const fs = require("node:fs");',
+        'fs.mkdirSync(".artifacts/dist-artifacts.lock", { recursive: true });',
+        ...(scenario === "existing"
+          ? []
+          : [
+              'fs.writeFileSync(".artifacts/dist-artifacts.lock/owner.json", "unfinished ownership");',
+            ]),
+        ...(scenario === "mutation" ? ['fs.writeFileSync("source.txt", "mutated\\n");'] : []),
+        'process.on("SIGTERM", () => {});',
+        'console.log("ownership fixture started");',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    assert.throws(
+      () =>
+        withPathOnlyPrefix(binDir, () =>
+          runAllowedValidationCommands(
+            ["pnpm check:changed"],
+            cwd,
+            validationOptions("openclaw/openclaw", {
+              validationTimeoutMs: 2_000,
+              pinnedBaseRef: "origin/main",
+            }),
+          ),
+        ),
+      (error: Error) => {
+        if (scenario !== "mutation") {
+          assert.match(error.message, /ownership fixture started/);
+          assert.match(error.message, /command timed out after/);
+        }
+        assert.equal(Boolean(validationRecoveryRequired(error)), false);
+        if (scenario === "mutation")
+          assert.match(error.message, /unsafe validation command mutated checkout identity/);
+        else assert.doesNotMatch(error.message, /unsafe validation command/);
+        return true;
+      },
+    );
+    assert.equal(fs.readFileSync(path.join(cwd, ".artifacts/retained"), "utf8"), "protected");
+    if (scenario === "existing")
+      assert.equal(fs.readFileSync(path.join(owner, "owner.json"), "utf8"), "previous ownership");
+    else assert.equal(fs.existsSync(owner), false);
+  }
+});
+
 test("unverified validation completion retains state and blocks every reuse path", (t) => {
   const cwd = gitPackageFixture({ "check:changed": "node scripts/check-changed.mjs" });
   fs.appendFileSync(path.join(cwd, ".gitignore"), ".artifacts/\ndist/\n");
@@ -7199,19 +7300,24 @@ test("validation rejects scripts that mutate the checkout", () => {
 
   assert.throws(
     () =>
-      runAllowedValidationCommands(
-        ["pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
+      withPackageScriptPnpm(
+        () =>
+          runAllowedValidationCommands(
+            ["pnpm verify"],
+            cwd,
+            validationOptions("steipete/example", {
+              toolchain: {
+                packageManager: "pnpm",
+                baseValidationCommands: [],
+                changedGate: null,
+              },
+            }),
+          ),
+        { name: "verify", file: "mutate.js" },
       ),
     /unsafe validation command mutated checkout identity/,
   );
+  assert.equal(fs.readFileSync(path.join(cwd, "generated.txt"), "utf8"), "mutated\n");
 });
 
 test("validation rejects scripts that mutate Git administrative state", () => {
@@ -7231,19 +7337,24 @@ test("validation rejects scripts that mutate Git administrative state", () => {
 
   assert.throws(
     () =>
-      runAllowedValidationCommands(
-        ["pnpm verify"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
+      withPackageScriptPnpm(
+        () =>
+          runAllowedValidationCommands(
+            ["pnpm verify"],
+            cwd,
+            validationOptions("steipete/example", {
+              toolchain: {
+                packageManager: "pnpm",
+                baseValidationCommands: [],
+                changedGate: null,
+              },
+            }),
+          ),
+        { name: "verify", file: "mutate-git.js" },
       ),
     /unsafe validation command mutated checkout identity/,
   );
+  assert.equal(fs.existsSync(path.join(cwd, ".git", "hooks", "pre-push")), true);
 });
 
 test("publication checkout bindings reject later Git administrative mutation", () => {
@@ -9415,6 +9526,71 @@ test("changed validation shares one timeout with checkout identity proof", (t) =
   }
 });
 
+test("a confirmed timeout remains primary when subsequent identity proof is inconclusive", (t) => {
+  const cwd = gitPackageFixture({ verify: "node verify.js" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+  let timedOut = false;
+  let recovery: ReturnType<typeof validationRecoveryRequired>;
+  try {
+    withVirtualDeadlineCommands(
+      t,
+      () => 10_000,
+      ({ command, args, contained }) => {
+        if (command === "git") {
+          if (timedOut && args.includes("write-tree"))
+            throw new Error("synthetic identity probe failure");
+          return undefined;
+        }
+        assert.equal(contained, true);
+        timedOut = true;
+        return {
+          status: null,
+          error: { code: "ETIMEDOUT", message: "validation command timed out" },
+        };
+      },
+      () =>
+        assert.throws(
+          () =>
+            runAllowedValidationCommands(
+              ["pnpm verify"],
+              cwd,
+              validationOptions("steipete/example", {
+                validationTimeoutMs: 4_000,
+                pinnedBaseRef: "origin/main",
+              }),
+            ),
+          (error) => {
+            recovery = validationRecoveryRequired(error);
+            assert.ok(recovery);
+            assert.match(recovery.message, /^command timed out after/);
+            assert.match(
+              recovery.message,
+              /Post-timeout checkout identity verification failed.*synthetic identity probe failure/,
+            );
+            assert.match(recovery.message, /do not retry this checkout/);
+            assert.ok(recovery.recoveryPaths.has(cwd));
+            assert.ok(recovery.cause instanceof AggregateError);
+            assert.equal(recovery.cause.errors.length, 2);
+            assert.match(recovery.cause.errors[0].message, /command timed out after/);
+            assert.match(recovery.cause.errors[1].message, /synthetic identity probe failure/);
+            return true;
+          },
+        ),
+    );
+    assert.throws(
+      () =>
+        runAllowedValidationCommands(["pnpm verify"], cwd, validationOptions("steipete/example")),
+      /do not retry this checkout/,
+    );
+  } finally {
+    for (const root of recovery?.recoveryPaths ?? []) {
+      if (root !== cwd) fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("validation reserves deadline to prove checkout mutation after command timeout", (t) => {
   const fixture = makeFixtureDir("clawsweeper-validation-timeout-");
   const marker = path.join(fixture, "phases");
@@ -9577,9 +9753,18 @@ test("target validation strips credentials and target-controlled environment inj
   const secretValues = Object.fromEntries(
     secretNames.map((name) => [name, `secret-${name.toLowerCase()}`]),
   );
-  const cwd = gitPackageFixture({
-    "check:env": `node -e 'for (const [key, value] of Object.entries(${JSON.stringify(secretValues)})) if (process.env[key] === value) process.exit(9); if (process.env.GIT_OPTIONAL_LOCKS !== "0") process.exit(10)'`,
-  });
+  const cwd = gitPackageFixture({ "check:env": "node check-env.js" });
+  fs.writeFileSync(
+    path.join(cwd, "check-env.js"),
+    `for (const [key, value] of Object.entries(${JSON.stringify(secretValues)})) {
+  if (process.env[key] === value) {
+    console.error("leaked " + key);
+    process.exit(9);
+  }
+}
+if (process.env.GIT_OPTIONAL_LOCKS !== "0") process.exit(10);
+`,
+  );
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
@@ -9588,16 +9773,20 @@ test("target validation strips credentials and target-controlled environment inj
   for (const [key, value] of Object.entries(secretValues)) process.env[key] = value;
   try {
     assert.deepEqual(
-      runAllowedValidationCommands(
-        ["pnpm check:env"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
+      withPackageScriptPnpm(
+        () =>
+          runAllowedValidationCommands(
+            ["pnpm check:env"],
+            cwd,
+            validationOptions("steipete/example", {
+              toolchain: {
+                packageManager: "pnpm",
+                baseValidationCommands: [],
+                changedGate: null,
+              },
+            }),
+          ),
+        { name: "check:env", file: "check-env.js" },
       ),
       ["pnpm check:env"],
     );
@@ -9810,16 +9999,20 @@ fs.writeFileSync(${JSON.stringify(observationPath)}, JSON.stringify({
   process.env.XDG_CONFIG_HOME = hostConfig;
   try {
     assert.deepEqual(
-      runAllowedValidationCommands(
-        ["pnpm check:env"],
-        cwd,
-        validationOptions("steipete/example", {
-          toolchain: {
-            packageManager: "pnpm",
-            baseValidationCommands: [],
-            changedGate: null,
-          },
-        }),
+      withPackageScriptPnpm(
+        () =>
+          runAllowedValidationCommands(
+            ["pnpm check:env"],
+            cwd,
+            validationOptions("steipete/example", {
+              toolchain: {
+                packageManager: "pnpm",
+                baseValidationCommands: [],
+                changedGate: null,
+              },
+            }),
+          ),
+        { name: "check:env", file: "write-global.mjs" },
       ),
       ["pnpm check:env"],
     );
@@ -10001,7 +10194,12 @@ function withVirtualDeadlineCommands(t, now, onCommand, callback) {
       output: [null, output.stdout, output.stderr],
       ...output,
       ...(contained
-        ? { status: 0, stderr: "", stdout: JSON.stringify({ ...output, backgroundProcesses: 0 }) }
+        ? {
+            error: undefined,
+            status: 0,
+            stderr: "",
+            stdout: JSON.stringify({ ...output, backgroundProcesses: 0 }),
+          }
         : {}),
     };
   });

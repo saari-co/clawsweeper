@@ -36,6 +36,17 @@ outputs and caches together, or discard the disposable checkout and start
 from a fresh one. Keep the retained paths until recovery is complete. A base
 reproduction that requires recovery retains its own checkout as well.
 
+## Stopped review attention is not a repair attempt
+
+The dashboard's Repair & attention area can contain exhausted exact-review
+records as well as live repair activity. An exhausted review does not establish
+that a code-repair worker ran or that the target patch is invalid. Its
+acknowledgement-only explanation uses observed closed failure categories, or
+explicitly states that historical detail is unavailable. Settling that status
+does not authorize a retry, reset a budget, or start autofix/automerge. See
+[exhausted command review records](../live-dashboard.md#exhausted-command-review-records-in-bay)
+for ownership and receipt boundaries.
+
 ## Cluster Repair Operations Counters
 
 The README dashboard and hosted live dashboard expose passive counters for the
@@ -301,6 +312,11 @@ local `setup-codex` action's `auth-mode: login` input.
 
 Codex runs in a read-only sandbox for classification and receives no GitHub token. GitHub read access is scoped to deterministic preflight scripts. For reviewed fix artifacts, `execute-fix-artifact` gives Codex a temporary target checkout without GitHub credentials, then the deterministic executor commits, pushes, opens the replacement PR, and closes uneditable source PRs only after the replacement exists. When a replacement carries contributor work forward, non-bot source PR authors are added as `Co-authored-by` trailers and named in the replacement PR body and source close comment. Remaining write access is scoped to `apply-result`.
 
+Both review and repair Codex environments remove inherited process-local Git
+configuration (`GIT_CONFIG_COUNT`, numbered keys/values, and
+`GIT_CONFIG_PARAMETERS`). Git isolation settings, explicit command-line
+configuration, and the repair commit identity remain available.
+
 The repair worker wrapper emits a heartbeat while Codex is running. Execute-side
 edit, review, and final rebase subprocesses emit the same
 heartbeat. If a model call is slow, Actions logs should show
@@ -468,6 +484,8 @@ five-minute router scan is the recovery producer. Both converge on the same
 comment-version receipt, so a throttled router cannot lose the command and a
 redelivery cannot start the same version twice. The queue verifies the source
 comment and current PR head before it creates the marker-backed acknowledgement.
+The queue also owns acknowledgement updates after intake; the recovery router
+records the handoff without posting another reply or replacing terminal progress.
 Issue implementation commands (`implement`, `fix`, `build`, `create pr`, `fix issue`)
 dispatch the repair worker for one open issue and ask it to create or update a
 single ClawSweeper implementation PR. The generated job uses

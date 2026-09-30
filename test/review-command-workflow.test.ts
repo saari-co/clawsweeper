@@ -32,6 +32,7 @@ import {
   ReviewGitError,
 } from "../dist/clawsweeper-review-blobs.js";
 import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
+import { ValidationRecoveryRequiredError } from "../dist/repair/validation-recovery.js";
 import { reviewOutputItemBudget } from "../dist/review-output-policy.js";
 
 import { parseArgs } from "../dist/clawsweeper-args.js";
@@ -249,6 +250,7 @@ const scheduledScenarios = [
   "changed-pr-exact-codex-failure",
   "changed-pr-exact-fetch-failure",
   "changed-pr-exact-native-checkout-failure",
+  "changed-pr-exact-settlement-failure",
   "changed-pr-exact-source-incompatible",
   "changed-pr-clean",
   "changed-pr-proof-invalid-cursor",
@@ -291,6 +293,7 @@ function testScheduledCacheScenario(
     const fetchFailure = scenario.endsWith("fetch-failure");
     const blobMetadataFailure = scenario.endsWith("blob-metadata-failure");
     const nativeCheckoutFailure = scenario.endsWith("native-checkout-failure");
+    const settlementFailure = scenario.endsWith("settlement-failure");
     const checkoutUnavailable = scenario.endsWith("checkout-unavailable");
     const cacheRecovery = scenario === "structural-pr-checkout-recovery";
     const partialJsonFailure = scenario.startsWith("changed-pr-partial-json-")
@@ -307,6 +310,14 @@ function testScheduledCacheScenario(
     const artifactDir = join(root, "artifacts");
     const itemsDir = join(root, "items");
     const target = join(root, "target");
+    const recovery = Object.assign(
+      new ValidationRecoveryRequiredError("unsettled Git", undefined, [target]),
+      { code: "EPROCESSSETTLEMENT" },
+    );
+    const unsettled = new ReviewGitError(
+      "review_commit_fetch_failed",
+      Object.assign(new Error("unsettled fixture", { cause: recovery }), { error: recovery }),
+    );
     mkdirSync(target);
     const mediaCase = outputCase?.surface === "media";
     const cumulativeCase = outputCase?.surface === "cumulative";
@@ -698,6 +709,10 @@ else {
       materializePullRequestReviewTree: ({ worktreeDir }) => {
         privateReviewRoots.add(dirname(worktreeDir));
         reviewTreeAttempts += 1;
+        if (settlementFailure) {
+          mkdirSync(worktreeDir);
+          throw unsettled;
+        }
         if (checkoutUnavailable || (cacheRecovery && reviewTreeAttempts === 1)) return false;
         if (cacheRecovery) assert.equal(hydrationCalls, 1);
         if (nativeCheckoutFailure) {
@@ -777,13 +792,29 @@ else {
           });
         throw new Error("scan refusal must not become a decision");
       },
-      runCodex: ({ item: reviewItem, openclawDir, reviewTreeRoot, reviewEnv, prompt }) => {
+      runCodex: ({
+        item: reviewItem,
+        openclawDir,
+        reviewTreeRoot,
+        reviewEnv,
+        prompt,
+        reasoningEffort,
+        serviceTier,
+      }) => {
         assert.equal(
           prompt,
           "Review the current item.",
           "workflow supplies the runtime prompt; media fallback is unreachable",
         );
         assert.equal(reviewEnv.GH_TOKEN, "synthetic-inspection-token");
+        if (scenario === "changed-pr-clean" && !outputCase && !publicationCase) {
+          assert.equal(reasoningEffort, "medium");
+          assert.equal(serviceTier, "");
+        }
+        if (scenario === "changed-pr-proof-maintainer-change") {
+          assert.equal(reasoningEffort, "high");
+          assert.equal(serviceTier, "fast");
+        }
         generationCalls += 1;
         if (isPullRequest) {
           assert.equal(reviewTreeRoot, realpathSync(dirname(openclawDir)));
@@ -1096,6 +1127,20 @@ else {
         }
         return;
       }
+      if (settlementFailure) {
+        assert.throws(execute, (error) => error === unsettled);
+        assert.equal(reviewTreeAttempts, 1);
+        assert.equal(reviewTreeCleanupCalls, 0);
+        assert.equal(generationCalls, 0);
+        assert.equal(checkoutInspectionCalls, 0);
+        assert.equal(existsSync(providerCalls), false);
+        assert.equal(existsSync(join(artifactDir, `${ITEM_NUMBER}.md`)), false);
+        const manifest = JSON.parse(
+          readFileSync(join(artifactDir, "failure-diagnostics", "manifest.json"), "utf8"),
+        );
+        assert.equal(manifest.process.error_code, "EPROCESSSETTLEMENT");
+        return;
+      }
       if (fetchFailure || nativeCheckoutFailure || blobMetadataFailure || checkoutUnavailable) {
         const reason = fetchFailure
           ? "review_commit_fetch_failed"
@@ -1129,6 +1174,17 @@ else {
         assert.deepEqual(manifest.failure, {
           stage: "source_preparation",
           reason_code: reason,
+          ...(fetchFailure
+            ? {
+                acquisition: {
+                  phase: "base",
+                  requested_sha: "e".repeat(40),
+                  source: "pin",
+                  commit: "missing",
+                  history: "complete",
+                },
+              }
+            : {}),
         });
         assert.equal(
           manifest.source.sha,
@@ -1255,6 +1311,11 @@ else {
       assert.equal(cachedCompletions, 1);
       assert.equal(checkoutInspectionCalls, 1);
       const inspectedContext = JSON.parse(inspectedPrompt);
+      if (hydrated && isPullRequest) {
+        assert.equal(inspectedContext.pullFiles[0].filename, "value.ts");
+        assert.equal(Object.hasOwn(inspectedContext.pullFiles[0], "patch"), false);
+        assert.equal(context.pullFiles?.[0]?.patch, patch);
+      }
       assert.equal(
         hydrated ? inspectedContext.issue.body : inspectedContext.title,
         hydrated ? safeFixtureQuote : `Scheduled cache proof. ${safeFixtureQuote}`,
@@ -1277,12 +1338,15 @@ else {
         for (const privateRoot of privateReviewRoots) {
           assert.equal(
             existsSync(privateRoot),
-            false,
-            "command must remove its private sibling root",
+            settlementFailure,
+            "only uncertain acquisition retains its private sibling root",
           );
         }
         assert.equal(existsSync(join(target, "value.ts")), true, "sibling target remains intact");
       } finally {
+        if (settlementFailure)
+          for (const privateRoot of privateReviewRoots)
+            rmSync(dirname(privateRoot), { recursive: true, force: true });
         rmSync(root, { recursive: true, force: true });
       }
     }

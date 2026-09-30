@@ -1,4 +1,5 @@
 import { isOpenClawTestRolePath } from "./openclaw-file-role.js";
+import { escapeRegExp } from "./clawsweeper-text.js";
 import type {
   ConfigSurfaceChange,
   DataModelChange,
@@ -90,7 +91,9 @@ export function dataModelChangeFromContext(repo: string, context: ItemContext): 
     const candidates = [path, previousPath].filter(isDataModelCandidatePath);
     const patch = typeof file.patch === "string" ? file.patch : null;
     const lines = patch === null ? [] : changedPatchLines(patch);
-    const storageContext = dataModelStorageContext(patch ?? "");
+    const storageContext = (patch ?? "")
+      .split(/^@@.*$/m)
+      .flatMap((hunk) => dataModelStorageContext(hunk));
     const likelyPath =
       candidates.find(
         (candidate) =>
@@ -213,7 +216,7 @@ function isProductionSourcePath(path: string): boolean {
     return false;
   }
   const basename = segments.at(-1) ?? "";
-  if (isOpenClawTestRolePath(basename)) return false;
+  if (isOpenClawTestRolePath(path.toLowerCase())) return false;
   return ![".spec.", ".test.", ".test-support."].some((marker) => {
     const markerIndex = basename.indexOf(marker);
     return markerIndex >= 0 && markerIndex + marker.length < basename.length;
@@ -370,78 +373,6 @@ function pluginManifestConfigSurfaceKey(path: string, key: string): string {
   return `contracts.${key}`;
 }
 
-export function hasDataModelUpgradeProof(text: string): boolean {
-  const noMigrationRequiredPattern =
-    /\bno\s+(?:data\s+)?migrations?\s+(?:(?:is|are)\s+)?(?:required|needed|necessary)\b/i;
-  const negativeProofText = text.replace(
-    new RegExp(noMigrationRequiredPattern.source, "gi"),
-    "migration unnecessary",
-  );
-  if (
-    /\b(?:missing|lacks?|without|no)\b[^.]{0,120}\b(?:migration|upgrade|backfill|compatibility)\b/i.test(
-      negativeProofText,
-    )
-  ) {
-    return false;
-  }
-  if (
-    /\b(?:migration|upgrade|backfill|compatibility)\b[^.]{0,160}\b(?:proof|test(?:ed|s|ing)?|cover(?:ed|age)?|verif(?:y|ied|ication)|compatib(?:le|ility))\b[^.]{0,120}\b(?:required|needed|missing|todo|before merge)\b/i.test(
-      negativeProofText,
-    ) ||
-    /\b(?:must|should|needs?|requires?|required|needed|todo)\b[^.]{0,120}\b(?:migration|upgrade|backfill|compatibility)\b[^.]{0,160}\b(?:proof|test(?:ed|s|ing)?|cover(?:ed|age)?|verif(?:y|ied|ication)|compatib(?:le|ility))\b/i.test(
-      negativeProofText,
-    )
-  ) {
-    return false;
-  }
-  if (
-    /\b(?:migration|upgrade|backfill|schema version|existing data|existing database|existing cache|existing state)\b[^.]{0,180}\b(?:not|never)\b[^.]{0,80}\b(?:test(?:ed|s)?|cover(?:ed|age)?|prov(?:e|ed|en)|verif(?:y|ied)|compatib(?:le|ility)|preserv(?:e|ed|es)|migrat(?:e|ed|es)|backfill(?:ed|s)?)\b/i.test(
-      negativeProofText,
-    ) ||
-    /\b(?:not|never)\b[^.]{0,80}\b(?:test(?:ed|s)?|cover(?:ed|age)?|prov(?:e|ed|en)|verif(?:y|ied)|compatib(?:le|ility)|preserv(?:e|ed|es))\b[^.]{0,180}\b(?:migration|upgrade|backfill|schema version|existing data|existing database|existing cache|existing state)\b/i.test(
-      negativeProofText,
-    )
-  ) {
-    return false;
-  }
-  if (
-    /\b(?:should|would|will|expected|intend(?:ed)?|designed|aims?|plans?|promises?)\b[^.]{0,120}\b(?:preserv(?:e|ed|es)|remain(?:s)? compatible|compatib(?:le|ility)|migration|upgrade|backfill)\b/i.test(
-      negativeProofText,
-    ) ||
-    /\b(?:migration|upgrade|backfill|existing data|existing database|existing cache|existing state)\b[^.]{0,120}\b(?:should|would|will|expected|intend(?:ed)?|designed|aims?|plans?|promises?|planned|pending|unimplemented)\b/i.test(
-      negativeProofText,
-    )
-  ) {
-    return false;
-  }
-  if (
-    /\b(?:migration|upgrade|backfill|compatibility)\b[^.]{0,160}\b(?:proof|test(?:ed|s|ing)?|cover(?:ed|age)?|verif(?:y|ied|ication)|compatib(?:le|ility))\b[^.]{0,120}\b(?:is|are|remains?)?\s*(?:planned|pending|future|unimplemented|incomplete|todo|not yet|to be (?:added|done|implemented|verified|tested))\b/i.test(
-      negativeProofText,
-    ) ||
-    /\b(?:planned|pending|future|unimplemented|incomplete|todo|not yet|to be (?:added|done|implemented|verified|tested))\b[^.]{0,120}\b(?:migration|upgrade|backfill|compatibility)\b[^.]{0,160}\b(?:proof|test(?:ed|s|ing)?|cover(?:ed|age)?|verif(?:y|ied|ication)|compatib(?:le|ility))\b/i.test(
-      negativeProofText,
-    )
-  ) {
-    return false;
-  }
-  if (
-    noMigrationRequiredPattern.test(text) &&
-    /\b(?:existing data|existing database|existing cache|existing state|upgrade compatibility|compatibility)\b[^.]{0,160}\b(?:test(?:ed|s)?|cover(?:ed|age)?|prov(?:e|ed|en)|verif(?:y|ied)|compatib(?:le|ility)|preserv(?:e|ed|es))\b/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-  return (
-    /\b(?:migration|upgrade|backfill|schema version|existing data|existing database|existing cache|existing state)\b[^.]{0,180}\b(?:test(?:ed|s)?|cover(?:ed|age)?|prov(?:e|ed|en)|verif(?:y|ied)|compatib(?:le|ility)|preserv(?:e|ed|es)|migrat(?:e|ed|es)|backfill(?:ed|s)?)\b/i.test(
-      text,
-    ) ||
-    /\b(?:test(?:ed|s)?|cover(?:ed|age)?|prov(?:e|ed|en)|verif(?:y|ied)|preserv(?:e|ed|es))\b[^.]{0,180}\b(?:migration|upgrade|backfill|schema version|existing data|existing database|existing cache|existing state)\b/i.test(
-      text,
-    )
-  );
-}
-
 function dataModelSurfacesFromPatch(
   path: string,
   lines: readonly string[],
@@ -452,6 +383,7 @@ function dataModelSurfacesFromPatch(
 
   const surfaces = new Set<string>();
   const add = (surface: string) => surfaces.add(dataModelSurfaceLabel(path, surface));
+  if (dataModelPatchChangesExistingStatePath(options.patch ?? "")) add("serialized state");
   const pathOwner = dataModelPathOwner(path);
   const pathHint = pathOwner?.surface ?? "";
   if (
@@ -461,16 +393,53 @@ function dataModelSurfacesFromPatch(
   )
     add(pathHint);
   if (pathHint && dataModelTextLooksLikePersistedShapeField(text, pathHint)) add(pathHint);
+  const nodeConsoleImport = /^import\s+\{\s*Console\s*\}\s+from\s+["']node:console["'];?$/;
+  const consoleStreamDeclaration =
+    /^const\s+(?!Console\b)[$A-Z_a-z][$\w]*\s*=\s*new\s+Console\(\{\s*stdout:\s*process\.(?:stdout|stderr),\s*stderr:\s*process\.(?:stdout|stderr)\s*\}\);?$/;
+  const consoleStreamSides = ["+", "-"].filter((side) => {
+    const sideLines = (options.patch ?? "")
+      .split("\n")
+      .filter((line) => !line.startsWith(side === "+" ? "-" : "+"))
+      .map((line) => line.replace(/^[ +-]/, "").trim())
+      .filter((line) => dataModelLineLooksSemantic(line, options));
+    return (
+      sideLines.some((line) => nodeConsoleImport.test(line)) &&
+      sideLines.every(
+        (line) =>
+          !/\bConsole\b/.test(line) ||
+          nodeConsoleImport.test(line) ||
+          consoleStreamDeclaration.test(line),
+      )
+    );
+  });
   // Storage context establishes changed fields or JSON conversion only within
   // the same hunk, including formatting/argument edits with no field declaration.
   for (const hunk of (options.patch ?? "").split(/^@@.*$/m)) {
     const changedText = changedPatchLines(hunk)
       .filter((line) => dataModelLineLooksSemantic(line, options))
       .join("\n");
+    // Node Console consumes these fields as process stream routing, even when
+    // an unrelated storage callback shares the hunk. Require a same-side import
+    // with no visible binding ambiguity, and keep all direct storage evidence.
+    const fieldPatch = hunk
+      .split("\n")
+      .filter(
+        (line) =>
+          !consoleStreamSides.includes(line[0] ?? "") ||
+          !consoleStreamDeclaration.test(line.slice(1).trim()),
+      )
+      .join("\n");
+    const changedFieldText = changedPatchLines(fieldPatch)
+      .filter((line) => dataModelLineLooksSemantic(line, options))
+      .join("\n");
     for (const surface of dataModelStorageContext(hunk, pathOwner?.strong ?? false)) {
+      // Doctor routes and upgrade guidance also occur without changing stored data.
+      if (/\b(?:doctor|upgrade)\b/i.test(changedText)) add("migration/backfill/repair");
       if (
-        dataModelTextLooksLikePersistedShapeField(changedText, surface) ||
-        dataModelTextHasJsonConversion(changedText)
+        dataModelTextLooksLikePersistedShapeField(changedFieldText, surface) ||
+        dataModelTextHasJsonConversion(changedText) ||
+        (surface === "serialized state" &&
+          (dataModelTextHasFileIo(changedText, true) || /\bstatePath\b/i.test(changedText)))
       )
         add(surface);
     }
@@ -482,7 +451,11 @@ function dataModelSurfacesFromPatch(
   ) {
     add("database schema");
   }
-  if (/\b(?:migration|migrate|upgrade|backfill|doctor|repair|reindex|rehydrat\w*)\b/i.test(text)) {
+  if (
+    /\b(?:migration|migrate|backfill|repair|reindex|rehydrat\w*)\b/i.test(text) ||
+    dataModelPatchHasUpgradeEvidence(options.patch ?? "", text) ||
+    ((options.docsOnly || pathOwner?.strong) && /\b(?:doctor|upgrade)\b/i.test(text))
+  ) {
     add("migration/backfill/repair");
   }
   if (
@@ -508,15 +481,99 @@ function dataModelSurfacesFromPatch(
   return [...surfaces];
 }
 
+function dataModelPatchHasUpgradeEvidence(patch: string, changedText: string): boolean {
+  if (!/\bupgrade\b/i.test(changedText)) return false;
+  const maskStaticErrorMessages = (source: string) =>
+    source.replace(
+      /(?<![\w$.])Error\s*\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\$]|\$(?!\{))*`)/g,
+      (match: string, literal: string) =>
+        match.slice(0, -literal.length) + literal.replace(/[^\r\n]/g, " "),
+    );
+  if (!patch) return /\bupgrade\b/i.test(maskStaticErrorMessages(changedText));
+
+  // Context can own an unchanged Error call. Keep the two diff sides separate,
+  // and preserve line positions so only changed executable tokens count.
+  return patch.split(/^@@.*$/m).some((hunk) =>
+    ["+", "-"].some((side) => {
+      const sourceLines = hunk
+        .split("\n")
+        .filter(
+          (line) =>
+            (line.startsWith(" ") || line.startsWith(side)) && !/^(?:\+\+\+|---)/.test(line),
+        );
+      const source = sourceLines.map((line) => line.slice(1)).join("\n");
+      return maskStaticErrorMessages(source)
+        .split("\n")
+        .some(
+          (line, index) =>
+            sourceLines[index]?.startsWith(side) &&
+            dataModelLineLooksSemantic(line, { docsOnly: false }) &&
+            /\bupgrade\b/i.test(line),
+        );
+    }),
+  );
+}
+
 function dataModelTextHasJsonConversion(text: string): boolean {
   return /\bJSON\.(?:parse|stringify)\b/i.test(text);
+}
+
+function dataModelTextHasFileRead(text: string): boolean {
+  return /\breadFile(?:Sync)?\b/i.test(text);
+}
+
+function dataModelTextHasFileIo(text: string, hasStorageContext = false): boolean {
+  if (
+    dataModelTextHasFileRead(text) ||
+    /\b(?:create(?:Read|Write)Stream|(?:appendFile|truncate|ftruncate)(?:Sync)?|openSync|readSync|readv(?:Sync)?|writeSync|writev(?:Sync)?)\b/.test(
+      text,
+    )
+  )
+    return true;
+  // Generic methods also belong to browsers and in-memory streams. They can
+  // count as a change inside storage context, but cannot establish it alone.
+  if (hasStorageContext) return /\b(?:open|read|write)(?:["'`]\s*\])?\s*(?:\?\.\s*)?\(/i.test(text);
+  const qualifiers = ["fs", "fsp", "fsPromises"];
+  for (const match of text.matchAll(
+    /\bimport\s+(?:([\w$]+)(?:\s*,\s*(?:\*\s+as\s+([\w$]+)|\{[^}]*\}))?|\*\s+as\s+([\w$]+))\s*from\s*["'](?:node:)?fs(?:\/promises)?["']/g,
+  )) {
+    for (const name of match.slice(1)) {
+      if (name) qualifiers.push(name);
+    }
+  }
+  for (const match of text.matchAll(
+    /\bimport\s+(?:[\w$]+\s*,\s*)?\{([^}]+)\}\s*from\s*["'](?:node:)?fs(?:\/promises)?["']/g,
+  )) {
+    const bindings = match[1];
+    if (!bindings) continue;
+    for (const binding of bindings.split(",")) {
+      const name = binding.trim().match(/^(open|read|write|promises)(?:\s+as\s+([\w$]+))?$/);
+      if (!name) continue;
+      const localName = name[2] ?? name[1];
+      if (!localName) continue;
+      if (name[1] === "promises") {
+        qualifiers.push(localName);
+        continue;
+      }
+      const callee = escapeRegExp(localName);
+      if (new RegExp(`(?<![\\w$.])${callee}\\s*\\(`).test(text)) return true;
+    }
+  }
+  const receiver = qualifiers.map(escapeRegExp).join("|");
+  if (
+    new RegExp(
+      String.raw`(?<![\w$.])(?:${receiver})(?:\s*(?:\?\.|\.)\s*promises)?\s*(?:(?:\?\.|\.)\s*(?:open|read|write)|(?:\?\.)?\s*\[\s*["'\x60](?:open|read|write)["'\x60]\s*\])\s*(?:\?\.\s*)?\(`,
+    ).test(text)
+  )
+    return true;
+  return false;
 }
 
 function dataModelTextHasSerializedStateBoundary(text: string): boolean {
   // JSON conversion and a variable named "serialized" also occur in transient
   // diagnostics and IPC; neither supplies a storage boundary on its own.
   return (
-    /\b(?:readFile(?:Sync)?|writeFile(?:Sync)?|localStorage|sessionStorage|indexedDB|IDBObjectStore|workspaceState|globalState|persisted?|statePath)\b/i.test(
+    /\b(?:writeFile(?:Sync)?|localStorage|sessionStorage|indexedDB|IDBObjectStore|workspaceState|globalState|persisted?)\b/i.test(
       text,
     ) || /\bserialized\s+(?:data\s+)?(?:format|schema|layout|identity|namespace)\b/i.test(text)
   );
@@ -524,6 +581,25 @@ function dataModelTextHasSerializedStateBoundary(text: string): boolean {
 
 function dataModelTextHasCacheSchema(text: string): boolean {
   return /\bcache[_-]?schema\b|\bcache\s+(?:data\s+)?(?:format|schema|layout)\b/i.test(text);
+}
+
+function dataModelPatchChangesExistingStatePath(patch: string): boolean {
+  const declaration = /^(?:export\s+)?(?:const|let|var)\s+statePath(?:\s|[:=;,]|$)/;
+  const lines = patch
+    .split("\n")
+    .filter((line) => /^[+-]/.test(line) && !/^(?:\+\+\+|---)/.test(line))
+    .map((line) => ({ side: line.charAt(0), text: line.slice(1).trim() }))
+    .filter((line) => declaration.test(line.text));
+  const added = lines.filter((line) => line.side === "+").map((line) => line.text);
+  // Pair identical declarations across hunks so plain moves do not imply retargeting.
+  return lines
+    .filter((line) => line.side === "-")
+    .some((line) => {
+      const unchanged = added.indexOf(line.text);
+      if (unchanged < 0) return true;
+      added.splice(unchanged, 1);
+      return false;
+    });
 }
 
 function dataModelStorageContext(patch: string, hasPersistenceOwner = false): string[] {
@@ -535,10 +611,15 @@ function dataModelStorageContext(patch: string, hasPersistenceOwner = false): st
     .map((line) => line.slice(1).trim())
     .filter((line) => dataModelLineLooksSemantic(line, { docsOnly: false }))
     .join("\n");
+  const fileRead = dataModelTextHasFileRead(text);
+  const statePathStorage =
+    /\bstatePath\b/i.test(text) && (hasPersistenceOwner || dataModelTextHasFileIo(text));
   const surfaces: string[] = [];
   if (
     dataModelTextHasSerializedStateBoundary(text) ||
-    (hasPersistenceOwner && dataModelTextHasJsonConversion(text))
+    (hasPersistenceOwner && dataModelTextHasJsonConversion(text)) ||
+    (fileRead && (hasPersistenceOwner || /\bJSON\.parse\b/i.test(text))) ||
+    statePathStorage
   ) {
     surfaces.push("serialized state");
   }
@@ -585,6 +666,13 @@ function isDataModelDocumentationPath(path: string): boolean {
   return isDocsPath(path) || isMarkdownConfigSurfacePath(path);
 }
 
+function isNonPersistentMemoryContractPath(path: string): boolean {
+  if (!/(?:^|\/)memory-[^/]+(?:\/|$)/i.test(path)) return false;
+  const basename = path.split("/").at(-1) ?? "";
+  const stem = basename.replace(/\.[^.]+$/, "");
+  return /(?:^|[-_.])(?:tool|prompt)[-_.](?:contract|description|instructions?)$/i.test(stem);
+}
+
 function dataModelPathOwner(path: string): { surface: string; strong: boolean } | undefined {
   const sqliteRole = sqlitePathOwnerRole(path);
   if (sqliteRole === "codec") return { surface: "serialized state", strong: true };
@@ -598,7 +686,14 @@ function dataModelPathOwner(path: string): { surface: string; strong: boolean } 
   if (/(^|\/)persistence(?:\/|[-_.])|(?:serialized|persisted?)[-_.]?(?:state|json)/i.test(path)) {
     return { surface: "serialized state", strong: true };
   }
-  if (/vector|embedding|(?:^|\/)memory(?:\/|[-_.])/i.test(path)) {
+  // Explicit vector/embedding paths own their persisted metadata even when a
+  // contract basename also carries the broad memory-package signal.
+  if (/vector|embedding/i.test(path)) {
+    return { surface: "vector/embedding metadata", strong: true };
+  }
+  // Prompt and tool contracts can live inside memory packages without owning
+  // persistence. Other incomplete memory-package changes stay conservative.
+  if (/(?:^|\/)memory(?:\/|[-_.])/i.test(path) && !isNonPersistentMemoryContractPath(path)) {
     return { surface: "vector/embedding metadata", strong: true };
   }
   if (

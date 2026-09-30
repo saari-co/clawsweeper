@@ -185,15 +185,17 @@ export function createItemContext(dependencies: CreateItemContextDependencies) {
 
     const issue = readJson<unknown>(["api", `repos/${targetRepo()}/issues/${item.number}`]);
     const issueRecord = asRecord(issue);
-    const commentsWindow = readContextWindow<unknown>(
-      `repos/${targetRepo()}/issues/${item.number}/comments`,
-      issueRecord.comments,
-      24,
-    );
+    const commentsPath = `repos/${targetRepo()}/issues/${item.number}/comments`;
+    let completeComments: unknown[] | undefined;
+    const readCompleteComments = () => (completeComments ??= readPaged<unknown>(commentsPath));
+    // Source revision needs the whole thread anyway. Derive the prompt window
+    // locally so its first/tail pages and later generation reads are not fetched twice.
+    const commentsWindow = ghPagedContextWindow<unknown>(commentsPath, issueRecord.comments, 24, {
+      page: (_path, page) => readCompleteComments().slice((page - 1) * 100, page * 100),
+      paged: readCompleteComments,
+    });
     const comments = commentsWindow.items;
-    const sourceRevisionComments = commentsWindow.truncated
-      ? readPaged<unknown>(`repos/${targetRepo()}/issues/${item.number}/comments`)
-      : comments;
+    const sourceRevisionComments = completeComments ?? comments;
     const filteredComments = filterReviewContextComments(comments, item.number);
     const previousClawSweeperReview = extractLatestClawSweeperReviewFromHydration(
       commentsWindow,
@@ -291,6 +293,10 @@ export function createItemContext(dependencies: CreateItemContextDependencies) {
       const pullChangedFileCount = nonnegativeCount(pullRecord.changed_files);
       const pullCommitCount = nonnegativeCount(pullRecord.commits);
       const pullReviewCommentCount = nonnegativeCount(pullRecord.review_comments);
+      const reviewCommentsPath = `repos/${targetRepo()}/pulls/${item.number}/comments`;
+      let allReviewComments: unknown[] | undefined;
+      const readCompleteReviewComments = () =>
+        (allReviewComments ??= readPaged<unknown>(reviewCommentsPath));
       const hydration =
         pullUpdatedAt &&
         pullHeadSha &&
@@ -329,13 +335,14 @@ export function createItemContext(dependencies: CreateItemContextDependencies) {
                   80,
                 ),
               fetchReviewComments: () =>
-                readContextWindow<unknown>(
-                  `repos/${targetRepo()}/pulls/${item.number}/comments`,
-                  pullRecord.review_comments,
-                  40,
-                ),
-              fetchCompleteReviewComments: () =>
-                readPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/comments`),
+                // Full hydration needs the complete inline thread as well as
+                // its prompt window. Derive both from the same generation read.
+                ghPagedContextWindow<unknown>(reviewCommentsPath, pullRecord.review_comments, 40, {
+                  page: (_path, page) =>
+                    readCompleteReviewComments().slice((page - 1) * 100, page * 100),
+                  paged: readCompleteReviewComments,
+                }),
+              fetchCompleteReviewComments: readCompleteReviewComments,
               fetchReviewCommentsSince: (since) =>
                 readPaged<unknown>(
                   `repos/${targetRepo()}/pulls/${item.number}/comments?since=${encodeURIComponent(since)}`,

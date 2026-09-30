@@ -1,4 +1,3 @@
-import { hasDataModelUpgradeProof } from "./clawsweeper-change-detection.js";
 import { createLabelSynchronization } from "./clawsweeper-label-sync.js";
 import type {
   CloseReason,
@@ -42,6 +41,7 @@ export function createReportOrchestrationFoundation(
     publicReviewTextDiffers,
     publicTableCell,
     repoUrlFor,
+    reportRealBehaviorProof,
     reportRealBehaviorProofPolicy,
     reportSecurityReview,
     reviewSectionValue,
@@ -187,15 +187,7 @@ export function createReportOrchestrationFoundation(
     bestSolutionLine: string;
     evidence: Evidence[];
   }): string[] {
-    if (options.reason !== "duplicate_or_superseded") return [];
-    return [
-      options.bestSolutionLine,
-      ...options.evidence
-        .filter((entry) =>
-          /\b(?:canonical|duplicate|superseded|implementation)\b/i.test(entry.label),
-        )
-        .map((entry) => sentence(entry.detail)),
-    ];
+    return duplicateCanonicalTexts(options);
   }
 
   function duplicateCanonicalLinks(options: {
@@ -264,13 +256,9 @@ export function createReportOrchestrationFoundation(
   }
 
   function dataModelUpgradeProofFromReport(markdown: string): boolean {
-    if (!dataModelSurfaceChangeFromReport(markdown)) return false;
-    return hasDataModelUpgradeProof(
-      [
-        reviewSectionValue(markdown, "realBehaviorProof"),
-        reviewSectionValue(markdown, "solutionAssessment"),
-        reviewSectionValue(markdown, "evidence"),
-      ].join("\n"),
+    return (
+      dataModelSurfaceChangeFromReport(markdown) &&
+      reportRealBehaviorProof(markdown).dataModelCompatibility === "sufficient"
     );
   }
 

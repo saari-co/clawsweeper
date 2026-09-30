@@ -4,6 +4,7 @@ import {
   ALL_REASONS,
   AUTO_IMPLEMENTATION_CANDIDATES,
   CONFIDENCES,
+  DATA_MODEL_COMPATIBILITY_STATUSES,
   DECISIONS,
   DECISION_SCHEMA_KEYS,
   EVIDENCE_SCHEMA_KEYS,
@@ -291,14 +292,18 @@ export function createDecisionParser({
   }
 
   function validateMergeRiskOptions(
-    decision: Pick<Decision, "mergeRiskLabels" | "mergeRiskOptions">,
+    decision: Pick<Decision, "mergeRiskLabels" | "mergeRiskOptions" | "risks">,
   ): void {
     if (decision.mergeRiskLabels.length === 0 && decision.mergeRiskOptions.length > 0) {
       throw new Error("decision.mergeRiskOptions must be empty when mergeRiskLabels is empty");
     }
-    if (decision.mergeRiskLabels.length > 0 && decision.mergeRiskOptions.length === 0) {
+    if (
+      decision.mergeRiskLabels.length > 0 &&
+      decision.risks.length > 0 &&
+      decision.mergeRiskOptions.length === 0
+    ) {
       throw new Error(
-        "decision.mergeRiskOptions must include 1-3 options when mergeRiskLabels is not empty",
+        "decision.mergeRiskOptions must include 1-3 options when labeled risks remain unresolved",
       );
     }
   }
@@ -608,6 +613,15 @@ export function createDecisionParser({
         record.needsContributorAction,
         `${path}.needsContributorAction`,
       ),
+      ...(record.dataModelCompatibility === undefined
+        ? {}
+        : {
+            dataModelCompatibility: requireEnum(
+              record.dataModelCompatibility,
+              DATA_MODEL_COMPATIBILITY_STATUSES,
+              `${path}.dataModelCompatibility`,
+            ),
+          }),
     };
   }
 

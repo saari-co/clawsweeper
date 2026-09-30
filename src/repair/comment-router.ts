@@ -5,7 +5,11 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { readRepairLoopComments } from "./comment-router-read-model.js";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
-import { CLOSE_PROTECTED_LABEL_NAMES } from "./exact-review-guard-labels.js";
+import {
+  AUTOMERGE_BLOCKING_LABEL_NAMES,
+  CLOSE_PROTECTED_LABEL_NAMES,
+  MANUAL_ONLY_LABEL,
+} from "./exact-review-guard-labels.js";
 import {
   activeRepairWorkflowRunForJobAfterDispatchRecheck,
   assertLiveWorkerCapacity,
@@ -275,7 +279,6 @@ const issueCommentsCache = new Map<number, JsonValue[]>();
 const throttledIssueCommentLookups = new Set<number>();
 const throttledCollaboratorLookups = new Set<string>();
 let deferredGitHubThrottle: GitHubRateLimitError | null = null;
-const MAX_MEDIA_PREPROCESSING_TIMEOUT_MS = 480_000;
 const PROOF_OVERRIDE_DESCRIPTION_MARKER = "<!-- clawsweeper-proof-override-note -->";
 const cachedIssueComments = createCachedIssueCommentsLookup(
   (number) => ghPaged<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`),
@@ -2319,7 +2322,9 @@ function executeCommand(command: LooseRecord) {
       shouldDispatchClawSweeper
     ) {
       const clawsweeper = dispatchClawSweeperReview(command);
-      if (command.intent === "request_proof") {
+      const stale = clawsweeper.admission === "stale";
+      if (stale) command.reason = clawsweeper.reason;
+      if (command.intent === "request_proof" && !stale) {
         command.proof_admission = {
           ...command.proof_admission,
           status: "queued",
@@ -2332,15 +2337,25 @@ function executeCommand(command: LooseRecord) {
         if (action.action === "dispatch_clawsweeper") {
           return {
             ...action,
-            ...dispatchedActionStatus(clawsweeper),
+            ...(stale
+              ? { ...clawsweeper, status: "skipped" }
+              : dispatchedActionStatus(clawsweeper)),
+          };
+        }
+        if (action.action === "comment") {
+          return {
+            ...action,
+            status: "skipped",
+            reason: stale
+              ? clawsweeper.reason
+              : "The durable review queue owns this command acknowledgement.",
           };
         }
         return action;
       });
-      if (clawsweeper.status === "claimed") {
-        keepCommandClaimed(command);
-        return;
-      }
+      // A recovery producer must not overwrite a queue-owned terminal reply.
+      command.status = stale ? "skipped" : "executed";
+      return;
     }
     if (
       AUTOCLOSE_INTENTS.has(command.intent) &&
@@ -3362,11 +3377,6 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
     command.target?.kind === "pull_request"
       ? adaptiveReviewBudgetForPullRequest(command.target)
       : null;
-  // Comment-only media is hydrated after dispatch, so fallback must reserve the full bounded
-  // preprocessing budget even when the initial PR title/body did not expose media.
-  const fallbackCodexTimeoutMs = reviewBudget
-    ? reviewBudget.codexTimeoutMs + MAX_MEDIA_PREPROCESSING_TIMEOUT_MS
-    : null;
   const commandStatus = requiresCommandStatus
     ? {
         command_status_marker: commandStatusMarker(command),
@@ -3414,53 +3424,11 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
     },
   );
   if (result.status !== 0) {
-    const fallback = runGitHubSpawnMutation(
-      command,
-      "review_dispatch",
-      {
-        repository: reviewRepo,
-        workflow: reviewWorkflow,
-        event: "workflow_dispatch",
-        dispatchKey,
-      },
-      [
-        "workflow",
-        "run",
-        reviewWorkflow,
-        "--repo",
-        reviewRepo,
-        "-f",
-        `target_repo=${command.repo}`,
-        "-f",
-        ...(command.target_branch ? [`target_branch=${String(command.target_branch)}`, "-f"] : []),
-        `item_number=${command.issue_number}`,
-        "-f",
-        `item_numbers=${dispatchKey}`,
-        "-f",
-        `additional_prompt=${freeformReviewPrompt(command)}`,
-        "-f",
-        ...(fallbackCodexTimeoutMs ? [`codex_timeout_ms=${fallbackCodexTimeoutMs}`, "-f"] : []),
-        "batch_size=1",
-        "-f",
-        "shard_count=1",
-      ],
-      { env: dispatchTokenEnv() },
+    throw new Error(
+      `failed to dispatch ClawSweeper review for #${command.issue_number}: repository_dispatch=${
+        result.stderr || result.stdout
+      }`,
     );
-    if (fallback.status !== 0) {
-      throw new Error(
-        `failed to dispatch ClawSweeper review for #${command.issue_number}: repository_dispatch=${
-          result.stderr || result.stdout
-        }; workflow_dispatch=${fallback.stderr || fallback.stdout}`,
-      );
-    }
-    return {
-      workflow: reviewWorkflow,
-      event: "workflow_dispatch",
-      repo: reviewRepo,
-      item_number: command.issue_number,
-      dispatch_key: dispatchKey,
-      fallback_reason: stripAnsi(result.stderr || result.stdout).trim(),
-    };
   }
   return {
     workflow: reviewWorkflow,
@@ -3515,6 +3483,8 @@ function enqueueClawSweeperReReview(command: LooseRecord): LooseRecord {
     item_number: command.issue_number,
     dispatch_key: dispatchKey,
     command_version_id: intake.commandVersionId,
+    admission: result.kind,
+    ...(result.kind === "stale" ? { reason: result.reason } : {}),
     deduped: result.kind === "accepted" && result.deduped,
   };
 }
@@ -4334,6 +4304,7 @@ function writeAutomergeMergeBody(command: LooseRecord, target: LooseRecord, body
 }
 
 function validateAutomergeReadiness({ command, view, target, comments }: LooseRecord) {
+  if (hasLabel(target, MANUAL_ONLY_LABEL)) return "PR is marked manual-only; merge is disabled";
   if (hasLabel(target, AUTOGENERATED_LABEL))
     return "generated issue implementation PRs require manual merge";
   if (hasLabel(target, AUTOFIX_LABEL))
@@ -4348,6 +4319,18 @@ function validateAutomergeReadiness({ command, view, target, comments }: LooseRe
   ) {
     return "PR is paused for human review";
   }
+  const blockedLabel = AUTOMERGE_BLOCKING_LABEL_NAMES.find((label) => {
+    // Explicit approval can resolve the existing human/merge-ready pause, not safety holds.
+    if (label === HUMAN_REVIEW_LABEL) return false;
+    if (
+      label === MERGE_READY_LABEL &&
+      (command.intent === "maintainer_approve_automerge" ||
+        command.validated_maintainer_human_approval === true)
+    )
+      return false;
+    return hasLabel(target, label);
+  });
+  if (blockedLabel) return `protected or paused repair label: ${blockedLabel}`;
   if (view.state && view.state !== "OPEN")
     return `pull request is ${String(view.state).toLowerCase()}`;
   if (view.isDraft) return "pull request is draft";

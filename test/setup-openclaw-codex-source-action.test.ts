@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -16,6 +17,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import YAML from "yaml";
 
 const script = ".github/actions/setup-openclaw-codex-source/install.sh";
 const realGit = execFileSync("/usr/bin/env", ["which", "git"], { encoding: "utf8" }).trim();
@@ -398,4 +401,185 @@ test("private sibling setup replaces links but preserves file and directory coll
   assert.notEqual(directoryCollision.status, 0);
   assert.match(directoryCollision.stderr, /already exists and is not a symbolic link/u);
   assert.equal(readFileSync(join(sibling, "owned.txt"), "utf8"), "preserve directory\n");
+});
+
+test(
+  "fetch deadlines honor precedence and stop descendants before setup returns",
+  {
+    skip: process.platform === "win32" ? "POSIX process groups" : false,
+    timeout: 20_000,
+  },
+  async (t) => {
+    const fixture = useFixture(t);
+    const fakeGit = join(fixture.root, "stalled-fetch.cjs");
+    writeFileSync(
+      fakeGit,
+      `
+const fs = require("node:fs");
+const child = require("node:child_process").spawn(process.execPath, ["-e",
+  'process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(process.env.FETCH_READY, "ready"); setInterval(() => {}, 1000);'
+], { stdio: "inherit" });
+process.on("SIGTERM", () => process.exit(0));
+const ready = setInterval(() => {
+  if (!fs.existsSync(process.env.FETCH_READY)) return;
+  clearInterval(ready);
+  fs.writeFileSync(process.env.FETCH_PIDS, JSON.stringify([process.pid, child.pid]));
+}, 10);
+setInterval(() => {}, 1000);
+`,
+    );
+    writeFileSync(
+      join(fixture.bin, "git"),
+      `#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ "$arg" == "fetch" ]]; then
+    exec env -u NODE_V8_COVERAGE "$REAL_NODE" "$FETCH_FIXTURE"
+  fi
+done
+exec "$REAL_GIT" "$@"
+`,
+    );
+    const cases = [
+      {
+        CLAWSWEEPER_OPENCLAW_CODEX_SOURCE_TIMEOUT_MS: "1500",
+        CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS: "9000",
+        CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS: "9000",
+      },
+      { CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS: "1500", CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS: "9000" },
+      { CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS: "1500" },
+    ];
+    for (const [index, overrides] of cases.entries()) {
+      const pidsPath = join(fixture.root, `pids-${index}.json`);
+      const child = spawn(
+        "bash",
+        [script, "openclaw/openclaw", fixture.target, fixture.cache, fixture.remote],
+        {
+          env: {
+            ...process.env,
+            GITHUB_WORKSPACE: fixture.workspace,
+            GITHUB_ENV: fixture.githubEnv,
+            PATH: `${fixture.bin}:${process.env.PATH}`,
+            REAL_GIT: realGit,
+            REAL_NODE: process.execPath,
+            FETCH_FIXTURE: fakeGit,
+            FETCH_PIDS: pidsPath,
+            FETCH_READY: join(fixture.root, `ready-${index}`),
+            CLAWSWEEPER_OPENCLAW_CODEX_SOURCE_TIMEOUT_MS: undefined,
+            CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS: undefined,
+            CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS: undefined,
+            ...overrides,
+          },
+          detached: true,
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
+      let stderr = "";
+      child.stderr.on("data", (data) => {
+        stderr += data;
+      });
+      const cleanup = () => {
+        const pids = existsSync(pidsPath)
+          ? (JSON.parse(readFileSync(pidsPath, "utf8")) as number[])
+          : [];
+        for (const pid of [pids[0], child.pid])
+          if (pid) {
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch {}
+          }
+      };
+      const watchdog = setTimeout(cleanup, 8_000);
+      try {
+        assert.deepEqual(await once(child, "close"), [1, null], stderr);
+        assert.match(stderr, /Codex source fetch timed out after 1500ms/);
+        await delay(50);
+        const pids = JSON.parse(readFileSync(pidsPath, "utf8")) as number[];
+        for (const pid of pids) {
+          const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+            encoding: "utf8",
+          }).stdout.trim();
+          assert.ok(!state || state.startsWith("Z"), `fetch descendant ${pid} is still running`);
+        }
+      } finally {
+        clearTimeout(watchdog);
+        cleanup();
+      }
+    }
+  },
+);
+
+test("invalid fetch deadlines use the default and preserve Git failure status", (t) => {
+  const fixture = useFixture(t);
+  const helper = join(process.cwd(), ".github/actions/setup-openclaw-codex-source/fetch.mjs");
+  writeFileSync(join(fixture.bin, "git"), "#!/usr/bin/env bash\nsleep 0.2\nexit 7\n");
+  for (const value of [undefined, "invalid", "0", "-1", "2147483648"]) {
+    const result = spawnSync(process.execPath, [helper], {
+      env: {
+        ...process.env,
+        PATH: `${fixture.bin}:${process.env.PATH}`,
+        CLAWSWEEPER_OPENCLAW_CODEX_SOURCE_TIMEOUT_MS: value,
+        CLAWSWEEPER_GH_COMMAND_TIMEOUT_MS: value === undefined ? undefined : "1",
+        CLAWSWEEPER_NETWORK_COMMAND_TIMEOUT_MS: undefined,
+      },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 7, result.stderr);
+    assert.doesNotMatch(result.stderr, /timed out/);
+  }
+});
+
+test("Codex source cache is keyed by the exact base pin and saved only after a ready setup", (t) => {
+  const fixture = useFixture(t);
+  const action = YAML.parse(
+    readFileSync(".github/actions/setup-openclaw-codex-source/action.yml", "utf8"),
+  ) as {
+    runs: {
+      steps: Array<{
+        id?: string;
+        if?: string;
+        uses?: string;
+        run?: string;
+        with?: Record<string, string>;
+        "continue-on-error"?: boolean;
+      }>;
+    };
+  };
+  const steps = action.runs.steps;
+  const keyStep = steps.find((step) => step.id === "cache-key");
+  const restore = steps.find((step) => step.uses === "actions/cache/restore@v6");
+  const save = steps.find((step) => step.uses === "actions/cache/save@v6");
+  assert.ok(keyStep?.run && restore && save);
+  assert.equal(restore.with?.key, "${{ steps.cache-key.outputs.key }}");
+  assert.equal(restore.with?.["restore-keys"], undefined);
+  assert.equal(save.with?.key, restore.with?.key);
+  assert.equal(save["continue-on-error"], true);
+  assert.match(save.if ?? "", /steps\.cache\.outputs\.cache-hit != 'true'/);
+  assert.match(save.if ?? "", /steps\.materialize\.outputs\.ready == 'true'/);
+  assert.ok(steps.indexOf(save) > steps.findIndex((step) => step.id === "materialize"));
+
+  const resolveKey = (pinFile: string): string => {
+    const output = join(fixture.root, "cache-key-output");
+    writeFileSync(output, "");
+    const result = spawnSync("bash", ["-c", keyStep.run!], {
+      env: {
+        ...process.env,
+        GITHUB_ACTION_PATH: join(process.cwd(), ".github/actions/setup-openclaw-codex-source"),
+        GITHUB_OUTPUT: output,
+        PIN_FILE: pinFile,
+        RUNNER_OS: "Linux",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return readFileSync(output, "utf8");
+  };
+  const pin = join(fixture.target, "extensions", "codex", "package.json");
+  assert.equal(resolveKey(pin), "key=Linux-openclaw-codex-source-v2-1.2.3\n");
+  const linked = join(fixture.root, "linked-package.json");
+  symlinkSync(pin, linked);
+  assert.equal(resolveKey(linked), "");
+  writePin(fixture.target, "^1.2.3");
+  assert.equal(resolveKey(pin), "");
+  assert.equal(resolveKey(join(fixture.root, "missing.json")), "");
 });

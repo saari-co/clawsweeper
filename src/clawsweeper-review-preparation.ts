@@ -2,12 +2,7 @@ import { readPrAdmissionInput } from "./clawsweeper-pr-admission-input.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { boolArg, itemNumbersArg, numberArg, stringArg } from "./clawsweeper-args.js";
-import {
-  DEFAULT_CODEX_MODEL,
-  DEFAULT_REASONING_EFFORT,
-  DEFAULT_REVIEW_CODEX_TIMEOUT_MS,
-  DEFAULT_SERVICE_TIER,
-} from "./clawsweeper-policy.js";
+import { DEFAULT_CODEX_MODEL, DEFAULT_REVIEW_CODEX_TIMEOUT_MS } from "./clawsweeper-policy.js";
 import type { GitInfo } from "./clawsweeper-types.js";
 import { UserFacingCommandError } from "./command.js";
 import {
@@ -25,6 +20,7 @@ import {
 } from "./clawsweeper-review-failure-diagnostics.js";
 import { ReviewSourcePreparationError } from "./review-source-preparation.js";
 import { exactTupleIdentityFromReviewArgs } from "./saari-exact-tuple.js";
+import { validationRecoveryRequired } from "./repair/validation-recovery.js";
 import {
   createTransientReviewOutput,
   createReviewOutputBudget,
@@ -83,6 +79,16 @@ export function prepareReviewCommand(
     "clawsweeper-review-workspace-",
     transientOutput ?? undefined,
   );
+  const cleanupReviewOutput = (error?: unknown) => {
+    const recovery = validationRecoveryRequired(error);
+    if (recovery) {
+      // A supervisor without a completion receipt may still own this checkout.
+      recovery.retain([reviewWorkspace.path, ...(transientOutput ? [transientOutput.path] : [])]);
+      return;
+    }
+    reviewWorkspace.cleanup();
+    transientOutput?.cleanup();
+  };
   let retainedReviewOutput: ReturnType<typeof prepareRetainedReviewOutput> | null = null;
   try {
     const verbose = boolArg(args.verbose);
@@ -157,12 +163,12 @@ export function prepareReviewCommand(
     const batchSize = numberArg(args.batch_size, DEFAULT_PLAN_BATCH_SIZE);
     const maxPages = numberArg(args.max_pages, 250);
     const model = stringArg(args.codex_model, DEFAULT_CODEX_MODEL);
-    const reasoningEffort = stringArg(args.codex_reasoning_effort, DEFAULT_REASONING_EFFORT);
+    if (args.codex_reasoning_effort !== undefined || args.codex_service_tier !== undefined) {
+      throw new UserFacingCommandError(
+        "--codex-reasoning-effort and --codex-service-tier are retired for item reviews; author association selects the fixed profile.",
+      );
+    }
     const sandboxMode = stringArg(args.codex_sandbox, "read-only");
-    const serviceTier = stringArg(
-      args.codex_service_tier,
-      localOnly ? "fast" : DEFAULT_SERVICE_TIER,
-    );
     const timeoutMs = numberArg(args.codex_timeout_ms, DEFAULT_REVIEW_CODEX_TIMEOUT_MS);
     const expectedSourceRevision = stringArg(args.expected_source_revision, "").trim();
     if (expectedSourceRevision && !/^[0-9a-f]{64}$/.test(expectedSourceRevision)) {
@@ -222,6 +228,7 @@ export function prepareReviewCommand(
     const readonlyOpenclaw = boolArg(args.readonly_openclaw);
     const skipStartComment = boolArg(args.skip_start_comment) || localOnly || localRange;
     const suppliedReviewLease = suppliedReviewStartLeaseFromArgs(args);
+    const trustSuppliedReviewLease = boolArg(args.trust_supplied_review_lease);
     if (suppliedReviewLease && !skipStartComment) {
       throw new UserFacingCommandError(
         "A supplied review lease requires --skip-start-comment to prevent a second lease from being created.",
@@ -230,6 +237,19 @@ export function prepareReviewCommand(
     if (suppliedReviewLease && localOnly) {
       throw new UserFacingCommandError(
         "A supplied review lease cannot be used with local-only review.",
+      );
+    }
+    if (trustSuppliedReviewLease && !suppliedReviewLease) {
+      throw new UserFacingCommandError(
+        "--trust-supplied-review-lease requires a supplied review lease identity.",
+      );
+    }
+    if (
+      trustSuppliedReviewLease &&
+      (!process.env.EXACT_REVIEW_ITEM_KEY || !process.env.EXACT_REVIEW_LEASE_ID)
+    ) {
+      throw new UserFacingCommandError(
+        "--trust-supplied-review-lease requires exact-review queue authority.",
       );
     }
     const forcedLoginMethod = reviewCodexForcedLoginMethod(args);
@@ -306,9 +326,7 @@ export function prepareReviewCommand(
     }
     const reviewPolicy = reviewPolicyHash({
       model,
-      reasoningEffort,
       sandboxMode,
-      serviceTier,
       ...(exactTupleIdentity ? { reviewScope: exactTupleIdentity.reviewScope } : {}),
     });
     const explicitDispatch = isExplicitReviewDispatch(
@@ -332,9 +350,7 @@ export function prepareReviewCommand(
       batchSize,
       maxPages,
       model,
-      reasoningEffort,
       sandboxMode,
-      serviceTier,
       timeoutMs,
       expectedSourceRevision,
       additionalPrompt,
@@ -358,10 +374,7 @@ export function prepareReviewCommand(
       outputSelection,
       outputBudget,
       retainedReviewOutput,
-      cleanupReviewOutput: () => {
-        reviewWorkspace.cleanup();
-        transientOutput?.cleanup();
-      },
+      cleanupReviewOutput,
     };
   } catch (error) {
     try {
@@ -373,8 +386,7 @@ export function prepareReviewCommand(
         }`,
       );
     }
-    reviewWorkspace.cleanup();
-    transientOutput?.cleanup();
+    cleanupReviewOutput(error);
     throw error;
   }
 }

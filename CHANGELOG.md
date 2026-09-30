@@ -7,6 +7,198 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ## 0.3.1 - Unreleased
 
+- Qualify the exact OpenClaw SDK browser CDP fixtures by their observed native URI identities, complete source lines, and committed path while preserving scanning and changed-input refusal.
+
+- Requalify the unchanged OpenClaw Cron notification redaction fixture for expanded routing/webhook coverage and its canonical review base, preserving complete-source and native-finding checks.
+
+- Stop endless `source_drift_requeue` reviews of PR close proposals: apply no longer treats ClawSweeper's own review-acknowledgement progress edit as source drift when it is the latest item update and the reviewed source, timeline, head, and review-activity receipt still match. Human comments, title/body edits, non-managed label changes, PR reviews, and new heads still block apply and requeue.
+- Speed up exact-review target checkouts by restoring an hourly blobless cache that already holds the branch-tip blobs and cloning it locally, keeping at most two target cache entries per branch instead of saving a new ~1 GB entry on every review run; warm checkouts refresh moved/deleted tags and rebuild after branch rewinds, and the pinned Codex source cache is now saved once per Codex version.
+
+- Admit the existing OpenClaw completion-webhook FTP redaction fixture only when its exact native finding and complete committed source bytes match the reviewed qualification, keeping scanning and verification enabled.
+
+- Speed up exact-event publication apply: repeated metadata and comment reads revalidate their already-read body directly with GitHub instead of repeating Worker ETag lookups and confirmations, and each held-lease mutation boundary runs the pull-request review-activity check once; every guard still reads GitHub live.
+
+- Fix `@clawsweeper automerge` and `autofix` command reviews failing with `invalid queue-owned command review lease` before review: when the claimed decision has no source head, the command acknowledgement lease now uses the live PR head from admission or the head in the command status marker, and fails with a clear message only when neither exists.
+- Hold automatic reviews after a terminal scanner refusal until a fresh explicit re-review or intentional scanner-policy update, preventing repeated attempts and notifications across sweep, event, and recovery producers. Retire per-run sweep batch/shard and immediate-apply controls in favor of the shared queue and separate apply lane. Thanks @yetval.
+- Recover pinned review bases after branch rewrites or deletion within the existing acquisition deadline. Record the failed pin and completeness state, and stop optional evidence work when Git process settlement is unverified.
+
+- Stop pnpm setup at a failed store lookup, preserving its exit status instead of reporting a missing cache path.
+
+- Keep Endor test-repository reviews owned by the automerge loop and preserve current PR command identity through repair follow-ups and source-event supersession. Thanks @jesse-merhi.
+
+- Enforce strict TypeScript checks for the extracted Bay activity, review-status, and observed-failure modules, bringing the dashboard strict ratchet to 52 of 54 modules.
+
+- Defer failed-shard review recovery while an earlier publication is pending, preserving the recovery request and allowing explicit re-reviews and source changes.
+
+- Clarify that automatic implementation builds a fix for an issue. Thanks @jihoon-ernesto and @awhite0030.
+
+- Recognize test-helper directories in stored-data classification so synthetic fixture writes do not request migration proof, while preserving production and rename checks. Thanks @serg0x and @awhite0030.
+
+- Avoid data-model compatibility blockers for static error messages recommending an upgrade outside storage code, while retaining checks for executable upgrades and persistence evidence.
+
+- Qualify the exact Git-source redaction fixture while preserving native verification, literal patch witnesses, and refusal of changed or unrelated input.
+
+- Qualify the exact repeated proxy CLI redaction fixture while preserving native verification, full-line witnesses, and occurrence counts.
+
+- Qualify the exact Autoreview proxy fixture under BASE64 labeling only when its approved literal source witnesses match.
+
+- Qualify exact historical acpx Autoreview URI test fixtures by native digests, ordered line witnesses, and committed source path while preserving verification and rejection of unreviewed findings.
+
+- Preserve worker results and Git cleanup on macOS when a process group contains only owned zombies, while retaining live-process permission errors and settlement deadlines.
+
+- Isolate documentation-test build output so concurrent publication proofs can copy the compiled runtime without losing files.
+
+- Explain missing local review checkouts without a stack trace after Git source preparation, preserving the existing command error guidance.
+
+- Keep targeted apply and comments-only sync from starting broad review backstops; preserve backstops for automatic close-mode apply.
+
+- Retain oversized PR proposals as explicit policy no-ops when close or comment-only gates prevent publication, without retrying the same review or claiming a GitHub comment was delivered.
+
+- Recover longer review source fetches through bounded Git acquisition, preserving fresh branch checks and verified-object reuse. Settle interrupted Git processes before retry and retain uncertain workspaces for recovery.
+
+- Stop memory prompt and tool contracts from triggering stored-data compatibility holds on incomplete patches while preserving conservative checks for other memory persistence owners. Thanks @LLagoon3.
+
+- Reduce retained-lifecycle Bay refresh CPU by skipping repeated sample sorting for older cards while preserving full-history validation, counts, and ordering.
+
+- Preserve app-server turn failures so capacity errors remain retryable and unavailable models remain terminal instead of surfacing a missing result file. Thanks @Yigtwxx.
+
+- Restore OpenClaw Bay live status when reviews are parked for incompatible sources or unknown reasons; preserve the validated queue contract across cached reads, and polish the shoreline header, filters, and lane labels.
+
+- Keep scheduled and manual review intake independent of aggregate telemetry failures while preserving signed admission, pacing, replay, and publication-policy checks. Require signed capability proof in exact-revision deployment smoke checks before rolling out the new producers.
+
+- Admit canonical Git-metadata false positives for modified executable files without weakening source-content or supplemental-scan checks.
+
+- Reuse the command acknowledgement as the active review status so exact re-reviews no longer post a second temporary comment.
+
+- Stop scheduled sweeps from repeatedly preparing an unchanged PR with an incompatible pinned Codex version, while preserving source-change recovery and explicit maintainer re-review.
+
+- Avoid migration-proof blockers for newly captured in-memory `statePath` routing while preserving existing path edits, file-read, persisted-format, and incomplete-storage checks.
+
+- Route maintainer-authored issues and pull requests to GPT-6 Sol with high reasoning and fast service while other items use medium reasoning and standard service, retiring the legacy per-run profile overrides.
+
+- Qualify the relocated Gateway config CDP-redaction fixture by its exact old and new source lines while preserving complete input scanning and changed-input refusal.
+
+- Move ClawSweeper review and fix lanes to GPT-6 Sol with high reasoning and fast service, and refresh the hosted Codex tools to the latest green main snapshot.
+
+- Admit generated Git object metadata findings in raw diffs only after canonical source witnesses and a complete supplemental scan, including added and deleted files, while preserving all primary source scanning.
+
+- Keep re-review acknowledgements owned by the durable queue so a delayed recovery router cannot overwrite a completed or failed status.
+
+- Qualify three synthetic OpenClaw model-egress URI fixtures by exact native identities, complete source lines, and committed paths while preserving input scanning and refusal controls.
+
+- Bound pinned Codex source fetches at their shared setup owner, stopping native Git and transport descendants while preserving retry classification and Git low-speed settings. Thanks @SebTardif.
+
+- Stop POSIX Codex descendants when their leader exits naturally, including descendants holding output pipes, without turning clean exits into review timeouts. Thanks @SebTardif.
+
+- Reduce publication backlog churn with shared inline-comment reads, bounded source-fetch retries that reuse verified Git objects, transient scanner-download retries, page-bounded dead-letter membership reads, and two isolated preparation workers per batch.
+
+- Stop publication metadata and comment reads from repeatedly probing exhausted GitHub credentials within a batch; preserve scoped fallback and resume fresh reads at the recorded reset.
+
+- Bound conflict self-heal, failed-run self-heal, and issue-implementation workflow dispatches with the existing GitHub CLI deadline. Thanks @SebTardif.
+
+- Qualify the existing Crabbox Azure endpoint-rejection fixture by exact native URI identity and committed source witnesses while retaining full input scanning and refusal controls.
+
+- Qualify six existing Crabbox scope and redaction fixtures by exact URI identities, complete ordered source lines, and committed source references while retaining full input scanning.
+
+- Show an explicit no-op label plan when the publisher confirms unchanged labels, without inferring confirmation from report metadata. Thanks @saariuslystoned.
+
+- Reduce CI review/publication REST calls by hydrating comment threads once per read generation and deriving prompt windows locally, while preserving fresh mutation guards.
+
+- Retry transient terminal-review telemetry publication failures with the same signed run identity, preserving bounded deadlines and duplicate suppression.
+
+- Qualify the existing Gateway question URL-rejection fixture by exact native identities, complete source line, and original test path while preserving full input scanning.
+
+- Keep passive review-run telemetry writes independent of queue size by removing the retired per-item reconciliation alarm scan.
+
+- Share artifact-cache cleanup across overlapping publication requests to avoid duplicate R2 scans and cursor writes.
+
+- Retry timed-out review blob fetches through the existing bounded source-preparation recovery instead of permanently rejecting the unchanged review as a scanner refusal.
+
+- Preserve approved URI provenance when scanner replay masks Git object IDs, while keeping the replay byte and source-identity checks intact. Thanks @vincentkoc.
+
+- Defer automatic Endor reviews until the existing automerge enrollment is ready, preserving explicit requests and holds and finishing skipped review lifecycles as policy no-ops. Thanks @jesse-merhi.
+
+- Use Codex's explicit stored-data compatibility assessment instead of English proof-matching rules; retain compatibility holds for unassessed historical reports and preserve independent proof gates. Thanks @fuller-stack-dev.
+
+- Bound scheduled target-fanout GitHub CLI calls with the existing shared timeout, preserving explicit audit-wave deadlines. Thanks @SebTardif.
+
+- Strip inherited process-local Git configuration from review and repair model environments while preserving Git isolation and repair identity. Thanks @saariuslystoned.
+
+- Finish Codex worker process-group cleanup after repeated cancellation, early child exit, or app-server turn completion, preventing orphaned descendants. Thanks @Yigtwxx.
+
+- Use plain language for issue follow-up and preserve Codex's requested next action without inventing generic reproduction checklists. Thanks @PollyBot13.
+
+- Redact private model identifiers from spam-scanner errors before publishing logs, audit records, reports, and ledger entries. Thanks @Yigtwxx.
+
+- Raise the worker budget to 128, exact-review capacity to 80 with 64 reviews per repository, and scheduled concurrency to 32 while retaining scheduled intake pacing, publication headroom, and the separate imported-cluster cap.
+
+- fix(dashboard): report bounded status diagnostics when the deployment smoke rejects the Bay contract, while preserving its failure gate.
+
+- Stop superseded review workers from repeatedly posting start comments, and reuse the same worker's active comment when queue checks temporarily fail.
+
+- Qualify the approved TypeSafe local URL-rejection fixture using its exact native identity and source line while retaining complete input scanning.
+
+- Keep POSIX synthetic GitHub CLI fixtures out of inherited Node coverage so interrupted fixture shutdown cannot corrupt the coverage report; real ClawSweeper subprocesses remain covered.
+
+- Keep explicitly accepted PR tradeoffs visible as evidence without asking maintainers to resolve them again, while retaining blockers for unresolved or changed risks.
+
+- Qualify the existing OpenClaw browser CDP discovery fixture using exact native identities, its complete source line, and committed source references while preserving scanner enforcement.
+
+- Avoid migration-proof blockers when Node Console stream routing shares a patch hunk with unchanged storage, while retaining gates for real stored-field and persistence changes.
+
+- Qualify the exact OpenClaw Gateway readiness privacy-test fixture using observed native URI identities and its complete source-line witness, without changing scanner enforcement.
+
+- Qualify the existing OpenClaw question URL-rejection fixture using exact native identities, the complete source-line witness, and its original test path without weakening input scanning.
+
+- Qualify reviewed autoreview hardening URI fixtures at both canonical and mirrored source paths using exact native identities and complete source-line witnesses.
+
+- Avoid migration-proof blockers for plain source-file reads while retaining gates for persisted readers, storage writes, and schema changes.
+
+- Qualify the existing marketplace entries telemetry fixture using both exact source-line witnesses while preserving the refresh fixture’s separate approval.
+
+- Restore adaptive publication capacity from newly accepted batch publications after cooldown, while preserving quota backoff and replay safety.
+
+- Classify the reviewed Git-remote rejection and scanner-proof fixtures using exact native detector, decoder, source-line, and regular-file attribution.
+
+- Classify generated Git blob IDs mistaken for Cloudflare credentials only after complete source witnesses and an independent native patch replay rule out decoded content matches, while keeping verified or incomplete scans blocked.
+
+- Let exact-review admission use the existing one-shot scoped read-token fallback when the public Actions quota is exhausted, while preserving private-repository access and retry behavior.
+
+- Avoid migration-proof blockers for read-only doctor dispatch changes while retaining doctor warnings under persistence owners and beside same-hunk storage evidence.
+
+- Allow reviewed browser configuration URL fixtures through input scanning with exact occurrence witnesses, preserving native explicit-default-port metadata and rejection of changed or unrelated input.
+
+- Admit approved synthetic URI fixtures in unchanged patch context only with exact before/after Git source witnesses, and qualify the existing OpenClaw create-profile redaction fixture without hiding raw scan input.
+
+- Keep standalone notification commands alive during transient hook retry backoff so they finish retries and write their report instead of silently exiting successfully.
+
+- Run full repair acceptance in the executor instead of duplicating it in edit workers, and derive the overall repair budget from validation allowances with a hard ceiling and report headroom.
+
+- Preserve bounded native Git diagnostics when a source-blob fetch exhausts the hydration deadline, without changing the terminal refusal or exposing scanner output.
+
+- Give OpenClaw's combined changed-gate command 25 minutes so lint can finish after its long core-test typecheck, and log successful typecheck/lint stage timings, while retaining the eight-minute default elsewhere and the overall repair deadline.
+
+- Keep PR source hydration's GitHub metadata requests, retries, and rate-limit checks within its existing deadline.
+
+- Keep confirmed validation timeouts primary when the subsequent checkout identity proof is inconclusive, retaining both errors and blocking reuse until recovery.
+
+- Report confirmed validation timeouts after reaping command trees and cleaning newly generated ownership locks.
+
+- Admit the existing OpenClaw browser CDP proxy and target fixtures through exact URI, source-line, decoder, and source-path bindings so unrelated test imports do not block exact review.
+
+- Recognize the existing approved browser documentation fixture after its page split, preserving exact-value and source-path restrictions.
+
+- Keep repair-result publication within its job budget by hydrating only the operational Git state it consumes, without loading unrelated canonical review records.
+
+- Bound dashboard status collection to 18 seconds so stalled dependencies show unavailable freshness and the next Dashboard or Bay poll can recover; retain complete snapshots without persisting timeout results or blocking later writes, and avoid showing a synthetic age when freshness is unavailable.
+
+- Wait for the exact-review queue to become available before declaring a dashboard deployment ready, while retaining the deployment deadline and all smoke checks.
+
+- Fix OpenClaw Bay refusing to load inside the Team dashboard while continuing to block embedding by other sites.
+
+- Keep webhook receipt validation deterministic when fixed test timestamps pass their 30-day retention window.
+- Refresh Markdown rendering and Wrangler patches, Node 24.21.0 repair runners and E2E images, Bun 1.4.2, and the OpenClaw 2026.9.4 runner while preserving the 48-hour dependency release window.
+
 **Highlights:** Preserve later review evidence, reject forged report findings, bound stalled repair calls, and recheck paired-close eligibility before mutations.
 
 ### Removed
@@ -20,6 +212,8 @@ checkpoint, and status-only commits are intentionally omitted.
 - Deleted the monthly `state-compaction.yml` history rewrite of `openclaw/clawsweeper-state`, removing one of the last writers ahead of that repository's retirement.
 
 ### Changed
+
+- Attribute GitHub CLI throttles to the credential used by the failed request, preserving one-shot public-read recovery and the original command diagnostics.
 
 - Restore OpenClaw changed-gate receipts, caches, and disposable outputs for strict `pnpm run`, selector, and environment-prefixed commands without granting root artifact exemptions to workspace scripts.
 
@@ -161,6 +355,8 @@ checkpoint, and status-only commits are intentionally omitted.
 - Generated live-proof plans now receive the effective cold-checkout setup contract and guidance to supply missing build or code-generation prerequisites before dependent commands.
 
 ### Fixed
+
+- Accept sufficient recorded upgrade proof without treating serialized contributor-action metadata as a compatibility blocker; preserve missing-proof and override safeguards. Thanks @roboclaw-bot for the report and @goutamadwant for the fix.
 
 - Prevent label sweeps from reactivating autofix after a ready review handler completes it in the same router run.
 - Keep OpenClaw Bay controls compact and show more sampled cards in crowded lanes while preserving readable labels, focus, and observer-only navigation. Thanks @brokemac79.

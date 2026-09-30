@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { TRUFFLEHOG_VERSION } from "./review-tool-bootstrap.js";
+import { resolvePatchWitnesses } from "./agent-input-scan-patch.js";
+import { resolveGitObjectMetadata } from "./agent-input-scan-git-metadata.js";
 
 interface ReviewedFixture {
   fixtureSha256: string;
@@ -13,14 +15,15 @@ interface ReviewedFixture {
 export type ScanSourceRole = "base" | "head" | "index" | "tree" | "worktree";
 
 export type ReviewedAttribution = readonly [
-  detectorType: 17 | 895 | 968,
-  detectorName: "URI" | "MongoDB" | "Postgres",
-  decoder: "PLAIN" | "HTML" | "ESCAPED_UNICODE",
+  detectorType: 17 | 895 | 899 | 968,
+  detectorName: "URI" | "MongoDB" | "FTP" | "Postgres",
+  decoder: "PLAIN" | "HTML" | "ESCAPED_UNICODE" | "BASE64",
   rawSha256: string,
   rawV2Sha256: string,
-  lineSha256: string,
+  lineSha256: string | readonly string[],
   source: string,
   mode: "100644",
+  sourceSha256s?: readonly string[],
 ];
 
 // This is host policy, never an allowlist loaded from the reviewed checkout.
@@ -67,14 +70,30 @@ const REVIEWED_FIXTURES: readonly ReviewedFixture[] = [
     ],
   },
   {
+    // OpenClaw loopback CDP proxy-bypass fixture introduced by a37ebb2d496c.
+    fixtureSha256: "c10384849acffcfd5e4a8c5c7e368a9822425fbd631b1b51e74e48fd974b76d0",
+    rawSha256: "6eff40b9b295cc8f78a2a7762888d6884610d3399a676b6c648fd1f8a71c1d58",
+    lineSha256s: ["389cd151272bf0c7005e544b01a6c173a008af9bec42fb9d5c4de577b6113c32"],
+    decoders: ["PLAIN", "HTML"],
+    sources: ["extensions/browser/src/browser/cdp.helpers.internal.test.ts"],
+  },
+  {
+    // OpenClaw credential-bearing CDP target fixture moved by 9a7ceceffaa8.
+    fixtureSha256: "996b19a5512866475ab05efe0308921cadf916d8a506b76ea1a4204ad1e1193c",
+    rawSha256: "996b19a5512866475ab05efe0308921cadf916d8a506b76ea1a4204ad1e1193c",
+    lineSha256s: ["f0fa784540b0d2421ae27c655b5648cf5c94a1d24e29d8058fdcf26c0ba2375a"],
+    decoders: ["PLAIN", "HTML"],
+    sources: ["extensions/browser/src/browser/cdp.test.ts"],
+  },
+  {
     // Profile-status redaction repeats this synthetic URI in config and a mocked-call assertion.
     fixtureSha256: "d15184614e748450d49a726f84955ca7745b87d0728afbd6bb6b50d84cce4fe0",
     sources: ["extensions/browser/src/browser/server-context.list-profiles.test.ts"],
   },
   {
-    // OpenClaw remote-CDP documentation example introduced by bf15c87d2b12.
+    // Introduced by bf15c87d2b12; moved unchanged to browser/remote.md by 26b84d3f38d.
     fixtureSha256: "e6907dddaccdec944b0f02e14fe9186293e2d513ff753db0a95b3460aa5dc1d9",
-    sources: ["docs/tools/browser.md"],
+    sources: ["docs/tools/browser.md", "docs/tools/browser/remote.md"],
   },
   {
     // OpenClaw credentialed-page rejection fixture introduced by d5fb4903f1b1.
@@ -136,7 +155,7 @@ const REVIEWED_FIXTURES: readonly ReviewedFixture[] = [
     fixtureSha256: "97c60d02f5114db97718cfe1c3686c0a36fb5138840611c8793c7abbd9c64f71",
     rawSha256: "43690a8c13d4028ed731bc4dfeb37f83adaa4e5849d2e0fa13f746843adec333",
     lineSha256s: ["87f28bc6a5b0037cfd2ecc94349d5c9bfff572776c25d5e713ae7d83144f5f98"],
-    decoders: ["PLAIN"],
+    decoders: ["PLAIN", "HTML"],
     sources: ["apps/macos/Tests/OpenClawIPCTests/DashboardWindowSmokeTests.swift"],
   },
   {
@@ -195,14 +214,6 @@ const REVIEWED_FIXTURES: readonly ReviewedFixture[] = [
     decoders: ["PLAIN"],
     sources: ["src/cli/plugins-cli.marketplace-refresh.test.ts"],
   },
-  {
-    // OpenClaw Gateway config CDP-redaction fixture introduced by 4b5987829d0f.
-    fixtureSha256: "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f",
-    rawSha256: "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f",
-    lineSha256s: ["fab950a882e7e3d2f50a68a07fa6adec03baeecf9f604321ebe80098dba167ec"],
-    decoders: ["PLAIN"],
-    sources: ["src/gateway/server.config-patch.test.ts"],
-  },
 ];
 
 const CRABBOX_POSTGRES_DOC_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
@@ -228,8 +239,127 @@ const CRABBOX_POSTGRES_DOC_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
   ],
 ];
 
+// HTML decoding can hide another occurrence; FTP admits only these inspected complete blobs.
+const CRON_FTP_SOURCE_SHA256S = [
+  "9e80ccc47c8373fc9b22c64d1297c8e21a74aba226fe84781256a3fcf4786ac4",
+  "82b5327be49d6e7f9b046c43e3d77a30af33baa8a532d4f9357870a30c4d46a9",
+  "9e9ec747fe268991cde3f65280c0b4480e9d7748b9e9ce4d539a28f6f8fc23a1",
+  "64919155ae619bb0159a37d7ea97b6aba473671c50120cf78be7c27f8a15dae4",
+  "e181c69bd874b3e50d70631a6f1a94eed2308d765f05046ec66a84089a62c7cb",
+] as const;
+
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
+  // Inventory Connect rejects these synthetic credential-bearing site/verification URLs.
+  // Native TruffleHog 3.97.4: PLAIN only; exact test line/path and both native identities.
+  [17, "URI", "PLAIN", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "3ee274980dba1cc67117e838a9038067c6b42f0f81a3e32153ae87e96652cb6d", "tests/store-connect/protocol.test.mjs", "100644"],
+  [17, "URI", "PLAIN", "ca9cff428f18cb601cd048fbee5eea99b4881f6aa7440e61fcd80f5065594eb0", "c71a6ed95a91bf84af8f88ad7b75bbf01d23b5ccf8fb55e258450cf2dd998830", "c4b1cfe20b94cff441df790ea165be9a7c9ba0aa3e3f4827a2c9a84a9561451e", "tests/store-connect/protocol.test.mjs", "100644"],
+  // OpenClaw SDK CDP fixtures: observed native PLAIN identities and complete source lines.
+  [17, "URI", "PLAIN", "87c268ea768beeb60885ffe0d9168e807d77c7f512aea8823703046c734cbdbf", "87c268ea768beeb60885ffe0d9168e807d77c7f512aea8823703046c734cbdbf", "808983a7a484c49a6b2a47f9696e4e86ecff5880d1fd2d76b081734e75a9e7fc", "src/plugin-sdk/browser-subpaths.test.ts", "100644"],
+  [17, "URI", "PLAIN", "d85938093727ccf6959e1199023569dcfaa302bf5e86a28aa3ea9e011b7c1224", "069a918f1609e9f5c0f688d50e234f9b021eae193b573c2312355703eb2fa414", "e22c3375ec9e03b63845c873a0aa46c844ef5c3c9afa087d0b93d53e0fc4af64", "src/plugin-sdk/browser-subpaths.test.ts", "100644"],
+  // OpenClaw completion-webhook redaction fixture; only observed native blob findings qualify.
+  [899, "FTP", "PLAIN", "927664cc6f3d082fb8acb9e01b47942d21d8043ddf150a6d833b5660bc240e07", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "47389a842fa9b1a3cb74c54ab2455b02b9cb0bd41c4b832eaf83aa52fbccbdc8", "src/gateway/server-cron-notifications.test.ts", "100644", CRON_FTP_SOURCE_SHA256S],
+  [899, "FTP", "HTML", "927664cc6f3d082fb8acb9e01b47942d21d8043ddf150a6d833b5660bc240e07", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "47389a842fa9b1a3cb74c54ab2455b02b9cb0bd41c4b832eaf83aa52fbccbdc8", "src/gateway/server-cron-notifications.test.ts", "100644", CRON_FTP_SOURCE_SHA256S],
+  // Git-ref redaction: native PLAIN/ESCAPED_UNICODE; HTML qualifies the same verified literal.
+  [17, "URI", "PLAIN", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "38f7c5f5260b58730c16187c5777da1ed97c72a836f6213c4ea3b376fa96fa57", "c1f9ec504b9d934cd49e19e1dba0496f7d3fe5ce822b608097d606e76f5b8373", "src/infra/git-source.test.ts", "100644"],
+  [17, "URI", "HTML", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "38f7c5f5260b58730c16187c5777da1ed97c72a836f6213c4ea3b376fa96fa57", "c1f9ec504b9d934cd49e19e1dba0496f7d3fe5ce822b608097d606e76f5b8373", "src/infra/git-source.test.ts", "100644"],
+  [17, "URI", "ESCAPED_UNICODE", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "38f7c5f5260b58730c16187c5777da1ed97c72a836f6213c4ea3b376fa96fa57", "c1f9ec504b9d934cd49e19e1dba0496f7d3fe5ce822b608097d606e76f5b8373", "src/infra/git-source.test.ts", "100644"],
+  // Proxy CLI text/JSON redaction repeats the same complete synthetic line twice.
+  [17, "URI", "HTML", "0ef0207595a31168bf8da47767ebd6cd1df772894fad34d7c415c3a54bc9682a", "0ef0207595a31168bf8da47767ebd6cd1df772894fad34d7c415c3a54bc9682a", ["b34b027056c44f232c1ab8ef2d1e4c9b41ea4787a6f56ec2facbdfa5e4bff00c", "590899f2b5c558e7265ac4a53210cb4fd6f6baebdbedddc771d3dc2aed293648"], "src/cli/proxy-cli.runtime.test.ts", "100644"],
+  [17, "URI", "PLAIN", "0ef0207595a31168bf8da47767ebd6cd1df772894fad34d7c415c3a54bc9682a", "0ef0207595a31168bf8da47767ebd6cd1df772894fad34d7c415c3a54bc9682a", ["b34b027056c44f232c1ab8ef2d1e4c9b41ea4787a6f56ec2facbdfa5e4bff00c", "590899f2b5c558e7265ac4a53210cb4fd6f6baebdbedddc771d3dc2aed293648"], "src/cli/proxy-cli.runtime.test.ts", "100644"],
+  [17, "URI", "HTML", "d73af422596b1963c65ae6c2639fd088da3b9196ad1676465d4da43812708fba", "d73af422596b1963c65ae6c2639fd088da3b9196ad1676465d4da43812708fba", ["ba07145053e337022d012e835604c02e3b7e71403225b7d614bee8c1cdd4c746", "ba07145053e337022d012e835604c02e3b7e71403225b7d614bee8c1cdd4c746"], "src/cli/proxy-cli.runtime.test.ts", "100644"],
+  [17, "URI", "PLAIN", "d73af422596b1963c65ae6c2639fd088da3b9196ad1676465d4da43812708fba", "d73af422596b1963c65ae6c2639fd088da3b9196ad1676465d4da43812708fba", ["ba07145053e337022d012e835604c02e3b7e71403225b7d614bee8c1cdd4c746", "ba07145053e337022d012e835604c02e3b7e71403225b7d614bee8c1cdd4c746"], "src/cli/proxy-cli.runtime.test.ts", "100644"],
+  // Session Share negative userinfo-link fixtures in OpenClaw PR #156736; observed decoders only.
+  [17, "URI", "PLAIN", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "4eaa188aa62167bab9ffb1ef558222f557cfbb82b7bf480aec3fcb29482604d4", "extensions/session-share/src/session-catalog.test.ts", "100644"],
+  [17, "URI", "HTML", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "4eaa188aa62167bab9ffb1ef558222f557cfbb82b7bf480aec3fcb29482604d4", "extensions/session-share/src/session-catalog.test.ts", "100644"],
+  [17, "URI", "PLAIN", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "a5998ca156abbebcd91afd8e3b66dd07dc510a0e5c2bc37660f72572e7e1d08d", "324b82ec0c03a429c0255cca71ee35cf44d7b73d1aed27ad56a1eb9671714571", "ui/src/components/app-sidebar-catalog-menu.test.ts", "100644"],
+  [17, "URI", "HTML", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "a5998ca156abbebcd91afd8e3b66dd07dc510a0e5c2bc37660f72572e7e1d08d", "324b82ec0c03a429c0255cca71ee35cf44d7b73d1aed27ad56a1eb9671714571", "ui/src/components/app-sidebar-catalog-menu.test.ts", "100644"],
+  // Both receiver decoders require this exact shared-prefix witness in the complete sidebar patch.
+  [17, "URI", "PLAIN", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "324b82ec0c03a429c0255cca71ee35cf44d7b73d1aed27ad56a1eb9671714571", "ui/src/components/app-sidebar-catalog-menu.test.ts", "100644"],
+  [17, "URI", "HTML", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "d64fb4dbdd415057a5e18c16c1e7883ea0d4c0daf3bdfcde04df6412565f4738", "324b82ec0c03a429c0255cca71ee35cf44d7b73d1aed27ad56a1eb9671714571", "ui/src/components/app-sidebar-catalog-menu.test.ts", "100644"],
+  // Existing Gateway config CDP-redaction fixture relocated by OpenClaw #156637.
+  [17, "URI", "PLAIN", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "fab950a882e7e3d2f50a68a07fa6adec03baeecf9f604321ebe80098dba167ec", "src/gateway/server.config-patch.test.ts", "100644"],
+  [17, "URI", "HTML", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "fab950a882e7e3d2f50a68a07fa6adec03baeecf9f604321ebe80098dba167ec", "src/gateway/server.config-patch.test.ts", "100644"],
+  [17, "URI", "PLAIN", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "323f6e356cdfd4034df8542199adef7805e594cb27ecebecc550131cb29c721a", "src/gateway/server.config-patch.test.ts", "100644"],
+  [17, "URI", "HTML", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "3699f73147f6969e1a3273a5809e2dd7886b95fad51315008b75bb20c4c9832f", "323f6e356cdfd4034df8542199adef7805e594cb27ecebecc550131cb29c721a", "src/gateway/server.config-patch.test.ts", "100644"],
+  // OpenClaw model-egress mocks and endpoint rejection in PR #156207; observed native decoder variants only.
+  [17, "URI", "PLAIN", "5657f4461d80dbe503e3d0574f255ceb19be6b2c247df97467bd352c3a02d871", "5657f4461d80dbe503e3d0574f255ceb19be6b2c247df97467bd352c3a02d871", "da5878d386aed630ee515720e9fe0b407baf71277f4ed3412008a2fa96b0e178", "extensions/crabbox/src/crabbox-model-run.test.ts", "100644"],
+  [17, "URI", "HTML", "5657f4461d80dbe503e3d0574f255ceb19be6b2c247df97467bd352c3a02d871", "5657f4461d80dbe503e3d0574f255ceb19be6b2c247df97467bd352c3a02d871", "da5878d386aed630ee515720e9fe0b407baf71277f4ed3412008a2fa96b0e178", "extensions/crabbox/src/crabbox-model-run.test.ts", "100644"],
+  [17, "URI", "PLAIN", "7291e1dd92191deb23a9d7852746d0d0666812f209be34fca14125096404deae", "7291e1dd92191deb23a9d7852746d0d0666812f209be34fca14125096404deae", "559665840b585b1a2f32fd62aebe48356d53925905e10558bda002cfb5a39243", "src/secrets/model-egress.test.ts", "100644"],
+  [17, "URI", "HTML", "7291e1dd92191deb23a9d7852746d0d0666812f209be34fca14125096404deae", "7291e1dd92191deb23a9d7852746d0d0666812f209be34fca14125096404deae", "559665840b585b1a2f32fd62aebe48356d53925905e10558bda002cfb5a39243", "src/secrets/model-egress.test.ts", "100644"],
+  [17, "URI", "PLAIN", "6b67867fb8dd166b1fd7dcadb0a415a1453b3d4f9206e19d9a13fed21d6fa902", "beed93909cda1de00e65435a362281e7e8924bcc82cda6605699a451a80606ff", "e374bd128400917ff50afb22e3aadb4de2a6d4480d11e8ac259651220ce31bc5", "src/secrets/model-egress.test.ts", "100644"],
+  [17, "URI", "HTML", "6b67867fb8dd166b1fd7dcadb0a415a1453b3d4f9206e19d9a13fed21d6fa902", "beed93909cda1de00e65435a362281e7e8924bcc82cda6605699a451a80606ff", "e374bd128400917ff50afb22e3aadb4de2a6d4480d11e8ac259651220ce31bc5", "src/secrets/model-egress.test.ts", "100644"],
+  // OpenClaw mocked status-redaction fixture introduced by b6a94d4ef94c; native PLAIN findings in #154508/#154607.
+  [17, "URI", "PLAIN", "1d71159c56ca84a71d1b34c10e8d645f3ced3c75a5ac818104338ff58bb95993", "1d71159c56ca84a71d1b34c10e8d645f3ced3c75a5ac818104338ff58bb95993", "5b94a943db86311a9fad2e77bc395ce0a94cde5c73a04cf17943ab5b29928110", "extensions/browser/src/browser/routes/basic.existing-session.test.ts", "100644"],
+  // Approved TypeSafe loopback URL-rejection fixture: OpenClaw #154059.
+  [17, "URI", "HTML", "923d03ede473d23a81840727f6af65897692c61133596ca2a59d52d88fd6775f", "923d03ede473d23a81840727f6af65897692c61133596ca2a59d52d88fd6775f", "e6a2587ba99aab4b1437d4382b043f2253065508d5ab038841fd4262ce0b0a6f", "extensions/typesafe/src/local.transport.test.ts", "100644"],
+  [17, "URI", "PLAIN", "923d03ede473d23a81840727f6af65897692c61133596ca2a59d52d88fd6775f", "923d03ede473d23a81840727f6af65897692c61133596ca2a59d52d88fd6775f", "e6a2587ba99aab4b1437d4382b043f2253065508d5ab038841fd4262ce0b0a6f", "extensions/typesafe/src/local.transport.test.ts", "100644"],
+  // Approved browser CDP discovery fixture: https://github.com/openclaw/openclaw/pull/153597.
+  [17, "URI", "HTML", "58e5399334d925e239b1b4777a226340f84778101809699897154e2a3c750a42", "a2b7cdba4afae496b99e64423837887e56340606268f28b7edef5a33e22cdc0f", "285d12ccfcf9b9547713f38140953dde8763b2ddccd234f8deed19b04c4b6f42", "extensions/browser/src/browser/pw-session.connections.test.ts", "100644"],
+  [17, "URI", "PLAIN", "58e5399334d925e239b1b4777a226340f84778101809699897154e2a3c750a42", "a2b7cdba4afae496b99e64423837887e56340606268f28b7edef5a33e22cdc0f", "285d12ccfcf9b9547713f38140953dde8763b2ddccd234f8deed19b04c4b6f42", "extensions/browser/src/browser/pw-session.connections.test.ts", "100644"],
+  // Approved synthetic unsafe-link fixture: https://github.com/openclaw/openclaw/pull/153274.
+  [17, "URI", "PLAIN", "148db1b794aa55e895c253fc95230148dd8cf58b8f97bac16c3db0147df7f457", "e10c3a5ca351377dab596260b30d87d26337a91bb3bb7b8f8d1fecda7285a125", "9b986f89b4bc448cd97566a1512992e765197fe5be1333cbb79681b1c25d95e4", "extensions/github/src/detail-checks.test.ts", "100644"],
+  [17, "URI", "HTML", "148db1b794aa55e895c253fc95230148dd8cf58b8f97bac16c3db0147df7f457", "e10c3a5ca351377dab596260b30d87d26337a91bb3bb7b8f8d1fecda7285a125", "9b986f89b4bc448cd97566a1512992e765197fe5be1333cbb79681b1c25d95e4", "extensions/github/src/detail-checks.test.ts", "100644"],
+  // Maintainer-qualified Gateway readiness error privacy fixture from OpenClaw #152309.
+  [17,"URI","PLAIN","630affa5ad9abd80845b370cfee593f079ea56cf2907e2e0135d154bb7d30fcb","630affa5ad9abd80845b370cfee593f079ea56cf2907e2e0135d154bb7d30fcb","135365663033f668caf9d6e3fc27b905e8ffaef8ad43bc587e43fceb055bad59","test/helpers/openclaw-test-instance.test.ts","100644"],
+  [17,"URI","HTML","630affa5ad9abd80845b370cfee593f079ea56cf2907e2e0135d154bb7d30fcb","630affa5ad9abd80845b370cfee593f079ea56cf2907e2e0135d154bb7d30fcb","135365663033f668caf9d6e3fc27b905e8ffaef8ad43bc587e43fceb055bad59","test/helpers/openclaw-test-instance.test.ts","100644"],
+  // Gateway sibling of the reviewed question URL-rejection fixture; exact source bytes differ.
+  [17, "URI", "PLAIN", "2c45f25f2626ac90554ac699f6b285846faf497f796f3d1c05acb7fef231d0a9", "c914cd0ca5fb29af5f36f2e92ac43bf9fa59e1a729049dcbdd5b09cee50d4b28", "61b6dd9a49e1ba2bbbb38735e6227c34642f606603cf41999cd99be24a1fa011", "src/gateway/server-methods/question.test.ts", "100644"],
+  [17, "URI", "HTML", "2c45f25f2626ac90554ac699f6b285846faf497f796f3d1c05acb7fef231d0a9", "c914cd0ca5fb29af5f36f2e92ac43bf9fa59e1a729049dcbdd5b09cee50d4b28", "61b6dd9a49e1ba2bbbb38735e6227c34642f606603cf41999cd99be24a1fa011", "src/gateway/server-methods/question.test.ts", "100644"],
+  // Question URL-rejection fixture: native matching stops at the hyphen; bind the full source line.
+  [17, "URI", "PLAIN", "056ba31f89867351c82b216a148b00bc322977c7da7a4aec9e0a1c222d239b50", "a62b014a9aedc9b5b538eed1f6fc5825be583d195348a11ff94076b4a6b4f55b", "87861ba38fa50d5190bf1b03c8fb631cf929f99b16bd73b786933aa1a1c40add", "ui/src/app/question-prompt.test.ts", "100644"],
+  [17, "URI", "HTML", "056ba31f89867351c82b216a148b00bc322977c7da7a4aec9e0a1c222d239b50", "a62b014a9aedc9b5b538eed1f6fc5825be583d195348a11ff94076b4a6b4f55b", "87861ba38fa50d5190bf1b03c8fb631cf929f99b16bd73b786933aa1a1c40add", "ui/src/app/question-prompt.test.ts", "100644"],
+  // The malformed-port native prefix also occurs in the valid proxy; bind both complete lines.
+  [17, "URI", "PLAIN", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", ["1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "c445f98d7d20b87bca6fead0e081385981add30abd58123db8d8d71c799d14a9"], "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", ["1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "c445f98d7d20b87bca6fead0e081385981add30abd58123db8d8d71c799d14a9"], ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  // BASE64 can label this literal URI; vendored witnesses are statically qualified.
+  [17, "URI", "BASE64", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "BASE64", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "BASE64", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", ["1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "eb4b4694b1c0d3a50371cc30fad8c967ca2bd82920ffb5f1077f29a18a394219"], ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  // Old-base witnesses at the vendored path: https://github.com/openclaw/acpx/pull/806.
+  [17, "URI", "PLAIN", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", ["1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "eb4b4694b1c0d3a50371cc30fad8c967ca2bd82920ffb5f1077f29a18a394219"], ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", "7b8ee01b06a7e5b375164f2c45249bb258c75726a60b27e20a0ba6e42d5d0b27", ["1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "eb4b4694b1c0d3a50371cc30fad8c967ca2bd82920ffb5f1077f29a18a394219"], ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "6c529e5b9845e7f41a5406cea40dc9dc98bfc8da6a330c3cdb34554f2dc0317f", "eebab8ec3df3ff0426c28021cce68ab7d2391e32d3040b128210e9df7ad3e092", "891868de8d56884650fcf0190c6d1ec5985d0f69d93ab8c7a106fbb141080acc", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  // Additional native PLAIN variants in the same reviewed negative-test source.
+  [17, "URI", "PLAIN", "2d082b79ad4da55704d07af5754a91f9a677bfbbdc626d93a58291f11edf53c5", "2d082b79ad4da55704d07af5754a91f9a677bfbbdc626d93a58291f11edf53c5", "cb345a378aff388d79a0457d58f542b96eac6a985ec45b3427f6ed796686330d", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "b12f4f7ee1e8ec1c544b81f14b0252734d816bd79ced79d342dbca650c4f6c31", "b12f4f7ee1e8ec1c544b81f14b0252734d816bd79ced79d342dbca650c4f6c31", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "2d082b79ad4da55704d07af5754a91f9a677bfbbdc626d93a58291f11edf53c5", "2d082b79ad4da55704d07af5754a91f9a677bfbbdc626d93a58291f11edf53c5", "cb345a378aff388d79a0457d58f542b96eac6a985ec45b3427f6ed796686330d", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "b12f4f7ee1e8ec1c544b81f14b0252734d816bd79ced79d342dbca650c4f6c31", "b12f4f7ee1e8ec1c544b81f14b0252734d816bd79ced79d342dbca650c4f6c31", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  // Maintainer-reviewed autoreview hardening fixtures from agent-skills a7e91e188fa0.
+  [17, "URI", "PLAIN", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05a6e4a950742dd959c778c15c81c9c6a12a24c76bc77349d8779ea4d0c3b71e", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05a6e4a950742dd959c778c15c81c9c6a12a24c76bc77349d8779ea4d0c3b71e", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "3099aae4bfd434977aa185a0b73674b3238305b0c94b9f36255cf1ad9d9a66ac", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "3099aae4bfd434977aa185a0b73674b3238305b0c94b9f36255cf1ad9d9a66ac", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", "skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "662a886a0fd7447dad0acda3aeccc9eb539fc90438b453de7e2f523ca7ee6c83", "1a0920c31a227ead081fd2e6582572dfee060995e266a5520f66021acaa918c9", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05a6e4a950742dd959c778c15c81c9c6a12a24c76bc77349d8779ea4d0c3b71e", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05ac498c28c2d5ac33d1623fa344fa9dfc5e74ac56fef091df3ab4886ad44de1", "05a6e4a950742dd959c778c15c81c9c6a12a24c76bc77349d8779ea4d0c3b71e", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "3099aae4bfd434977aa185a0b73674b3238305b0c94b9f36255cf1ad9d9a66ac", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "80842079cf4e73add753d25a74646356617b39c399e77d38b34bb21818e303d2", "3099aae4bfd434977aa185a0b73674b3238305b0c94b9f36255cf1ad9d9a66ac", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "PLAIN", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  [17, "URI", "HTML", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fe36092bead3bd47192a05374917c4614ce7642137dc83b9685ab6b5a37d8736", "fd0e2849810c912b53dafd71eb60b4a9e2a3bb25bbd7d2dbd67136b207393d9b", ".agents/skills/autoreview/tests/test_autoreview_hardening.py", "100644"],
+  // The listing fixture repeats the approved feed URL in live and snapshot metadata.
+  [17, "URI", "PLAIN", "a9bdc2ad7ded74870594f1addb8c4f86a5a075516bc840235ed7cc74ed306959", "838f16c9fef468c069583811edaac840bd0378ff46b59008793c552bfbf1c77b", ["6b9804d61dcc7c7c1f9220403787eb71b340645797a7a7926297db085f36c4d5", "6cebd78792a012243cedb635efb44b01181cbd474fd135ebc5112f260284ee43"], "src/cli/plugins-cli.marketplace-entries.test.ts", "100644"],
+  [17, "URI", "HTML", "a9bdc2ad7ded74870594f1addb8c4f86a5a075516bc840235ed7cc74ed306959", "838f16c9fef468c069583811edaac840bd0378ff46b59008793c552bfbf1c77b", ["6b9804d61dcc7c7c1f9220403787eb71b340645797a7a7926297db085f36c4d5", "6cebd78792a012243cedb635efb44b01181cbd474fd135ebc5112f260284ee43"], "src/cli/plugins-cli.marketplace-entries.test.ts", "100644"],
+  // Plugin-help redaction fixtures: bind every literal occurrence, including object keys and the unsaved URL query.
+  [17, "URI", "PLAIN", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", ["3835950cbb9c584ba2c052e76ba31ac1c83cf48ec422c588fd00605dfec4b082", "0452c2176a2ce671ae67942c523f65774d9fbaa672ac973968844d00fcf44852"], "ui/src/pages/custodian/custodian-session-store.test.ts", "100644"],
+  [17, "URI", "HTML", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", ["3835950cbb9c584ba2c052e76ba31ac1c83cf48ec422c588fd00605dfec4b082", "0452c2176a2ce671ae67942c523f65774d9fbaa672ac973968844d00fcf44852"], "ui/src/pages/custodian/custodian-session-store.test.ts", "100644"],
+  [17, "URI", "PLAIN", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "bd8755761c1bc3e97de6db5abbb63b57bd89237423154144de2bc16c03dd96a7", "ui/src/e2e/plugins-help.e2e.test.ts", "100644"],
+  [17, "URI", "HTML", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "bd8755761c1bc3e97de6db5abbb63b57bd89237423154144de2bc16c03dd96a7", "ui/src/e2e/plugins-help.e2e.test.ts", "100644"],
+  // Existing browser URL-port fixtures from OpenClaw #83707; repeated input/assertion lines form one exact witness.
+  [17, "URI", "PLAIN", "fe30fb721f4e8b1d50f281ae338da254a0e34dba6804776c231b8666d5856055", "3d66d0da353b12cda6548577a624bbb7803b9110255d998a07e5e772dfc5781e", "484aa826bff427f81ddc9e65a3c931d198fee4ca469b51f2a1bec72d669aa7bf", "extensions/browser/src/browser/config.test.ts", "100644"],
+  [17, "URI", "HTML", "fe30fb721f4e8b1d50f281ae338da254a0e34dba6804776c231b8666d5856055", "3d66d0da353b12cda6548577a624bbb7803b9110255d998a07e5e772dfc5781e", "484aa826bff427f81ddc9e65a3c931d198fee4ca469b51f2a1bec72d669aa7bf", "extensions/browser/src/browser/config.test.ts", "100644"],
+  [17, "URI", "PLAIN", "f5accb521ff7c6ffce0ecd2fb4cb9c05475a832e44c8ac4d336c3cab8e79cfa2", "c81f3e0d5d8aae13f7084e4f5cee483b12b08fb7a4e91f2f7d21072c51b7baa8", ["c016f2251f34393b8dd84f20652f89c4acf457015d6fbc92aa440d6fa1854854", "c753a0542e4bdec89fdd79181e0efa82120253a4c56de4cf0b4365d3f3cb1d76"], "extensions/browser/src/browser/config.test.ts", "100644"],
+  [17, "URI", "HTML", "f5accb521ff7c6ffce0ecd2fb4cb9c05475a832e44c8ac4d336c3cab8e79cfa2", "c81f3e0d5d8aae13f7084e4f5cee483b12b08fb7a4e91f2f7d21072c51b7baa8", ["c016f2251f34393b8dd84f20652f89c4acf457015d6fbc92aa440d6fa1854854", "c753a0542e4bdec89fdd79181e0efa82120253a4c56de4cf0b4365d3f3cb1d76"], "extensions/browser/src/browser/config.test.ts", "100644"],
+  [17, "URI", "PLAIN", "e34573089185e607a0cf66ed5635da4375033afb255217b6a0999973c96edf6d", "714a0731adfb5b5f3c8c54d5432adaef98a11bccd8d78695cd7c51a9df33eb15", "1ac5194292c5dd0ac2ffb35da904e610bfa6253bd87b233ed147ca1c8cc6d528", "extensions/browser/src/browser/config.test.ts", "100644"],
+  [17, "URI", "HTML", "e34573089185e607a0cf66ed5635da4375033afb255217b6a0999973c96edf6d", "714a0731adfb5b5f3c8c54d5432adaef98a11bccd8d78695cd7c51a9df33eb15", "1ac5194292c5dd0ac2ffb35da904e610bfa6253bd87b233ed147ca1c8cc6d528", "extensions/browser/src/browser/config.test.ts", "100644"],
+  // Existing OpenClaw create-profile redaction fixture; native PLAIN/HTML findings in PR #149354.
+  [17, "URI", "PLAIN", "9052f1f4f392d163174d33f5069883336c7a9da094f773f83b719685f4b9a239", "9052f1f4f392d163174d33f5069883336c7a9da094f773f83b719685f4b9a239", "160d09c72a4cc728dde5d883acd48d170878bbb79d05c06e533517c2afe64138", "extensions/browser/src/browser/profiles-service.test.ts", "100644"],
+  [17, "URI", "HTML", "9052f1f4f392d163174d33f5069883336c7a9da094f773f83b719685f4b9a239", "9052f1f4f392d163174d33f5069883336c7a9da094f773f83b719685f4b9a239", "160d09c72a4cc728dde5d883acd48d170878bbb79d05c06e533517c2afe64138", "extensions/browser/src/browser/profiles-service.test.ts", "100644"],
   [17, "URI", "PLAIN", "e26b2ccf9953c3e0e675998528577649327e1d3e1072233ff86cad586ca5c05d", "e26b2ccf9953c3e0e675998528577649327e1d3e1072233ff86cad586ca5c05d", "04e4f717532e6f38582816622367e020b28d8db6ced6e714667328853a422484", "extensions/matrix/src/matrix/client.test.ts", "100644"],
   [17, "URI", "HTML", "e26b2ccf9953c3e0e675998528577649327e1d3e1072233ff86cad586ca5c05d", "e26b2ccf9953c3e0e675998528577649327e1d3e1072233ff86cad586ca5c05d", "04e4f717532e6f38582816622367e020b28d8db6ced6e714667328853a422484", "extensions/matrix/src/matrix/client.test.ts", "100644"],
   [17, "URI", "ESCAPED_UNICODE", "31ff9f3ec446cbcc27e6fc08f3cd96b5d95d8b436b4144f3a098d7c524a863f7", "0d9e27039ed24044fe06ab5145d7b04569ced32d3ff6fe8eb9acf04a75663919", "47171b920ebd0800ac107a92ad80b7279677f0096fad5a367f82fe3b1955c790", "src/logging/redact.test.ts", "100644"],
@@ -250,24 +380,119 @@ const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
   [968, "Postgres", "PLAIN", "4734d8b7c6e9bf96ae464bfc45b1482e00caaedea951cb96b9e88a92ba37a00f", "4734d8b7c6e9bf96ae464bfc45b1482e00caaedea951cb96b9e88a92ba37a00f", "252d197820142c40bc8701a8b1400f28a3224f305f37fd65cd2e6bfbe48d9fb1", "src/logging/redact.test.ts", "100644"],
   [968, "Postgres", "PLAIN", "8be6f6c2f1e50f070e97e4b46fce7e7ad499a6bc0c145e8bdd4fc0a6ee4b5565", "8be6f6c2f1e50f070e97e4b46fce7e7ad499a6bc0c145e8bdd4fc0a6ee4b5565", "6a9d1339c87f11af0ba4e7ef89a77ea8eb8e7f7ac48fdec0abb19d9138821d18", "src/logging/redact.test.ts", "100644"],
   [968, "Postgres", "PLAIN", "f2e76a2fe75ea0d64265b2a61462f1d8026a2286e3030077b4f3972fc0df3b70", "f2e76a2fe75ea0d64265b2a61462f1d8026a2286e3030077b4f3972fc0df3b70", "2020783f7b14c74d2d6960efca4ca82727980494ddef883f15ae9980141662ec", "src/logging/redact.test.ts", "100644"],
+  // Maintainer-qualified Git-remote rejection fixtures; only observed native PLAIN tuples.
+  [17, "URI", "PLAIN", "609f5f8c987b35e0d48b35e8463574db63b84c087e79d4189ef6fea5979f7609", "8074e19d513f3bdb60156065af46081e407232026590b37476c5b7745db3d776", ["f0144dec37814ca30e23745ffff253f710c20e51e4ac2fbdf3ae4b82afb17e10", "b59f02752a9188dc4d89ebf86442a3af3c2c49a64a217614fb29e9d0d1b88f88"], "internal/cli/repo_test.go", "100644"],
+  [17, "URI", "PLAIN", "4b113e9ace3e5b41991d62d947eb1bb8251c904aded634c011eac87f7011c518", "4b113e9ace3e5b41991d62d947eb1bb8251c904aded634c011eac87f7011c518", ["f0144dec37814ca30e23745ffff253f710c20e51e4ac2fbdf3ae4b82afb17e10", "b59f02752a9188dc4d89ebf86442a3af3c2c49a64a217614fb29e9d0d1b88f88"], "internal/cli/repo_test.go", "100644"],
+  [17, "URI", "PLAIN", "609f5f8c987b35e0d48b35e8463574db63b84c087e79d4189ef6fea5979f7609", "8074e19d513f3bdb60156065af46081e407232026590b37476c5b7745db3d776", "35f038c31f598ead2d83273f87972633d956fd55395644cf722d963121a0f999", "internal/cli/ssh_test.go", "100644"],
+  // Scanner regression/proof controls: exact owned source lines, including the deliberate rejection case.
+  [17, "URI", "PLAIN", "dab81a433bea3f155bdd2e6568380c6e21c4a629096e29443c949fcab4ab8adc", "dab81a433bea3f155bdd2e6568380c6e21c4a629096e29443c949fcab4ab8adc", ["e7173a8ac7ee26ee3846d6487ea01f33027e226087f561866b009f60dc34178e", "508ded3f91728edcc7d4ee16d478fae1afd678604e85a9c1f5b701faead11057"], "test/agent-input-scan-git-metadata.test.ts", "100644"],
+  [17, "URI", "PLAIN", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "3cd99e06be80f0f01f21d20433c9e1fa20245f0fac149007b0e45b1738f4a327", "test/agent-input-scan-git-metadata.test.ts", "100644"],
+  [17, "URI", "HTML", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "3cd99e06be80f0f01f21d20433c9e1fa20245f0fac149007b0e45b1738f4a327", "test/agent-input-scan-git-metadata.test.ts", "100644"],
+  [17, "URI", "HTML", "dab81a433bea3f155bdd2e6568380c6e21c4a629096e29443c949fcab4ab8adc", "dab81a433bea3f155bdd2e6568380c6e21c4a629096e29443c949fcab4ab8adc", ["e7173a8ac7ee26ee3846d6487ea01f33027e226087f561866b009f60dc34178e", "508ded3f91728edcc7d4ee16d478fae1afd678604e85a9c1f5b701faead11057"], "test/agent-input-scan-git-metadata.test.ts", "100644"],
+  [17, "URI", "PLAIN", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "a271d1f3d9e105af4a08d27cb5372f891021a0e254241ee23ea257863300a9fd", "docs/proof/agent-input-scan-git-metadata/run-shared-oid-proof.mjs", "100644"],
+  [17, "URI", "HTML", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "1e2c0641bc640f9f57706e40d1c3852f130e85266ba6c13d05e6ca66525d59bd", "a271d1f3d9e105af4a08d27cb5372f891021a0e254241ee23ea257863300a9fd", "docs/proof/agent-input-scan-git-metadata/run-shared-oid-proof.mjs", "100644"],
+  // Maintainer-qualified Crabbox config/routing fixtures: exact native PLAIN identities and full lines.
+  // Azure Dynamic Sessions rejects this synthetic userinfo endpoint before token acquisition.
+  [17, "URI", "PLAIN", "18b8a05caad228f56cfded41e0ce2f513f859be0da13c3a688b169ded93637d1", "18b8a05caad228f56cfded41e0ce2f513f859be0da13c3a688b169ded93637d1", "ef440d51ff51ec8f5275825de6b2076ba44cecffb83ac00ee44f84b13e345ae4", "internal/providers/azuredynamicsessions/client_test.go", "100644"],
+  [17, "URI", "PLAIN", "6b167ea4a777545dcca0e4d425aafccd750a6c6fca8a5b2b370f16491f3a8a4d", "0ff6fd85d257fff2c1caed69eb7aae2c67aed01380cb46e34d557984e27fa54c", "40bbc6377ab4eb23719df798cc9b1679686090fba77d4a382be0afb4657d1d8a", "internal/cli/config_test.go", "100644"],
+  [17, "URI", "PLAIN", "a89628da8274772f7fa0afe708243ae49b6791bdedb1750677427cc9d5a5a000", "14c716479d52c028b8fb328b96101ede45e16dd037240e7c47a81ec43090ab9e", "ac71824a6b75fdfd7f008ef1daa6ada48b1610e2b7dc1f1ae9805a93a7f17b52", "internal/providers/all/command_routing_test.go", "100644"],
+  [17, "URI", "PLAIN", "074f22e4df02459f0d76314ba50dace1f636490fe1c46c529b5937af3e7b132a", "feb035cc8ff180121b5b0c9632560ea099625ff64cad056624cefaa345493304", ["68ac16cb2abadc3f53f40db689be2eb91b3d6999b22ceb2a461f9fb6805b992b", "7b5b808586aae3f8ed29071a60f463104e9dbdeae40fb38b74c299c850bd523a"], "internal/providers/all/command_routing_test.go", "100644"],
+  [17, "URI", "PLAIN", "07968c00c423fd77a0ee19bd8a05e59e9365a48342e66818eee4b34b1c3ee087", "bbc496f1b46b968ed3dc0e1e794c3ab7e65f59720270b2a3c2cccc74d7374953", "ca4ab725d43ebe7996e64ed6ff9297fc356ce07de90dddb77b7b4b020ad5f22b", "internal/providers/all/command_routing_test.go", "100644"],
+  [17, "URI", "PLAIN", "843c5932c66afbc53056c0249de449e9b24bc4ce8a289d88ff1e0505c95a43b2", "e3904bc450ae63f438013ea8c33377e09f2cecc8135fcb8c23eb61f27bc44f07", "7c8e7f2230a2fb9f35048c860ec30ff66bf975e56aad6732e11fac322c6243da", "internal/providers/all/command_routing_test.go", "100644"],
+  [17, "URI", "PLAIN", "59357e59c291991c90b270b631c211824c280da20067aab43514642be03e9638", "5cb65d249cba9bb31b78f257134608da51cbe7adef0236dc641a9ce33e7f6fb3", "29d6a35a441309fc081af0bf3f1c053f82318f4af113458a928ac3de66c51e96", "internal/providers/all/claim_scope_test.go", "100644"],
+  // Native-worker rejection fixtures: exact observed native identities and full lines.
+  [17, "URI", "PLAIN", "f6729932bd0216a9ced489911667e48ede49c4c0c9886343567e8abee5e4a2b6", "245d7408cf9309f13d71c800c1bea998316a44557319d3d9e25c27af5d1286b6", "a6f4875b345810baafb9140823570f1a2792cab59e1328393d86e2675d2f88f6", "src/worker/native-runtime-transport.test.ts", "100644"],
+  [17, "URI", "HTML", "f6729932bd0216a9ced489911667e48ede49c4c0c9886343567e8abee5e4a2b6", "245d7408cf9309f13d71c800c1bea998316a44557319d3d9e25c27af5d1286b6", "a6f4875b345810baafb9140823570f1a2792cab59e1328393d86e2675d2f88f6", "src/worker/native-runtime-transport.test.ts", "100644"],
+  [17, "URI", "PLAIN", "3ba4b9eb95fbafcb38a3dd4bc9886809ca70168cc4a8e552ed23d894cbb07df3", "3ba4b9eb95fbafcb38a3dd4bc9886809ca70168cc4a8e552ed23d894cbb07df3", "b832b4b17c9898d6604bb73c764f82f2eec8bb3e86e06791d70c1f55b4d8435e", "src/worker/native-runtime.test.ts", "100644"],
+  [17, "URI", "HTML", "3ba4b9eb95fbafcb38a3dd4bc9886809ca70168cc4a8e552ed23d894cbb07df3", "3ba4b9eb95fbafcb38a3dd4bc9886809ca70168cc4a8e552ed23d894cbb07df3", "b832b4b17c9898d6604bb73c764f82f2eec8bb3e86e06791d70c1f55b4d8435e", "src/worker/native-runtime.test.ts", "100644"],
   ...CRABBOX_POSTGRES_DOC_ATTRIBUTIONS,
 ];
 
 const sha256Pattern = /^[0-9a-f]{64}$/;
-const detectorNames = { 17: "URI", 895: "MongoDB", 968: "Postgres" } as const;
+const detectorNames = { 17: "URI", 895: "MongoDB", 899: "FTP", 968: "Postgres" } as const;
 
 function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): void {
   const seen = new Set<string>();
   for (const row of rows) {
-    const [detectorType, detectorName, decoder, raw, rawV2, line, source, mode] = row;
+    const [detectorType, detectorName, decoder, raw, rawV2, line, source, mode, sourceSha256s] =
+      row;
+    const lines = typeof line === "string" ? [line] : line;
     if (
-      row.length !== 8 ||
+      row.length !== (detectorType === 899 ? 9 : 8) ||
       detectorNames[detectorType] !== detectorName ||
-      ![raw, rawV2, line].every((digest) => sha256Pattern.test(digest)) ||
+      !Array.isArray(lines) ||
+      !lines.length ||
+      ![raw, rawV2, ...lines].every((digest) => sha256Pattern.test(digest)) ||
       !(
+        (source === "src/plugin-sdk/browser-subpaths.test.ts" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          decoder === "PLAIN") ||
+        (source === "src/gateway/server-cron-notifications.test.ts" &&
+          detectorType === 899 &&
+          Array.isArray(sourceSha256s) &&
+          sourceSha256s.length > 0 &&
+          sourceSha256s.every((digest) => sha256Pattern.test(digest)) &&
+          (decoder === "PLAIN" || decoder === "HTML")) ||
         (source === "src/logging/redact.test.ts" &&
+          detectorType !== 899 &&
           (decoder === "PLAIN" || decoder === "ESCAPED_UNICODE")) ||
+        (source === "src/infra/git-source.test.ts" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML" || decoder === "ESCAPED_UNICODE")) ||
+        (source === "src/cli/plugins-cli.marketplace-entries.test.ts" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML")) ||
         (source === "extensions/matrix/src/matrix/client.test.ts" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML")) ||
+        ((source === "skills/autoreview/tests/test_autoreview_hardening.py" ||
+          source === ".agents/skills/autoreview/tests/test_autoreview_hardening.py") &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          decoder === "BASE64") ||
+        ((source === "extensions/browser/src/browser/profiles-service.test.ts" ||
+          source === "extensions/crabbox/src/crabbox-model-run.test.ts" ||
+          source === "extensions/session-share/src/session-catalog.test.ts" ||
+          source === "ui/src/components/app-sidebar-catalog-menu.test.ts" ||
+          source === "src/secrets/model-egress.test.ts" ||
+          source === "src/cli/proxy-cli.runtime.test.ts" ||
+          source === "extensions/browser/src/browser/routes/basic.existing-session.test.ts" ||
+          source === "extensions/typesafe/src/local.transport.test.ts" ||
+          source === "extensions/browser/src/browser/config.test.ts" ||
+          source === "extensions/browser/src/browser/pw-session.connections.test.ts" ||
+          source === "extensions/github/src/detail-checks.test.ts" ||
+          source === "ui/src/pages/custodian/custodian-session-store.test.ts" ||
+          source === "ui/src/e2e/plugins-help.e2e.test.ts" ||
+          source === "ui/src/app/question-prompt.test.ts" ||
+          source === "src/gateway/server-methods/question.test.ts" ||
+          source === "src/gateway/server.config-patch.test.ts" ||
+          source === "test/helpers/openclaw-test-instance.test.ts" ||
+          source === "skills/autoreview/tests/test_autoreview_hardening.py" ||
+          source === ".agents/skills/autoreview/tests/test_autoreview_hardening.py") &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML")) ||
+        ((source === "src/worker/native-runtime-transport.test.ts" ||
+          source === "src/worker/native-runtime.test.ts") &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML")) ||
+        ((source === "tests/store-connect/protocol.test.mjs" ||
+          source === "internal/cli/repo_test.go" ||
+          source === "internal/cli/ssh_test.go" ||
+          source === "internal/cli/config_test.go" ||
+          source === "internal/providers/azuredynamicsessions/client_test.go" ||
+          source === "internal/providers/all/command_routing_test.go" ||
+          source === "internal/providers/all/claim_scope_test.go") &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          decoder === "PLAIN") ||
+        ((source === "test/agent-input-scan-git-metadata.test.ts" ||
+          source === "docs/proof/agent-input-scan-git-metadata/run-shared-oid-proof.mjs") &&
           detectorType === 17 &&
           detectorName === "URI" &&
           (decoder === "PLAIN" || decoder === "HTML")) ||
@@ -288,10 +513,19 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
 
 validateReviewedAttributions(REVIEWED_ATTRIBUTIONS);
 
-export function serializeReviewContext(context: object): string {
+export function serializeReviewContext(
+  context: object,
+  sourcePatchRecords: readonly unknown[] = [],
+): string {
+  const sourceRecords = new Set(sourcePatchRecords);
   return JSON.stringify(
     context,
-    (_key, value) => (typeof value === "string" ? omitReviewedFixtureReferences(value) : value),
+    function (this: unknown, key: string, value: unknown) {
+      // Source patches are scanned with their committed provenance. Copying them
+      // into prompt text loses that attribution; retain their identities instead.
+      if (sourceRecords.has(this) && (key === "patch" || key === "patchComplete")) return undefined;
+      return typeof value === "string" ? omitReviewedFixtureReferences(value) : value;
+    },
     2,
   );
 }
@@ -329,7 +563,19 @@ export interface ScanSourceReference {
 
 export type ScanInputOrigin =
   | { kind: "prompt" | "schema" | "additional" }
-  | { kind: "raw_diff" | "patch"; from: string; to: string }
+  | { kind: "raw_diff"; from: string; to: string }
+  | { kind: "raw_diff_proof"; from: string; to: string }
+  | {
+      kind: "patch";
+      from: string;
+      to: string;
+      metadataProof?: {
+        file: string;
+        originalFile: string;
+        original: StagedScanInput;
+        bytes: Buffer;
+      };
+    }
   | { kind: "worktree" | "blob"; references: readonly ScanSourceReference[] };
 
 export type StagedScanInput = ScanInputOrigin & { id: string; bytes?: Buffer };
@@ -374,6 +620,7 @@ export type ScanRefusalDiagnostic =
     };
 
 export interface ReviewedFixtureNotice {
+  classification?: "git_object_id";
   fixtureSha256: string;
   source: string;
   detector: string;
@@ -386,6 +633,14 @@ interface RefusedScan {
   diagnostic: ScanRefusalDiagnostic;
 }
 
+type ClassifiedScan =
+  | { kind: "classified"; notices: ReviewedFixtureNotice[] }
+  | {
+      kind: "git_metadata_proof_required";
+      notices: ReviewedFixtureNotice[];
+      proofInputs: ReadonlyMap<string, Buffer>;
+    };
+
 interface ClassifiedFinding {
   blob: string;
   scannerLine: number;
@@ -393,6 +648,7 @@ interface ClassifiedFinding {
   decoder: string;
   occurrences: number;
   role?: ScanSourceRole;
+  patch?: { from: string; to: string; sourceBlob: string; sourceLine: number };
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -457,7 +713,7 @@ export function classifyReviewedFixtureScan(
   stderr: Buffer,
   inputs: ReadonlyMap<string, StagedScanInput>,
   reviewedAttributions: readonly ReviewedAttribution[] = REVIEWED_ATTRIBUTIONS,
-): { kind: "classified"; notices: ReviewedFixtureNotice[] } | RefusedScan {
+): ClassifiedScan | RefusedScan {
   validateReviewedAttributions(reviewedAttributions);
   const nativeFailure = (
     reason: Extract<ScanRefusalDiagnostic, { kind: "native_contract" }>["reason"],
@@ -466,9 +722,9 @@ export function classifyReviewedFixtureScan(
     reason: "scanner_failed",
     diagnostic: { kind: "native_contract", reason },
   });
-  if (status !== 183) return nativeFailure("unexpected_exit");
+  if (status !== 183 && (status !== 0 || stdout.length)) return nativeFailure("unexpected_exit");
   const findings = records(stdout);
-  if (!findings?.length) return nativeFailure("invalid_stdout");
+  if (!findings || (status === 183 && !findings.length)) return nativeFailure("invalid_stdout");
   const logs = records(stderr);
   if (!logs) return nativeFailure("invalid_stderr");
   // TruffleHog can log detector failures and still exit 183. Its exit status
@@ -505,10 +761,36 @@ export function classifyReviewedFixtureScan(
   )
     return nativeFailure("completion_mismatch");
 
-  const literalLines = new Map<string, number>();
+  return classifyReviewedFindings(findings, inputs, reviewedAttributions);
+}
+
+function nativeUriParts(value: string) {
+  const uri = new URL(value);
+  // TruffleHog's Go URL host retains explicit default ports and original spelling.
+  const authority = /^[^:]+:\/\/([^/?#]*)/.exec(value)?.[1];
+  return {
+    host: authority?.slice(authority.lastIndexOf("@") + 1),
+    username: uri.username,
+    password: uri.password,
+  };
+}
+
+function classifyReviewedFindings(
+  findings: Record<string, unknown>[],
+  inputs: ReadonlyMap<string, StagedScanInput>,
+  reviewedAttributions: readonly ReviewedAttribution[],
+  literalLines = new Map<string, number>(),
+): ClassifiedScan | RefusedScan {
+  const patchWitnesses = new Map<string, NonNullable<ReturnType<typeof resolvePatchWitnesses>>>();
+  const objectWitnesses = new Map<
+    string,
+    NonNullable<ReturnType<typeof resolveGitObjectMetadata>>
+  >();
+  const proofInputs = new Map<string, Buffer>();
   const classified = new Map<
     string,
     {
+      classification?: "git_object_id";
       fixtureSha256: string;
       source: string;
       detector: string;
@@ -565,7 +847,175 @@ export function classifyReviewedFixtureScan(
             ([, , , expectedRaw, expectedRawV2]) =>
               expectedRaw === rawDigest && expectedRawV2 === rawV2Digest,
           );
-    if (exactCandidates.length > 0) {
+    const fixture = REVIEWED_FIXTURES.find(
+      (entry) =>
+        entry.fixtureSha256 === rawV2Digest &&
+        (entry.rawSha256 ?? entry.fixtureSha256) === rawDigest,
+    );
+    // Shared fixture values must not replace another source's existing policy.
+    // Mixed references still take the exact path and must all qualify there.
+    const usesExactPolicy = (input: StagedScanInput | undefined) =>
+      exactCandidates.length > 0 &&
+      (input?.kind !== "blob" ||
+        !fixture ||
+        input.references.length === 0 ||
+        input.references.some(({ source }) =>
+          exactCandidates.some((candidate) => candidate[6] === source),
+        ) ||
+        input.references.some(({ source }) => !fixture.sources.includes(source)));
+    if (staged?.kind === "patch" || staged?.kind === "raw_diff") {
+      if (typeof file !== "string" || scannerLine === null) return refuse("metadata_mismatch");
+      if (finding.DetectorType === 58) {
+        const parts = object(finding.SecretParts);
+        if (
+          finding.DetectorName !== "CloudflareGlobalApiKey" ||
+          (staged.kind === "raw_diff" && scannerLine !== 1) ||
+          finding.SourceType !== 15 ||
+          finding.Verified !== false ||
+          typeof finding.VerificationError !== "string" ||
+          !finding.VerificationError ||
+          (finding.DecoderName !== "PLAIN" && finding.DecoderName !== "HTML") ||
+          finding.ExtraData !== null ||
+          finding.StructuredData !== null ||
+          !raw ||
+          !rawDigest ||
+          !exactStringRecord(parts, ["key", "email"]) ||
+          parts?.key !== raw ||
+          rawV2 !== raw + parts.email ||
+          finding.Redacted !== parts.email
+        )
+          return refuse("metadata_mismatch");
+        const witnessKey = `${file}:${rawDigest}`;
+        const witnesses =
+          objectWitnesses.get(witnessKey) ?? resolveGitObjectMetadata(staged, raw, inputs);
+        if (!witnesses) return refuse("material_not_reviewed");
+        objectWitnesses.set(witnessKey, witnesses);
+        // Only independently proven metadata fields change in this second input.
+        // The original complete patch remains part of the primary native scan.
+        const proof = proofInputs.get(file) ?? Buffer.from(staged.bytes!);
+        const literal = Buffer.from(raw);
+        for (
+          let offset = proof.indexOf(literal);
+          offset !== -1;
+          offset = proof.indexOf(literal, offset + literal.length)
+        )
+          proof.fill("_", offset, offset + literal.length);
+        proofInputs.set(file, proof);
+        for (const witness of witnesses) {
+          const key = `git-object:${rawDigest}:${witness.source}`;
+          const group = classified.get(key) ?? {
+            classification: "git_object_id" as const,
+            fixtureSha256: rawDigest,
+            source: witness.source,
+            detector: "CloudflareGlobalApiKey",
+            findings: new Map<string, ClassifiedFinding>(),
+          };
+          const findingKey = `${staged.id}:${scannerLine}:${finding.DecoderName}:${witness.patchLine}`;
+          const previous = group.findings.get(findingKey);
+          group.findings.set(findingKey, {
+            blob: staged.id,
+            scannerLine,
+            literalLine: witness.patchLine,
+            decoder: finding.DecoderName,
+            occurrences: (previous?.occurrences ?? 0) + 1,
+          });
+          classified.set(key, group);
+        }
+        continue;
+      }
+      if (staged.kind === "raw_diff") return refuse("material_not_reviewed");
+      const exactGitSourceEscapedAttribution =
+        finding.DecoderName === "ESCAPED_UNICODE" &&
+        exactCandidates.some(
+          ([detectorType, detectorName, decoder, , , , source, mode]) =>
+            detectorType === 17 &&
+            detectorName === finding.DetectorName &&
+            decoder === finding.DecoderName &&
+            source === "src/infra/git-source.test.ts" &&
+            mode === "100644",
+        );
+      if (
+        finding.DetectorType !== 17 ||
+        !rawV2 ||
+        (finding.DecoderName !== "PLAIN" &&
+          finding.DecoderName !== "HTML" &&
+          (finding.DecoderName !== "ESCAPED_UNICODE" || !exactGitSourceEscapedAttribution))
+      )
+        return refuse("material_not_reviewed");
+      // Decoder labels do not reconstruct source: this fixture still needs literal witnesses.
+      const witnessKey = `${file}:${rawV2Digest}`;
+      const witnesses =
+        patchWitnesses.get(witnessKey) ?? resolvePatchWitnesses(staged, rawV2, inputs);
+      if (!witnesses) return refuse("material_not_reviewed");
+      patchWitnesses.set(witnessKey, witnesses);
+      if (witnesses.some((witness) => usesExactPolicy(inputs.get(witness.file)))) {
+        const key = [
+          file,
+          scannerLine,
+          finding.DetectorType,
+          finding.DetectorName,
+          finding.DecoderName,
+          rawDigest,
+          rawV2Digest,
+        ].join("\0");
+        if (exactFindings.has(key)) return refuse("duplicate_finding");
+        exactFindings.add(key);
+      }
+      for (const witness of witnesses) {
+        // Changed lines need exact full-line policy; legacy URI rows remain
+        // context-only even when their value and source path are reviewed.
+        if (witness.kind !== "context" && !usesExactPolicy(inputs.get(witness.file)))
+          return refuse("material_not_reviewed");
+        // Reuse source policy against the original full blob and every logical
+        // reference. This derived attribution never replaces scanned patch bytes.
+        const result = classifyReviewedFindings(
+          [
+            {
+              ...finding,
+              SourceMetadata: {
+                Data: { Filesystem: { file: witness.file, line: witness.sourceLine } },
+              },
+            },
+          ],
+          inputs,
+          reviewedAttributions,
+          literalLines,
+        );
+        if (result.kind !== "classified")
+          return refuse(
+            result.kind === "refused" && result.diagnostic.kind === "unclassified_finding"
+              ? result.diagnostic.reason
+              : "finding_not_reviewed",
+          );
+        for (const notice of result.notices) {
+          const key = `patch:${notice.fixtureSha256}:${notice.source}`;
+          const group = classified.get(key) ?? {
+            ...notice,
+            findings: new Map<string, ClassifiedFinding>(),
+          };
+          for (const attributed of notice.findings) {
+            const findingKey = `${staged.id}:${scannerLine}:${finding.DecoderName}:${witness.patchLine}:${attributed.blob}:${attributed.role ?? ""}`;
+            const previous = group.findings.get(findingKey);
+            group.findings.set(findingKey, {
+              ...attributed,
+              occurrences: (previous?.occurrences ?? 0) + attributed.occurrences,
+              blob: staged.id,
+              scannerLine,
+              literalLine: witness.patchLine,
+              patch: {
+                from: staged.from,
+                to: staged.to,
+                sourceBlob: attributed.blob,
+                sourceLine: witness.sourceLine,
+              },
+            });
+          }
+          classified.set(key, group);
+        }
+      }
+      continue;
+    }
+    if (usesExactPolicy(staged)) {
       if (
         raw === undefined ||
         rawV2 === undefined ||
@@ -581,7 +1031,7 @@ export function classifyReviewedFixtureScan(
         finding.StructuredData !== null
       )
         return refuse("finding_not_reviewed");
-      const matchingMetadata = exactCandidates.filter(
+      let matchingMetadata = exactCandidates.filter(
         ([detectorType, detectorName, decoder]) =>
           detectorType === finding.DetectorType &&
           detectorName === finding.DetectorName &&
@@ -591,11 +1041,16 @@ export function classifyReviewedFixtureScan(
       const [detectorType, detectorName, decoder] = matchingMetadata[0]!;
       if (typeof file !== "string" || scannerLine === null) return refuse("metadata_mismatch");
       if (staged?.kind !== "blob" || !staged.bytes) return refuse("material_not_reviewed");
+      if (detectorType === 899) {
+        const sourceSha256 = createHash("sha256").update(staged.bytes).digest("hex");
+        matchingMetadata = matchingMetadata.filter((row) => row[8]?.includes(sourceSha256));
+        if (matchingMetadata.length === 0) return refuse("source_not_reviewed");
+      }
       const parts = object(finding.SecretParts);
       if (detectorType === 17) {
-        let uri: URL;
+        let uri: ReturnType<typeof nativeUriParts>;
         try {
-          uri = new URL(rawV2);
+          uri = nativeUriParts(rawV2);
         } catch {
           return refuse("metadata_mismatch");
         }
@@ -608,13 +1063,20 @@ export function classifyReviewedFixtureScan(
           parts.password !== uri.password
         )
           return refuse("metadata_mismatch");
-      } else if (detectorType === 895) {
+      } else if (detectorType === 895 || detectorType === 899) {
         if (
           rawV2 !== "" ||
           !parts ||
           Object.keys(parts).join("\0") !== "key" ||
           parts.key !== raw ||
-          !exactStringRecord(finding.ExtraData, ["database", "host", "rotation_guide", "username"])
+          (detectorType === 899
+            ? finding.ExtraData !== null
+            : !exactStringRecord(finding.ExtraData, [
+                "database",
+                "host",
+                "rotation_guide",
+                "username",
+              ]))
         )
           return refuse("metadata_mismatch");
       } else if (
@@ -634,37 +1096,37 @@ export function classifyReviewedFixtureScan(
       }
       let lineStart = 0;
       let lineNumber = 1;
-      let witnessLine: string | undefined;
       let witnessLineNumber: number | undefined;
-      let literalOccurrences = 0;
+      const witnessDigests: string[] = [];
+      const expectedDigests = matchingMetadata.map(([, , , , , line]) =>
+        typeof line === "string" ? [line] : line,
+      );
+      const maxOccurrences = Math.max(...expectedDigests.map((lines) => lines.length));
+      const sourceLiteral = detectorType === 17 ? rawV2 : detectorType === 899 ? raw : undefined;
       while (lineStart <= text.length) {
         const newline = text.indexOf("\n", lineStart);
         const lineEnd = newline === -1 ? text.length : newline;
         const line = text.slice(lineStart, lineEnd);
-        if (detectorType === 17 && line.includes(rawV2)) {
-          let occurrence = line.indexOf(rawV2);
+        if (sourceLiteral !== undefined && line.includes(sourceLiteral)) {
+          let occurrence = line.indexOf(sourceLiteral);
           while (occurrence !== -1) {
-            literalOccurrences++;
-            occurrence = line.indexOf(rawV2, occurrence + rawV2.length);
+            if (witnessDigests.length >= maxOccurrences) return refuse("literal_mismatch");
+            witnessDigests.push(createHash("sha256").update(line).digest("hex"));
+            occurrence = line.indexOf(sourceLiteral, occurrence + sourceLiteral.length);
           }
-          witnessLine ??= line;
           witnessLineNumber ??= lineNumber;
-        } else if (detectorType !== 17 && lineNumber === scannerLine) {
-          witnessLine = line;
+        } else if (sourceLiteral === undefined && lineNumber === scannerLine) {
+          witnessDigests.push(createHash("sha256").update(line).digest("hex"));
           witnessLineNumber = lineNumber;
         }
         if (newline === -1) break;
         lineStart = newline + 1;
         lineNumber++;
       }
-      if (
-        witnessLine === undefined ||
-        witnessLineNumber === undefined ||
-        (detectorType === 17 && literalOccurrences !== 1)
-      )
-        return refuse("literal_mismatch");
-      const lineDigest = createHash("sha256").update(witnessLine).digest("hex");
-      if (!matchingMetadata.some(([, , , , , expectedLine]) => expectedLine === lineDigest))
+      const matchesWitness = (lines: readonly string[]) =>
+        lines.length === witnessDigests.length &&
+        lines.every((digest, index) => digest === witnessDigests[index]);
+      if (witnessLineNumber === undefined || !expectedDigests.some(matchesWitness))
         return refuse("literal_mismatch");
       if (
         !staged.references.length ||
@@ -672,8 +1134,10 @@ export function classifyReviewedFixtureScan(
           ({ source, mode, role }) =>
             (role !== "base" && role !== "head") ||
             matchingMetadata.every(
-              ([, , , , , expectedLine, expectedSource, expectedMode]) =>
-                expectedLine !== lineDigest || expectedSource !== source || expectedMode !== mode,
+              ([, , , , , , expectedSource, expectedMode], index) =>
+                !matchesWitness(expectedDigests[index]!) ||
+                expectedSource !== source ||
+                expectedMode !== mode,
             ),
         )
       )
@@ -729,12 +1193,6 @@ export function classifyReviewedFixtureScan(
       return refuse("finding_not_reviewed");
     // URI Raw omits the path; bind both native outputs to the reviewed match.
     const digest = createHash("sha256").update(finding.RawV2).digest("hex");
-    const legacyRawDigest = createHash("sha256").update(finding.Raw).digest("hex");
-    const fixture = REVIEWED_FIXTURES.find(
-      (entry) =>
-        entry.fixtureSha256 === digest &&
-        (entry.rawSha256 ?? entry.fixtureSha256) === legacyRawDigest,
-    );
     if (!fixture) return refuse("literal_not_reviewed");
     if (!(fixture.decoders ?? ["PLAIN", "HTML"]).some((decoder) => decoder === finding.DecoderName))
       return refuse("finding_not_reviewed");
@@ -747,7 +1205,7 @@ export function classifyReviewedFixtureScan(
       )
     )
       return refuse("source_not_reviewed");
-    const uri = new URL(finding.RawV2);
+    const uri = nativeUriParts(finding.RawV2);
     const parts = object(finding.SecretParts);
     if (
       !parts ||
@@ -822,17 +1280,18 @@ export function classifyReviewedFixtureScan(
       classified.set(groupKey, group);
     }
   }
-  return {
-    kind: "classified",
-    notices: [...classified.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([, group]) => ({
-        fixtureSha256: group.fixtureSha256,
-        source: group.source,
-        detector: group.detector,
-        findings: [...group.findings.entries()]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([, value]) => value),
-      })),
-  };
+  const notices = [...classified.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, group]) => ({
+      ...(group.classification ? { classification: group.classification } : {}),
+      fixtureSha256: group.fixtureSha256,
+      source: group.source,
+      detector: group.detector,
+      findings: [...group.findings.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([, value]) => value),
+    }));
+  return proofInputs.size
+    ? { kind: "git_metadata_proof_required", notices, proofInputs }
+    : { kind: "classified", notices };
 }

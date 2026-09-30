@@ -26,7 +26,6 @@ const REPAIR_RUNTIME_PATHS = [
 ] as const;
 
 const MAIN_BUNDLE = "dist/clawsweeper.js";
-const RUNTIME_DIST_ARTIFACT = "clawsweeper-runtime-dist";
 
 type CheckoutAuditStep = { uses?: string; with?: Record<string, unknown> };
 
@@ -115,7 +114,7 @@ test("repair planning and execution use a Node runtime accepted by current OpenC
     const setup = workflow.jobs?.[jobName]?.steps?.find(
       (step) => step.uses === "./.github/actions/setup-pnpm",
     );
-    assert.equal(setup?.with?.["node-version"], "24.18.1", `${jobName} runtime`);
+    assert.equal(setup?.with?.["node-version"], "24.21.0", `${jobName} runtime`);
   }
 });
 
@@ -224,7 +223,7 @@ test("review jobs upload completed reviews without automatic live proof", () => 
   const workflow = parse(fs.readFileSync(".github/workflows/sweep.yml", "utf8")) as {
     jobs?: Record<string, { steps?: { name?: unknown; run?: unknown; uses?: unknown }[] }>;
   };
-  for (const jobName of ["event-review-apply", "review"]) {
+  for (const jobName of ["event-review-apply"]) {
     const steps = workflow.jobs?.[jobName]?.steps ?? [];
     const review = steps.findIndex((step) => String(step.name ?? "").startsWith("Review "));
     const upload = steps.findIndex(
@@ -286,7 +285,7 @@ test("historical publication lanes preserve live-proof folding after generation 
       assert.ok(fold >= 0 && publish > fold, `${site} must fold live proof before publication`);
     }
   }
-  assert.equal(publicationSites.length, 4, JSON.stringify(publicationSites));
+  assert.equal(publicationSites.length, 3, JSON.stringify(publicationSites));
 });
 
 test("state-hydrating sparse repair workflows keep hydration dependencies", () => {
@@ -371,19 +370,18 @@ test("sweep workflow preserves one claimed target branch through exact review", 
   const workflow = readText(".github/workflows/sweep.yml");
   const dispatchTargetBranchResolver =
     /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
-  const continuationTargetBranch =
-    /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
-  const recoveryTargetBranch =
-    /--arg target_branch "\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/g;
 
   assert.match(workflow, /target_branch:\n\s+description: "Target repository branch to review"/);
   assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
-  assert.equal([...workflow.matchAll(continuationTargetBranch)].length, 1);
-  assert.equal([...workflow.matchAll(recoveryTargetBranch)].length, 1);
   assert.match(
     workflow,
     /CLAIM_TARGET_BRANCH: \$\{\{ fromJSON\(steps\.claim-exact-review-queue\.outputs\.decision\)\.targetBranch \}\}/,
   );
-  assert.match(workflow, /target_branch="\$CLAIM_TARGET_BRANCH"/);
-  assert.match(workflow, /target_branch="\$\{\{ steps\.live-item\.outputs\.target_branch \}\}"/);
+  assert.match(workflow, /workflow -- exact-review-admission/);
+  const checkout =
+    workflow.match(
+      /- name: Check out target repository[\s\S]*?review-target-checkout\.sh[^\n]*/,
+    )?.[0] ?? "";
+  assert.match(checkout, /TARGET_BRANCH: \$\{\{ steps\.live-item\.outputs\.target_branch \}\}/);
+  assert.match(checkout, /"\$CHECKOUT_DIR" "\$TARGET_BRANCH"$/);
 });

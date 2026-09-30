@@ -44,6 +44,8 @@ export function codexSubprocessEnv(): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
   for (const key of Object.keys(env)) {
+    // Keep trusted preparation's process-local Git overrides out of model subprocesses.
+    if (/^GIT_CONFIG_(COUNT|PARAMETERS|(KEY|VALUE)_\d+)$/i.test(key)) delete env[key];
     if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
   }
   if (process.env.GITHUB_ACTIONS === "true") {
@@ -54,16 +56,9 @@ export function codexSubprocessEnv(): NodeJS.ProcessEnv {
   return withoutColor(env);
 }
 
-export function repairCodexReasoningEffort(
-  value = process.env.CLAWSWEEPER_CODEX_REASONING_EFFORT,
-  allowExtraHigh = false,
-) {
-  const effort = String(value ?? "high").trim() || "high";
+export function repairCodexReasoningEffort(value?: string, allowExtraHigh = false) {
+  const effort = String(value ?? "medium").trim() || "medium";
   return effort.toLowerCase() === "xhigh" ? (allowExtraHigh ? "xhigh" : "high") : effort;
-}
-
-export function repairCodexServiceTier(value = process.env.CLAWSWEEPER_CODEX_SERVICE_TIER) {
-  return String(value ?? "fast").trim() || "fast";
 }
 
 export function clawsweeperGitUserName(): string {

@@ -41,11 +41,10 @@ See [`obsolescence-close-policies.md`](obsolescence-close-policies.md) for the
 120/90-day issue and 90/30-day PR age/inactivity contracts.
 
 GitHub repository variables still override selected live limits. When a variable
-is unset, workflows read the checked-in budget after checkout. The one exception
-is the `workflow_dispatch.inputs.shard_count.default` value in
-`.github/workflows/sweep.yml`: GitHub renders that UI before checkout, so it
-must remain a YAML literal. `pnpm run check:limits` verifies that literal and the
-docs stay in sync with the derived budget.
+is unset, workflows read the checked-in budget after checkout. Broad manual
+review uses the same queue limits as scheduled feeds; manual shard/batch
+controls are retired. `pnpm run check:limits` verifies the remaining derived
+Worker, workflow, and documentation values.
 
 The mental model:
 
@@ -74,12 +73,12 @@ It does not alter worker budgets, exact-review admission, or target selection.
 
 | Name                                       | Current | Meaning                                                                                         |
 | ------------------------------------------ | ------: | ----------------------------------------------------------------------------------------------- |
-| `workers.max`                              |      32 | Maximum global Codex worker budget used to derive lane limits.                                  |
+| `workers.max`                              |     128 | Maximum global Codex worker budget used to derive lane limits.                                  |
 | `workers.reserve_for_interactive`          |      16 | Worker slots background lanes leave open for exact/manual/urgent work.                          |
 | `workers.expansion_reserve`                |       8 | Extra slots background lanes leave open for independently planned matrix expansion.             |
-| `workers.minimum_background`               |       8 | Target floor for background progress when enough global capacity is available.                  |
-| `lanes.exact_review.max_concurrent`        |      32 | Maximum concurrent exact-item review workflow runs admitted to Codex.                           |
-| `lanes.exact_review.target_max_concurrent` |      24 | Maximum concurrent exact-item review workflow runs one target repository may consume.           |
+| `workers.minimum_background`               |      16 | Target floor for background progress when enough global capacity is available.                  |
+| `lanes.exact_review.max_concurrent`        |      80 | Maximum concurrent exact-item review workflow runs admitted to Codex.                           |
+| `lanes.exact_review.target_max_concurrent` |      64 | Maximum concurrent exact-item review workflow runs one target repository may consume.           |
 | `lanes.exact_review.actions_budget`        |     194 | Separate Actions budget; preserves publication and control-plane headroom without raising the review ceiling. |
 | `lanes.assist.max`                         |      10 | Maximum concurrent lightweight assist jobs.                                                     |
 | `lanes.repair.cluster_max_live_runs`       |       2 | Default live repair workflow cap for imported gitcrawl cluster dispatches.                      |
@@ -88,27 +87,27 @@ It does not alter worker budgets, exact-review admission, or target selection.
 
 Review and existing repair limits are intentionally percentages of
 `workers.max`; imported cluster repair has its own lane knob. With
-`workers.max = 32`, normal and hot intake have configured ceilings of 22 and 11.
-The interactive and expansion reserves leave only eight background slots when
-quiet. Existing repair lanes dispatch 12 live workers by default; imported
+`workers.max = 128`, normal and hot intake have configured ceilings of 89 and 44.
+The interactive and expansion reserves leave 104 background slots when
+quiet. Existing repair lanes dispatch 51 live workers by default; imported
 cluster repair dispatches two.
 
 | Name                                                | Current | Meaning                                                                               |
 | --------------------------------------------------- | ------: | ------------------------------------------------------------------------------------- |
-| `exact_review.concurrent_max`                       |      32 | Exact-item review admission cap, clamped to `workers.max`.                            |
-| `exact_review.target_concurrent_max`                |      24 | Exact-item per-target admission cap, clamped to global exact-review capacity.         |
+| `exact_review.concurrent_max`                       |      80 | Exact-item review admission cap, clamped to `workers.max`.                            |
+| `exact_review.target_concurrent_max`                |      64 | Exact-item per-target admission cap, clamped to global exact-review capacity.         |
 | `assist.default`                                    |      10 | Maintainer assist job cap.                                                            |
-| `review_shards.normal_default`                      |      22 | Quiet-system normal review shard ceiling.                                             |
-| `review_shards.normal_active_floor`                 |       9 | Minimum active normal review shards to keep queued for `openclaw/openclaw`.           |
-| `review_shards.hot_intake_default`                  |      11 | Quiet-system broad hot-intake review shard ceiling.                                   |
+| `review_shards.normal_default`                      |      89 | Quiet-system normal review shard ceiling.                                             |
+| `review_shards.normal_active_floor`                 |      38 | Minimum active normal review shards to keep queued for `openclaw/openclaw`.           |
+| `review_shards.hot_intake_default`                  |      44 | Quiet-system broad hot-intake review shard ceiling.                                   |
 | `review_shards.exact_item_default`                  |       1 | Exact-item hot-intake shard count.                                                    |
-| `review_shards.hard_cap`                            |      32 | Maximum accepted review shard count.                                                  |
-| `repair_live_runs.default`                          |      12 | Default live repair workflow run cap for manual dispatch/requeue/self-heal.           |
-| `repair_live_runs.hard_cap`                         |      32 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
-| `repair_live_runs.automerge_default`                |      12 | Live repair run cap for automerge comment-router dispatches.                          |
-| `repair_live_runs.issue_implementation_default`     |      12 | Live repair run cap for issue-to-PR implementation intake.                            |
+| `review_shards.hard_cap`                            |     128 | Maximum accepted review shard count.                                                  |
+| `repair_live_runs.default`                          |      51 | Default live repair workflow run cap for manual dispatch/requeue/self-heal.           |
+| `repair_live_runs.hard_cap`                         |     128 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
+| `repair_live_runs.automerge_default`                |      51 | Live repair run cap for automerge comment-router dispatches.                          |
+| `repair_live_runs.issue_implementation_default`     |      51 | Live repair run cap for issue-to-PR implementation intake.                            |
 | `repair_live_runs.cluster_default`                  |       2 | Live repair run cap for imported gitcrawl cluster dispatches.                         |
-| `issue_implementation.dispatches_per_sweep_default` |       1 | Maximum implementation intake jobs queued from one review publish run.                |
+| `issue_implementation.dispatches_per_sweep_default` |       5 | Maximum implementation intake jobs queued from one review publish run.                |
 
 Formula summary:
 
@@ -168,17 +167,12 @@ unset, empty, or invalid values use the defaults.
 | `CLAWSWEEPER_QUEUE_PRESSURE_SOFT_AGE_MS`  | 1800000 |
 | `CLAWSWEEPER_QUEUE_PRESSURE_HARD_AGE_MS`  | 7200000 |
 
-Only manual normal review and manual hot intake use this pressure
-multiplier. Scheduled review uses the queue's 600-item soft limit and 60/hour
-admission target. Repair, assist, issue implementation, cluster repair, and
-exact-item review keep their existing priority budgets.
-
-Background planner jobs serialize per target repository. A sweep that is still
-planning, queued, or expanding its matrix reserves its quiet lane size. Once
-its shard jobs exist and all finish, its publish phase counts as zero workers,
-allowing the next planner to refill the available capacity. Broad manual review
-`shard_count` inputs are also capped by the current lane allowance; exact-item
-runs still use the exact-item lane.
+Broad manual and scheduled review both use queue-advertised candidate capacity
+and the shared admission target. Planners serialize by target, offer candidates,
+and finish without reserving matrix workers. The legacy worker-limit pressure
+multiplier remains a helper for other callers; it no longer controls a hosted
+manual review matrix. Repair, assist, issue implementation, cluster repair, and
+exact-item admission retain their existing priority budgets.
 
 Priority lanes do not subtract the interactive reserve. They cap themselves at
 their derived lane ceiling and at the remaining global budget after other active
@@ -192,22 +186,22 @@ dashboard router and only imports that service boundary. The queue coalesces
 deliveries by repository and item number, so a new webhook updates the latest
 desired review rather than consuming another runner. Only
 `EXACT_REVIEW_QUEUE_MAX_CONCURRENT` leased items may dispatch an exact-review
-workflow at once; the default is 32. `EXACT_REVIEW_TARGET_MAX_CONCURRENT` bounds
+workflow at once; production sets this to 80. `EXACT_REVIEW_TARGET_MAX_CONCURRENT` bounds
 how many of those slots one target repository may consume; production sets it
-to 24 so other target repositories retain eight global slots during an OpenClaw
+to 64 so other target repositories retain 16 global slots during an OpenClaw
 backlog drain. Exact capacity is consumed only while queue work is pending. As
 those priority workers start, normal and hot-intake planners
 count them and reduce their next background wave.
 
-`EXACT_REVIEW_ACTIONS_BUDGET` is deliberately separate from the 32-slot Codex
-worker budget. Its production value remains 194: at 32 exact reviews and up to
-32 publishers it preserves the 16-slot control-plane reserve plus 114 slots of
+`EXACT_REVIEW_ACTIONS_BUDGET` is deliberately separate from the 128-slot Codex
+worker budget. Its production value remains 194: at 80 exact reviews and up to
+32 publishers it preserves the 16-slot control-plane reserve plus 66 slots of
 Actions headroom. Full review admission therefore
 cannot reduce verdict publication to zero, while repair and broad review
-derivations remain anchored to `workers.max = 32`.
+derivations remain anchored to `workers.max = 128`.
 
 `EXACT_REVIEW_SCHEDULED_MAX_CONCURRENT` caps combined scheduled hot intake and
-normal backfill at eight active reviews. Both dispatching and leased owners count,
+normal backfill at 32 active reviews in production. Both dispatching and leased owners count,
 using the immutable lease decision while a newer desired revision waits. Lowering
 the cap does not cancel owners or remove pending work. Organic/manual requests
 remain eligible when the scheduled cap is full. The same bound governs admission,
@@ -230,7 +224,18 @@ events never supersede an existing item; only a fresh source revision can revoke
 an active review. Duplicate workflow deliveries remain non-cancelling and rely
 on the lease claim tuple, so they cannot terminate the sole valid owner. An older
 unclaimed workflow cannot pass the replacement lease tuple and exits before
-review compute. Explicit command work and publication work bypass the delay.
+review compute. After setup, generation also checks the full lease tuple
+synchronously before either ordinary or oversized review starts. Known
+`lease_superseded` / `lease_not_active` conflicts exit as successful no-ops;
+unverified ownership fails before generation and leaves recovery to the queue.
+This adds one heartbeat request per generation attempt (with the existing
+bounded transport retries), not a faster polling loop. Earlier checkout/setup
+is not interrupted, and supersession after that check still relies on the
+ordinary-review one-minute heartbeat plus request/termination time. Oversized
+generation retains its post-generation finalization check rather than an active
+stop loop. Finalization and publication fences remain unchanged. The [startup proof](proof/exact-review-start/README.md)
+records the isolated workflow/process boundary and its limits.
+Explicit command work and publication work bypass the delay.
 When pending depth reaches
 `EXACT_REVIEW_PENDING_SOFT_LIMIT` (600 by default), new recovery and scheduled
 feed work is shed; this threshold counts review work only, so publication
@@ -247,13 +252,17 @@ advance the queue revision, revoke a lease, or count as new work.
 
 Exact-review result publication has a separate adaptive Actions lane. Source
 fallback minimum, base, and maximum are 4, 24, and 48; production overrides
-them to 8, 32, and 32, matching the reduced review ceiling that also bounds legacy
-publication capacity. Canonical publication batches retain eight slots. The controller records GitHub
+them to 8, 32, and 32, independently of the larger review ceiling.
+Canonical publication batches retain eight slots. The controller records GitHub
 pressure, cooldown, recovery, and demand telemetry, and can scale within that
 production range. Admission enforces a 16-slot control-plane reserve inside
-`EXACT_REVIEW_ACTIONS_BUDGET`; with 32 active exact reviews and the current
-production maximum of 32 publisher slots, another 114 slots remain as configuration
+`EXACT_REVIEW_ACTIONS_BUDGET`; with 80 active exact reviews and the current
+production maximum of 32 publisher slots, another 66 slots remain as configuration
 headroom rather than protected reserve.
+Newly accepted, published batch members contribute one recovery success each
+after cooldown, only when publication completes without requeueing. Replays, superseded
+members, and requeued revisions earn no credit. A batch carrying quota
+observations earns no positive credit, so its negative feedback takes precedence.
 Its checkout, artifact handling, comment sync, and result routing are
 deterministic control-plane work: they consume GitHub runners, but not Codex
 slots. The comment router and the singleton lease reconciler follow the same
@@ -265,6 +274,13 @@ four concurrent size-8 batches. Canonical Worker publication removes that
 shared Git writer constraint, so production now admits 8 preparation
 batches (up to 64 publication members) while retaining the Durable Object's
 transactional SQLite ownership boundaries.
+
+Each batch now prepares at most two members concurrently. This changes only
+per-batch preparation: publication maximum 32, eight batch owners, review and
+worker budgets, and intake limits are unchanged. A quota observation still
+defers later members without charging their retry budgets; at most the two
+already-started members may have requests in flight. The controlled trial and
+rollback criteria are in [backlog recovery proof](proof/backlog-recovery/README.md).
 
 The durable control plane owns reset-aware GitHub credential circuits for both
 review authority reads and publication batching. The
@@ -359,14 +375,14 @@ resolve, and exact-revision supersede records without exposing decisions publicl
 
 Examples with the current config:
 
-- Quiet system: manual normal review can request 22 shards, with eight background
+- Quiet system: manual normal review can request 89 shards, with 104 background
   slots available after reserving 16 for interactive work and 8 for matrix
   expansion. When the queue capacity probe is unavailable, a single-target
   scheduled plan falls back to offering up to 50 candidates to the durable
   60-review/hour admission target with a 6-item burst instead of starting
   matrix shards.
-- Four active repair workers and no other background work: normal review gets
-  four because `32 - 16 interactive reserve - 8 expansion reserve - 4 priority = 4`.
+- Four active repair workers and 96 active background workers: normal review gets
+  four because `128 - 16 interactive reserve - 8 expansion reserve - 4 priority - 96 background = 4`.
 
 Use these commands to inspect the effective values from a checkout:
 
@@ -450,8 +466,8 @@ These limits are owned by `dashboard/exact-review-queue.ts`, implemented in
 - `EXACT_REVIEW_TARGET_BURST` bounds the scheduled admission burst; the
   default is six and uses the same lane split.
 - `EXACT_REVIEW_SCHEDULED_MAX_CONCURRENT` caps active scheduled review owners;
-  the default is eight, clamped to the global review capacity.
-- Scheduled planners subtract active and pending review work from the 32-slot
+  the source fallback is eight and production sets 32, clamped to the global review capacity.
+- Scheduled planners subtract active and pending review work from the 80-slot
   review capacity before selecting candidates. Target fanout gives every
   cursor-selected repository a one-candidate floor, then apportions the
   remaining free capacity by untracked backlog.
@@ -487,5 +503,5 @@ These limits are owned by `dashboard/exact-review-queue.ts`, implemented in
 - Each enabled automatic issue intake lane scans durable open reports and
   dispatches at most `issue_implementation.dispatches_per_sweep_default`
   candidates per target sweep.
-- Manual `sweep.yml` dispatch `shard_count` overrides
-  `review_shards.normal_default`, then clamps to `review_shards.hard_cap`.
+- Broad `sweep.yml` dispatches use queue-advertised candidate capacity, bounded
+  by `review_shards.hard_cap`; there is no per-run shard override.

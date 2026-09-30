@@ -53,6 +53,11 @@ on:
         required: true
         default: blacksmith-16vcpu-ubuntu-2404
         type: string
+      target_validation_timeout_ms:
+        description: "Per-command validation budget in ms; blank uses repository config, then 480000"
+        required: false
+        default: ""
+        type: string
       planner_sandbox:
         description: "Codex planning sandbox; danger-full-access is for trusted ephemeral runner fallback only"
         required: true
@@ -193,7 +198,6 @@ jobs:
       CLAWSWEEPER_MAX_LINKED_REFS: ${{ vars.CLAWSWEEPER_MAX_LINKED_REFS || '20' }}
       CLAWSWEEPER_MAX_REVIEW_COMMENTS_PER_PR: ${{ vars.CLAWSWEEPER_MAX_REVIEW_COMMENTS_PER_PR || '50' }}
       CLAWSWEEPER_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_CODEX_TIMEOUT_MS || '1800000' }}
-      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
       CLAWSWEEPER_CODEX_PLANNER_SANDBOX: ${{ inputs.planner_sandbox }}
       CLAWSWEEPER_STEERABLE_CODEX: ${{ vars.CLAWSWEEPER_STEERABLE_CODEX || '0' }}
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
@@ -250,7 +254,7 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         with:
-          node-version: "24.18.1"
+          node-version: "24.21.0"
           build-script: build:repair
 
       - name: Restore durable intake job
@@ -469,11 +473,11 @@ jobs:
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_MERGE: ${{ !contains(inputs.job, '/inbox/issue-') && needs.cluster.outputs.allow_merge || '0' }}
-      CLAWSWEEPER_OPENCLAW_MODEL: ${{ contains(inputs.job, '/inbox/issue-') && format('openai/{0}', vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-5.6-sol') || secrets.CLAWSWEEPER_OPENCLAW_MODEL }}
-      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ contains(inputs.job, '/inbox/issue-') && (vars.CLAWSWEEPER_FIX_PR_REASONING_EFFORT || 'xhigh') || vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
+      CLAWSWEEPER_OPENCLAW_MODEL: ${{ contains(inputs.job, '/inbox/issue-') && format('openai/{0}', vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-6-sol') || secrets.CLAWSWEEPER_OPENCLAW_MODEL }}
       CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: ${{ vars.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS || '4' }}
       CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS || '1800000' }}
-      CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS || '4200000' }}
+      CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS: ${{ inputs.target_validation_timeout_ms || vars.CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS || '' }}
+      CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS || '' }}
       CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: ${{ vars.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS || '1800000' }}
       CLAWSWEEPER_RESOLVE_REVIEW_THREADS: ${{ vars.CLAWSWEEPER_RESOLVE_REVIEW_THREADS || '1' }}
       CLAWSWEEPER_TARGET_VALIDATION_MODE: ${{ vars.CLAWSWEEPER_TARGET_VALIDATION_MODE || 'changed-only' }}
@@ -544,7 +548,7 @@ jobs:
         id: execute-setup-pnpm
         with:
           # OpenClaw's runtime contract rejects the stale Node 24.13 runner cache.
-          node-version: "24.18.1"
+          node-version: "24.21.0"
           # This job publishes the action ledger with dist/clawsweeper.js, which
           # only the main build emits, so build both Node bundles and skip the
           # dashboard leg the job never runs.
@@ -588,7 +592,7 @@ jobs:
         if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.check_job.outputs.job_exists == '1' }}
         env:
           OPENAI_API_KEY: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && (contains(inputs.job, '/inbox/issue-') && (vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-5.6-sol') || secrets.CLAWSWEEPER_MODEL) || '' }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && (contains(inputs.job, '/inbox/issue-') && (vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-6-sol') || secrets.CLAWSWEEPER_MODEL) || '' }}
           CLAWSWEEPER_CLAWROUTER_CONFIG: ${{ secrets.CLAWSWEEPER_CLAWROUTER_CONFIG }}
         with:
           auth-mode: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE || 'proxy' }}
@@ -646,7 +650,7 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.2
 
       - name: Publish automatic implementation build status
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
@@ -661,10 +665,15 @@ jobs:
             --detail "Codex is editing, validating, and reviewing the implementation before a branch or pull request is published." \
             --run-url "$CLUSTER_RUN_URL"
 
+      - name: Resolve repair timeout budget
+        id: repair_budget
+        if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
+        run: node scripts/resolve-repair-timeout-budget.mjs "$CLUSTER_JOB_PATH"
+
       - name: Execute credited fix artifact
         id: execute_fix
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
-        timeout-minutes: 70
+        timeout-minutes: ${{ fromJSON(steps.repair_budget.outputs.timeout_minutes) }}
         env:
           GH_TOKEN: ${{ steps.target_write_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}

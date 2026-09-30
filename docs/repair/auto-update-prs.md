@@ -39,6 +39,20 @@ For the full automerge state machine, including exact-head gating, pending
 check handling, shepherd waits, router waits, and operator replay, see
 [`automerge-flow.md`](automerge-flow.md).
 
+In `openclaw/endor-clawsweeper-e2e`, ordinary automatic reviews of verified Endor
+PRs always skip, before and after enrollment. The existing intake adds
+`clawsweeper:automerge`; the label sweep starts the repair loop, whose own review
+requests still run. The central admission check completes ordinary event and
+scheduled deliveries without reviewing or publishing a competing verdict. Held
+PRs stay held, and explicit review requests still work. Repair follow-ups carry
+their existing command status identity; the Worker queue preserves that request
+when ordinary PR events replace a pending or active review. Endor enrollment and
+ordinary-review skipping remain limited to this test repository. Existing
+human-review holds are not cleared. Skipped admissions send the existing
+`policy_noop` completion to OpenClaw Bay so their journeys finish rather than
+staying pending. The queue uses the existing command lifecycle; no Bay UI change
+is needed.
+
 ## Trust Model
 
 There are two accepted input lanes.

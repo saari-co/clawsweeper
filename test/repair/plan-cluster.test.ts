@@ -261,7 +261,7 @@ test("plan-cluster allows security repair for linked PRs with automation opt-in 
   assert.deepEqual(clusterPlan.security_boundary.security_repair_allowed_items, ["#74742"]);
 });
 
-test("plan-cluster treats same-repo PR branches as writable despite raw maintainer flag", () => {
+test("plan-cluster verifies maintainer profiles and same-repo branch writability", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-plan-same-repo-writable-"));
   const binDir = path.join(tmp, "bin");
   const jobPath = path.join(tmp, "job.md");
@@ -304,6 +304,7 @@ test("plan-cluster treats same-repo PR branches as writable despite raw maintain
       ...process.env,
       ...mockGhBinEnv(path.join(binDir, "gh"), binDir),
       FAKE_GH_MAINTAINER_CAN_MODIFY: "false",
+      FAKE_GH_MAINTAINER_PROFILE: "1",
     },
     stdio: "pipe",
   });
@@ -311,6 +312,8 @@ test("plan-cluster treats same-repo PR branches as writable despite raw maintain
   const clusterPlan = JSON.parse(fs.readFileSync(path.join(runDir, "cluster-plan.json"), "utf8"));
   const pull = clusterPlan.items[0].pull_request;
 
+  assert.equal(clusterPlan.items[0].author_association, "MEMBER");
+  assert.equal(clusterPlan.items[0].author_repository_permission, "admin");
   assert.equal(pull.maintainer_can_modify, false);
   assert.equal(pull.same_repo_head, true);
   assert.equal(pull.branch_writable, true);
@@ -474,6 +477,10 @@ if (endpoint === "repos/openclaw/openclaw") {
 }
 if (endpoint === "repos/openclaw/openclaw/branches/" + encodeURIComponent(defaultBranch)) {
   write({ commit: { sha: defaultBranch + "-sha" }, _links: { html: "https://github.com/openclaw/openclaw/tree/" + defaultBranch } });
+  process.exit(0);
+}
+if (endpoint === "repos/openclaw/openclaw/collaborators/contributor/permission") {
+  write({ permission: process.env.FAKE_GH_MAINTAINER_PROFILE === "1" ? "admin" : "read" });
   process.exit(0);
 }
 if (isPaged()) {

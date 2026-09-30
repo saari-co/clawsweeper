@@ -65,7 +65,7 @@ Bay uses one closed set of six active stages:
 - Reviewing
 - Publishing
 - Applying & writing
-- Repair cove
+- Repair & attention
 
 Each complete public activity snapshot contains exactly those six queue counts,
 the same six live counts, and a total equal to their sum. Counts are bounded
@@ -74,6 +74,13 @@ The Worker privately correlates queue and live state long enough to subtract
 active overlaps from the queue counts. It drops that correlation material
 before serialization, so the two public maps are disjoint without publishing a
 join key.
+
+The Repair & attention area retains the existing `repairing` stage identifier.
+It distinguishes stopped review records requiring operator attention, scheduled
+review retries, and live repair activity; its aggregate is not a count of running
+code repairs. Review cards and their detail blades use only observed, closed
+failure categories. Legacy records without stored cause say the detailed
+historical reason is unavailable, rather than guessing from retry exhaustion.
 
 The page draws the bounded verified-public reference sample as cards. Each card
 contains only a canonical `owner/repository`, positive issue or pull-request
@@ -96,8 +103,11 @@ list is not the backlog and cannot retrieve unsampled identities.
 The finder is compact and left-aligned beside its actions and filters. Cards
 use deterministic, key-seeded offsets within nonoverlapping cells rather than
 perfect rows. Desktop lanes borrow spare width from quieter areas; crowded
-areas shrink sprites, not labels or hit targets. Capacity follows available
-geometry instead of a three-card limit. Resizing, filtering or changed sample
+areas show up to 20 sampled creatures with compact number labels and 44px-or-larger
+hit targets. Hover, keyboard focus and finder expand the creature and readable
+identity above its neighbors without repacking; touch opens the same inspector.
+Active scenes grow vertically when needed rather than silently dropping back to
+eight cards. Records beyond 20 remain in the read-only list and finder. Resizing, filtering or changed sample
 membership may rearrange cards; repeating an unchanged snapshot does not.
 Labels show the short repository name and item number on separate lines, with
 full owner/repository identity in the inspector. All available sample records
@@ -162,8 +172,10 @@ item link. Revision identifiers, target keys, facts, titles, raw URLs, and
 failure detail remain private. Historical growth does not cap the inventory:
 the store counts identities in SQL and streams every selected repository row
 through the lifecycle validator and reducer in one synchronous read transaction.
-It retains at most 24 candidate cards per lane and resolves current revisions
-only for the final 24-card sample. Validation still costs a linear scan of that
+It retains at most 24 candidate cards per lane, skips sorting candidates that
+cannot enter a full sample, and resolves current revisions only for the final
+24-card sample. Equal-ranked candidates preserve their original order.
+Validation still costs a linear scan of that
 history; it does not retain a history-sized JavaScript array or identity set.
 An invalid historical row makes the whole projection unavailable even when it
 would not appear in the sample. Reads never prune or rewrite durable facts.
@@ -282,6 +294,14 @@ other viewers determine when either page causes a GitHub refresh. In
 particular, Bay's 20-second timer can align with cache expiry, so Bay does not
 claim a lower upstream GitHub refresh rate than Overview.
 
+The queue's dedicated public projection owns its closed reason counters and
+publication policy through every status cache read. This keeps a valid parked
+review from making the entire shoreline unavailable. The controlled
+[cache-reprojection proof](proof/bay-live-status/README.md) reproduces the old
+failure and verifies populated status after repeated stored reads. The header
+separates current activity from review timing, and opaque lane labels keep the
+counts readable against the illustrated beach.
+
 The displayed end-to-end timing is an observed sample of the latest completed
 jobs found in the previous hour, not a complete one-hour census. Queue age and
 live-run age are not presented as time spent in the current visual lane;
@@ -299,9 +319,24 @@ The page, status API, and image assets all belong to `openclaw/clawsweeper`:
 - `.github/workflows/dashboard.yml` deploys the existing
   `clawsweeper-status` Worker to `clawsweeper.openclaw.ai`.
 
-The Bay HTML is `no-store`, frame-blocked, and protected by a content security
-policy. `/bay` is the single canonical public route; `/bay-demo` is retained
-only as a permanent redirect to the query-free canonical route.
+The Bay HTML is `no-store` and protected by a content security policy. Its
+`frame-ancestors https://team.openclaw.ai` policy permits embedding in the Team
+dashboard and blocks other parent origins. It deliberately omits
+`X-Frame-Options`, which cannot express this cross-origin allowlist. Standalone
+navigation remains available. `/bay` is the single canonical public route;
+`/bay-demo` is retained only as a permanent redirect to the query-free canonical
+route.
+
+The dashboard owner maintains this policy in `dashboard/worker.ts` and verifies
+it during deployment with `scripts/dashboard-smoke.mjs`. When changing allowed
+parents or Bay navigation, run `node scripts/proof-bay-embedding.mjs` in a
+browser-equipped validation environment. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE`
+to its Chromium binary if needed. This proof uses the real Worker responses
+and synthetic parents to exercise Overview-to-Bay iframe navigation, blocked
+origins, and standalone access; its JSON and screenshot artifacts are written
+to `.artifacts/bay-team-embedding/`. Telemetry is deliberately unavailable in
+this focused proof. The active embedding contract was verified on 2026-09-13;
+the proof receipt records the source revision and Worker hash.
 
 ## Local Proof
 

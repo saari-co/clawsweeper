@@ -1,3 +1,4 @@
+import { bayReviewStatusScript } from "../dashboard/bay-review-status.ts";
 import {
   assert,
   createHash,
@@ -6166,10 +6167,16 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(response.headers.get("x-robots-tag"), null);
   assert.equal(response.headers.get("referrer-policy"), "no-referrer");
   assert.equal(response.headers.get("x-content-type-options"), "nosniff");
-  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.equal(response.headers.get("x-frame-options"), null);
   const contentSecurityPolicy = response.headers.get("content-security-policy") || "";
   assert.match(contentSecurityPolicy, /connect-src 'self' https:\/\/\*\.openclaw\.ai/);
-  assert.match(contentSecurityPolicy, /frame-ancestors 'none'/);
+  assert.equal(
+    contentSecurityPolicy
+      .split(";")
+      .map((directive) => directive.trim())
+      .find((directive) => directive.startsWith("frame-ancestors ")),
+    "frame-ancestors https://team.openclaw.ai",
+  );
   const body = await response.text();
   assert.match(body, /<title>OpenClaw Bay · ClawSweeper<\/title>/);
   assert.doesNotMatch(body, /<meta name="robots"/);
@@ -6670,7 +6677,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.doesNotMatch(bayRendered, new RegExp(bayMarker, "i"));
   assert.doesNotMatch(bayRendered, /invalid\.example|repo=|token=/i);
   assert.match(body, /function expandQueue/);
-  assert.match(body, /Repair cove/);
+  assert.match(body, /Repair & attention/);
   assert.match(body, /"publishing":"Publishing"/);
   assert.match(body, /Waiting to publish final reviews/);
   assert.match(body, /bounded result-publication queue/);
@@ -7353,7 +7360,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     },
   });
   new Script(
-    `${body.slice(body.indexOf("var focusedStage="), body.indexOf("var repoPalette="))}${body.slice(drawerSourceStart, drawerSourceEnd)};openDrawer("queue:openclaw/openclaw#77");`,
+    `${bayReviewStatusScript}${body.slice(body.indexOf("var focusedStage="), body.indexOf("var repoPalette="))}${body.slice(drawerSourceStart, drawerSourceEnd)};openDrawer("queue:openclaw/openclaw#77");`,
   ).runInContext(drawerContext);
   const drawerText = [...drawerElements.values()]
     .map((element) => `${element.textContent} ${element.innerHTML}`)

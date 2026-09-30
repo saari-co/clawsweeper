@@ -2419,6 +2419,34 @@ test("review dispatch coordination guards label sweeps and maintainer mode comma
   assert.match(trustedVerdictGuard, /trustedAutomationPredatesReviewStartLease\(\{/);
 });
 
+test("manual-only holds block merge before maintainer approval exemptions", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const readiness = source.slice(
+    source.indexOf("function validateAutomergeReadiness"),
+    source.indexOf("function authoritativeMaintainerHumanApprovalTime"),
+  );
+  assert.match(
+    readiness,
+    /if \(hasLabel\(target, MANUAL_ONLY_LABEL\)\) return "PR is marked manual-only; merge is disabled";/,
+  );
+  assert.ok(
+    readiness.indexOf("MANUAL_ONLY_LABEL") <
+      readiness.indexOf("validated_maintainer_human_approval"),
+  );
+});
+
+test("fresh merge readiness checks the full blocking-label policy", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const readiness = source.slice(
+    source.indexOf("function validateAutomergeReadiness"),
+    source.indexOf("function authoritativeMaintainerHumanApprovalTime"),
+  );
+  assert.match(readiness, /AUTOMERGE_BLOCKING_LABEL_NAMES\.find/);
+  assert.match(readiness, /return hasLabel\(target, label\)/);
+  assert.match(readiness, /label === MERGE_READY_LABEL/);
+  assert.match(readiness, /protected or paused repair label/);
+});
+
 test("proof override authorization is durable before merge while pause labels remain success-only", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const mergeExecution = source.slice(
@@ -2543,10 +2571,9 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.match(claimFunction, /dispatchClaimLookupKeys\(command\)/);
   assert.match(source, /\/runs\?per_page=100&page=\$\{page\}/);
   assert.match(source, /status:\s*"recovered"/);
-  assert.match(source, /`item_numbers=\$\{dispatchKey\}`/);
   assert.doesNotMatch(reviewDispatch, /item_count=/);
-  assert.match(source, /event:\s*"workflow_dispatch"/);
-  assert.match(source, /workflow_dispatch=\$\{fallback\.stderr \|\| fallback\.stdout\}/);
+  assert.doesNotMatch(reviewDispatch, /event:\s*"workflow_dispatch"/);
+  assert.match(reviewDispatch, /Review manual item/);
   assert.match(sweepWorkflow, /Review event item \{0\}#\{1\} \[\{2\}\]/);
   assert.match(sweepWorkflow, /startsWith\(github\.event\.inputs\.item_numbers, 'router-'\)/);
   assert.match(assistWorkflow, /Assist \{0\}#\{1\} \[\{2\}\]/);
@@ -4074,10 +4101,7 @@ test("assist workflow preserves flat field fallbacks after nested dispatch field
     workflow,
     /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ vars\.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets\.CLAWSWEEPER_MODEL \|\| '' \}\}/,
   );
-  assert.match(
-    workflow,
-    /REASONING_EFFORT: \$\{\{ vars\.CLAWSWEEPER_CODEX_REASONING_EFFORT \|\| 'high' \}\}/,
-  );
+  assert.doesNotMatch(workflow, /REASONING_EFFORT|--codex-reasoning-effort/);
   assert.doesNotMatch(workflow, /client_payload\.(?:assist\.)?reasoning_effort/);
   assert.match(
     workflow,
@@ -4699,7 +4723,7 @@ test("maintainer command authorization requires maintainer repository permission
   );
 });
 
-test("organization members can explicitly request issue implementation", () => {
+test("issue implementation requires current write permission", () => {
   const allowedAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
   assert.equal(
     isIssueImplementationCommandAllowed({
@@ -4707,12 +4731,20 @@ test("organization members can explicitly request issue implementation", () => {
       repositoryPermission: "read",
       allowedAssociations,
     }),
+    false,
+  );
+  assert.equal(
+    isIssueImplementationCommandAllowed({
+      authorAssociation: "MEMBER",
+      repositoryPermission: "maintain",
+      allowedAssociations,
+    }),
     true,
   );
   assert.equal(
     isIssueImplementationCommandAllowed({
-      authorAssociation: "COLLABORATOR",
-      repositoryPermission: "read",
+      authorAssociation: "MEMBER",
+      repositoryPermission: null,
       allowedAssociations,
     }),
     false,
@@ -4721,6 +4753,14 @@ test("organization members can explicitly request issue implementation", () => {
     isIssueImplementationCommandAllowed({
       authorAssociation: "CONTRIBUTOR",
       repositoryPermission: "write",
+      allowedAssociations,
+    }),
+    true,
+  );
+  assert.equal(
+    isIssueImplementationCommandAllowed({
+      authorAssociation: "OWNER",
+      repositoryPermission: null,
       allowedAssociations,
     }),
     true,

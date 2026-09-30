@@ -39,11 +39,13 @@ export function codexModelArgs(requestedModel: string): string[] {
 export function redactInternalCodexModel(
   value: string | null | undefined,
   codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
+  additionalModels: readonly string[] = [],
 ): string {
   let redacted = value ?? "";
   const configuredModels = [
     process.env.CLAWSWEEPER_INTERNAL_MODEL?.trim() ?? "",
     process.env.CLAWSWEEPER_OPENCLAW_MODEL?.trim() ?? "",
+    ...additionalModels,
   ];
   const configPath = codexHome ? join(codexHome, "config.toml") : "";
   if (configPath && existsSync(configPath)) {
@@ -58,7 +60,8 @@ export function redactInternalCodexModel(
       }
     }
   }
-  for (const model of configuredModels.filter(Boolean)) {
+  // Replacing a prefix first would expose the remainder of a longer private ID.
+  for (const model of configuredModels.filter(Boolean).sort((a, b) => b.length - a.length)) {
     redacted = redacted.replaceAll(model, "[REDACTED_INTERNAL_MODEL]");
   }
   return redacted.replace(
@@ -82,15 +85,8 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
   for (const key of Object.keys(env)) {
-    // Trusted source preparation may use process-local Git authentication.
-    // Never carry its helper configuration into the untrusted model process.
-    if (
-      key === "GIT_CONFIG_COUNT" ||
-      key === "GIT_CONFIG_PARAMETERS" ||
-      /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)
-    ) {
-      delete env[key];
-    }
+    // Keep trusted preparation's process-local Git overrides out of model subprocesses.
+    if (/^GIT_CONFIG_(COUNT|PARAMETERS|(KEY|VALUE)_\d+)$/i.test(key)) delete env[key];
     if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
   }
   if (!options.preserveCodexAuth) {

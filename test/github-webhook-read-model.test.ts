@@ -29,10 +29,10 @@ const repository = {
 };
 
 test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, and TTL", async () => {
+  const now = Date.parse("2026-08-14T10:06:00.000Z");
   const storage = new MemoryDurableStorage();
   const store = new GithubWebhookReadModelStore(storage);
   store.ensureSchemaSync();
-  const now = Date.parse("2026-08-14T10:06:00.000Z");
   const newer = requiredDelivery("issues", "guid-newer", "2026-08-14T10:05:00.000Z", {
     action: "labeled",
     repository,
@@ -46,7 +46,10 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
   assert.deepEqual(store.ingest(newer, now), { accepted: true, deduped: false, watermark: 1 });
   assert.deepEqual(store.ingest(newer, now), { accepted: true, deduped: true, watermark: 1 });
   assert.deepEqual(store.ingest(old, now), { accepted: true, deduped: false, watermark: 2 });
-  const itemSnapshot = await store.readItem({ repository: "openclaw/openclaw", number: 42 }, now);
+  const itemSnapshot = await store.readItem(
+    { repository: "openclaw/openclaw", number: 42 },
+    Date.parse("2026-08-14T10:06:00.000Z"),
+  );
   assert.equal((itemSnapshot.item as Record<string, unknown>).title, "new title");
   assert.equal(itemSnapshot.watermark, 2);
   assert.equal(itemSnapshot.object_watermark, 1, "late delivery cannot regress the item");

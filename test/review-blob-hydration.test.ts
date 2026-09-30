@@ -1,3 +1,4 @@
+import { mockReviewGitTransport } from "./review-git-transport-fixture.ts";
 import assert from "node:assert/strict";
 import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -29,15 +30,18 @@ import {
   REVIEW_TREE_MAX_BYTES,
   ReviewGitError,
 } from "../dist/clawsweeper-review-blobs.js";
-import { MAX_SCAN_BYTES } from "../dist/agent-input-scan.js";
+import { agentInputScanFailureExitCode, MAX_SCAN_BYTES } from "../dist/agent-input-scan.js";
+import { writeExactReviewFailureDiagnostics } from "../dist/clawsweeper-review-failure-diagnostics.js";
 import { createContextHydration } from "../dist/clawsweeper-context-hydration.js";
 import { createGitHubRuntime } from "../dist/clawsweeper-github-runtime.js";
+import { createGitHubExecution } from "../dist/clawsweeper-github-execution.js";
 import { asRecord } from "../dist/clawsweeper-item-policy.js";
 import { createReviewRuntime } from "../dist/clawsweeper-review-runtime.js";
 import { main, reviewPolicyHashForTest } from "../dist/clawsweeper-runtime.js";
 import { runText } from "../dist/command.js";
 import { readReviewGit, reviewMergeBase } from "../dist/pr-review-evidence.js";
 import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
+import { validationRecoveryRequired } from "../dist/repair/validation-recovery.js";
 import { withMockGh } from "./helpers.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -186,6 +190,230 @@ function resolveFixtureBlobSizes(source: string) {
   };
 }
 
+function movedBaseFixture(deleted = false) {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  git(fixture.source, "checkout", "-q", "main");
+  writeFileSync(join(fixture.source, "base.txt"), "REST-pinned base\n");
+  git(fixture.source, "add", ".");
+  git(fixture.source, "commit", "-qm", "base pin");
+  const pinnedBase = git(fixture.source, "rev-parse", "HEAD");
+  git(fixture.source, "push", "-q", "origin", "main", "HEAD:refs/heads/retained-base");
+  git(fixture.source, "reset", "--hard", fixture.baseSha);
+  writeFileSync(join(fixture.source, "replacement.txt"), "rewritten branch\n");
+  git(fixture.source, "add", ".");
+  git(fixture.source, "commit", "-qm", "rewrite base branch");
+  git(fixture.source, "push", "-q", "--force", "origin", "main");
+  if (deleted) git(join(fixture.root, "origin.git"), "update-ref", "-d", "refs/heads/main");
+  return { ...fixture, pinnedBase };
+}
+
+for (const deleted of [false, true]) {
+  test(`pinned base survives a ${deleted ? "deleted" : "force-pushed"} branch and reuses complete objects`, (t) => {
+    const fixture = movedBaseFixture(deleted);
+    t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+    const options = {
+      targetDir: fixture.target,
+      sha: fixture.pinnedBase,
+      sourceRef: "refs/heads/main",
+      destinationRef: "refs/clawsweeper/review-cache/base-982",
+      phase: "base" as const,
+    };
+    assert.equal(objectExistsOffline(fixture.target, fixture.pinnedBase), false);
+    assert.equal(ensureReviewTreeCommit(options), true);
+    assert.equal(git(fixture.target, "rev-parse", options.destinationRef), fixture.pinnedBase);
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+    assert.equal(
+      reachable(fixture.target, fixture.pinnedBase),
+      reachable(fixture.source, fixture.pinnedBase),
+    );
+    git(fixture.target, "remote", "set-url", "origin", join(fixture.root, "unavailable.git"));
+    assert.equal(ensureReviewTreeCommit(options), true, "warm reuse must not fetch");
+    assert.equal(git(fixture.target, "rev-parse", "HEAD"), fixture.baseSha);
+    assert.equal(git(fixture.target, "status", "--porcelain"), "");
+  });
+}
+
+test("unavailable base pin preserves native failure and structured acquisition identity", (t) => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  const missing = "f".repeat(40);
+  assert.throws(
+    () =>
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: missing,
+        sourceRef: "refs/heads/main",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+        phase: "base",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewGitError);
+      assert.equal(error.diagnosticReason, "review_commit_fetch_failed");
+      assert.ok(error.status! > 0);
+      assert.match(error.stderr, /not our ref|couldn't find remote ref/);
+      assert.deepEqual(error.commitAcquisition, {
+        phase: "base",
+        requestedSha: missing,
+        source: "pin",
+        commit: "missing",
+        history: "complete",
+      });
+      return true;
+    },
+  );
+});
+
+test("a successful pin fetch cannot admit a non-commit object", (t) => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  assert.throws(
+    () =>
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: fixture.addedBlobSha,
+        sourceRef: "refs/pull/982/head",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+        phase: "base",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewGitError);
+      assert.equal(error.diagnosticReason, "review_commits_unavailable");
+      assert.equal(error.status, 0);
+      assert.equal(error.commitAcquisition?.commit, "missing");
+      return true;
+    },
+  );
+});
+
+test("successful fetches that leave shallow ancestry cannot admit a present pin", (t) => {
+  const fixture = partialCloneFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  const nativeSpawn = childProcess.spawnSync;
+  mockReviewGitTransport(t, (command, args, options) =>
+    command === "git" && args.includes("fetch")
+      ? { status: 0, signal: null, stdout: "", stderr: "" }
+      : nativeSpawn(command, args, options),
+  );
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.throws(
+    () =>
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: fixture.headSha,
+        sourceRef: "refs/pull/982/head",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+        phase: "base",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewGitError);
+      assert.equal(error.diagnosticReason, "review_commits_unavailable");
+      assert.equal(error.status, 0);
+      assert.equal(error.commitAcquisition?.commit, "present");
+      assert.equal(error.commitAcquisition?.history, "shallow");
+      return true;
+    },
+  );
+});
+
+test("successful incomplete base fetch retains its actual zero exit and missing-pin diagnostic", (t) => {
+  const fixture = partialCloneFixture({ prefetchHead: false });
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  const nativeSpawn = childProcess.spawnSync;
+  const fetches: string[] = [];
+  mockReviewGitTransport(t, (command, args, options) => {
+    if (command === "git" && args.includes("fetch")) {
+      fetches.push(args.at(-1));
+      return { status: 0, signal: null, stdout: "", stderr: "" };
+    }
+    return nativeSpawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.throws(
+    () =>
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: fixture.headSha,
+        sourceRef: "refs/heads/main",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+        phase: "base",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewGitError);
+      assert.equal(error.diagnosticReason, "review_commits_unavailable");
+      assert.equal(error.status, 0);
+      assert.deepEqual(error.commitAcquisition, {
+        phase: "base",
+        requestedSha: fixture.headSha,
+        source: "pin",
+        commit: "missing",
+        history: "complete",
+      });
+      return true;
+    },
+  );
+  assert.equal(fetches.length, 2);
+});
+
+test("ref and pinned-object acquisition share the original absolute deadline", (t) => {
+  const fixture = movedBaseFixture();
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  const nativeSpawn = childProcess.spawnSync;
+  let now = Date.now();
+  const deadlineAt = now + 10_000;
+  const timeouts: number[] = [];
+  let probes = 0;
+  t.mock.method(Date, "now", () => now);
+  mockReviewGitTransport(t, (command, args, options) => {
+    probes++;
+    if (command === "git" && args.includes("fetch")) {
+      timeouts.push(options.timeout);
+      const result = nativeSpawn(command, args, options);
+      if (timeouts.length === 1) now += 7_500;
+      return result;
+    }
+    return nativeSpawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  assert.equal(
+    ensureReviewTreeCommit({
+      targetDir: fixture.target,
+      sha: fixture.pinnedBase,
+      sourceRef: "refs/heads/main",
+      destinationRef: "refs/clawsweeper/review-cache/base-982",
+      phase: "base",
+      deadlineAt,
+    }),
+    true,
+  );
+  assert.deepEqual(timeouts, [10_000, 2_500]);
+  const completedProbes = probes;
+  assert.throws(
+    () =>
+      ensureReviewTreeCommit({
+        targetDir: fixture.target,
+        sha: fixture.pinnedBase,
+        sourceRef: "refs/heads/main",
+        destinationRef: "refs/clawsweeper/review-cache/base-982",
+        phase: "base",
+        deadlineAt: now,
+      }),
+    { errorCode: "ETIMEDOUT" },
+  );
+  assert.equal(probes, completedProbes, "even warm probes must obey the caller deadline");
+});
+
 function objectExistsOffline(cwd: string, sha: string): boolean {
   return (
     spawnSync("git", ["cat-file", "-e", sha], {
@@ -195,6 +423,60 @@ function objectExistsOffline(cwd: string, sha: string): boolean {
     }).status === 0
   );
 }
+
+test("commit admission stays offline when Git ignores the lazy-fetch environment flag", () => {
+  const { root, target, headSha } = partialCloneFixture({ prefetchHead: false });
+  const previousEnv = process.env;
+  try {
+    const wrapper = join(root, "git-without-no-lazy-fetch.mjs");
+    const calls = join(root, "git-calls.jsonl");
+    writeFileSync(
+      wrapper,
+      `import { spawnSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+delete process.env.GIT_NO_LAZY_FETCH;
+const result = spawnSync("git", args, { env: process.env, stdio: "inherit" });
+process.exit(result.status ?? 1);`,
+    );
+    git(target, "config", "protocol.file.allow", "always");
+    process.env = {
+      ...previousEnv,
+      GIT_ALLOW_PROTOCOL: "file",
+      GIT_BIN: process.execPath,
+      GIT_BIN_ARGS: JSON.stringify([wrapper]),
+    };
+    const options = {
+      targetDir: target,
+      sha: headSha,
+      sourceRef: "refs/pull/982/head",
+      destinationRef: "refs/clawsweeper/review-cache/head-982",
+      phase: "head" as const,
+    };
+    assert.equal(ensureReviewTreeCommit(options), true);
+    const explicitFetches = () =>
+      readFileSync(calls, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[])
+        .filter((args) => args[0] === "fetch");
+    assert.equal(
+      explicitFetches().length,
+      1,
+      "a missing commit must reach the owned fetch, not an implicit probe fetch",
+    );
+    assert.equal(ensureReviewTreeCommit(options), true);
+    assert.equal(
+      explicitFetches().length,
+      1,
+      "installed commits remain reusable without transport",
+    );
+  } finally {
+    process.env = previousEnv;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function populateFixtureHeadBlobs(source: string, target: string, headSha: string): void {
   const entries = git(
@@ -319,6 +601,7 @@ function reachable(target: string, sha: string): number {
 function prepareFixtureCommits(fixture: { target: string; baseSha: string; headSha: string }) {
   assert.ok(
     ensureReviewTreeCommit({
+      phase: "base",
       targetDir: fixture.target,
       sha: fixture.baseSha,
       sourceRef: "refs/heads/main",
@@ -334,7 +617,7 @@ function prepareFixtureCommits(fixture: { target: string; baseSha: string; headS
   );
 }
 
-function reviewGitInfo(releaseTag?: string) {
+function reviewRuntime(releaseTag?: string) {
   const unavailable = (): never => {
     throw new Error("Unexpected dependency in native Git preparation fixture");
   };
@@ -352,7 +635,7 @@ function reviewGitInfo(releaseTag?: string) {
     parseDecision: unavailable,
     ensureDir: unavailable,
     stringOrUndefined: unavailable,
-  }).gitInfo;
+  });
 }
 
 for (const withRelease of [false, true]) {
@@ -370,7 +653,7 @@ for (const withRelease of [false, true]) {
         git(fixture.source, "-c", "tag.gpgsign=false", "tag", releaseTag, fixture.branchPoint);
         git(fixture.source, "push", "-q", "origin", `refs/tags/${releaseTag}`);
       }
-      const gitInfo = reviewGitInfo(withRelease ? releaseTag : undefined);
+      const gitInfo = reviewRuntime(withRelease ? releaseTag : undefined).gitInfo;
       const expectedAncestors = reachable(fixture.source, fixture.baseSha);
       assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
       const info = gitInfo(fixture.target);
@@ -437,6 +720,216 @@ for (const withRelease of [false, true]) {
   });
 }
 
+for (const retryable of [true, false]) {
+  test(`target branch acquisition never accepts a stale ref after failed fetch: retryable=${retryable}`, (t) => {
+    const fixture = partialCloneFixture();
+    const nativeSpawn = childProcess.spawnSync;
+    let fetches = 0;
+    try {
+      git(fixture.source, "checkout", "-q", "main");
+      writeFileSync(join(fixture.source, "fresh.txt"), "fresh branch\n");
+      git(fixture.source, "add", ".");
+      git(fixture.source, "commit", "-qm", "advance main");
+      git(fixture.source, "push", "-q", "origin", "main");
+      const current = git(fixture.source, "rev-parse", "HEAD");
+      mockReviewGitTransport(t, (command, args, options) => {
+        if (command === "git" && args.includes("fetch")) {
+          fetches++;
+          assert.equal(options.killSignal, "SIGKILL");
+          assert.ok(options.timeout > 0 && options.timeout <= 60_000);
+          if (fetches === 1)
+            return { status: 128, stdout: "", stderr: `fatal: HTTP ${retryable ? 503 : 403}` };
+        }
+        return nativeSpawn(command, args, options);
+      });
+      syncBuiltinESMExports();
+      const acquire = () => reviewRuntime().gitInfo(fixture.target, { classifyFetchFailure: true });
+      if (retryable) {
+        assert.equal(acquire().mainSha, current);
+        assert.equal(fetches, 2);
+        assert.equal(acquire().mainSha, current);
+        assert.equal(fetches, 3, "even warm branch refs require fresh remote proof");
+      } else {
+        assert.throws(acquire, { diagnosticReason: "review_commit_fetch_failed" });
+        assert.equal(fetches, 1);
+        assert.equal(git(fixture.target, "rev-parse", "refs/remotes/origin/main"), fixture.baseSha);
+      }
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("fresh branch retry rechecks shallow state after an interrupted unshallow", (t) => {
+  const fixture = partialCloneFixture();
+  const nativeSpawn = childProcess.spawnSync;
+  let fetches = 0;
+  try {
+    git(fixture.target, "fetch", "--depth=1", "origin", "main");
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "true");
+    mockReviewGitTransport(t, (command, args, options) => {
+      const result = nativeSpawn(command, args, options);
+      if (command === "git" && args.includes("fetch")) {
+        fetches++;
+        assert.equal(args.includes("--unshallow"), fetches === 1);
+        assert.equal(result.status, 0, result.stderr);
+        if (fetches === 1)
+          return {
+            ...result,
+            status: null,
+            signal: "SIGKILL",
+            error: Object.assign(new Error("late timeout"), { code: "ETIMEDOUT" }),
+          };
+      }
+      return result;
+    });
+    syncBuiltinESMExports();
+    assert.equal(reviewRuntime().gitInfo(fixture.target).mainSha, fixture.baseSha);
+    assert.equal(fetches, 2, "freshness still requires a successful transport result");
+    assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+for (const phase of ["base", "head"] as const) {
+  for (const receipt of ["", "not-json\n", '{"pid":null}\n', '{"pid":1}\n']) {
+    test(`uncertain supervisor completion cannot reuse objects or try an exact-${phase} fallback: ${JSON.stringify(receipt)}`, (t) => {
+      const fixture = partialCloneFixture({ prefetchHead: false });
+      const nativeSpawn = childProcess.spawnSync;
+      let fetches = 0;
+      try {
+        t.mock.method(childProcess, "spawnSync", (command, args, options) => {
+          if (command === process.execPath && args[0]?.endsWith("/git-acquisition-worker.js")) {
+            const input = JSON.parse(options.input);
+            const installed = nativeSpawn("git", input.args, {
+              cwd: input.cwd,
+              env: options.env,
+              encoding: "utf8",
+            });
+            assert.equal(installed.status, 0, installed.stderr);
+            fetches++;
+            return { status: 1, stdout: receipt, stderr: "interrupted supervisor", signal: null };
+          }
+          return nativeSpawn(command, args, options);
+        });
+        syncBuiltinESMExports();
+        assert.throws(
+          () =>
+            phase === "head"
+              ? ensurePullRequestReviewHead({
+                  targetDir: fixture.target,
+                  itemNumber: 982,
+                  headSha: fixture.headSha,
+                })
+              : ensureReviewTreeCommit({
+                  targetDir: fixture.target,
+                  sha: fixture.headSha,
+                  sourceRef: "refs/pull/982/head",
+                  destinationRef: "refs/clawsweeper/review-cache/base-982",
+                  phase,
+                }),
+          { errorCode: "EPROCESSSETTLEMENT" },
+        );
+        assert.equal(fetches, 1);
+        assert.equal(objectExistsOffline(fixture.target, `${fixture.headSha}^{commit}`), true);
+      } finally {
+        t.mock.restoreAll();
+        syncBuiltinESMExports();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("optional pinned-base blobs cannot suppress unsettled acquisition", (t) => {
+  const fixture = partialCloneFixture({ historicalBase: true, prefetchHead: false });
+  t.after(() => rmSync(fixture.root, { recursive: true, force: true }));
+  // Introduce the optional blob after cloning, so the initial checkout cannot
+  // prefetch it and bypass the acquisition failure exercised below.
+  writeFileSync(join(fixture.source, "optional-only.txt"), "optional endpoint\n");
+  git(fixture.source, "add", ".");
+  git(fixture.source, "commit", "-qm", "new optional endpoint");
+  git(fixture.source, "push", "-q", "origin", "main");
+  const baseSha = git(fixture.source, "rev-parse", "main");
+  const baseOnlyBlob = git(fixture.source, "rev-parse", "main:optional-only.txt");
+  const nativeSpawn = childProcess.spawnSync;
+  let interrupted = 0;
+  t.mock.method(childProcess, "spawnSync", (command, args, options) => {
+    if (command === process.execPath && args[0]?.endsWith("/git-acquisition-worker.js")) {
+      const request = JSON.parse(options.input);
+      if (request.input?.includes(baseOnlyBlob)) {
+        interrupted++;
+        return {
+          status: 1,
+          signal: null,
+          stdout: '{"pid":null}\n',
+          stderr: "fixture supervisor failure",
+        };
+      }
+    }
+    return nativeSpawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  t.after(() => {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  const context = createContextHydration(
+    new Proxy(
+      {
+        asRecord,
+        stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
+        isSafeGitBranchName: (branch: string) => branch === "main",
+        targetRepo: () => "fixture/repository",
+        ghJson: (args: string[]) => {
+          const revision = args[1]!.match(/\/git\/trees\/([0-9a-f]+)\?recursive=1$/)![1]!;
+          return {
+            truncated: false,
+            tree: git(fixture.source, "ls-tree", "-r", "-l", revision)
+              .split("\n")
+              .map((line) => {
+                const match = line.match(/^\d+ (\w+) ([0-9a-f]+)\s+(-|\d+)\t/)!;
+                return {
+                  type: match[1],
+                  sha: match[2],
+                  ...(match[1] === "blob" ? { size: Number(match[3]) } : {}),
+                };
+              }),
+          };
+        },
+      },
+      {
+        get: (target, key) =>
+          Reflect.get(target, key) ??
+          (() => {
+            throw new Error("unexpected dependency");
+          }),
+      },
+    ) as Parameters<typeof createContextHydration>[0],
+  );
+  assert.throws(
+    () =>
+      context.hydratePullRequestReviewSource({
+        itemNumber: 982,
+        targetDir: fixture.target,
+        pullRequest: { base: { ref: "main", sha: baseSha }, head: { sha: fixture.headSha } },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewGitError);
+      assert.equal(error.errorCode, "EPROCESSSETTLEMENT");
+      assert.equal(error.reviewedHeadSha, fixture.headSha);
+      assert.ok(validationRecoveryRequired(error));
+      return true;
+    },
+  );
+  assert.equal(interrupted, 1);
+});
+
 test("review acquisition preserves a pinned base after main advances", () => {
   const fixture = partialCloneFixture({ prefetchHead: false });
   try {
@@ -452,6 +945,7 @@ test("review acquisition preserves a pinned base after main advances", () => {
     assert.equal(git(fixture.target, "rev-parse", "--is-shallow-repository"), "false");
     assert.equal(
       ensureReviewTreeCommit({
+        phase: "base",
         targetDir: fixture.target,
         sha: pinnedBase,
         sourceRef: "refs/heads/main",
@@ -753,6 +1247,201 @@ test("restricted review materializes the exact pull request head before model ex
   }
 });
 
+for (const attributes of [false, true]) {
+  test(`full tree acquisition retries only missing admitted blobs: attributes=${attributes}`, (t) => {
+    const fixture = partialCloneFixture({ attributes });
+    const nativeSpawn = childProcess.spawnSync;
+    const inputs: string[][] = [];
+    const reviewTree = join(fixture.root, "review-tree");
+    try {
+      mockReviewGitTransport(t, (command, args, options) => {
+        if (command === "git" && args.includes("fetch") && args.includes("--stdin")) {
+          const ids = String(options.input).trim().split("\n");
+          inputs.push(ids);
+          assert.equal(options.killSignal, "SIGKILL");
+          assert.ok(
+            options.timeout > 0 &&
+              options.timeout <= (attributes && inputs.length <= 2 ? 30_000 : 60_000),
+          );
+          if (inputs.length === 1) {
+            if (attributes) return { status: 128, stdout: "", stderr: "fatal: HTTP 503" };
+            const result = nativeSpawn(command, args, { ...options, input: `${ids[0]}\n` });
+            assert.equal(result.status, 0, result.stderr);
+            return { ...result, status: 128, stderr: "fatal: HTTP 503" };
+          }
+        }
+        return nativeSpawn(command, args, options);
+      });
+      syncBuiltinESMExports();
+      const options = {
+        targetDir: fixture.target,
+        worktreeDir: reviewTree,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+        resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+      };
+      assert.equal(materializePullRequestReviewTree(options), true);
+      assert.deepEqual(inputs[1], attributes ? inputs[0] : inputs[0]!.slice(1));
+      assert.equal(inputs.length, attributes ? 3 : 2);
+      assert.equal(git(reviewTree, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(reviewTree, "status", "--porcelain"), "");
+      assert.equal(readFileSync(join(reviewTree, "added.txt"), "utf8"), "new implementation\n");
+      removePullRequestReviewTree({ targetDir: fixture.target, worktreeDir: reviewTree });
+      assert.equal(materializePullRequestReviewTree(options), true);
+      assert.equal(inputs.length, attributes ? 3 : 2, "warm admitted objects require no fetch");
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const failure of ["forbidden", "incomplete", "type", "size"] as const) {
+  test(`full tree acquisition rejects ${failure} without retry or checkout`, (t) => {
+    const fixture = partialCloneFixture();
+    const nativeSpawn = childProcess.spawnSync;
+    let fetches = 0;
+    try {
+      mockReviewGitTransport(t, (command, args, options) => {
+        if (command === "git" && args.includes("fetch") && args.includes("--stdin")) {
+          fetches++;
+          if (failure === "forbidden")
+            return { status: 128, stdout: "", stderr: "fatal: HTTP 403" };
+          if (failure === "incomplete") return { status: 0, stdout: "", stderr: "" };
+        }
+        const result = nativeSpawn(command, args, options);
+        if (fetches && args[0] === "cat-file" && String(args[1]).startsWith("--batch-check")) {
+          if (failure === "type") result.stdout = String(result.stdout).replace(" blob ", " tree ");
+          if (failure === "size")
+            result.stdout = String(result.stdout).replace(
+              / blob (\d+)/,
+              (_, bytes) => ` blob ${Number(bytes) + 1}`,
+            );
+        }
+        return result;
+      });
+      syncBuiltinESMExports();
+      const worktreeDir = join(fixture.root, "review-tree");
+      assert.throws(
+        () =>
+          materializePullRequestReviewTree({
+            targetDir: fixture.target,
+            worktreeDir,
+            itemNumber: 982,
+            headSha: fixture.headSha,
+            resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+          }),
+        failure === "forbidden"
+          ? { diagnosticReason: "review_blobs_unavailable" }
+          : /fetched blob (?:metadata is incomplete|size did not match admitted metadata)/,
+      );
+      assert.equal(fetches, 1);
+      assert.equal(existsSync(worktreeDir), false);
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("full tree verification settles a process that ignores SIGTERM before refusing checkout", (t) => {
+  const fixture = partialCloneFixture();
+  const nativeSpawn = childProcess.spawnSync;
+  const marker = join(fixture.root, "verification-child");
+  let fetched = false;
+  try {
+    mockReviewGitTransport(t, (command, args, options) => {
+      if (command === "git" && args.includes("fetch") && args.includes("--stdin")) fetched = true;
+      if (fetched && command === "git" && args.includes("--missing=print")) {
+        assert.equal(options.killSignal, "SIGKILL");
+        return nativeSpawn(
+          process.execPath,
+          [
+            "-e",
+            'process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);',
+            marker,
+          ],
+          { ...options, timeout: 1000, env: { ...options.env, NODE_V8_COVERAGE: undefined } },
+        );
+      }
+      return nativeSpawn(command, args, options);
+    });
+    syncBuiltinESMExports();
+    const worktreeDir = join(fixture.root, "review-tree");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+          resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+        }),
+      {
+        diagnosticReason: "review_git_inspection_failed",
+        errorCode: "ETIMEDOUT",
+        signal: "SIGKILL",
+      },
+    );
+    assert.throws(() => process.kill(Number(readFileSync(marker, "utf8")), 0), { code: "ESRCH" });
+    assert.equal(existsSync(worktreeDir), false);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("attribute acquisition consumes the original metadata deadline across retries", (t) => {
+  const fixture = partialCloneFixture({ attributes: true });
+  const nativeSpawn = childProcess.spawnSync;
+  const realNow = Date.now.bind(Date);
+  let offset = 0;
+  let fetches = 0;
+  try {
+    t.mock.method(Date, "now", () => realNow() + offset);
+    mockReviewGitTransport(t, (command, args, options) => {
+      if (command === "git" && args.includes("fetch") && args.includes("--stdin")) {
+        fetches++;
+        assert.ok(options.timeout <= 1000);
+        offset += 1001;
+        return {
+          status: null,
+          signal: "SIGKILL",
+          stdout: "",
+          stderr: "",
+          error: Object.assign(new Error("deadline"), { code: "ETIMEDOUT" }),
+        };
+      }
+      return nativeSpawn(command, args, options);
+    });
+    syncBuiltinESMExports();
+    const worktreeDir = join(fixture.root, "review-tree");
+    assert.throws(
+      () =>
+        materializePullRequestReviewTree({
+          targetDir: fixture.target,
+          worktreeDir,
+          itemNumber: 982,
+          headSha: fixture.headSha,
+          resolveBlobSizes: (ids, timeout) => {
+            offset += timeout - 1000;
+            return resolveFixtureBlobSizes(fixture.source)(ids);
+          },
+        }),
+      { diagnosticReason: "review_blobs_unavailable", errorCode: "ETIMEDOUT" },
+    );
+    assert.equal(fetches, 1);
+    assert.equal(existsSync(worktreeDir), false);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("manual live proof admits pinned promisor trees with the requested repository and restores its profile", async (t) => {
   for (const scenario of ["admitted", "missing", "truncated", "overflow", "unavailable"] as const) {
     await t.test(scenario, async (t) => {
@@ -799,7 +1488,7 @@ test("manual live proof admits pinned promisor trees with the requested reposito
       let childLaunches = 0;
       t.mock.method(console, "log", () => {});
       const nativeSpawn = childProcess.spawnSync;
-      t.mock.method(childProcess, "spawnSync", (...args: Parameters<typeof nativeSpawn>) => {
+      mockReviewGitTransport(t, (...args: Parameters<typeof nativeSpawn>) => {
         const argv = args[1] ?? [];
         if (argv[0] === "api") {
           metadataCalls++;
@@ -1442,13 +2131,15 @@ test("missing partial-clone objects are fetched in one bounded network request",
       (event) => event.event === "start" && event.argv?.includes("fetch"),
     );
     assert.equal(result, 18);
-    assert.equal(revLists.length, 1);
-    assert.ok(revLists[0]!.argv?.includes(`${fixture.baseSha}^{tree}`));
-    assert.ok(revLists[0]!.argv?.includes(`${fixture.headSha}^{tree}`));
-    assert.equal(
-      revLists[0]!.argv?.some((argument) => argument.startsWith("--no-walk")),
-      false,
-    );
+    assert.equal(revLists.length, 3);
+    for (const probe of revLists) {
+      assert.ok(probe.argv?.includes(`${fixture.baseSha}^{tree}`));
+      assert.ok(probe.argv?.includes(`${fixture.headSha}^{tree}`));
+      assert.equal(
+        probe.argv?.some((argument) => argument.startsWith("--no-walk")),
+        false,
+      );
+    }
     assert.equal(nestedFetches.length, 0, "availability probe must not lazy-fetch blobs");
     assert.equal(explicitFetches.length, 1, "hydration must perform one explicit bounded fetch");
     assert.ok(explicitFetches[0]!.argv?.includes("--stdin"));
@@ -1504,6 +2195,282 @@ test("review hydration rejects aggregate scan budget overflow and incomplete siz
     );
     assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
   } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("expired blob fetch remains a retryable source preparation failure", (t) => {
+  const fixture = partialCloneFixture();
+  const originalSpawnSync = childProcess.spawnSync;
+  const realNow = Date.now.bind(Date);
+  const childMarker = join(fixture.root, "fetch-child");
+  let clockOffset = 0;
+  let fetchCount = 0;
+  let fetchTimeout = 0;
+  try {
+    t.mock.method(Date, "now", () => realNow() + clockOffset);
+    mockReviewGitTransport(t, (command, args, options) => {
+      if (command === "git" && args.includes("--missing=print")) {
+        assert.equal(
+          options.killSignal,
+          "SIGKILL",
+          "availability probes must settle within their deadline",
+        );
+      }
+      if (command === "git" && args.includes("fetch") && args.includes("--stdin")) {
+        fetchCount++;
+        fetchTimeout = options.timeout;
+        return originalSpawnSync(
+          process.execPath,
+          [
+            "-e",
+            `require("node:fs").writeFileSync(process.argv[1], String(process.pid));
+             process.stderr.write("fatal: synthetic Git transport stalled\\nAUTH_TOKEN=synthetic-private-value\\n");
+             process.stdout.write("raw transport payload must stay private\\n");
+             setInterval(() => {}, 1000);`,
+            childMarker,
+          ],
+          {
+            ...options,
+            timeout: 5_000,
+            env: { ...options.env, NODE_V8_COVERAGE: undefined },
+          },
+        );
+      }
+      return originalSpawnSync(command, args, options);
+    });
+    syncBuiltinESMExports();
+    let failure: Error | undefined;
+    assert.throws(
+      () =>
+        hydratePullRequestReviewBlobs({
+          targetDir: fixture.target,
+          baseSha: fixture.baseSha,
+          headSha: fixture.headSha,
+          resolveBlobSizes: (ids, deadlineAt) => {
+            const sizes = resolveFixtureBlobSizes(fixture.source)(ids);
+            clockOffset = deadlineAt - realNow() - 1000;
+            return sizes;
+          },
+        }),
+      (error) => {
+        assert.ok(error instanceof ReviewGitError);
+        failure = error;
+        assert.equal(error.diagnosticReason, "review_blobs_unavailable");
+        assert.equal(reviewRuntime().codexReviewFailureRetryable(error), true);
+        assert.equal(agentInputScanFailureExitCode(error) ?? 1, 1);
+        return true;
+      },
+    );
+    assert.equal(fetchCount, 2);
+    assert.ok(fetchTimeout > 30_000 && fetchTimeout <= 60_000);
+    const childPid = Number(readFileSync(childMarker, "utf8"));
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    assert.equal(objectExistsOffline(fixture.target, fixture.addedBlobSha), false);
+    const output = writeExactReviewFailureDiagnostics({
+      artifactDir: join(fixture.root, "diagnostics"),
+      error: failure,
+      prompt: "synthetic prompt",
+      model: "fixture-model",
+      classification: "codex_execution",
+      repo: "fixture/repository",
+      itemKind: "pull_request",
+      itemNumber: 1,
+      sourceSha: fixture.headSha,
+      retryable: reviewRuntime().codexReviewFailureRetryable(failure),
+      workflowExit: 1,
+      env: {},
+    });
+    const manifest = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
+    assert.equal(manifest.classification, "source_preparation");
+    assert.equal(manifest.retryable, true);
+    assert.deepEqual(manifest.failure, {
+      stage: "source_preparation",
+      reason_code: "review_blobs_unavailable",
+    });
+    assert.deepEqual(manifest.process, {
+      status: null,
+      signal: "SIGKILL",
+      error_code: "ETIMEDOUT",
+      workflow_exit: 1,
+    });
+    const stderr = readFileSync(join(output, "stderr.tail.txt"), "utf8");
+    assert.match(stderr, /synthetic Git transport stalled/);
+    assert.doesNotMatch(stderr, /synthetic-private-value/);
+    assert.equal(
+      readFileSync(join(output, "stdout.error.txt"), "utf8"),
+      "[no diagnostic detail]\n",
+    );
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+for (const [message, retry] of [
+  ["The requested URL returned error: 500", true],
+  ["The requested URL returned error: 502", true],
+  ["The requested URL returned error: 503", true],
+  ["The requested URL returned error: 504", true],
+  ["The requested URL returned error: 403", false],
+  ["The requested URL returned error: 404", false],
+  ["The requested URL returned error: 429", false],
+  ["Could not resolve host: example.invalid", true],
+  ["Could not resolve proxy: example.invalid", true],
+  ["Failed to connect to example.invalid", true],
+  ["gnutls_handshake() failed: The TLS connection was non-properly terminated.", true],
+  ["OpenSSL SSL_connect: SSL_ERROR_SYSCALL", true],
+  ["RPC failed; HTTP 403", false],
+  ["Authentication failed", false],
+  ["SSL certificate problem: unable to get local issuer certificate", false],
+  ["RPC failed; SSL certificate problem: unable to get local issuer certificate", false],
+] as const) {
+  test(`blob transport retry classification: ${message}`, (t) => {
+    const fixture = partialCloneFixture();
+    const nativeSpawn = childProcess.spawnSync;
+    let fetches = 0;
+    try {
+      mockReviewGitTransport(t, (command, args, options) => {
+        if (
+          command === "git" &&
+          args.includes("fetch") &&
+          args.includes("--stdin") &&
+          ++fetches === 1
+        ) {
+          return { status: 128, signal: null, stdout: "", stderr: message };
+        }
+        return nativeSpawn(command, args, options);
+      });
+      syncBuiltinESMExports();
+      const run = () =>
+        hydratePullRequestReviewBlobs({
+          targetDir: fixture.target,
+          baseSha: fixture.baseSha,
+          headSha: fixture.headSha,
+          resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+        });
+      if (retry) assert.ok(run() > 0);
+      else assert.throws(run, { diagnosticReason: "review_blobs_unavailable" });
+      assert.equal(fetches, retry ? 2 : 1);
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("blob retry reuses installed objects after a transient partial fetch", (t) => {
+  const fixture = partialCloneFixture();
+  const nativeSpawn = childProcess.spawnSync;
+  const inputs: string[][] = [];
+  try {
+    mockReviewGitTransport(t, (command, args, options) => {
+      if (command === "git" && args.includes("fetch") && args.includes("--stdin")) {
+        const ids = String(options.input).trim().split("\n");
+        inputs.push(ids);
+        if (inputs.length === 1) {
+          const result = nativeSpawn(command, args, { ...options, input: `${ids[0]}\n` });
+          assert.equal(result.status, 0, result.stderr);
+          return { ...result, status: 128, stderr: "fatal: HTTP 503" };
+        }
+      }
+      return nativeSpawn(command, args, options);
+    });
+    syncBuiltinESMExports();
+    const options = {
+      targetDir: fixture.target,
+      baseSha: fixture.baseSha,
+      headSha: fixture.headSha,
+      resolveBlobSizes: resolveFixtureBlobSizes(fixture.source),
+    };
+    const count = hydratePullRequestReviewBlobs(options);
+    assert.ok(count > 1);
+    assert.equal(inputs.length, 2);
+    assert.deepEqual(inputs[1], inputs[0]!.slice(1));
+    assert.equal(hydratePullRequestReviewBlobs(options), count);
+    assert.equal(inputs.length, 2, "verified local objects require no new fetch");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("introduced blob hydration does not start metadata work after its deadline", (t) => {
+  const fixture = partialCloneFixture();
+  const startedAt = Date.now();
+  let now = startedAt;
+  const requests: Array<{ revision: string; elapsedMs: number }> = [];
+  const unavailable = () => {
+    throw new Error("Unexpected dependency in hydration deadline fixture");
+  };
+  const runtime = createGitHubRuntime({
+    ROOT: fixture.root,
+    targetRepo: () => "fixture/repository",
+    run: (command, args) => {
+      assert.equal(command, "gh");
+      assert.equal(args[0], "api");
+      const revision = args[1]?.match(/\/git\/trees\/([0-9a-f]+)\?recursive=1$/)?.[1];
+      assert.ok(revision);
+      requests.push({ revision, elapsedMs: now - startedAt });
+      const tree = git(fixture.source, "ls-tree", "-r", "-l", revision)
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const match = line.match(/^\d+ (\w+) ([0-9a-f]+)\s+(-|\d+)\t/);
+          assert.ok(match);
+          return match[1] === "blob"
+            ? { type: "blob", sha: match[2], size: Number(match[3]) }
+            : { type: match[1], sha: match[2] };
+        });
+      now = startedAt + 30_001;
+      return JSON.stringify({ truncated: false, tree });
+    },
+  });
+  const execution = createGitHubExecution({
+    ROOT: fixture.root,
+    gitHubRuntime: runtime,
+    labelAlreadyExistsError: () => false,
+  });
+  const context = createContextHydration(
+    new Proxy(
+      {
+        asRecord,
+        stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
+        isSafeGitBranchName: (branch: string) => branch === "main",
+        targetRepo: () => "fixture/repository",
+        ghJson: execution.ghJson,
+        ghJsonOnce: execution.ghJsonOnce,
+      },
+      { get: (target, key) => Reflect.get(target, key) ?? unavailable },
+    ) as Parameters<typeof createContextHydration>[0],
+  );
+  try {
+    t.mock.method(Date, "now", () => now);
+    assert.throws(
+      () =>
+        context.hydratePullRequestReviewSource({
+          itemNumber: 982,
+          targetDir: fixture.target,
+          pullRequest: {
+            base: { ref: "main", sha: fixture.baseSha },
+            head: { sha: fixture.headSha },
+          },
+        }),
+      { name: "AgentInputScanError", reason: "deadline", retryable: false },
+    );
+    const addedBlobStillMissing = !objectExistsOffline(fixture.target, fixture.addedBlobSha);
+    t.diagnostic(JSON.stringify({ requests, addedBlobStillMissing }));
+    assert.deepEqual(
+      requests.map((request) => request.revision),
+      [fixture.baseSha],
+      "metadata work must stop before another request after the owner deadline",
+    );
+    assert.equal(addedBlobStillMissing, true);
+  } finally {
+    t.mock.restoreAll();
     rmSync(fixture.root, { recursive: true, force: true });
   }
 });

@@ -309,12 +309,12 @@ pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous 
 
 # Dispatch reviewed jobs. Dispatch derives its default live-worker cap from the
 # job's job_intent and config/automation-limits.json. Existing repair lanes
-# keep the normal 40%-of-workers.max cap, currently 12; imported gitcrawl
+# keep the normal 40%-of-workers.max cap, currently 51; imported gitcrawl
 # cluster jobs default to lanes.repair.cluster_max_live_runs, currently 2.
 # Use CLAWSWEEPER_MAX_LIVE_WORKERS/--max-live-workers for a one-lane override.
 # With --wait-for-capacity, dispatch can drain a larger file
 # list in capacity-sized waves instead of refusing the whole batch.
-CLAWSWEEPER_MAX_LIVE_WORKERS=12 pnpm run repair:dispatch -- jobs/openclaw/inbox/ordinary-example.md \
+CLAWSWEEPER_MAX_LIVE_WORKERS=51 pnpm run repair:dispatch -- jobs/openclaw/inbox/ordinary-example.md \
   --mode autonomous \
   --runner blacksmith-4vcpu-ubuntu-2404 \
   --execution-runner blacksmith-16vcpu-ubuntu-2404
@@ -427,18 +427,20 @@ The workflow needs:
   only the public `internal` alias
 - Codex CLI and its responses API proxy install from their latest npm tags on
   every worker run
-- repair planning defaults to high reasoning on the fast service tier;
-  automatic issue fix/PR execution uses `gpt-5.6-sol` with `xhigh` reasoning
+- repair planning and execution use `gpt-6-sol`; maintainer-authored canonical
+  items use high reasoning with fast service, while other items use medium
+  reasoning with standard service
 - optional `CLAWSWEEPER_MAX_LIVE_WORKERS` variable for dispatch/requeue/self-heal worker fan-out; dispatch defaults are derived from `job_intent`, cluster-lane classification, `workers.max`, and `lanes.repair.cluster_max_live_runs`
 - optional `CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA` variable for replacement PR backpressure; default is `50` open ClawSweeper PRs per touched area, `0` disables the area cap, and common changelog/release-note files are ignored for this check
 - ClawSweeper commit-finding repair PRs are labeled `clawsweeper:commit-finding`
 - optional `CLAWSWEEPER_CODEX_TIMEOUT_MS`, `CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS`,
   and `CLAWSWEEPER_FIX_STEP_TIMEOUT_MS` variables; worker planning defaults to
-  30 minutes, while fix execution defaults to a 20 minute per-Codex-call budget
-  inside a 40 minute executor budget. The cluster execute job keeps a 45 minute
-  timeout and a 40 minute execute-step cap so long edit/test passes still leave
-  room for internal `/review`, post-flight, and timeout artifact upload instead
-  of falling into a 30-second review floor near the end of the run.
+  30 minutes, as does each fix Codex call. The executor derives its budget from
+  setup, the edit-worker allowance, twice the configured validation budget, and
+  review/report margin: 70 minutes by default, 100 minutes for OpenClaw, with a
+  110-minute hard ceiling. Actions adds two minutes of step headroom inside the
+  120-minute job. See [target budget configuration](../target-repositories.md).
+  Edit workers use focused checks; the executor owns full deterministic acceptance.
 - optional `CLAWSWEEPER_CODEX_RETRY_DELAY_MS` variable for edit-worker backoff
   after retryable Codex transport or TPM rate-limit exits; default is `15000`.
 - If a contributor branch changes while a repair is preparing its push, the
@@ -454,10 +456,14 @@ The workflow needs:
   environment for these settings, default to two minutes, and enforce a
   30-second minimum for environment-configured budgets. An explicit `timeoutMs`
   call option takes precedence and may select a shorter positive deadline.
-  Cluster dispatch uses the same two-minute default; automatic worker target
-  clones default to three minutes. Both honor the same environment overrides
-  and report child-process timeout failures. A timed-out dispatch keeps its
-  durable claim for observation/recovery rather than immediately dispatching again.
+  Cluster dispatch, conflict self-heal, failed-run self-heal, issue-implementation
+  dispatch, and scheduled target-fanout inventory, coverage GraphQL, and
+  ordinary dispatch use the same two-minute default; automatic worker target
+  clones default to three minutes. Their default budgets honor these environment
+  overrides; audit-wave dispatch retains its explicit 30-second bound.
+  Cluster dispatch preserves its durable claim after timeout. Audit waves persist
+  the in-flight target before dispatch; ordinary fanout persists its cursor
+  afterward and may revisit targets when a call fails.
   Cluster-selector evidence and final-open checks use these shared GitHub CLI
   budgets. Its Responses API request has a two-minute deadline covering both
   response headers and body delivery; a timeout fails selection without publishing

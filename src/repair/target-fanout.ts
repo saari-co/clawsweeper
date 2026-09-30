@@ -25,6 +25,7 @@ import {
 import { fetchExactReviewQueuePressure } from "../queue-pressure.js";
 import { coverageTrackedCountsFromManifest } from "../review-coverage-manifest.js";
 import { readTargetRepositoryConfigSource } from "../target-repository-config.js";
+import { githubCommandTimeoutMs } from "./github-cli.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 export type FanoutMode = "hot-intake" | "normal-review" | "audit";
@@ -890,7 +891,7 @@ function runGh(args: readonly string[], env: NodeJS.ProcessEnv, timeout?: number
     env: childEnv,
     maxBuffer: 32 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout,
+    timeout: timeout ?? githubCommandTimeoutMs(childEnv),
   }).trimEnd();
 }
 

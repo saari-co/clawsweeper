@@ -6,6 +6,7 @@ import {
 } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { signalProcessGroup } from "./process-group.js";
 import {
   resolveSpawnCommand,
   windowsEnvironmentValue,
@@ -14,6 +15,8 @@ import {
 } from "./command.js";
 
 export type CodexSpawnInvocation = CommandInvocation;
+
+const gracefulTerminations = new WeakSet<ChildProcess>();
 
 export function codexProcessCommand(
   env: NodeJS.ProcessEnv = process.env,
@@ -74,9 +77,10 @@ export function terminateCodexProcessTree(
     return undefined;
   }
 
-  signalPosixProcessGroup(child, signal);
+  if (signal !== "SIGKILL") gracefulTerminations.add(child);
+  signalProcessGroup(child.pid, signal);
   if (signal === "SIGKILL") return undefined;
-  const timer = setTimeout(() => signalPosixProcessGroup(child, "SIGKILL"), forceAfterMs);
+  const timer = setTimeout(() => signalProcessGroup(child.pid, "SIGKILL"), forceAfterMs);
   timer.unref();
   return timer;
 }
@@ -101,7 +105,7 @@ export function spawnCodex(
   },
 ): ChildProcessWithoutNullStreams {
   const invocation = codexSpawnInvocation(args, options.env, process.platform, options.cwd);
-  return spawn(invocation.command, invocation.args, {
+  const child = spawn(invocation.command, invocation.args, {
     cwd: options.cwd,
     env: options.env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -109,15 +113,13 @@ export function spawnCodex(
     windowsHide: true,
     ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
-}
-
-function signalPosixProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (!child.pid) return;
-  try {
-    process.kill(-child.pid, signal);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  if (process.platform !== "win32") {
+    // Natural exits must not wait for descendant-held pipes; requested stops retain their grace.
+    child.once("exit", () => {
+      if (!gracefulTerminations.has(child)) signalProcessGroup(child.pid, "SIGKILL");
+    });
   }
+  return child;
 }
 
 function windowsCodexAppBinary(env: NodeJS.ProcessEnv): string | null {

@@ -120,7 +120,7 @@ for (const [kind, name, lateUrl] of (["issue", "pull_request"] as const).flatMap
 }
 
 for (const [name, url] of Object.entries(mediaFixtureUrls)) {
-  test(`PR patch-only ${name} media stays in reviewer context without host fetches`, () => {
+  test(`PR patch-only ${name} media stays captured without prompt copies or host fetches`, () => {
     const patch = `@@ -0,0 +1 @@\n+const proof = "${url}";`;
     const pullFiles = [{ filename: "test/proof-fixture.ts", status: "added", patch }];
     const fixture = hydratePrimaryBody("Patch-only media.", "pull_request", { pullFiles });
@@ -131,10 +131,11 @@ for (const [name, url] of Object.entries(mediaFixtureUrls)) {
     });
     const json = prompt.split("## GitHub Context\n")[1]?.match(/```json\n([\s\S]*?)\n```/)?.[1];
     assert.ok(json);
-    assert.deepEqual(
-      JSON.parse(json).pullFiles,
-      JSON.parse(JSON.stringify(fixture.context.pullFiles)),
-    );
+    assert.deepEqual(JSON.parse(json).pullFiles, [
+      { filename: "test/proof-fixture.ts", status: "added" },
+    ]);
+    assert.equal(fixture.context.pullFiles[0].patch, patch);
+    assert.ok(!prompt.includes(url));
     const dir = mkdtempSync(join(tmpdir(), "clawsweeper-patch-media-"));
     const calls: string[][] = [];
     const runner = (command: string, args: readonly string[]) => {
@@ -322,8 +323,9 @@ test("review prompt treats plugin API changes as compatibility-sensitive P1 repa
   assert.match(prompt, /adds new similar\/parallel\s+calls to a plugin API/);
   assert.match(prompt, /require explicit maintainer-visible discussion/);
   assert.match(prompt, /Use\s+`merge-risk: 🚨 compatibility`/);
-  assert.match(prompt, /name the plugin API concern in `risks`/);
-  assert.match(prompt, /make\s+`mergeRiskOptions` spell out the maintainer choices or repair path/);
+  assert.match(prompt, /When the plugin API\s+concern remains unresolved, name it in `risks`/);
+  assert.match(prompt, /make `mergeRiskOptions` spell\s+out the maintainer choices or repair path/);
+  assert.match(prompt, /retain already-accepted tradeoffs in\s+evidence/);
   assert.match(prompt, /Prefer a\s+resolvable P1 review finding/);
   assert.match(prompt, /preserving the existing API/);
   assert.match(prompt, /removing the duplicate\/parallel call/);

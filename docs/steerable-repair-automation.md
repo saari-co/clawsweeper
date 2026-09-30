@@ -109,9 +109,10 @@ bypass repair policy or mutation gates.
 
 ## Intake Paths
 
-### Maintainer and Organization-Member Commands
+### Maintainer Commands
 
-An eligible OpenClaw organization member can comment on an open issue:
+A maintainer with current repository `admin`, `maintain`, or `write` permission
+can comment on an open issue:
 
 ```text
 @clawsweeper implement issue
@@ -124,9 +125,10 @@ An eligible OpenClaw organization member can comment on an open issue:
 The comment router:
 
 1. Verifies that the target is an open issue.
-2. Verifies the command author. Repository maintainers are accepted through
-   collaborator permission; OpenClaw organization owners and members may
-   explicitly request issue implementation.
+2. Verifies the command author through live collaborator permission.
+   Organization membership alone does not authorize issue implementation; the
+   existing `OWNER` association fallback applies only when permission lookup is
+   unavailable.
 3. Checks pause labels and existing PR signals.
 4. Creates or reuses one durable issue implementation job.
 5. Dispatches the normal repair worker in autonomous mode.
@@ -583,15 +585,15 @@ Current global and key lane limits:
 
 | Limit | Value |
 | --- | ---: |
-| Global Codex worker budget | 32 |
+| Global Codex worker budget | 128 |
 | Interactive reserve | 16 |
 | Expansion reserve | 8 |
-| Existing repair, PR repair, and issue implementation default | 12 |
+| Existing repair, PR repair, and issue implementation default | 51 |
 | Imported GitCrawl cluster repair | 2 |
-| Configured normal-review ceiling | 22 |
-| Configured hot-intake ceiling | 11 |
-| Effective quiet background allowance after reserves | 8 |
-| Combined scheduled-review concurrency | 8 |
+| Configured normal-review ceiling | 89 |
+| Configured hot-intake ceiling | 44 |
+| Effective quiet background allowance after reserves | 104 |
+| Combined scheduled-review concurrency | 32 |
 
 Important behavior:
 
@@ -816,6 +818,7 @@ Core steerable-session configuration:
 | `CLAWSWEEPER_CODEX_TIMEOUT_MS` | Planning Codex call timeout. |
 | `CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS` | Per-call execution Codex timeout. |
 | `CLAWSWEEPER_FIX_STEP_TIMEOUT_MS` | Overall fix executor step budget. |
+| `CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS` | Per-command target validation override; defaults to repository configuration, then 480,000 ms. OpenClaw uses 1,500,000 ms for the complete changed gate. See [repository overrides](target-repositories.md). |
 
 Issue implementation controls:
 

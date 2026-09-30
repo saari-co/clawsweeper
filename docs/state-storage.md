@@ -75,6 +75,13 @@ Jobs that need operational Git state receive a sparse checkout containing only
 the retained paths above. Canonical-only lanes set `hydrate-git-state: "false"`
 and never mint or use a state-repository token.
 
+Repair-result publication consumes the Git-backed operational paths and sets
+`hydrate-records: "false"` with `hydrate-state-blobs: "false"`. This avoids
+unused canonical-record discovery, snapshot caches, and R2 hydration while
+preserving the normal publication and validation steps. The equivalent CLI
+flags are `--skip-records --skip-state-blobs`; other callers retain canonical
+record hydration by default.
+
 State-blob publication gives each signed Worker request, including multipart
 operations, a 15-second deadline. Requests retain their existing retry policy
 of at most four attempts, so a stalled upload eventually fails and releases the
@@ -116,6 +123,9 @@ revision, and protocol version. Reuse requires an exact tuple match and a
 verified object digest; every miss or mismatch falls back to GitHub. Receipts
 expire after 30 days, and cache traffic incrementally prunes expired receipts
 plus old unreferenced R2 objects (including upload orphans) in bounded batches.
+Overlapping receipt requests share one cleanup pass within the queue instance,
+so they do not repeatedly scan the same R2 page or overwrite its cursor. A
+completed or failed pass releases that slot for the next request.
 
 GitHub conditional-read entries stay in queue SQLite rather than runner-local
 files because publication runners are ephemeral. They share the 30-day receipt

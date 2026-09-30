@@ -20,7 +20,7 @@ import {
   serializeReviewContext,
 } from "./agent-input-scan-fixtures.js";
 import { stringArg, type Args } from "./clawsweeper-args.js";
-import { ReviewGitError } from "./clawsweeper-review-blobs.js";
+import { refreshReviewTargetBranch, ReviewGitError } from "./clawsweeper-review-blobs.js";
 import {
   mediaProofRuntimeHints,
   mediaProofRuntimePrompt,
@@ -58,7 +58,7 @@ import {
   isRetryableCodexTransportError,
   isTerminalCodexErrorMessage,
 } from "./codex-transient.js";
-import { UserFacingCommandError } from "./command.js";
+import { explainSpawnFailure, UserFacingCommandError } from "./command.js";
 import { validateDecisionProcessGates } from "./review-process-gates.js";
 import { emptyMaintainerDecision } from "./decision-packets.js";
 import {
@@ -114,28 +114,17 @@ export function createReviewRuntime({
   function gitInfo(openclawDir: string, options: ReviewGitInfoOptions = {}): GitInfo {
     const targetBranch = options.targetBranch ?? reviewTargetBranch(openclawDir);
     requireSafeGitBranchName(targetBranch, "target branch");
-    const shallow = run("git", ["rev-parse", "--is-shallow-repository"], { cwd: openclawDir });
     try {
-      run(
-        "git",
-        [
-          "fetch",
-          "--filter=blob:none",
-          "--no-tags",
-          "--recurse-submodules=no",
-          ...(shallow === "true" ? ["--unshallow"] : []),
-          "origin",
-          `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`,
-        ],
-        {
-          cwd: openclawDir,
-          timeoutMs: 30_000,
-        },
-      );
+      refreshReviewTargetBranch(openclawDir, targetBranch);
     } catch (error) {
-      if (!options.classifyFetchFailure || !(error instanceof Error)) throw error;
-      // runText preserves execFileSync's native spawn result, including timeout evidence.
-      throw new ReviewGitError("review_commit_fetch_failed", error);
+      if (
+        !options.classifyFetchFailure &&
+        error instanceof ReviewGitError &&
+        error.cause instanceof Error
+      ) {
+        throw explainSpawnFailure(error.cause, "git", openclawDir);
+      }
+      throw error;
     }
     const mainSha = run("git", ["rev-parse", `refs/remotes/origin/${targetBranch}`], {
       cwd: openclawDir,
@@ -481,9 +470,9 @@ export function createReviewRuntime({
     return reviewDecisionSchemaCache;
   }
 
-  function contextJsonForPrompt(context: ItemContext): string {
+  function contextJsonForPrompt(context: ItemContext, kind: Item["kind"]): string {
     const { pullCommitsRevision: __, prHydrationSnapshot: ___, ...promptContext } = context;
-    return serializeReviewContext(promptContext);
+    return serializeReviewContext(promptContext, kind === "pull_request" ? context.pullFiles : []);
   }
 
   function buildReviewPrompt(
@@ -494,17 +483,20 @@ export function createReviewRuntime({
     runtimeHints: ReviewPromptRuntimeHints = {},
   ): ReviewPromptBuild {
     const prompt = reviewPromptTemplate();
-    const contextJson = contextJsonForPrompt(context);
-    const introductionEvidence =
+    const contextJson = contextJsonForPrompt(context, item.kind);
+    const prEvidence =
       item.kind === "pull_request"
-        ? `\n\n## PR Introduction Evidence\n\n\`\`\`json\n${serializeReviewContext(
-            buildPullRequestReviewEvidence({
-              ...(runtimeHints.targetDir ? { targetDir: runtimeHints.targetDir } : {}),
-              context,
-              mainSha: git.mainSha,
-            }),
-          )}\n\`\`\`\n`
-        : "";
+        ? buildPullRequestReviewEvidence({
+            ...(runtimeHints.targetDir ? { targetDir: runtimeHints.targetDir } : {}),
+            context,
+            mainSha: git.mainSha,
+          })
+        : null;
+    const introductionEvidence = prEvidence
+      ? `\n\n## PR Introduction Evidence\n\n\`\`\`json\n${serializeReviewContext(prEvidence, [
+          prEvidence.introduced,
+        ])}\n\`\`\`\n`
+      : "";
     const schema = reviewDecisionSchemaText();
     const profile = repositoryProfileFor(item.repo);
     const proofScratchDir = runtimeHints.proofScratchDir?.trim();

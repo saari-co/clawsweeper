@@ -5,6 +5,7 @@ import {
 } from "../src/repair/direct-re-review-admission.ts";
 import {
   COMMAND_PROOF_BATCH_CONTEXT_MAX,
+  COMMAND_PROOF_SOURCE_ACTION,
   commandProofBatchBinding,
 } from "../src/command-proof-contract.ts";
 import {
@@ -51,6 +52,7 @@ export type ExactReviewBaseDecision = {
   sourceBaseSha?: string;
   sourceIsDraft?: boolean;
   sourceContentRevision?: string;
+  expectedSourceRevision?: string;
   sourceHeadVerified?: boolean;
   sourceAuthoritySeq?: number;
   sourceUpdatedAt?: string;
@@ -136,7 +138,19 @@ export type ExactReviewEditedSemanticInput = {
   fingerprint: string;
 };
 export type ExactReviewTargetItemState =
-  | { state: "open"; headSha?: string }
+  | {
+      state: "open";
+      headSha?: string;
+      sourceIdentity?: Pick<
+        ExactReviewDecision,
+        | "sourceHeadSha"
+        | "sourceBaseSha"
+        | "sourceIsDraft"
+        | "sourceContentRevision"
+        | "sourceHeadVerified"
+        | "sourceUpdatedAt"
+      >;
+    }
   | { state: "terminal" }
   | { state: "unavailable" };
 
@@ -333,6 +347,14 @@ export function exactReviewBaseDecisionFrom(value: unknown): ExactReviewBaseDeci
   const itemKind = String(decision.itemKind || "");
   const sourceEvent = String(decision.sourceEvent || "");
   const sourceAction = String(decision.sourceAction || "");
+  const expectedSourceRevision = decision.expectedSourceRevision;
+  if (
+    expectedSourceRevision !== undefined &&
+    (decision.itemKind !== "issue" ||
+      typeof expectedSourceRevision !== "string" ||
+      !/^[0-9a-f]{64}$/.test(expectedSourceRevision))
+  )
+    return null;
   const hasSourceHeadSha = Object.hasOwn(decision, "sourceHeadSha");
   const sourceHeadSha = hasSourceHeadSha
     ? String(decision.sourceHeadSha || "")
@@ -493,6 +515,7 @@ export function exactReviewBaseDecisionFrom(value: unknown): ExactReviewBaseDeci
     itemKind,
     sourceEvent,
     sourceAction,
+    ...(typeof expectedSourceRevision === "string" ? { expectedSourceRevision } : {}),
     ...(publicationPolicy ? { publicationPolicy } : {}),
     supersedesInProgress: Boolean(decision.supersedesInProgress),
     ...(sourceHeadSha === undefined ? {} : { sourceHeadSha }),
@@ -744,6 +767,8 @@ export function mergePendingExactReviewDecision(
   next: ExactReviewDecision,
 ): ExactReviewDecision {
   const merged = { ...current, ...next };
+  // A failed-review retry's source pin belongs only to that request.
+  if (!Object.hasOwn(next, "expectedSourceRevision")) delete merged.expectedSourceRevision;
   // Coalescing cannot widen an admitted manual revision. A separately claimed
   // successor may review normally; it cannot lend authority to these bytes.
   const retainedPolicy = decisionPublicationPolicy(current);
@@ -758,6 +783,16 @@ export function mergePendingExactReviewDecision(
       if (current.additionalPrompt === undefined) delete merged.additionalPrompt;
       else merged.additionalPrompt = current.additionalPrompt;
     }
+  }
+  // Proof context is trusted only with its proof-result source action. An
+  // ordinary event keeps the command lifecycle, but must not reuse proof
+  // evidence. An explicitly supplied successor prompt remains its own input.
+  if (
+    current.sourceAction === COMMAND_PROOF_SOURCE_ACTION &&
+    next.sourceAction !== COMMAND_PROOF_SOURCE_ACTION &&
+    !Object.hasOwn(next, "additionalPrompt")
+  ) {
+    delete merged.additionalPrompt;
   }
   const commandMarkerChanged =
     Object.hasOwn(next, "commandStatusMarker") &&

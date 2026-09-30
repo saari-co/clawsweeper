@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { requiredRawEnv as env } from "../dist/required-env.js";
 import {
   appendLegacyAvoidedGithubEgressMember,
   recordGithubEgressMember,
@@ -391,6 +392,10 @@ async function worker(itemPath, root, workspace) {
         capture: true,
       },
     );
+    const throttled = result.code !== 0 && githubThrottleText(result.stderr);
+    // Close admission before awaiting the reset lookup: a successful sibling
+    // can finish and start another member while that request is in flight.
+    if (throttled) appendJsonLine(rateLimitObservationPath, fallbackRateLimitObservation());
     appendRequestMetric(requestMetricsPath, {
       scope: "repository_actions",
       category: "artifact_download",
@@ -400,7 +405,7 @@ async function worker(itemPath, root, workspace) {
       repeat_revision: item.repeatRevision === true,
       count: 1,
     });
-    if (result.code !== 0 && githubThrottleText(result.stderr)) {
+    if (throttled) {
       const observation = await resolveRateLimitObservation(
         repositoryToken,
         requestMetricsPath,
@@ -628,13 +633,7 @@ async function resolveRateLimitObservation(
   try {
     closeSync(openSync(`${observationPath}.lookup-repository_actions.lock`, "wx"));
   } catch {
-    return {
-      scope: "repository_actions",
-      observed_at: new Date(now).toISOString(),
-      retry_at: new Date(now + 60_000).toISOString(),
-      provenance: "fallback",
-      authoritative: false,
-    };
+    return fallbackRateLimitObservation(now);
   }
   const status = await run(
     "gh",
@@ -644,7 +643,7 @@ async function resolveRateLimitObservation(
       "--jq",
       "{remaining:.resources.core.remaining,reset:.resources.core.reset}",
     ],
-    { env: { ...process.env, GH_TOKEN: token, ...telemetryEnv }, capture: true },
+    { env: { ...process.env, GH_TOKEN: token, ...telemetryEnv }, capture: true, timeoutMs: 30_000 },
   );
   appendRequestMetric(requestMetricsPath, {
     scope: "repository_actions",
@@ -672,6 +671,16 @@ async function resolveRateLimitObservation(
     retry_at: new Date(Math.max(now + 60_000, resetAt)).toISOString(),
     provenance: resetAt ? "rate_limit_status" : "fallback",
     authoritative: resetAt > 0,
+  };
+}
+
+function fallbackRateLimitObservation(now = Date.now()) {
+  return {
+    scope: "repository_actions",
+    observed_at: new Date(now).toISOString(),
+    retry_at: new Date(now + 60_000).toISOString(),
+    provenance: "fallback",
+    authoritative: false,
   };
 }
 
@@ -737,12 +746,6 @@ function positiveInteger(value, fallback) {
   if (!Number.isSafeInteger(parsed) || parsed < 1)
     throw new Error("value must be a positive integer");
   return parsed;
-}
-
-function env(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
 }
 
 export function run(command, args, options = {}) {

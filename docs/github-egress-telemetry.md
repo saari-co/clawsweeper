@@ -71,7 +71,7 @@ Do not add unlike units. Each row declares one of these units:
 | `invocation`           | One `gh` command invocation, including a pre-wire failure or an opaque artifact download action. |
 | `wire_attempt`         | One HTTP request observed in a safe `GH_DEBUG=api` transport frame; each pagination page counts. |
 | `broker_lookup`        | One durable ETag broker lookup decision: hit, miss, or skip.                                     |
-| `conditional_response` | One GitHub 200 stored by the broker or one 304 whose durable body was confirmed and served.      |
+| `conditional_response` | One GitHub 200 stored by the broker or one 304 served with a confirmed or same-process body.     |
 
 A paginated invocation therefore contributes one `invocation` and N
 `wire_attempt` rows. An artifact download whose binary redirect is unsafe to
@@ -87,7 +87,8 @@ configuration revisions are combined before serialization.
 Do not equate a broker hit with a quota saving. `cache_hit` means only that an
 ETag was available for the next live request. The separate
 `cache_304_served` conditional-response row proves that GitHub returned 304 and
-the matching durable body was confirmed. A 304 costs zero REST quota points but
+the matching body was either confirmed by the broker or retained in this process
+from an earlier live validation. A 304 costs zero REST quota points but
 still contributes a normal `wire_attempt`; the broker reduces quota charges,
 not wire requests. `cache_200_stored`, `cache_miss`, and `cache_skip` remain
 separate outcomes so operators can distinguish population, absence, and
@@ -100,6 +101,35 @@ page-stable issue comments, pull comments, and pull reviews, plus the dashboard
 Actions run/job health reads. Publication reads continue to use the existing
 in-generation memoizer; the broker is consulted only when a real cross-run or
 new-generation GitHub request is about to be sent.
+
+Each publication process also retains, per cache key, the last body it
+validated: a live 200 with an ETag or a broker-confirmed 304. A repeated read
+sends that ETag straight to GitHub. A 304 serves the retained body and records
+`cache_304_served` without another broker lookup or confirmation; a 200
+replaces both the retained and the durable entry. The retained set is bounded
+(128 entries, 16 MiB) and never answers a read by itself, so freshness barriers
+keep their live GitHub authority while repeated guard reads avoid two Worker
+round trips each. It also keeps bodies above the 128 KiB durable bound, so a
+large comment thread revalidates with a 304 instead of being downloaded again
+on every guard read.
+
+Issue-comment context hydration reads the complete thread once for its source
+revision and derives the bounded prompt window locally. That complete read also
+serves later comment consumers in the same apply generation, avoiding duplicate
+first/tail-page requests. Explicit freshness barriers bypass the generation and
+mutations invalidate it, so this does not reuse stale comments before writes.
+
+Exact-publication public OpenClaw metadata and comment reads also consult the
+batch's shared credential reset observations before transport. A throttle records
+its provisional reset before the bounded rate-status lookup, so sibling publishers
+can defer immediately. A valid unexpired observation suppresses repeated calls
+only for the matching credential scope; App observations additionally require the
+same target owner. The existing one-shot App fallback remains available when that
+credential is not exhausted. Expired or malformed observations never supply a
+response: the next permitted read still goes to GitHub. Mutation routing and
+freshness barriers are unchanged. These deferrals increment the version-1
+`skipped_by_circuit` counter without inventing wire attempts or new throttle
+observations, and do not perform another rate-status lookup or extend the reset.
 
 The version-1 key is the canonical JSON tuple
 `[1, credential_pool, route_with_sorted_query, media_type]`. Collection routes
@@ -142,10 +172,11 @@ bounded query. The safety invariant remains two independent reads: a normal
 single-PR check therefore contributes two GraphQL invocations instead of two
 sets of reviews, inline-comment, and review-thread reads. The same query shape
 can alias up to eight PRs, so a bounded publication batch still contributes two
-GraphQL invocations. Any GraphQL error, pagination, partial connection, or
-missing required field activates the complete version-1 path for that PR and
-emits one `reviewed_pr_activity_cursor_v2_fallback` JSON line; the decoder never
-accepts a partial activity identity.
+GraphQL invocations. A held-lease mutation boundary runs this check once before
+its head, comment, and head lease reads. Any GraphQL error, pagination, partial
+connection, or missing required field activates the complete version-1 path for
+that PR and emits one `reviewed_pr_activity_cursor_v2_fallback` JSON line; the
+decoder never accepts a partial activity identity.
 
 Use the unit totals as a conservation check:
 

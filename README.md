@@ -91,9 +91,12 @@ and videos are probed and converted to contact sheets. PR patches and supplement
 body excerpts never supply host download URLs.
 
 ClawSweeper syncs one marker-backed public review comment per item and edits it
-in place instead of posting repeated comments. If a review starts before a
-completed comment exists, it first posts a short status placeholder, then
-replaces that same comment with the final review. Pull request comments include
+in place instead of posting repeated completed reviews. Scheduled review workers
+use a separate temporary status comment for lease coordination. Command-triggered
+exact reviews instead rewrite their existing acknowledgement and use the durable
+queue claim as their coordination lease, so they do not add a second visible status
+comment. Exact-review workers verify queue ownership before generation and during
+finalization. Temporary lease comments are removed after publication. Pull request comments include
 hidden verdict/action markers so trusted repair and automerge flows can continue
 without scraping visible prose. See
 [`docs/pr-review-comments.md`](docs/pr-review-comments.md).
@@ -285,19 +288,24 @@ Common commands:
 - Scheduled router runs (`CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1`) also dispatch
   the router for `openclaw/endor-clawsweeper-e2e`. Execute-enabled scheduled or
   manual runs for that test repository enrol eligible Endor Pro PRs with
-  `clawsweeper:autofix`: review and repair, never automatic merge. Intake checks
+  `clawsweeper:automerge`: review, repair if needed, then merge only after the
+  existing exact-head review and merge gates pass. Intake checks
   bot identity, PR state and same-repository/default-branch targeting. Current
   or historical control labels block enrolment; a maintainer must resume it.
   Other repositories, including `openclaw/openclaw`, are excluded from Endor
   enrolment. Endor policy owns reachability. Intake failures do not stop the
-  router. Read-only preview:
-  `node dist/repair/endor-autofix-intake.js --repo openclaw/endor-clawsweeper-e2e`.
-  The controlled intake/router proof is `node scripts/e2e/endor-autofix.mjs`
+  router.
+  Existing autofix PRs and human-review holds are not automatically upgraded
+  or cleared by this change. Read-only preview:
+  `node dist/repair/endor-automerge-intake.js --repo openclaw/endor-clawsweeper-e2e`.
+  The controlled intake/router proof is `node scripts/e2e/endor-automerge.mjs`
   after `pnpm run build:node`; it uses synthetic GitHub state and verifies
-  completion, human-review pause, replay, and zero merge calls.
+  review dispatch, automatic merge, human-review pause, stale-review rejection,
+  all late automerge-blocking labels, and replay without duplicate merge calls.
 - `implement issue` on an open issue creates or reuses one issue implementation
-  job and dispatches the issue-to-PR lane. OpenClaw organization members may
-  request this explicitly even without repository write permission.
+  job and dispatches the issue-to-PR lane. The requester must have current
+  repository `admin`, `maintain`, or `write` permission; organization membership
+  alone does not authorize the write action.
 - With automatic issue implementation enabled, newly reviewed issues and
   existing eligible open issue reports enter the enabled bounded lanes. Codex
   inspects the issue and repository, chooses the
@@ -324,8 +332,10 @@ Common commands:
   immediately before every branch push and before PR creation.
 
 Only maintainers are accepted for write actions. The router checks repository
-collaborator permission (`admin`, `maintain`, or `write`) and falls back to
-trusted `author_association` values when permission lookup is unavailable.
+collaborator permission (`admin`, `maintain`, or `write`) and falls back to the
+`OWNER` author association only when permission lookup is unavailable. Issue
+implementation uses the same fail-closed rule; organization membership alone
+does not authorize a write action.
 Users with repository write access and issue/PR authors may ask
 `@clawsweeper re-review` or `@clawsweeper re-run` for a fresh read-only review.
 Other contributor commands are ignored without a reply. Scheduled comment routing is dry unless
@@ -423,15 +433,18 @@ scheduling, capacity, and monitoring behavior is documented in
 
 Review is proposal-only. It never closes items.
 
-- A planner scans open issues and PRs, then assigns exact item numbers to shards.
-- Manual runs can pass `item_number` or comma-separated `item_numbers` to review
-  exact Audit Health findings without scanning for a normal batch. Batch
-  dispatchers can use `shard_count` to bound parallel shards and `batch_size`
-  to set the number of items assigned to each worker.
-- Each shard checks out the selected target repository at `main`.
-- Codex reviews with the internal model and the configured service tier. Sweep planning,
-  reviews, assist answers, and close-coverage proofs honor `CLAWSWEEPER_CODEX_REASONING_EFFORT`
-  (default `high`), matching the repair lane. Reviews have a 10-minute per-item timeout.
+- A planner selects due items and offers them to the shared exact-review queue.
+- Manual runs can select `item_number` or comma-separated `item_numbers`, target
+  branch, prompt, timeout, and hot-intake mode. Broad runs use the same queue
+  capacity and pacing as scheduled feeds; per-run `batch_size`, `shard_count`,
+  and `apply_after_review` inputs are retired. Use the separate `apply_existing`
+  lane to apply eligible proposals.
+- Each admitted item gets its own review workflow for the selected target.
+- Codex reviews use the configured model profiles. OWNER, MEMBER, and COLLABORATOR-authored issues
+  and pull requests use high reasoning with fast service; other items use medium
+  reasoning with standard service. Sweep planning, assist answers, and
+  close-coverage proofs use the configured ordinary-item defaults. Reviews have
+  a 10-minute per-item timeout.
 - Each item becomes a flat report under
   `records/<repo-slug>/items/<number>.md` with the decision, evidence,
   Codex `/review`-style PR findings, suggested comment, runtime metadata, and
@@ -477,14 +490,15 @@ retries, and inconsistent records. Its cycle estimate covers work actionable in
 the current scheduler window rather than presenting every probe as immediately
 closable.
 
-Exact event runs skip the bulk planner and shard matrix. The read-only reviewer
+All review execution uses the exact-item queue; broad runs only feed its planner. The read-only reviewer
 handles only the selected item, uploads a hash-bound GitHub Actions artifact,
 enqueues a separate durable publication lease, and then releases its review
 lease without checking out or pushing the state repository. The queue retries
 publication independently, so a cancelled publisher does not rerun Codex. The
 source fallback uses adaptive minimum/base/maximum values of 4/24/48; production
 overrides them with 8/32/32 and enables direct
-publication plus up to 8 concurrent size-8 batches. The Durable Object validates
+publication plus up to 8 concurrent size-8 batches, with two isolated preparation
+workers per batch. The Durable Object validates
 each artifact's workflow run, queue tuple,
 target, decision digest, file inventory, sizes, and SHA-256 hashes before a
 publisher receives write tokens.
@@ -502,10 +516,7 @@ waiting for the retention deadline.
 Deterministic terminal and remain-open outcomes flow through the same publisher.
 Ordinary synced verdicts publish their exact durable comment, then queue an
 executing target-wide comment-router scan. Exact publishers use the bounded
-Durable Object lane while batch publishers remain per-target serialized. Direct
-exact-event viable-issue
-implementation dispatch stays disabled; the bounded broad publish/backfill lane
-owns that separately revalidated intake. Publication still does not claim an
+Durable Object lane while batch publishers remain per-target serialized. Exact publishers and the separate issue-implementation backfill workflow retain their guarded intake. Publication still does not claim an
 atomic state-publish-and-route boundary.
 `stale_insufficient_info` issue reports and `mostly_implemented_on_main` PR
 reports are never applied to young items; apply requires those reports to be at
@@ -553,9 +564,10 @@ appropriate repair job.
   that head changed. It also refuses to push when the PR closed during the
   wait. Override the window with `CLAWSWEEPER_BRANCH_PUSH_SETTLE_SECONDS`
   (bounded to 0-120 seconds) when a manual backfill is already settled.
-- An OpenClaw organization member can comment `@clawsweeper implement issue`;
-  ClawSweeper refuses when an open PR already mentions the issue, a generated
-  branch PR is already open, the issue is paused, or security blockers remain.
+- A repository maintainer with current `admin`, `maintain`, or `write`
+  permission can comment `@clawsweeper implement issue`; ClawSweeper refuses
+  when an open PR already mentions the issue, a generated branch PR is already
+  open, the issue is paused, or security blockers remain.
 - `CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES=1` enables newly reviewed issues and
   bounded backfill from existing eligible open issue reports. General viable
   implementation remains limited to public sibling repositories;
@@ -618,7 +630,17 @@ The host classifies the reviewed synthetic malformed-configuration URI in
 `test/action-ledger-runtime.test.ts` and the explicitly approved autoreview
 negative-test URI in the [canonical autoreview test](https://github.com/openclaw/agent-skills/blob/a8466c1d860588a083610fe41fd277c1d88b14e0/skills/autoreview/tests/test_autoreview_hardening.py)
 or its [vendored OpenClaw copy](https://github.com/openclaw/openclaw/blob/136eab023035dd5943818f791d3c3db7d92e4491/.agents/skills/autoreview/tests/test_autoreview_hardening.py)
-as non-sensitive after a complete scan. The same exact-fixture policy covers
+as non-sensitive after a complete scan. OpenClaw's existing
+[completion-webhook warning-redaction fixture](https://github.com/openclaw/openclaw/blob/226302c6ef7b496ced68f69f917669cd8a18f7ed/src/gateway/server-cron-notifications.test.ts#L735)
+qualifies only for FTP detector 899
+with the observed `PLAIN` and `HTML` decoders. Both native value digests, the
+complete source file's SHA256, every literal occurrence's complete source line,
+original path, regular-file mode, committed base/head roles, and native FTP
+metadata shape must match. Any source-file edit requires requalification, including
+unrelated changes: HTML decoding can hide another occurrence from plain-text
+search. FTP patch findings and other decoders
+remain blocking. See the [native before/after proof](docs/proof/cron-ftp-fixture/README.md).
+The same exact-fixture policy covers
 the reviewed OpenClaw Browser CDP authentication and credential-redaction fixtures in
 [`chrome.test.ts`](https://github.com/openclaw/openclaw/blob/8e03b0c62e76dc25c77045a84ab3098a111a7be3/extensions/browser/src/browser/chrome.test.ts),
 the [remote-CDP coverage](https://github.com/openclaw/openclaw/blob/58da2f5897feb6840937d8e50cf7ee6f26aa57d7/extensions/browser/src/browser/chrome.test.ts),
@@ -654,7 +676,7 @@ original source. Repeated literals remain eligible unless an entry is bound to
 an approved complete-line digest; those entries require exactly one occurrence
 in the staged blob. Finding order and duplicate records do not change the exact
 value, path, and mode checks.
-Findings must use `PLAIN` or `HTML`, except the Mac dashboard, MCP Apps, marketplace telemetry, and Gateway config entries permit only
+Findings must use `PLAIN` or `HTML`, except the MCP Apps, marketplace telemetry, and Gateway config entries permit only
 their observed `PLAIN` decoder and the two guarded-CDP fixtures also permit `BASE64`.
 The pinned Base64 decoder preserves the rest of a chunk after
 decoding another token, so an unchanged literal can acquire that decoder label
@@ -670,8 +692,12 @@ only their observed `PLAIN` or `ESCAPED_UNICODE` variants; the Crabbox
 documentation row permits only its observed `PLAIN` or `HTML` variants. These
 exact attribution rows are role-neutral; every logical staged reference must
 independently match the row and have a committed `base` or `head` role. URI
-findings require one literal `RawV2` witness and derived host, username, and
-password fields. MongoDB and Postgres findings bind the scanner-reported line
+findings require one literal `RawV2` witness unless the row declares an exact
+ordered sequence of complete source-line digests. A declared sequence must match
+every occurrence exactly; missing, extra, reordered, or changed lines refuse
+admission. Derived host, username, and password fields must match native metadata;
+the host preserves explicit default ports and original spelling, as TruffleHog
+does. MongoDB and Postgres findings bind the scanner-reported line
 and their exact native metadata shape. Any emitted subset and order may qualify;
 duplicate exact findings, unknown variants, lossy decoder buckets, or an
 unqualified deduplicated blob reference refuse admission.
@@ -686,9 +712,61 @@ second finding's details. Constructed HTML regression records are not recovered
 hosted evidence. Qualification does not waive that unknown finding or replace
 fresh whole-input admission and a completed review.
 
+The same table qualifies the existing OpenClaw [browser URL-port precedence
+fixtures](https://github.com/openclaw/openclaw/blob/3e6f7494af752db12ee8f1f9160a8c950158174d/extensions/browser/src/browser/config.test.ts).
+The HTTPS input and assertion require their exact two-line sequence; the two
+loopback fixtures each require one complete source line. Only URI detector 17,
+`PLAIN`/`HTML`, the pinned raw-value identities, regular-file mode, and committed
+base/head references qualify. The native proof for PR #149651 observed `PLAIN`
+findings; `HTML` is separately covered by constructed classifier records.
+
+The marketplace entries telemetry test uses the same reviewed feed URI twice, in live and snapshot metadata. Its exact attribution binds both complete source lines in order, URI detector 17, observed PLAIN or HTML decoding, regular-file mode, and committed base/head roles. The refresh test keeps its existing legacy approval and repair roles. Policy selection follows the staged source references, including each patch witness, so a shared URI does not transfer changed-line approval or duplicate-record rules between these sources. See [the native proof](docs/proof/marketplace-telemetry-fixtures/README.md).
+
+Six existing Crabbox scope-normalization and redaction fixtures use the same exact attribution table, limited to their observed URI detector 17 / PLAIN results. Both raw digests, each complete source line (including the ordered pair for the repeated fixture), the three original test paths, regular-file mode, and every committed base/head reference must match. No test file is exempt from scanning. See [the qualification contract and native proof](docs/proof/crabbox-config-fixtures/README.md).
+
+The Gateway readiness error-privacy fixture in OpenClaw's
+[readiness test](https://github.com/openclaw/openclaw/blob/876b4c34f16b46bb4cbff8569d6cb2ba39ee0e59/test/helpers/openclaw-test-instance.test.ts#L2002) is also qualified by this table.
+The exact URI detector 17 identities, complete source line (including the
+surrounding synthetic payload expression), regular-file mode, and committed
+base/head references must match. Native 3.97.4 scans observed `PLAIN` and `HTML`;
+only those two variants qualify. See [the native proof](docs/proof/readiness-privacy-fixture/README.md).
+
+The browser CDP discovery fixture in
+`extensions/browser/src/browser/pw-session.connections.test.ts` uses the same
+exact table for its observed URI detector 17 `PLAIN` and `HTML` findings. Both
+raw-value digests, the complete source line, original path, regular-file mode,
+and committed base/head references must match. See [the native proof](docs/proof/agent-input-scan-context/README.md#browser-cdp-discovery-fixture).
+
+The CDP authentication and explicit-port fixtures in OpenClaw's
+[SDK browser tests](https://github.com/openclaw/openclaw/blob/38d949a549dbb8f9376d5d08a96422615c8e7ab0/src/plugin-sdk/browser-subpaths.test.ts) qualify only for their observed URI
+detector 17 `PLAIN` findings. Both native value digests, each complete source
+line (including the path suffix beyond the native match), the original path,
+regular-file mode, and every committed base/head reference must match. Other
+decoders and changed source lines remain blocking; the WebSocket fixture has
+no qualification because the pinned scanner did not emit a finding for it.
+
+The TypeSafe local-transport URL-rejection fixture in
+`extensions/typesafe/src/local.transport.test.ts` binds its exact URI detector 17
+identities, full source line, regular-file mode, and committed base/head references.
+Native 3.97.4 scans observed `PLAIN` and `HTML`; only those variants qualify.
+See [the native proof](docs/proof/agent-input-scan-context/README.md#typesafe-local-transport-fixture).
+
+The native-worker endpoint and startup-config rejection fixtures in
+[transport tests](https://github.com/openclaw/openclaw/blob/93dbee664f93ca80668f85ab346c8e7a4e07db7e/src/worker/native-runtime-transport.test.ts) and
+[startup tests](https://github.com/openclaw/openclaw/blob/93dbee664f93ca80668f85ab346c8e7a4e07db7e/src/worker/native-runtime.test.ts)
+qualify only through their exact URI-17 PLAIN/HTML attribution, both value
+digests, complete source lines, regular-file mode and committed source references.
+No whole test file is exempt. See [the native source-admission proof](docs/proof/native-worker-fixtures/README.md).
+
 One source path may contain multiple independently reviewed fixtures; each
 digest/path/mode tuple must match exactly, so source membership alone never
 qualifies a finding.
+The model-egress fixtures in OpenClaw's
+[Crabbox model runner](https://github.com/openclaw/openclaw/blob/15c14e982fd7640a77b0c2b9bab6e5b4b168f705/extensions/crabbox/src/crabbox-model-run.test.ts) and
+[configured model egress](https://github.com/openclaw/openclaw/blob/15c14e982fd7640a77b0c2b9bab6e5b4b168f705/src/secrets/model-egress.test.ts) tests qualify three synthetic URI identities using
+their complete source lines and committed regular-file references. Native
+TruffleHog 3.97.4 observed `PLAIN` and `HTML` for each identity; only those
+variants qualify. See [the native proof](docs/proof/agent-input-scan-context/README.md#model-egress-fixtures).
 Deduplicated blobs retain every scanned logical endpoint's role, path, and Git
 mode, including mode-only transitions and shared-path aliases. Every captured
 reference must qualify under the same exact attribution policy before any source
@@ -701,9 +779,84 @@ Markdown and sentence punctuation. The original context is preserved, and change
 paths, credentials, or additional query text remain untouched. This omission does not classify a native finding or prove
 its verification status. Source blobs, introduced patches, and scanner admission
 retain their existing checks.
-Findings attributed to prompt, schema, diff, additional-input, other-path, or
-encoded-only blobs remain blocking, as do other findings, verified findings,
-and incomplete scans. Unverified findings alone never qualify: every finding must
+The create-profile response-redaction fixture in OpenClaw's
+`extensions/browser/src/browser/profiles-service.test.ts` also binds its exact
+URI identity, complete source line, regular-file mode, and committed base/head
+references. Native 3.97.4 scans observed only `PLAIN` and `HTML` attribution;
+the policy accepts those two variants.
+
+The plugin settings redaction fixtures in OpenClaw's
+`ui/src/pages/custodian/custodian-session-store.test.ts` and
+`ui/src/e2e/plugins-help.e2e.test.ts` bind their exact synthetic URI, ordered
+complete source lines, regular-file mode, and committed base/head references.
+Native 3.97.4 scans observed `PLAIN` and `HTML` attribution for these fixtures;
+only those exact tuples qualify.
+
+The autoreview hardening negative-test fixtures in
+`skills/autoreview/tests/test_autoreview_hardening.py` and its OpenClaw mirror at
+[.agents/skills/autoreview/tests/test_autoreview_hardening.py](https://github.com/openclaw/openclaw/blob/b2d3d0f86be704f80a04c11110aa1a7082a961a6/.agents/skills/autoreview/tests/test_autoreview_hardening.py) use the same exact
+attribution table. URI detector 17, each row's qualified `PLAIN` or `HTML` decoder, both pinned
+raw-value digests, every complete source line in order, regular-file mode, and
+committed base/head references qualify. The existing legacy value-only row stays
+available for review-context omission; changed patch lines require these exact
+tuples. No other literal or source line in either test file is implicitly approved.
+The additional empty-username and encoded-NUL identities permit only their
+observed `PLAIN` decoding. See [the repeated native proof](docs/proof/agent-input-scan-context/README.md#autoreview-hardening-fixtures).
+
+The full generated patch remains scanned. Every literal occurrence of an
+eligible URI must bind to committed regular-file bytes through canonical
+same-path headers, full Git object IDs, hunk coordinates, counts, and newline
+markers. Unchanged context requires the identical full line in both blobs.
+Added lines require the head blob; removed lines require the base blob, and
+both require exact ordered full-line attribution policy. Legacy value/path-only
+rows remain context-only. Every retained blob reference must independently pass
+the existing fixture policy.
+New and deleted files additionally require one matching host-captured raw Git
+diff record proving the absent endpoint, correct zero object ID and mode, and
+the complete present-file hunk. A textual `/dev/null` header or missing blob is
+not absence proof; contradictory captured references refuse admission.
+Headers containing the URI, binary patches, ambiguous paths, mode changes,
+uncommitted endpoints, and encoded-only matches remain blocking. Decoder line
+coordinates are diagnostic only; source matching does not rely on them.
+Patch notices retain the original material ID, scanner line, decoder, and literal
+line, with `patch` provenance recording both revisions and each source blob/line.
+The prompt omission helper is never applied to scan input. See
+[the reproducible admission proof](docs/proof/agent-input-scan-context/README.md).
+
+CloudflareGlobalApiKey detector 58 can pair Git's generated 40-character blob
+IDs with nearby email context. An unverified `PLAIN`/`HTML` finding in a patch or raw diff
+requires a separate provenance scan only when every literal occurrence is an exact
+object-ID field in canonical same-path regular-file patch/raw-diff headers.
+Modified executable files also qualify when both endpoint modes remain `100755`;
+their raw records, patch headers, and blob references must agree on that mode.
+Executable additions/deletions, mode changes, and symlinks remain unsupported.
+The two endpoint revisions, paths, modes, and full staged blobs must agree;
+the host independently rehashes each present blob. Added and deleted files require
+matching zero endpoints, mode/status fields, patch headers, and absence of source
+references at the missing endpoint. Raw records and matching patch sections must
+be unambiguous; malformed, duplicate, or unmatched records refuse. The matched bytes must be absent
+from every staged prompt, schema, additional input, raw working file, and full
+blob, preventing detector deduplication from hiding a content occurrence.
+Missing retained bytes, unsupported metadata, malformed native fields, verified
+findings, and scanner errors still refuse. The complete patch, raw diff, and
+blobs remain scanned unchanged. Metadata notices identify their classification
+and use a SHA-256 digest in the existing notice identity field; matched object
+IDs and verification values are never emitted. OpenClaw Bay is unaffected.
+
+Those witnesses alone never admit a review: HTML decoding can create another
+matching value from source content while its reported line differs from the
+original bytes. The host scans a second complete copy of each affected patch or raw diff with only the proven
+object-ID fields masked at their original lengths. All filename context and
+content bytes remain unchanged, and the staged bytes record that actual masked
+copy. The same pinned scanner, verification flags, completion checks, and shared
+deadline apply. Any remaining unclassified finding or request for metadata proof
+refuses admission; success notices are emitted only after this replay and the
+final source fences. Raw-diff replay has no fixture-admission route: any remaining
+finding refuses. Existing URI-only reviews retain their original single scan.
+
+Findings attributed to prompt, schema, additional-input, other-path,
+or unqualified patch material remain blocking, as do other findings, verified
+findings, and incomplete scans. Unverified findings alone never qualify: every finding must
 match the exact bytes, source association, and strict detector contract. This
 classification does not expand TruffleHog's detection coverage.
 The classification is pinned to TruffleHog 3.97.4's output contract; scanner
@@ -817,8 +970,8 @@ source ~/.profile
 corepack enable
 pnpm install
 pnpm run build
-pnpm run plan -- --target-repo openclaw/openclaw --batch-size 5 --shard-count 22 --max-pages 250 --codex-model internal --codex-reasoning-effort high
-pnpm run review -- --target-repo openclaw/openclaw --target-dir ../openclaw --batch-size 5 --max-pages 250 --artifact-dir artifacts/reviews --output-retention debug --codex-model internal --codex-reasoning-effort high --codex-timeout-ms 600000
+pnpm run plan -- --target-repo openclaw/openclaw --batch-size 5 --shard-count 89 --max-pages 250 --codex-model internal
+pnpm run review -- --target-repo openclaw/openclaw --target-dir ../openclaw --batch-size 5 --max-pages 250 --artifact-dir artifacts/reviews --output-retention debug --codex-model internal --codex-timeout-ms 600000
 pnpm run apply-artifacts -- --target-repo openclaw/openclaw --artifact-dir artifacts/reviews --skip-dashboard
 pnpm run audit -- --target-repo openclaw/openclaw --max-pages 250 --sample-limit 25 --update-dashboard
 pnpm run reconcile -- --target-repo openclaw/openclaw --dry-run
@@ -969,13 +1122,13 @@ default, subject to the selected repository profile; pass `target_repo`,
 `apply_kind=issue`, or `apply_kind=pull_request` to narrow a manual run.
 
 Scheduled runs cover the configured product profiles. `openclaw/openclaw` runs
-normal backfill hourly; scheduled hot intake and normal backfill share an
-eight-worker cap in the durable review queue. `openclaw/clawhub` runs on offset review/apply/audit crons so its reports
+normal backfill hourly; scheduled hot intake and normal backfill share a
+32-worker cap in the durable review queue. `openclaw/clawhub` runs on offset review/apply/audit crons so its reports
 live under `records/openclaw-clawhub/` without colliding with default repo
 records. `openclaw/clawsweeper` has a scheduled read-only audit row and is
 available for manual and event self-review smoke tests. Broad hot-intake sweeps
-use the queue's scheduled admission budget; manual background matrices have at
-most eight slots when quiet, while exact event reviews still use one shard.
+use the queue's scheduled admission budget; manual normal and hot-intake matrices
+have at most 89 and 44 slots when quiet, while exact event reviews still use one shard.
 Normal review and hot intake are
 background lanes, so they shrink automatically while repair or exact-item work
 is active. Throughput defaults live in
@@ -984,22 +1137,22 @@ is active. Throughput defaults live in
 ### Worker Budget
 
 ClawSweeper has one main capacity knob:
-`config/automation-limits.json` -> `workers.max`. The current value is `32`.
+`config/automation-limits.json` -> `workers.max`. The current value is `128`.
 This is a Codex worker budget, not a GitHub Actions runner limit. Deterministic
 exact-review publishers, comment routers, and lease reconcilers are
-control-plane workflows and do not consume these 32 slots.
-Lane limits are derived from that number: manual normal review defaults to 22
-requested shards and hot intake to 11; the interactive and expansion reserves
-reduce both to at most eight slots when quiet. Scheduled work has a separate
-eight-slot admission cap and a 60-review/hour target with a six-item burst. The
+control-plane workflows and do not consume these 128 slots.
+Lane limits are derived from that number: manual normal review defaults to 89
+requested shards and hot intake to 44; the interactive and expansion reserves
+leave 104 background slots when quiet. Scheduled work has a separate
+32-slot admission cap and a 60-review/hour target with a six-item burst. The
 existing repair/issue implementation lanes use 40% of `workers.max`, currently
-12 live workers. Imported gitcrawl cluster repair allows 2 live workers by default.
+51 live workers. Imported gitcrawl cluster repair allows 2 live workers by default.
 Exact-item review, repair, and issue implementation are priority work; normal
 review and hot intake are background work and automatically
 yield when priority work is active. Exact-item runs use a durable Worker queue
-that coalesces item deliveries, leases at most 32 concurrent reviews, and admits
-up to 24 active exact reviews per target repository. Other lanes retain the
-checked-in 32-worker scheduling model. A separate 194-slot exact-review
+that coalesces item deliveries, leases at most 80 concurrent reviews, and admits
+up to 64 active exact reviews per target repository. Other lanes use the
+checked-in 128-worker scheduling model. A separate 194-slot exact-review
 Actions budget supports the production maximum of 32 legacy publisher slots, the
 enforced 16-slot control-plane reserve, and additional Actions headroom without
 raising the Codex review ceiling.
@@ -1040,6 +1193,12 @@ value, and accepts an explicit `--test-concurrency` override for diagnostics.
 absent, allowing controlled concurrency experiments through package scripts.
 CI retains the adaptive default. Crabbox diagnostic bundles under `.crabbox/` are generated scratch
 and are ignored by Git.
+
+On Linux and macOS, the shared synthetic GitHub CLI fixtures clear
+`NODE_V8_COVERAGE` before starting their Node stand-ins. Those fixtures do not
+execute ClawSweeper source; interrupting their profile writes must not break the
+real coverage report. Production subprocesses keep inherited coverage. Other
+fixture launchers and Windows retain their existing behavior.
 
 ## GitHub Actions Setup
 

@@ -86,10 +86,21 @@ Trailing marker recovery stops at visible prose, including prose ending in
 `-->`. An already-closed HTML comment cannot extend across that prose into the
 final marker block; valid contiguous trailing markers remain recoverable.
 
-When review starts and no ClawSweeper-owned comment exists yet, the review
-shard posts a short status placeholder with the same durable identity marker.
-The placeholder is intentionally light and crustacean-friendly, then the final
-review sync edits that exact comment in place.
+Scheduled and other non-command review workers coordinate through a separate
+temporary `clawsweeper-review-lease` comment; final publication updates the durable
+review and removes the owned lease. Command-triggered exact reviews rewrite their
+existing command acknowledgement and use the durable queue claim directly, without
+posting a second visible lease comment. The acknowledgement lease records the
+claimed decision's source head; router-dispatched autofix/automerge commands carry
+none, so the lease uses the live PR head read during admission, or the head in the
+command status marker when that read failed. A lease with no valid head fails before
+any comment edit. If that acknowledgement cannot be resolved,
+they fall back to the temporary lease path. Exact-review workers check queue ownership
+before GitHub comment work and again before generation and finalization. A definitive ownership rejection completes
+as superseded without retrying. A transport or service failure retries the check;
+the same authorized run reuses its own active lease instead of posting another
+status comment. Exhausted service failures remain failures for normal queue
+recovery, not successful supersession. Other workers' leases remain protected.
 
 Interactive re-review commands have a separate durable intake marker. The
 ExactReviewQueue records the exact source-comment version before creating or
@@ -199,6 +210,17 @@ report; it cannot supply repair or merge permission. Only a unique valid
 value in leading canonical frontmatter counts; body or fenced examples cannot
 supply it. This compatibility limit means old false-positive prose needs a fresh
 producer assessment, not a guess from its summary, rating, or automation markers.
+The producer keeps only unresolved concerns in `risks`: each entry becomes a
+blocking checklist item. Explicit maintainer acceptance resolves only the
+specific tradeoff it covers at the reviewed change. The limitation and cited
+decision remain visible in evidence and any applicable merge-risk label rationale;
+they do not reopen the same decision or populate `mergeRiskOptions`. A nonempty
+merge-risk label list therefore permits empty options when `risks` is empty;
+labeled unresolved risks still require options. Proposed or conditional acceptance, contributor assertions, and changed scope remain
+unresolved. The renderer does not infer acceptance from prose or labels, and
+historical reports require a fresh review to change their assessment. Acceptance
+does not grant merge authority or waive enforced gates.
+
 Independent findings, security concerns, risks, contributor proof, historical
 verification, decisions, failed reviews, and low-quality remediation still render
 and count. Scores retain their existing policy. A required action prevents a pass,
@@ -230,6 +252,12 @@ review metrics, stored-data warnings, root-cause clusters, proof suggestions,
 merge-risk options, full review comments, labels, evidence, optional rank-up
 moves, the rank legend, workflow notes, and review history.
 
+The label section explicitly says `No label changes.` when the publisher supplies
+confirmed previous labels, the review is not failed, and owned-label
+justifications remain but there are no add/remove transitions. Report metadata
+alone does not establish this no-op claim. Existing nonempty transitions and
+automation markers are unchanged.
+
 For OpenClaw, the PR surface table and config detector share explicit test-role
 names: test/spec code leaves, Go `*_test.go` files, terminal dotted or hyphenated
 `test-support`, `test-helpers`, `test-utils`, `test-harness`, and `test-fixtures`
@@ -239,6 +267,25 @@ each rename side before patch uncertainty, retaining production or semantic docs
 evidence and truncated-list warnings. Reviewer production/test metrics remain
 separately assessed. Test roles grant no contributor-proof exemption. Storage
 warnings retain their separate persistence-evidence and upgrade-proof rules.
+
+Codex assesses stored-data compatibility in
+`realBehaviorProof.dataModelCompatibility`, independently of general behavior
+proof. The report writer persists it as the canonical
+`real_behavior_proof_data_model_compatibility` field. Only a unique, valid
+`sufficient` value clears a detected data-model compatibility hold. Missing,
+malformed, duplicate, `insufficient`, and contradictory `not_applicable` values
+retain the hold. Summaries, evidence prose, ratings, general proof sufficiency,
+`proof: override`, and maintainer/bot or docs-only exemptions cannot grant it.
+
+Historical reports remain readable. A report with a stored-data change but no
+typed compatibility assessment requires a fresh Codex review; deployment alone
+does not reinterpret its old prose or markers. Prompt/schema changes use the
+existing review policy hash to invalidate cached assessments.
+Run `pnpm run build` followed by `node scripts/e2e/data-model-proof.ts` to exercise
+the compiled parser, report writer, reader and renderer with synthetic assessments.
+The proof retains input/output Markdown and receipts under
+`.artifacts/typed-compatibility-proof/`, without publishing to GitHub or claiming
+to exercise an actual database upgrade.
 OpenClaw Bay needs no change because its observer API and data contract are unchanged.
 
 The recorded reviewer proof assessment and the host's existing proof requirement
@@ -269,6 +316,12 @@ vector/embedding contracts, and same-hunk persistence
 evidence still require review; diagnostic logging does not exempt real storage
 changes in the same patch.
 
+The word `doctor` can name a read-only diagnostic route. It requires a known
+persistence owner or storage evidence in the same diff hunk before producing a
+migration warning; unrelated storage elsewhere in the file does not qualify.
+Documentation describing an explicit persisted contract also retains doctor
+warnings. Explicit migration, backfill, repair, and persisted-shape evidence remain eligible.
+
 SQLite table detection retains directly changed table DDL and `sqliteTable(...)`
 declarations. Unchanged SQL or ORM table context must share a diff hunk with a
 changed column declaration; context from another hunk cannot establish one.
@@ -294,8 +347,27 @@ persistence boundary; component-local maps, promises, and abort signals do not
 supply one. JSON parse/stringify syntax and a bare `serialized` variable do not
 establish persistence, unchanged storage context, or truncated-patch uncertainty.
 Transient stdout/stderr diagnostics, IPC, and in-memory JSON conversion need a
-durable boundary. Explicit serialized-format contracts, disk read/write APIs
-(including synchronous variants), browser/VSCode storage, durable storage, and
+durable boundary. A complete single-line `const` declaration constructing the directly imported
+`node:console` `Console` with `stdout` and `stderr` bound to process streams is
+stream routing, not a changed stored field. An adjacent unchanged storage call
+does not make those options persistent. The import must belong to the same diff
+side, and other visible `Console` uses leave the binding conservative. Explicit
+storage changes, other changed fields, and known persistence-owner paths still
+retain their warnings.
+Changing or removing an existing explicit `statePath` variable declaration retains the compatibility hold. The full-file patch owner pairs identical removed and added declaration lines after trimming indentation, including plain moves across hunks; unmatched removed declarations retain the hold. New captures, unchanged declarations, and reference-only awaits do not acquire a hold from this rule. It does not infer semantic equivalence: parentheses-only or other non-identical declaration rewrites may conservatively retain the prior hold.
+
+An in-memory `statePath` field or read-routing argument does not itself define a
+stored format. It needs a known persistence owner or file-I/O evidence in the same semantic diff hunk:
+file reads, read/write streams, append/truncate operations, or filesystem-qualified open/read/write calls. Generic browser and in-memory methods cannot establish storage context by themselves; generic handle calls can still count as changes once that context exists. Filesystem qualification is best-effort hunk evidence from known receivers and explicit named, default, namespace, or `promises` imports; it does not resolve arbitrary JavaScript data flow.
+This preserves dot or bracket members, awaits, nested path builders, and other
+read spellings without parsing JavaScript argument syntax. The association is
+conservative: an unrelated state path and source read colocated in that hunk
+can still require compatibility review. Evidence from separate hunks cannot combine.
+File reads can inspect source or media and need a persistence
+owner, explicit stored-state evidence, or JSON decoding in the same diff hunk.
+Unrelated hunks cannot combine a file read and decoding into storage evidence.
+Explicit serialized-format contracts, disk write APIs (including synchronous
+variants), browser/VSCode storage, durable storage, and
 schema/migration evidence remain eligible in UI code too. An explicit persistence
 owner path or unchanged storage boundary in the same diff hunk retains warnings
 for changed stored fields and JSON formatting/argument edits. Unrelated hunks
@@ -348,15 +420,25 @@ does not erase recorded parents or prove their objects are available. Neither
 workspace/test-merge ancestry nor fetched main or the merge base may substitute
 for original parentage; raw parents do not establish causality or authorship.
 
-The reviewer also receives fetched main, the unique merge base, introduced files
-and patch from merge-base to head, base-branch changes, and a separately labeled
-base-to-head endpoint comparison. A file that differs only because main advanced is not
+The reviewer also receives fetched main, the unique merge base, introduced-file
+metadata from merge-base to head, base-branch changes, and a separately labeled
+base-to-head endpoint comparison. Prompt serialization omits only the `patch` and
+`patchComplete` fields of host-selected source records: introduced evidence and
+PR pull-file records. Captured patches remain unchanged for deterministic policy
+and hydration; the input scanner still scans complete committed patches and blobs
+with their provenance. Reviewers read hunks from the checkout using the supplied
+immutable bounds. Discussion, review comments, maintainer requests, and issue-only
+context remain scanner-visible. Hydrated PR cache preflight uses the same projection
+for current and persisted file records while retaining complete discussion evidence.
+A file that differs only because main advanced is not
 automatically a PR edit. Findings in untouched files remain valid when an
 introduced hunk elsewhere causes the failure; risks, labels, scores, and fixups
 must use that same ownership boundary.
 
 PR source acquisition fetches complete blobless ancestry and the pinned open-PR
-test merge before restricted review, with a 30-second deadline per fetch. Branch
+test merge before restricted review. Each pinned commit shares one 120-second
+budget across ref/exact-object acquisition and verification, with 60-second
+fetch attempts. Moved base and head refs never replace the REST pins. Branch
 and release refreshes preserve that ancestry; existing shallow checkouts are
 unshallowed rather than deepened to a fixed commit count. The evidence reader
 itself cannot fetch objects or run external diff drivers. It bounds each Git read
@@ -372,6 +454,8 @@ merges and final merge commits cannot establish what this merge would change.
 A clean merge does not rule out semantic regressions.
 
 This is reviewer input, not a new persistent decision or repair contract.
+The [source-prompt proof](proof/review-source-prompt/README.md) records native
+admission and prompt/source refusal controls for the projection boundary.
 OpenClaw Bay is unaffected: no observer fields, routes, or controls change.
 
 Security defaults to `None.` when there are no concerns. Do not spend public
@@ -410,6 +494,8 @@ still read as `Codex review: passed.` in the durable review comment.
 
 Issues use `**Next step**` instead of the PR-specific `**Next step before
 merge**` heading. Non-PR comments are never repair triggers.
+Reproduction requests come from the model's assessment and next action; the
+renderer does not invent additional evidence requests from keywords in its prose.
 
 ## History Attribution
 
@@ -630,8 +716,8 @@ pnpm run apply-decisions -- --target-repo openclaw/openclaw --sync-comments-only
 
 Hosted Codex issue/PR review tools use the `clawsweeper-review` permission profile in
 `.github/actions/setup-codex/review-permissions.toml`, owned by ClawSweeper
-maintainers and verified with Codex 0.154.0. Update this guidance when the pinned
-CLI, profile, credential handling, or setup smoke changes. The active profile
+maintainers and verified with Codex 0.158.0-alpha.2. Update this guidance when
+the pinned CLI, profile, credential handling, or setup smoke changes. The active profile
 extends read-only filesystem access and enables the managed proxy in limited
 mode for its explicit GitHub, npm, Node, MDN, and OpenClaw documentation hosts.
 Other hosts are blocked; blocked access is not evidence against the PR. The

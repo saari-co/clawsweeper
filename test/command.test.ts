@@ -32,6 +32,13 @@ import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
 
+test("synthetic GitHub commands preserve arguments without polluting production coverage", () => {
+  const output = execFileSync(process.execPath, ["scripts/e2e/fixture-coverage.mjs"], {
+    encoding: "utf8",
+  });
+  assert.equal(JSON.parse(output).result, "passed");
+});
+
 test("expire-review-lease patches the queued placeholder and preserves unrelated comments", (t) => {
   const repo = "openclaw/openclaw";
   const root = mkdtempSync(join(tmpdir(), "cmd-expire-lease-"));
@@ -121,6 +128,13 @@ test("review CLI suppresses stack traces for missing local target checkout", () 
   const root = mkdtempSync(join(tmpdir(), "cmd-"));
   const missing = join(root, "missing-target");
   const artifactDir = join(root, "artifacts");
+  const ghPath = join(root, "gh.cjs");
+  writeFileSync(
+    ghPath,
+    `const args = process.argv.slice(2);
+if (args[0] !== "api" || args[1] !== "repos/openclaw/openclaw/pulls/357") process.exit(1);
+process.stdout.write(JSON.stringify({ base: { ref: "main" } }));`,
+  );
   try {
     const result = spawnSync(
       process.execPath,
@@ -137,7 +151,7 @@ test("review CLI suppresses stack traces for missing local target checkout", () 
         "--artifact-dir",
         artifactDir,
       ],
-      { encoding: "utf8" },
+      { encoding: "utf8", env: { ...process.env, ...mockGhBinEnv(ghPath, root) } },
     );
 
     assert.equal(result.status, 1);
@@ -1000,9 +1014,14 @@ test("managed local review source stays checkout-free while preserving pull requ
     });
 
     mkdirSync(join(root, "artifacts", "local-review-357"), { recursive: true });
-    execFileSync("git", ["clone", "--filter=blob:none", "--no-checkout", origin, targetDir], {
-      stdio: "ignore",
-    });
+    // Use the transport so concurrent Git maintenance cannot race a local object-directory copy.
+    execFileSync(
+      "git",
+      ["clone", "--no-local", "--filter=blob:none", "--no-checkout", origin, targetDir],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     execFileSync("git", ["fetch", "origin", "refs/pull/357/head", "--depth=50"], {
       cwd: targetDir,
       stdio: "ignore",
