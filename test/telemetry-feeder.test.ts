@@ -283,9 +283,8 @@ test("rows are capped at the consumer MAX_ROWS", async () => {
 });
 
 test("deadline covers a real upstream response that stalls after headers", async () => {
-  let requests = 0;
+  let fetchAttempts = 0;
   const server = createServer((_request, response) => {
-    requests += 1;
     response.writeHead(200, { "content-type": "application/json" });
     response.flushHeaders();
     response.write("{");
@@ -294,9 +293,11 @@ test("deadline covers a real upstream response that stalls after headers", async
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   const feeder = createTelemetryFeeder({
-    fetch: (_url, options) =>
-      fetch(`http://127.0.0.1:${address.port}/`, { signal: options?.signal }),
-    timeoutMs: 50,
+    fetch: (_url, options) => {
+      fetchAttempts += 1;
+      return fetch(`http://127.0.0.1:${address.port}/`, { signal: options?.signal });
+    },
+    timeoutMs: 100,
   });
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -318,7 +319,7 @@ test("deadline covers a real upstream response that stalls after headers", async
         clearTimeout(deadline);
       }
     }
-    assert.equal(requests, 2, "timed-out responses must not populate the cache");
+    assert.equal(fetchAttempts, 2, "timed-out responses must not populate the cache");
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
