@@ -390,7 +390,13 @@ const {
   reviewCommentContentRevision,
 } = sourceRevisionTools;
 
-function reviewPolicyHash(options: { model?: string; sandboxMode?: string }): string {
+function reviewPolicyHash(options: {
+  model?: string;
+  reasoningEffort?: string;
+  sandboxMode?: string;
+  serviceTier?: string;
+  reviewScope?: string;
+}): string {
   const policyTargetRepo = targetRepo();
   return sha256(
     stableJson({
@@ -411,6 +417,7 @@ function reviewPolicyHash(options: { model?: string; sandboxMode?: string }): st
       repositoryProfile: targetProfile(),
       prompt: reviewPromptTemplate(),
       schema: reviewDecisionSchemaText(),
+      ...(options.reviewScope ? { reviewScope: options.reviewScope } : {}),
     }),
   ).slice(0, 16);
 }
@@ -419,6 +426,8 @@ export function reviewPolicyHashForTest(
   options: {
     model?: string;
     sandboxMode?: string;
+    serviceTier?: string;
+    reviewScope?: string;
   } = {},
 ): string {
   return reviewPolicyHash(options);

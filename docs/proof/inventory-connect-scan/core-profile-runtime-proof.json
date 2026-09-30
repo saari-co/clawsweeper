@@ -1,0 +1,6 @@
+{
+  "surface": "built native configuration loader",
+  "core_profile_override": "refused",
+  "dinkuskit_overlay": "admitted",
+  "limits": "Controlled local loader invocation; no repair/automerge or network operation."
+}

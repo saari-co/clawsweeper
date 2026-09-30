@@ -1,0 +1,21 @@
+{"at":"2026-09-12T14:30:00Z","event":"inventory_started","source":"authenticated Bobby WebChat request","mode":"review-only dashboard implementation"}
+{"at":"2026-09-12T14:32:24Z","event":"live_edge_verified","url":"https://clawsweeper.ztoned.com","result":"302_cloudflare_access"}
+{"at":"2026-09-12T14:35:00Z","event":"worktree_created","branch":"codex/clawsweeper-dashboard-unification-20260912","base":"77c6fb150ff63a463929b83f86bc7510e83c93c6"}
+{"at":"2026-09-12T14:45:00Z","event":"implementation_started","contract":"clawsweeper.telemetry.v1","tenant_bindings":["SAARI_REVIEW_TELEMETRY","DINKUSKIT_REVIEW_TELEMETRY"]}
+{"at":"2026-09-12T14:53:00Z","event":"focused_verification_passed","dashboard_tests":6,"dashboard_build":"passed","changed_lint":"passed"}
+{"at":"2026-09-12T14:55:00Z","event":"full_check_partial","passed":["static","build_all","lint_all","dashboard_tests","aggregate_coverage"],"unrelated_host_failure":"apply-drift-refresh requires GNU Bash mapfile; host resolved /bin/bash 3.2"}
+{"at":"2026-09-12T14:56:00Z","event":"local_browser_proof_passed","all_rows":2,"dinkuskit_rows":1,"tenant_isolation":true,"screenshots":["all-view.png","dinkuskit-view.png"]}
+{"at":"2026-09-12T14:58:00Z","event":"implementation_committed","head":"c434d324a9ae52749c532f93577d141543479a5a"}
+{"at":"2026-09-12T15:04:47Z","event":"exact_local_review_completed","reviewed_head":"a6a4463894bc7dc26b3cc0df720a1583f01693b0","decision":"keep_open","confidence":"high","findings":4}
+{"at":"2026-09-12T15:05:00Z","event":"hosted_ci_passed","reviewed_head":"a6a4463894bc7dc26b3cc0df720a1583f01693b0","run_id":34700818962}
+{"at":"2026-09-12T15:07:00Z","event":"repair_cycle_completed","cycle":1,"resolved":["malformed_rows_fail_closed","future_timestamps_rejected","tenant_fetch_isolation","feed_deadline"],"focused_tests":10,"remaining":"public-safe versus authenticated-private projection"}
+{"at":"2026-09-12T15:20:00Z","event":"architecture_gate_approved","decision":"cloudflare_access_authenticated_private_observer","production_deploy":false,"auth_policy_change":false}
+{"at":"2026-09-12T15:39:04Z","event":"private_observer_focused_proof_passed","dashboard_build":"passed","focused_tests":13,"lint":"passed","public_private_isolation":true,"credential_serialization":false}
+{"at":"2026-09-12T15:39:04Z","event":"authenticated_browser_proof_passed","all_rows":2,"dinkuskit_rows":1,"tenant_isolation":true,"screenshots":["private-all-view.png","private-dinkuskit-view.png"]}
+{"at":"2026-09-12T15:48:53Z","event":"repair_cycle_completed","cycle":2,"resolved":["canonical_public_proof_urls","missing_findings_remain_unknown","public_private_renderer_separation"],"focused_tests":14,"repair_limit_reached":true}
+{"at":"2026-09-12T15:48:53Z","event":"full_check_partial","passed":["static","build_all","lint_all","observer_tests","aggregate_coverage"],"unrelated_host_failure":"apply-drift-refresh invokes macOS Bash 3.2 without mapfile"}
+{"at":"2026-09-12T15:50:00Z","event":"proof_assets_published","source_head":"01f1254d423acaf634f7c3c73549f71bff369238","destination":"saari-co/swarm-pr-assets","release":"clawsweeper-pr-16-private-observer-01f1254d423a","sanitized":true,"product_repo_binaries_removed":true}
+{"at":"2026-09-12T16:22:39Z","event":"repair_cycle_authorized","cycle":3,"owner":"Bobby","scope":"single accepted P1 lifecycle truth defect","production_deploy":false,"merge":false}
+{"at":"2026-09-12T16:24:00Z","event":"repair_cycle_focused_proof_passed","cycle":3,"resolved":["bare_completed_maps_unknown","explicit_terminal_conclusion_required"],"focused_tests":16,"failed_cancelled_coverage":true,"dashboard_build":"passed","lint":"passed","docs":"passed"}
+{"at":"2026-09-12T16:40:00Z","event":"repair_cycle_full_check_partial","cycle":3,"passed":["static","build_all","lint_all","observer_tests","aggregate_coverage","286_test_files"],"unrelated_host_failure":"apply-drift-refresh invokes macOS Bash 3.2 without mapfile; GNU Bash is not installed on this host"}
+{"at":"2026-09-12T16:42:00Z","event":"repair_cycle_committed","cycle":3,"head":"1ed54aa24bb2ddf57ef2ebaacffdd94eded0739b","parent":"6029cb38c19781f8c706e1361718008e69421f1f","concurrent_parent_preserved":true}

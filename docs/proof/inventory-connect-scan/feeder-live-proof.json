@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "surface": "native Node24 fetch to real loopback HTTP server; response stalls after headers",
+  "timeout_ms": 100,
+  "requests": 2,
+  "results": [
+    {
+      "status": 503,
+      "reason": "telemetry timeout",
+      "elapsed_ms": 107
+    },
+    {
+      "status": 503,
+      "reason": "telemetry timeout",
+      "elapsed_ms": 102
+    }
+  ],
+  "cache": "timed-out response was not cached",
+  "limits": "No Cloudflare deployment or production request; standard Fetch/AbortController behavior exercised."
+}

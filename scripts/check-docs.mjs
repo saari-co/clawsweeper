@@ -188,10 +188,28 @@ function checkOperatorDocumentation({ root, inventory, findings }) {
   const declaredRouteEntries = (manifest.publicObserverRoutes ?? []).map(
     ({ path: route, method }) => [route, method],
   );
+  const authenticatedRouteEntries = (manifest.authenticatedObserverRoutes ?? []).map(
+    ({ path: route, method }) => [route, method],
+  );
   for (const route of duplicateKeys(declaredRouteEntries))
     addFinding(findings, manifestPath, 1, "operator-route", `duplicate manifest route ${route}`);
-  const sourceRoutes = observerRouteMethods(worker);
+  for (const route of duplicateKeys(authenticatedRouteEntries))
+    addFinding(
+      findings,
+      manifestPath,
+      1,
+      "operator-route",
+      `duplicate authenticated manifest route ${route}`,
+    );
+  const allSourceRoutes = observerRouteMethods(worker);
+  const sourceRoutes = new Map(
+    [...allSourceRoutes].filter(([route]) => !route.startsWith("/api/private/")),
+  );
+  const authenticatedSourceRoutes = new Map(
+    [...allSourceRoutes].filter(([route]) => route.startsWith("/api/private/")),
+  );
   const declaredRoutes = new Map(declaredRouteEntries);
+  const authenticatedRoutes = new Map(authenticatedRouteEntries);
   for (const route of sourceRoutes.keys()) {
     if (!declaredRoutes.has(route))
       addFinding(findings, manifestPath, 1, "operator-route", `missing public route ${route}`);
@@ -217,8 +235,34 @@ function checkOperatorDocumentation({ root, inventory, findings }) {
     if (documentedRouteMethods.get(`\`${route}\``) !== `\`${method}\``)
       addFinding(findings, apiDocumentPath, 1, "operator-route", `missing route ${route}`);
   }
+  for (const route of authenticatedSourceRoutes.keys()) {
+    if (!authenticatedRoutes.has(route))
+      addFinding(
+        findings,
+        manifestPath,
+        1,
+        "operator-route",
+        `missing authenticated route ${route}`,
+      );
+  }
+  for (const [route, method] of authenticatedRoutes) {
+    const sourceMethod = authenticatedSourceRoutes.get(route);
+    if (!sourceMethod)
+      addFinding(findings, manifestPath, 1, "operator-route", `stale authenticated route ${route}`);
+    if (sourceMethod && method !== sourceMethod)
+      addFinding(
+        findings,
+        manifestPath,
+        1,
+        "operator-route",
+        `method drift for ${route}: expected ${sourceMethod}, found ${method}`,
+      );
+  }
 
-  const wrangler = fs.readFileSync(path.join(root, "dashboard/wrangler.toml"), "utf8");
+  const wrangler = ["dashboard/wrangler.toml", "dashboard/wrangler.ztoned.toml"]
+    .filter((file) => inventory.exact.has(file))
+    .map((file) => fs.readFileSync(path.join(root, file), "utf8"))
+    .join("\n");
   const workflowSources = [...inventory.exact]
     .filter((file) => file.startsWith(".github/workflows/") && /\.ya?ml$/.test(file))
     .map((file) => fs.readFileSync(path.join(root, file), "utf8"));

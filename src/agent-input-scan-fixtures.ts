@@ -250,6 +250,10 @@ const CRON_FTP_SOURCE_SHA256S = [
 
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
+  // Inventory Connect rejects these synthetic credential-bearing site/verification URLs.
+  // Native TruffleHog 3.97.4: PLAIN only; exact test line/path and both native identities.
+  [17, "URI", "PLAIN", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "3ee274980dba1cc67117e838a9038067c6b42f0f81a3e32153ae87e96652cb6d", "tests/store-connect/protocol.test.mjs", "100644"],
+  [17, "URI", "PLAIN", "ca9cff428f18cb601cd048fbee5eea99b4881f6aa7440e61fcd80f5065594eb0", "c71a6ed95a91bf84af8f88ad7b75bbf01d23b5ccf8fb55e258450cf2dd998830", "c4b1cfe20b94cff441df790ea165be9a7c9ba0aa3e3f4827a2c9a84a9561451e", "tests/store-connect/protocol.test.mjs", "100644"],
   // OpenClaw SDK CDP fixtures: observed native PLAIN identities and complete source lines.
   [17, "URI", "PLAIN", "87c268ea768beeb60885ffe0d9168e807d77c7f512aea8823703046c734cbdbf", "87c268ea768beeb60885ffe0d9168e807d77c7f512aea8823703046c734cbdbf", "808983a7a484c49a6b2a47f9696e4e86ecff5880d1fd2d76b081734e75a9e7fc", "src/plugin-sdk/browser-subpaths.test.ts", "100644"],
   [17, "URI", "PLAIN", "d85938093727ccf6959e1199023569dcfaa302bf5e86a28aa3ea9e011b7c1224", "069a918f1609e9f5c0f688d50e234f9b021eae193b573c2312355703eb2fa414", "e22c3375ec9e03b63845c873a0aa46c844ef5c3c9afa087d0b93d53e0fc4af64", "src/plugin-sdk/browser-subpaths.test.ts", "100644"],
@@ -477,7 +481,8 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
           detectorType === 17 &&
           detectorName === "URI" &&
           (decoder === "PLAIN" || decoder === "HTML")) ||
-        ((source === "internal/cli/repo_test.go" ||
+        ((source === "tests/store-connect/protocol.test.mjs" ||
+          source === "internal/cli/repo_test.go" ||
           source === "internal/cli/ssh_test.go" ||
           source === "internal/cli/config_test.go" ||
           source === "internal/providers/azuredynamicsessions/client_test.go" ||

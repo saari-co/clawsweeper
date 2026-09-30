@@ -318,7 +318,13 @@ export interface CreateReviewCommandWorkflowDependencies {
     leaseHeadSha: string,
   ) => boolean;
   reviewMutationRunner: (ledger: ReviewActionLedger, item: Item) => MutationRunner;
-  reviewPolicyHash: (options: { model?: string; sandboxMode?: string }) => string;
+  reviewPolicyHash: (options: {
+    model?: string;
+    reasoningEffort?: string;
+    sandboxMode?: string;
+    serviceTier?: string;
+    reviewScope?: string;
+  }) => string;
   reviewStructuralPullStateFromContext: (context: ItemContext) => ReviewStructuralPullState | null;
   runReviewCheckoutInspection: (options: {
     scanSource: AgentScanSource;
@@ -351,6 +357,7 @@ export interface CreateReviewCommandWorkflowDependencies {
     streamFileBytes?: number;
     quietLogs?: boolean;
     extraCodexConfig?: string[];
+    qualifiedOwnCurrentCheck?: boolean;
   }) => Decision;
   selectCandidates: (options: {
     batchSize: number;

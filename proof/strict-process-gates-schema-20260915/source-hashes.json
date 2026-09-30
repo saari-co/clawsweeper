@@ -1,0 +1,6 @@
+{
+  "schema/clawsweeper-decision.schema.json": "0423598ecf25415122817488b417879aa5ae3b509ed83bc71c0566b6c1c575af",
+  "test/codex-review-runner.test.ts": "d66eb2fcbec007d74317b42a59b1014c40dd3eb11bb3d7f492f48357707f857a",
+  "test/review-process-gates.test.ts": "5343598bbf724d94e381f3dbffdc26c5e984dddf1608d9d78065eec4fcfd85df",
+  "docs/saari-exact-tuple.md": "267b3909a4ab457356ea1ed297c2fd9eb16b28acf00b4a43196885ce2510de96"
+}

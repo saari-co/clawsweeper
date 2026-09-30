@@ -18,6 +18,20 @@ ClawSweeper has two target-repository paths:
 - conservative generic fallbacks for exact event/manual reviews of configured
   owner inventories such as `openclaw/*` and `steipete/*`
 
+Host-side installations may extend those runtime profiles without forking the
+engine by setting `CLAWSWEEPER_REPOSITORY_PROFILE_OVERLAY` to an absolute path.
+The exact-tuple producer reads tenant, engine-repository, actor, and artifact
+prefix policy from a separate absolute overlay
+(`CLAWSWEEPER_EXACT_TUPLE_CONFIG`). See
+[Exact-tuple review producer](saari-exact-tuple.md). Do not bake those tenant
+entries into `config/target-repositories.json`.
+The JSON file uses the bundled `schema_version` and may contain only
+`repositories` and `generic_fallbacks`. Entries are appended after strict
+validation; an overlay cannot replace a bundled repository or owner fallback.
+The overlay affects repository profile lookup and repair toolchain selection.
+It does not alter the bundled target inventory, hosted admission registry,
+dashboard targets, scheduled fanout, or apply membership.
+
 `openclaw/openclaw` remains a built-in profile because it has broader
 auto-close policy. Every other configured profile declares its own issue and PR
 close rules in `apply_close_rules`; do not infer those rules from whether the

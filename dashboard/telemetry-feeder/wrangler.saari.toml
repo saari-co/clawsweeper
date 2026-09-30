@@ -1,0 +1,21 @@
+# Prepared deployment configuration. Deployment remains human-gated.
+# This Worker is a read-only telemetry feeder. It carries no writer secret
+# and no GitHub App private key.
+name = "clawsweeper-telemetry-saari"
+main = "worker.ts"
+account_id = "cddb32366789cab1bdf4c25584dc1920"
+compatibility_date = "2026-05-11"
+workers_dev = false
+
+# Service-binding-only consumer (clawsweeper-ztoned SAARI_REVIEW_TELEMETRY).
+# Do not add public routes.
+
+[vars]
+TENANT = "saari"
+TELEMETRY_SOURCE_REPO = "saari-co/clawsweeper-state"
+TELEMETRY_SOURCE_REF = "state"
+TELEMETRY_SOURCE_PATH = "results/review-telemetry/saari.json"
+STALE_AFTER_SECONDS = "900"
+
+# Secret (set at deploy time, never in this file):
+# TELEMETRY_SOURCE_TOKEN — read-only GitHub token for TELEMETRY_SOURCE_REPO contents.

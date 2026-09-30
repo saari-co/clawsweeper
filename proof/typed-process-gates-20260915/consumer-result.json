@@ -1,0 +1,102 @@
+{
+  "consumerHead": "3d536c553abbf9361c3cefe5307b812982c931da",
+  "files": [
+    {
+      "name": "review_conductor_userland.py",
+      "sha256": "a7f6f6e9d560a4b19be7f4e29a1f20b7536982d0e30836d38e4e248cf3ced4b7"
+    },
+    {
+      "name": "review_result_projection.py",
+      "sha256": "19d571e38d13b5f108d8d9961d96d6bea92120e289974dc666baac7abf0cdbd0"
+    }
+  ],
+  "results": [
+    {
+      "name": "qualified process wait",
+      "result": {
+        "verdict": "clean",
+        "content_verdict": "clean",
+        "process_gates": [
+          "own_current_check",
+          "owner_merge_authority"
+        ],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "findings preserved",
+      "result": {
+        "verdict": "findings",
+        "content_verdict": "findings",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "proof deficiency preserved",
+      "result": {
+        "verdict": "human_gate",
+        "content_verdict": "proof_deficient",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "maintainer decision preserved",
+      "result": {
+        "verdict": "human_gate",
+        "content_verdict": "human_policy",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "stale tuple rejected",
+      "override": {
+        "head_sha": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    },
+    {
+      "name": "stale tuple rejected",
+      "override": {
+        "review_epoch": 4
+      }
+    },
+    {
+      "name": "terminal failure preserved",
+      "result": {
+        "verdict": "failed",
+        "content_verdict": "failed",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "missing own-check cannot waive F",
+      "result": {
+        "verdict": "human_gate",
+        "content_verdict": "human_policy",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "missing own-check cannot waive F",
+      "result": {
+        "verdict": "human_gate",
+        "content_verdict": "human_policy",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    },
+    {
+      "name": "missing own-check cannot waive F",
+      "result": {
+        "verdict": "human_gate",
+        "content_verdict": "human_policy",
+        "process_gates": [],
+        "merge_authorized": false
+      }
+    }
+  ]
+}

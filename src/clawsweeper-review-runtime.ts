@@ -59,6 +59,7 @@ import {
   isTerminalCodexErrorMessage,
 } from "./codex-transient.js";
 import { explainSpawnFailure, UserFacingCommandError } from "./command.js";
+import { validateDecisionProcessGates } from "./review-process-gates.js";
 import { emptyMaintainerDecision } from "./decision-packets.js";
 import {
   openClawCodexSourcePreparationFailureRetryable,
@@ -512,6 +513,14 @@ export function createReviewRuntime({
 ${additionalPrompt.trim()}
 `
       : "";
+    const exactTuple = runtimeHints.exactTuplePrompt?.trim()
+      ? `
+
+## Bound exact-tuple review
+
+${runtimeHints.exactTuplePrompt.trim()}
+`
+      : "";
     const networkDescription =
       runtimeHints.networkCapability === "allowlisted-proxy"
         ? "Network egress uses a managed proxy limited to allowlisted GitHub, npm, Node, MDN, and OpenClaw documentation hosts; other hosts are blocked. A blocked request is not evidence about the PR."
@@ -554,7 +563,7 @@ Primary-body and discussion-comment \`bodyCoverage\` describes separate untruste
 \`\`\`json
 ${contextJson}
 \`\`\`
-${extra}
+${exactTuple}${extra}
 `;
     return {
       text,
@@ -1017,6 +1026,7 @@ ${extra}
     streamFileBytes?: number;
     quietLogs?: boolean;
     extraCodexConfig?: string[];
+    qualifiedOwnCurrentCheck?: boolean;
   }): Decision {
     if (!Number.isSafeInteger(options.resultFileBytes) || options.resultFileBytes <= 0) {
       throw new UserFacingCommandError("Review result output requires a positive byte limit.");
@@ -1174,6 +1184,11 @@ ${extra}
         const decision = parseDecision(
           JSON.parse(readBoundedReviewResult(outputPath, options.resultFileBytes).trim()),
           options.item,
+        );
+        validateDecisionProcessGates(
+          decision,
+          options.qualifiedOwnCurrentCheck === true,
+          result.status === 0,
         );
         if (result.status !== 0) {
           if (!options.quietLogs) {

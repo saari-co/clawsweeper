@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "producer": {
+    "engine_repository": "saari-co/clawsweeper",
+    "workflow_path": ".github/workflows/saari-exact-tuple-review.yml"
+  },
+  "tenants": [
+    {
+      "repository": "example-org/example-private-suite",
+      "repository_id": 1000000001,
+      "visibility": "private",
+      "default_branch": "main",
+      "reviewer_actor": "example-reviewer-bot",
+      "review_scope": "comprehensive",
+      "artifact_prefix": "example-suite-review",
+      "publish_side_effects": false
+    }
+  ]
+}

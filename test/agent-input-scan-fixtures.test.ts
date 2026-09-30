@@ -1704,3 +1704,61 @@ for (const config of [false, true]) {
     });
   }
 }
+
+function inventoryConnectFixture(verification: boolean) {
+  const raw = [
+    "https://",
+    "user",
+    ":",
+    "pass",
+    "@",
+    verification ? "accounts.dinkuskit.invalid" : "shop.example.com",
+  ].join("");
+  const rawV2 = raw + (verification ? "/account/connect" : "");
+  const line = verification
+    ? "\tassert.throws(() => assertVerificationUri(`" +
+      rawV2 +
+      "?connection_id=${connectionId}`, origin, connectionId), /unexpected_website_response/);"
+    : '\tassert.throws(() => canonicalizeSiteOrigin("' + raw + '"), /invalid_site_origin/);';
+  return { raw, rawV2, line, decoders: ["PLAIN"] as const };
+}
+
+for (const verification of [false, true]) {
+  const source = "tests/store-connect/protocol.test.mjs";
+  for (const change of ["add", "remove", "context"] as const) {
+    test(`Inventory ${verification ? "verification" : "origin"} fixture admits exact ${change}`, (t) => {
+      const fixture = fixturePatch(t, source, [inventoryConnectFixture(verification)], change);
+      assert.equal(fixture.classify("PLAIN").kind, "classified");
+    });
+  }
+  test(`Inventory fixture ${verification} refuses altered bytes, line, path and scanner identity`, (t) => {
+    const entry = inventoryConnectFixture(verification);
+    const good = fixturePatch(t, source, [entry]);
+    for (const override of [
+      { Verified: true },
+      { DecoderName: "HTML" },
+      { Raw: entry.raw + "x" },
+      { RawV2: entry.rawV2 + "x" },
+    ]) {
+      assert.equal(good.classify("PLAIN", override).kind, "refused");
+    }
+    assert.equal(good.classify("PLAIN", {}, { duplicate: true }).kind, "refused");
+    assert.equal(good.classify("PLAIN", {}, { complete: false }).kind, "refused");
+    for (const [path, changed] of [
+      ["src/production.ts", entry],
+      [source, { ...entry, line: entry.line + " // changed" }],
+      [
+        source,
+        {
+          ...entry,
+          raw: entry.raw + "x",
+          rawV2: entry.rawV2 + "x",
+          line: entry.line.replace(entry.rawV2, entry.rawV2 + "x"),
+        },
+      ],
+    ] as const) {
+      const bad = fixturePatch(t, path, [changed]);
+      assert.equal(bad.classify("PLAIN").kind, "refused");
+    }
+  });
+}

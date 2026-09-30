@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "observed_at": "2026-09-30T22:17:29.732Z",
+  "surface": "Native HTTP request into real dashboard worker and built overlay loader",
+  "public_projection": {
+    "status": 200,
+    "rows": 1,
+    "source": "public review telemetry",
+    "executor": null,
+    "private_markers_absent": true
+  },
+  "review_only_overlay": "admitted empty rules; rejected nonempty issue close rule",
+  "limits": "Controlled local Node24 runtime, no Cloudflare deployment, no live apply/close invocation"
+}

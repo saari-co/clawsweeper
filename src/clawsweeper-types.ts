@@ -566,6 +566,7 @@ export interface ReviewCommentRenderOptions {
 }
 
 export interface Decision {
+  processGates?: import("./review-process-gates.js").ProcessGate[];
   oversizedPullRequestSource?: import("./clawsweeper-oversized-pr-freshness.js").OversizedPrSourceSnapshot;
   /** Runner-owned GitHub metadata; never populated from model output. */
   oversizedPullRequest?: import("./clawsweeper-oversized-pr-policy.js").OversizedPullRequestEvidence;
@@ -785,6 +786,7 @@ export interface ReviewPromptRuntimeHints {
   proofScratchDir?: string;
   mediaProofManifestPath?: string;
   mediaProofSummary?: string;
+  exactTuplePrompt?: string;
 }
 
 export interface DashboardItem {
