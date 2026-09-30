@@ -237,9 +237,11 @@ export function createReportCommentPresentation(
         "",
         labelTransitionJustificationsMarkdown(labelTransitionJustifications),
       );
-    } else {
-      // Exact publication parsers require an explicit empty plan; they refuse to
-      // infer no-op from Label justifications or an omitted Label changes block.
+    } else if (
+      options.previousLabels !== undefined &&
+      !reviewFailed &&
+      labelJustifications.length > 0
+    ) {
       labelDetails.push("Label changes:", "", "No label changes.");
     }
     if (labelJustifications.length) {

@@ -162,16 +162,6 @@ test("every workflow job that runs the main bundle directly obtains it", () => {
       const site = `${workflowPath}:${jobName}`;
       audited.push(site);
 
-      // A job may restore the compiled runtime instead of building it, as sweep's
-      // review shard does. Only that exact artifact counts: other jobs download
-      // unrelated artifacts and still have to build the bundle themselves.
-      const restoresRuntime = steps.some(
-        (step) =>
-          String(step.uses ?? "").startsWith("actions/download-artifact@") &&
-          String(step.with?.["name"] ?? "") === RUNTIME_DIST_ARTIFACT,
-      );
-      if (restoresRuntime) continue;
-
       const setupPnpmScripts = steps
         .filter((step) => String(step.uses ?? "").includes("actions/setup-pnpm"))
         .map((step) => String(step.with?.["build-script"] ?? ""));

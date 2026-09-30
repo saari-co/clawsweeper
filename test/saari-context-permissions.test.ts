@@ -79,3 +79,25 @@ echo "private response must be discarded"
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("producer refuses targets outside the caller token scope before API access", () => {
+  const step = workflow.jobs.admit.steps.find(
+    (candidate: { name: string }) => candidate.name === "Validate repository token scope",
+  );
+  assert.ok(step);
+  const run = (target: string) =>
+    execFileSync("bash", ["-c", step.run], {
+      env: { GITHUB_REPOSITORY: "example/caller", TARGET_REPO: target },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  assert.equal(run("example/caller"), "");
+  assert.throws(() => run("example/private-target"), /must call this reusable workflow/);
+  assert.throws(() => run(""), /must call this reusable workflow/);
+  assert.ok(
+    workflow.jobs.admit.steps.indexOf(step) <
+      workflow.jobs.admit.steps.findIndex(
+        (candidate: { name: string }) => candidate.name === "Bind the live pull request tuple",
+      ),
+  );
+});

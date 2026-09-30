@@ -156,6 +156,15 @@ jobs:
             exit 1
           fi
 
+      - name: Validate repository token scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "Target reviews must call this reusable workflow from the target repository; direct dispatch is restricted to this repository." >&2
+            exit 1
+          fi
+
       - name: Validate immutable caller inputs
         shell: bash
         run: |
@@ -473,7 +482,7 @@ jobs:
           echo "Native review context read access verified."
 
       - name: Check out the trusted ClawSweeper engine
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -689,7 +698,7 @@ jobs:
           corepack pnpm@12.4.1 run --silent repair:exact-review-bundle create
 
       - name: Upload the bounded native review bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ env.EXACT_TUPLE_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/exact-review-bundle

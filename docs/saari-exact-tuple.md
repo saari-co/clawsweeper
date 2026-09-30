@@ -14,7 +14,10 @@ Reusable producer: `.github/workflows/saari-exact-tuple-review.yml`
 This workflow is source-only until independently reviewed and separately
 activated. It does not schedule reviews, project checks, or replace Review
 Conductor. It is `workflow_dispatch` / `workflow_call` only and does not alter
-the default sweep rail.
+the default sweep rail. Cross-repository targets must invoke `workflow_call`
+from their own repository so `github.token` has target read access. Direct
+`workflow_dispatch` is restricted to the repository receiving the dispatch;
+an external target is refused before any target API request.
 
 ## External tenant policy
 
