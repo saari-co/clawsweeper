@@ -347,10 +347,15 @@ function parseFindings(markdown) {
     match[1].trim(),
   );
   if (items.length === 0) return { total: 0, actionable: 0 };
-  const actionable = items.filter((item) =>
-    /^(p[0-2]|critical|high|actionable|blocker|must)\b/i.test(item),
-  ).length;
-  return { total: items.length, actionable: actionable > 0 ? actionable : null };
+  const priorities = items.map((item) =>
+    /^(?:\*\*|__)?\[?(p[0-3]|critical|high|actionable|blocker|must)\b/i
+      .exec(item)?.[1]
+      ?.toLowerCase(),
+  );
+  const actionable = priorities.every((priority) => priority !== undefined)
+    ? priorities.filter((priority) => priority !== "p3").length
+    : null;
+  return { total: items.length, actionable };
 }
 
 function clawsweeperFromArtifact(artifact) {

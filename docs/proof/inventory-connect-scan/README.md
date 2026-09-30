@@ -67,3 +67,9 @@ fallback negative tests cover both close-rule arrays and malformed/missing rules
 This changes Bay's public projection privacy boundary without changing its schema
 or adding action controls. Proof ran in local Node24; no Cloudflare deployment or
 live apply/close action was performed.
+
+`priority-count-live-proof.json` exercises the actual native report renderer and
+publisher CLI on controlled report fixtures. Native P0/P1/P2/P3 Markdown produces
+four total findings and three actionable findings; a P3-only report produces one
+total and zero actionable. Unclassified text remains unknown in negative tests.
+The proof does not publish state or call GitHub.

@@ -424,3 +424,21 @@ test("write helper and arg parser reject unsafe inputs", () => {
   assert.equal(written.tenant, "saari");
   assert.deepEqual(written.rows, []);
 });
+
+test("counts native Markdown priorities without inventing counts for unknown findings", () => {
+  const queueRoot = fixtureRoot();
+  const reviewRoot = fixtureRoot();
+  writeDoneRecord(queueRoot);
+  for (const [findings, total, actionable] of [
+    ["- **[P0] Critical**\n- **[P1] High**\n- **[P2] Medium**\n- **[P3] Low**", 4, 3],
+    ["- **[P3] Low**", 1, 0],
+    ["- [P2] Medium\n- P1 High", 2, 2],
+    ["- P3 Low\n- Unclassified finding", 2, null],
+    ["- **[P1] High**\n- Unclassified finding", 2, null],
+  ] as const) {
+    writeItemArtifact(reviewRoot, { findings: `## Review Findings\n\n${findings}\n` });
+    const row = publish({ queueRoot, reviewRoot }).rows[0];
+    assert.equal(row.findings_total, total);
+    assert.equal(row.findings_actionable, actionable);
+  }
+});
