@@ -354,6 +354,11 @@ jobs:
             echo "The target repository identity is not an admitted exact-tuple tenant." >&2
             exit 1
           fi
+          enrolled_branch="$(jq -r '.default_branch // empty' <<<"$tenant")"
+          if [ -z "$enrolled_branch" ] || [ "$BASE_REF" != "$enrolled_branch" ]; then
+            echo "The admitted base branch differs from the enrolled tenant branch." >&2
+            exit 1
+          fi
           engine_repository="$(jq -r '.producer.engine_repository' "$config")"
           workflow_path="$(jq -r '.producer.workflow_path' "$config")"
           reviewer_actor="$(jq -r '.reviewer_actor' <<<"$tenant")"

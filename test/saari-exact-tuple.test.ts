@@ -731,6 +731,7 @@ test("exact identity mismatches reject before any Spark host work", () => {
     BASE_SHA: BASE,
     HEAD_SHA: HEAD,
     MERGE_BASE_SHA: "3".repeat(40),
+    BASE_REF: "main",
     CLAWSWEEPER_EXACT_TUPLE_CONFIG: OVERLAY_PATH,
     TRUSTED_ENGINE_REPOSITORY: ENGINE_REPO,
     GITHUB_RUN_ID: "801",
@@ -785,4 +786,35 @@ test("Spark host preflight reuses the existing profile and fails closed when too
   });
   assert.equal(missingExec.ok, false);
   assert.match(missingExec.stderr, /not an executable|absent from known paths/);
+});
+
+test("host admission rejects a renamed default branch outside tenant enrollment", () => {
+  const script = extractStepRunScript(
+    readText(".github/workflows/saari-exact-tuple-review.yml"),
+    "Reject stale exact-tuple identity before host work",
+  );
+  const dir = mkdtempSync(join(tmpdir(), "saari-enrolled-branch-"));
+  const env = {
+    REVIEW_SCOPE: "comprehensive",
+    PR_NUMBER: "7",
+    REVIEW_EPOCH: "1",
+    REPOSITORY_ID: "1000000001",
+    TARGET_REPOSITORY_ID: "1000000001",
+    TARGET_REPO: SUITE,
+    BASE_SHA: BASE,
+    HEAD_SHA: HEAD,
+    MERGE_BASE_SHA: BASE,
+    CLAWSWEEPER_EXACT_TUPLE_CONFIG: OVERLAY_PATH,
+    TRUSTED_ENGINE_REPOSITORY: ENGINE_REPO,
+    BASE_REF: "main",
+    GITHUB_RUN_ID: "123",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ENV: join(dir, "env"),
+  };
+  assert.equal(runPinnedEngineScript(script, env).ok, true);
+  for (const branch of ["renamed-main", ""]) {
+    const result = runPinnedEngineScript(script, { ...env, BASE_REF: branch });
+    assert.equal(result.ok, false);
+    assert.match(result.stderr, /enrolled tenant branch/);
+  }
 });
