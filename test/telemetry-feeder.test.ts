@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createServer } from "node:http";
 import { normalizeTenantFeed } from "../dashboard/unified-review-dashboard.ts";
 import {
   createTelemetryFeeder,
@@ -279,4 +280,49 @@ test("rows are capped at the consumer MAX_ROWS", async () => {
   const normalized = normalizeTenantFeed("saari", result.body, NOW);
   assert.equal(normalized.projection.status, "available");
   assert.equal(normalized.projection.row_count, MAX_TELEMETRY_ROWS);
+});
+
+test("deadline covers a real upstream response that stalls after headers", async () => {
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.flushHeaders();
+    response.write("{");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const feeder = createTelemetryFeeder({
+    fetch: (_url, options) =>
+      fetch(`http://127.0.0.1:${address.port}/`, { signal: options?.signal }),
+    timeoutMs: 50,
+  });
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          feeder(statusRequest(), env()).then(read),
+          new Promise<never>((_resolve, reject) => {
+            deadline = setTimeout(
+              () => reject(new Error("response body deadline was not enforced")),
+              2000,
+            );
+          }),
+        ]);
+        assert.equal(result.status, 503);
+        assert.equal(result.body.reason, "telemetry timeout");
+        assertNoSecret(result.text);
+      } finally {
+        clearTimeout(deadline);
+      }
+    }
+    assert.equal(requests, 2, "timed-out responses must not populate the cache");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });

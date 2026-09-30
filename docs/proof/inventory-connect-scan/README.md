@@ -35,3 +35,24 @@ The controlled proof runs no model; a live review must scan its own current
 prompt, schema and source again. Product review findings are not cleared here.
 OpenClaw Bay is unaffected: this changes host scanner admission only, with no
 observer schema, queue or dashboard changes.
+
+
+## Retained integration review corrections
+
+`telemetry-live-proof.json` records the real GitHub check-runs default page
+for the pinned upstream commit: 30 returned of 6612 total, now classified
+unknown rather than treated as a complete set. Focused consumer tests also
+reject action-required, stale, startup-failed and unknown conclusions as CI
+success.
+
+`feeder-live-proof.json` records the actual feeder handler using Node 24 native
+Fetch against a loopback HTTP server that sends headers and stalls its body.
+Two requests return 503 telemetry timeout at the configured 100ms deadline;
+the second request proves the timed-out response was not cached. The same
+scenario failed before the fix because the body deadline was not enforced.
+The regression scenario is in `test/telemetry-feeder.test.ts`.
+
+Limits: no Cloudflare deployment or production request. Current Cloudflare
+Workers Fetch/AbortController types and documentation were consulted. Bay's
+existing unknown/failure/unavailable values and normalizer are exercised;
+there is no observer schema or action-control change.

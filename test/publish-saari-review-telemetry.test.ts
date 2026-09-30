@@ -337,6 +337,44 @@ test("gh check-runs populate explicit CI conclusions and empty checks stay unkno
   assert.equal(normalizeTenantFeed("saari", empty, NOW).rows[0]?.ci, "unknown");
 });
 
+test("CI telemetry cannot clear an incomplete page or a non-success conclusion", () => {
+  const queueRoot = fixtureRoot();
+  const reviewRoot = fixtureRoot();
+  writeDoneRecord(queueRoot);
+  for (const conclusion of ["action_required", "stale", "startup_failure", "unrecognized", ""]) {
+    const report = publish({
+      queueRoot,
+      reviewRoot,
+      ciSource: "gh",
+      ghExec: () => ({
+        total_count: 2,
+        check_runs: [
+          { status: "completed", conclusion: "success" },
+          { status: "completed", conclusion },
+        ],
+      }),
+    });
+    assert.equal(
+      normalizeTenantFeed("saari", report, NOW).rows[0]?.ci,
+      ["unrecognized", ""].includes(conclusion) ? "unknown" : "failure",
+      conclusion,
+    );
+  }
+  const truncated = publish({
+    queueRoot,
+    reviewRoot,
+    ciSource: "gh",
+    ghExec: () => ({
+      total_count: 31,
+      check_runs: Array.from({ length: 30 }, () => ({
+        status: "completed",
+        conclusion: "success",
+      })),
+    }),
+  });
+  assert.equal(normalizeTenantFeed("saari", truncated, NOW).rows[0]?.ci, "unknown");
+});
+
 test("CLI writes the envelope to --out", () => {
   const queueRoot = fixtureRoot();
   const reviewRoot = fixtureRoot();

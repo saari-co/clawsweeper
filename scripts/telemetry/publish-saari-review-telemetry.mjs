@@ -440,7 +440,12 @@ export function readClawsweeperArtifacts(reviewStateRoot) {
 export function summarizeCheckRuns(payload) {
   const body = object(payload);
   const runs = Array.isArray(body?.check_runs) ? body.check_runs : [];
-  if (runs.length === 0) return { ci: "unknown", ci_conclusion: null };
+  if (
+    runs.length === 0 ||
+    (Number.isInteger(body?.total_count) && body.total_count > runs.length)
+  ) {
+    return { ci: "unknown", ci_conclusion: null };
+  }
   const statuses = runs.map((run) =>
     String(object(run)?.status ?? "")
       .trim()
@@ -462,10 +467,38 @@ export function summarizeCheckRuns(payload) {
   }
   if (
     conclusions.some((value) =>
-      ["failure", "failed", "error", "cancelled", "canceled", "timed_out"].includes(value),
+      [
+        "failure",
+        "failed",
+        "error",
+        "cancelled",
+        "canceled",
+        "timed_out",
+        "action_required",
+        "stale",
+        "startup_failure",
+      ].includes(value),
     )
   ) {
     return { ci: "completed", ci_conclusion: "failure" };
+  }
+  if (
+    conclusions.some(
+      (value) =>
+        ![
+          "success",
+          "successful",
+          "clean",
+          "pass",
+          "passed",
+          "skipped",
+          "not_applicable",
+          "n/a",
+          "neutral",
+        ].includes(value),
+    )
+  ) {
+    return { ci: "unknown", ci_conclusion: null };
   }
   if (
     conclusions.some((value) =>

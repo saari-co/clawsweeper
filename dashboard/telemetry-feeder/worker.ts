@@ -305,9 +305,9 @@ export function createTelemetryFeeder(options: TelemetryFeederOptions = {}) {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
+    let body: Awaited<ReturnType<typeof readBoundedBody>>;
     try {
-      response = await fetchImpl(sourceUrl, {
+      const response = await fetchImpl(sourceUrl, {
         method: "GET",
         signal: controller.signal,
         headers: {
@@ -317,6 +317,9 @@ export function createTelemetryFeeder(options: TelemetryFeederOptions = {}) {
           "user-agent": "clawsweeper-telemetry-feeder",
         },
       });
+      if (!response.ok) return unavailable(tenant, "source unavailable");
+      body = await readBoundedBody(response, maxBodyBytes);
+      if (controller.signal.aborted) return unavailable(tenant, "telemetry timeout");
     } catch (error) {
       const timedOut =
         (error instanceof Error && error.name === "AbortError") ||
@@ -326,9 +329,6 @@ export function createTelemetryFeeder(options: TelemetryFeederOptions = {}) {
       clearTimeout(timer);
     }
 
-    if (!response.ok) return unavailable(tenant, "source unavailable");
-
-    const body = await readBoundedBody(response, maxBodyBytes);
     if ("reason" in body) {
       return unavailable(
         tenant,
