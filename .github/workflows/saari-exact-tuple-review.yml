@@ -634,10 +634,19 @@ jobs:
           target_dir="$PRODUCER_TARGET"
           test -z "$(git -C "$target_dir" status --porcelain)"
           test "$(git -C "$target_dir" rev-parse HEAD)" = "$HEAD_SHA"
-          live_head="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" --jq '.head.sha')"
+          live_pull="$(gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER")"
+          jq -e \
+            --arg repository "$TARGET_REPO" --arg repository_id "$REPOSITORY_ID" \
+            --arg base_ref "$BASE_REF" --arg base_sha "$BASE_SHA" \
+            --arg head_repo "$HEAD_REPO" --arg head_sha "$HEAD_SHA" \
+            '.state == "open" and .draft == false and
+             .base.repo.full_name == $repository and
+             (.base.repo.id | tostring) == $repository_id and
+             .base.ref == $base_ref and .base.sha == $base_sha and
+             .head.repo.full_name == $head_repo and .head.sha == $head_sha' \
+            <<<"$live_pull" >/dev/null
           live_base="$(gh api "repos/$TARGET_REPO/git/ref/heads/$BASE_REF" --jq '.object.sha')"
           live_merge_base="$(gh api "repos/$TARGET_REPO/compare/$BASE_SHA...$HEAD_SHA" --jq '.merge_base_commit.sha')"
-          test "$live_head" = "$HEAD_SHA"
           test "$live_base" = "$BASE_SHA"
           test "$live_merge_base" = "$MERGE_BASE_SHA"
           node scripts/validate-saari-exact-tuple-report.mjs \

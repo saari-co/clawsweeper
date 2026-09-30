@@ -101,3 +101,82 @@ test("producer refuses targets outside the caller token scope before API access"
       ),
   );
 });
+
+test("publication revalidates the open PR and its admitted repository/base/head", () => {
+  const step = workflow.jobs.review.steps.find(
+    (candidate: { name: string }) =>
+      candidate.name === "Validate the exact native report and live tuple",
+  );
+  const script = step.run.slice(step.run.indexOf("live_pull="), step.run.indexOf("node scripts/"));
+  const root = mkdtempSync(join(tmpdir(), "saari-publication-tuple-"));
+  try {
+    const gh = join(root, "gh");
+    writeFileSync(
+      gh,
+      `#!/bin/sh
+case "$2" in
+  */pulls/*) printf '%s' "$LIVE_PULL" ;;
+  */git/ref/*) printf '%s' "$BASE_SHA" ;;
+  */compare/*) printf '%s' "$MERGE_BASE_SHA" ;;
+  *) exit 99 ;;
+esac
+`,
+    );
+    chmodSync(gh, 0o755);
+    const original = {
+      state: "open",
+      draft: false,
+      base: { repo: { full_name: "example/target", id: 42 }, ref: "main", sha: "a".repeat(40) },
+      head: { repo: { full_name: "example/fork" }, sha: "b".repeat(40) },
+    };
+    const run = (pull: typeof original) =>
+      execFileSync("bash", ["-ec", script], {
+        env: {
+          PATH: `${root}:${process.env.PATH}`,
+          LIVE_PULL: JSON.stringify(pull),
+          TARGET_REPO: "example/target",
+          REPOSITORY_ID: "42",
+          PR_NUMBER: "7",
+          BASE_REF: "main",
+          BASE_SHA: original.base.sha,
+          HEAD_REPO: "example/fork",
+          HEAD_SHA: original.head.sha,
+          MERGE_BASE_SHA: "c".repeat(40),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    assert.equal(run(original).length, 0);
+    for (const mutate of [
+      (pull: typeof original) => {
+        pull.state = "closed";
+      },
+      (pull: typeof original) => {
+        pull.draft = true;
+      },
+      (pull: typeof original) => {
+        pull.base.ref = "release";
+      },
+      (pull: typeof original) => {
+        pull.base.repo.id = 43;
+      },
+      (pull: typeof original) => {
+        pull.base.repo.full_name = "example/other";
+      },
+      (pull: typeof original) => {
+        pull.base.sha = "d".repeat(40);
+      },
+      (pull: typeof original) => {
+        pull.head.sha = "e".repeat(40);
+      },
+      (pull: typeof original) => {
+        pull.head.repo.full_name = "example/other-fork";
+      },
+    ]) {
+      const pull = structuredClone(original);
+      mutate(pull);
+      assert.throws(() => run(pull));
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
