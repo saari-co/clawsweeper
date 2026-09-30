@@ -56,3 +56,14 @@ Limits: no Cloudflare deployment or production request. Current Cloudflare
 Workers Fetch/AbortController types and documentation were consulted. Bay's
 existing unknown/failure/unavailable values and normalizer are exercised;
 there is no observer schema or action-control change.
+
+Final compatibility-boundary proof: `boundary-live-proof.json` records a native
+HTTP request into the real dashboard Worker handler. An allowlisted public row
+containing controlled private source/executor markers is returned with a fixed
+public source label and no executor; neither private marker is present in the
+response. The built profile loader accepts explicit empty close rules and rejects
+an external profile attempting to add an issue close rule. Repository and owner
+fallback negative tests cover both close-rule arrays and malformed/missing rules.
+This changes Bay's public projection privacy boundary without changing its schema
+or adding action controls. Proof ran in local Node24; no Cloudflare deployment or
+live apply/close action was performed.

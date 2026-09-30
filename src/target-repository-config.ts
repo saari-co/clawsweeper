@@ -100,6 +100,20 @@ function appendUniqueEntries(
         `target repository profile overlay cannot replace bundled ${label}: ${identity}`,
       );
     }
+    const rules = (entry as JsonObject).apply_close_rules;
+    if (
+      !rules ||
+      typeof rules !== "object" ||
+      Array.isArray(rules) ||
+      !["issue", "pull_request"].every((kind) => {
+        const values = (rules as JsonObject)[kind];
+        return Array.isArray(values) && values.length === 0;
+      })
+    ) {
+      throw new Error(
+        `target repository profile overlay ${label} must have empty review-only close rules`,
+      );
+    }
     identities.add(identity);
   }
   return [...bundledValue, ...overlayValue];

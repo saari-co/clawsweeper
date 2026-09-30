@@ -334,6 +334,8 @@ test("a stalled selected feeder becomes explicitly unavailable at its deadline",
 
 test("public API suppresses private repositories, lane details, and private proof links", async () => {
   const dinkuskit = feed("dinkuskit") as { rows: Array<Record<string, unknown>> };
+  dinkuskit.rows[0]!.source = "PRIVATE_SOURCE_SENTINEL /internal/source";
+  dinkuskit.rows[0]!.executor = "PRIVATE_EXECUTOR_SENTINEL /internal/worker";
   dinkuskit.rows[0]!.proof_links = [
     "https://github.com/dinkuskit/blocks/actions/runs/1",
     "https://user:password@github.com/dinkuskit/blocks/actions/runs/2",
@@ -367,6 +369,10 @@ test("public API suppresses private repositories, lane details, and private proo
   assert.equal(body.sources.find((source) => source.tenant === "saari")?.row_count, 0);
   assert.doesNotMatch(JSON.stringify(body), /ghs_must_never_escape|private\/proof|saari-co\/x-api/);
   assert.doesNotMatch(JSON.stringify(body), /password|token=secret|private\.txt/);
+  assert.doesNotMatch(
+    JSON.stringify(body),
+    /PRIVATE_SOURCE_SENTINEL|PRIVATE_EXECUTOR_SENTINEL|\/internal\//,
+  );
 });
 
 test("private observer rejects missing or invalid Access assertions before reading feeds", async () => {

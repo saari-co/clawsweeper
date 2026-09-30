@@ -194,3 +194,32 @@ test("repair toolchain lookup keeps its total-function fallback for an invalid o
     __resetTargetRepoToolchainCache();
   }
 });
+
+test("external profiles cannot expand close policy for repositories or owner fallbacks", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-review-only-overlay-"));
+  const overlayPath = join(root, "profiles.json");
+  try {
+    for (const collection of ["repositories", "generic_fallbacks"] as const) {
+      for (const rules of [
+        { issue: ["implemented_on_main"], pull_request: [] },
+        { issue: [], pull_request: ["implemented_on_main"] },
+        null,
+        {},
+        { issue: [], pull_request: "" },
+      ]) {
+        const overlay = overlayFixture();
+        Object.assign(overlay[collection][0]!, { apply_close_rules: rules });
+        writeFileSync(overlayPath, JSON.stringify(overlay));
+        assert.throws(
+          () =>
+            readTargetRepositoryConfigSource(bundledPath, {
+              [TARGET_REPOSITORY_PROFILE_OVERLAY_ENV]: overlayPath,
+            }),
+          /empty review-only close rules/,
+        );
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

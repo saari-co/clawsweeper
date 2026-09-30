@@ -327,7 +327,12 @@ function publicProofLinks(links: string[], repositories: Set<string>): string[] 
 function publicResult(result: SourceResult, repositories: Set<string>): SourceResult {
   const rows = result.rows
     .filter((row) => repositories.has(row.repository))
-    .map((row) => ({ ...row, proof_links: publicProofLinks(row.proof_links, repositories) }));
+    .map((row) => ({
+      ...row,
+      source: "public review telemetry",
+      executor: null,
+      proof_links: publicProofLinks(row.proof_links, repositories),
+    }));
   return {
     projection: {
       ...result.projection,
