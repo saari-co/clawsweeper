@@ -133,6 +133,16 @@ test("profile overlay cannot replace bundled repository or owner policy", () => 
         schema_version: bundled.schema_version,
         repositories: [{ target_repo: "OpenClaw/ClawHub" }],
       },
+      {
+        schema_version: bundled.schema_version,
+        repositories: [
+          {
+            target_repo: "OpenClaw/OpenClaw",
+            changed_gate: null,
+            apply_close_rules: { issue: [], pull_request: [] },
+          },
+        ],
+      },
       { schema_version: bundled.schema_version, generic_fallbacks: [{ owner: "OPENCLAW" }] },
     ].entries()) {
       const overlayPath = join(root, `profiles-${index}.json`);

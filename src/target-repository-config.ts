@@ -95,7 +95,11 @@ function appendUniqueEntries(
   );
   for (const [index, entry] of overlayValue.entries()) {
     const identity = entryIdentity(entry, identityKey, `overlay ${label}[${index}]`);
-    if (identities.has(identity)) {
+    // The core OpenClaw profile is implicit and must be protected like bundled entries.
+    if (
+      identities.has(identity) ||
+      (identityKey === "target_repo" && identity === "openclaw/openclaw")
+    ) {
       throw new Error(
         `target repository profile overlay cannot replace bundled ${label}: ${identity}`,
       );
