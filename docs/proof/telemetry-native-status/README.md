@@ -44,5 +44,5 @@ while a 501-row upstream response returns 503.
 `browser.json` records a real in-app browser race using the actual generated
 HTML and a controlled HTTP server. The Saari response arrived first; the older
 All response arrived later. Saari remained selected and the visible source
-remained Saari. Screenshot/AX evidence is retained locally and its hash is
-recorded; it is not a deployment claim.
+remained Saari. The selected screenshot is linked from [PROOF.md](PROOF.md); AX evidence remains
+local. It is not a deployment claim.
