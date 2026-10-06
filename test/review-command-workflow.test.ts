@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -240,6 +241,8 @@ const scheduledScenarios = [
   "content-exact-refusal",
   "changed-pr-refusal",
   "changed-pr-exact-refusal",
+  "changed-pr-findings-refusal",
+  "changed-pr-exact-findings-refusal",
   "changed-pr-exact-incomplete-refusal",
   "changed-pr-exact-invalid-base-refusal",
   "changed-pr-exact-missing-head-refusal",
@@ -280,6 +283,7 @@ function testScheduledCacheScenario(
       : `scheduled ${scenario} preserves admission and terminal ledger classification`;
   test(name, (t) => {
     const refuseScan = scenario.endsWith("refusal");
+    const findingRefusal = scenario.includes("findings-refusal");
     const invalidProofPrior = scenario.startsWith("changed-pr-proof-");
     const proofMaintainerChange = scenario === "changed-pr-proof-maintainer-change";
     const sourceIncompatible = scenario.endsWith("source-incompatible");
@@ -305,7 +309,27 @@ function testScheduledCacheScenario(
     const publicationCacheMiss = publicationCase?.compatible === false;
     const contentPath = scenario.startsWith("content-");
     const hydrated = fresh || contentPath || cacheRecovery || publicationCacheMiss;
-    if (refuseScan && !earlyScanRefusal) useFakeScanner(t, "process.exit(183);");
+    if (refuseScan && !earlyScanRefusal)
+      useFakeScanner(
+        t,
+        findingRefusal
+          ? String.raw`
+const input = inputs.find(({ name }) => /^[a-f0-9]{40}$/.test(name));
+assert.ok(input);
+console.log(JSON.stringify({
+  DetectorType: 999999, DecoderName: "PLAIN", Verified: false,
+  Raw: "SYNTHETIC_MATCH_CANARY", RawV2: "SYNTHETIC_MATCH_CANARY",
+  SourceMetadata: { Data: { Filesystem: { file: path.join(inputDir, input.name), line: 1 } } },
+}));
+console.error(JSON.stringify({
+  level: "info-0", logger: "trufflehog", msg: "finished scanning",
+  trufflehog_version: "3.97.4", chunks: 1, bytes: 1,
+  verified_secrets: 0, unverified_secrets: 1,
+}));
+process.exit(183);
+`
+          : "process.exit(183);",
+      );
     const root = realpathSync(mkdtempSync(join(tmpdir(), "clawsweeper-scheduled-cache-")));
     const artifactDir = join(root, "artifacts");
     const itemsDir = join(root, "items");
@@ -851,9 +875,11 @@ else {
             label: "fresh-review",
             cwd: target,
             prompt: "Review the current item.",
-            scanSource: incompleteSource
-              ? { kind: "committed", baseSha, headSha: "f".repeat(40) }
-              : { kind: "prompt" },
+            scanSource: findingRefusal
+              ? { kind: "committed", baseSha, headSha }
+              : incompleteSource
+                ? { kind: "committed", baseSha, headSha: "f".repeat(40) }
+                : { kind: "prompt" },
             model: "internal",
             env: { ...process.env, CODEX_BIN: provider },
             timeoutMs: 30_000,
@@ -1083,11 +1109,18 @@ else {
       }
 
       if (refuseScan) {
-        const reason = incompleteSource ? "incomplete_source" : "scanner_failed";
+        const reason = findingRefusal
+          ? "findings"
+          : incompleteSource
+            ? "incomplete_source"
+            : "scanner_failed";
         assert.throws(execute, (error) => {
           assert.ok(error instanceof AgentInputScanError);
           assert.equal(error.reason, reason);
-          assert.equal(agentInputScanFailureExitCode(error), incompleteSource ? 78 : null);
+          assert.equal(
+            agentInputScanFailureExitCode(error),
+            findingRefusal ? 79 : incompleteSource ? 78 : null,
+          );
           if (earlyScanRefusal) {
             assert.equal(error, earlyHydrationError);
             assert.equal(error.reviewedHeadSha, missingHead ? "" : headSha);
@@ -1105,25 +1138,114 @@ else {
         assert.equal(cachedCompletions, 0);
         assert.equal(generationCalls, fresh && !earlyScanRefusal ? 1 : 0);
         assert.equal(existsSync(join(artifactDir, `${ITEM_NUMBER}.md`)), false);
-        assert.equal(existsSync(join(artifactDir, "failure-diagnostics")), exactFailure);
-        if (exactFailure) {
-          const manifest = JSON.parse(
-            readFileSync(join(artifactDir, "failure-diagnostics", "manifest.json"), "utf8"),
-          );
+        const expectedDiagnostics = exactFailure || (!incompleteSource && !earlyScanRefusal);
+        const scanRoot = join(artifactDir, "scan-refusals");
+        const nativeRuns = existsSync(scanRoot) ? readdirSync(scanRoot) : [];
+        assert.equal(nativeRuns.length, expectedDiagnostics && !exactFailure ? 1 : 0);
+        const diagnosticDir = exactFailure
+          ? join(artifactDir, "failure-diagnostics")
+          : join(scanRoot, nativeRuns[0] ?? "absent", "failure-diagnostics");
+        assert.equal(existsSync(diagnosticDir), expectedDiagnostics);
+        if (expectedDiagnostics) {
+          const manifest = JSON.parse(readFileSync(join(diagnosticDir, "manifest.json"), "utf8"));
           assert.deepEqual(manifest.failure, {
             stage: "agent_input_scan",
             reason_code: reason,
-            ...(!incompleteSource
-              ? { scan: { kind: "native_contract", reason: "invalid_stdout" } }
-              : {}),
+            ...(findingRefusal
+              ? { scan: manifest.failure.scan }
+              : !incompleteSource
+                ? { scan: { kind: "native_contract", reason: "invalid_stdout" } }
+                : {}),
           });
           assert.equal(manifest.retryable, false);
-          assert.equal(manifest.process.workflow_exit, incompleteSource ? 78 : 1);
+          assert.equal(
+            manifest.process.workflow_exit,
+            findingRefusal ? 79 : incompleteSource ? 78 : 1,
+          );
           assert.equal(
             manifest.source.sha,
             missingHead ? null : isPullRequest ? headSha : priorRecord.sourceRevision,
             "observed source identity must replace the stale dispatch head, including missing heads",
           );
+          if (findingRefusal) {
+            const scan = manifest.failure.scan;
+            assert.equal(scan.kind, "unclassified_finding");
+            assert.equal(scan.findingCount, 1);
+            assert.equal(scan.detectorType, 999999);
+            assert.equal(scan.material.kind, "blob");
+            assert.ok(
+              scan.material.references.every(
+                (ref: { revision: string; pathSha256: string }) =>
+                  [baseSha, headSha].includes(ref.revision) &&
+                  ref.pathSha256 === digest("value.ts"),
+              ),
+            );
+            const files = readdirSync(diagnosticDir);
+            const serialized = files
+              .map((file) => readFileSync(join(diagnosticDir, file), "utf8"))
+              .join("\n");
+            assert.ok(Buffer.byteLength(serialized) <= 24 * 1024);
+            for (const forbidden of [
+              "SYNTHETIC_MATCH_CANARY",
+              "sensitive-comment-marker",
+              "Review the current item.",
+              root,
+            ])
+              assert.equal(serialized.includes(forbidden), false);
+            if (!exactFailure) {
+              const firstBytes = readFileSync(join(diagnosticDir, "manifest.json"), "utf8");
+              process.env.GITHUB_RUN_ID = "124";
+              assert.throws(
+                execute,
+                (error) =>
+                  error instanceof AgentInputScanError &&
+                  agentInputScanFailureExitCode(error) === 79,
+              );
+              const repeatedRuns = readdirSync(scanRoot);
+              assert.equal(
+                repeatedRuns.length,
+                2,
+                "reused debug roots retain both native refusals",
+              );
+              assert.equal(readFileSync(join(diagnosticDir, "manifest.json"), "utf8"), firstBytes);
+              const secondRun = repeatedRuns.find((run) => run !== nativeRuns[0])!;
+              const second = JSON.parse(
+                readFileSync(
+                  join(scanRoot, secondRun, "failure-diagnostics", "manifest.json"),
+                  "utf8",
+                ),
+              );
+              assert.equal(second.source.sha, headSha);
+              assert.equal(second.process.workflow_exit, 79);
+              assert.equal(existsSync(providerCalls), false);
+            }
+            const proofDir = process.env.CLAWSWEEPER_SYNTHETIC_SCAN_PROOF_DIR;
+            if (proofDir) {
+              mkdirSync(proofDir, { recursive: true });
+              writeFileSync(
+                join(proofDir, `${scenario}.json`),
+                JSON.stringify(
+                  {
+                    scenario,
+                    baseSha,
+                    headSha,
+                    manifest,
+                    diagnosticFiles: files,
+                    diagnosticBytes: Buffer.byteLength(serialized),
+                    providerCalls: 0,
+                    workflowExit: 79,
+                    nonLeakage: true,
+                  },
+                  null,
+                  2,
+                ) + "\n",
+              );
+            }
+          }
+          if (!exactFailure) {
+            assert.deepEqual(readdirSync(diagnosticDir), ["manifest.json"]);
+            assert.deepEqual(manifest.process, { workflow_exit: findingRefusal ? 79 : 1 });
+          }
         }
         return;
       }

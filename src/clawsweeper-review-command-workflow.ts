@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { oversizedPrSourceSnapshot } from "./clawsweeper-oversized-pr-freshness.js";
 import {
@@ -485,15 +486,23 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             retention: outputSelection.retention,
           });
         const recordFailureDiagnostics = (error: unknown, classification = "codex_execution") => {
-          if (!process.env.EXACT_REVIEW_ITEM_KEY) return;
+          const scanOnly =
+            error instanceof AgentInputScanError &&
+            !process.env.EXACT_REVIEW_ITEM_KEY &&
+            Boolean(error.scanDiagnostic);
+          if (!process.env.EXACT_REVIEW_ITEM_KEY && !scanOnly) return;
+          // Keep every native refusal immutable when a local debug root is reused.
+          const diagnosticArtifactDir = scanOnly
+            ? join(artifactDir, "scan-refusals", randomUUID())
+            : artifactDir;
           try {
             produceReviewOutput(outputBudget, {
-              paths: [join(artifactDir, "failure-diagnostics")],
+              paths: [join(diagnosticArtifactDir, "failure-diagnostics")],
               maxBytes: EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES,
-              maxFiles: EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES,
+              maxFiles: scanOnly ? 1 : EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES,
               metadata: true,
             }, () => writeExactReviewFailureDiagnostics({
-              artifactDir,
+              artifactDir: diagnosticArtifactDir,
               error,
               prompt: diagnosticPrompt,
               model,
@@ -506,6 +515,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 : diagnosticSourceSha,
               retryable: codexReviewFailureRetryable(error),
               workflowExit: agentInputScanFailureExitCode(error) ?? 1,
+              scanOnly,
             }));
           } catch {
             console.error("[review] exact-review failure diagnostics could not be written.");
