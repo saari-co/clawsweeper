@@ -568,9 +568,12 @@ export function unifiedReviewHtml(visibility: "public" | "private" = "public") {
 <script>
 const esc=v=>String(v??'unknown').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const short=v=>v?esc(v.slice(0,12)):'unknown';
+let latestRequest=0;
 async function load(tenant='all'){
+ const request=++latestRequest;
  const response=await fetch('${endpoint}?tenant='+encodeURIComponent(tenant),{cache:'no-store'});
  const data=await response.json();
+ if(request!==latestRequest)return;
  if(!response.ok){document.querySelector('#sources').innerHTML='';document.querySelector('#rows').innerHTML='<article class="card"><div class="identity">Private observer authentication required.</div></article>';return;}
  document.querySelectorAll('[data-tenant]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tenant===tenant)));
  document.querySelector('#sources').innerHTML=data.sources.map(s=>'<article class="source"><strong>'+esc(s.tenant)+'</strong> <span class="'+esc(s.status)+'">'+esc(s.status)+'</span><br><span class="label">freshness</span>'+esc(s.freshness)+'<br><span class="label">rows</span>'+esc(s.row_count)+'<br><span class="label">lane boundaries</span>'+esc(s.lane?s.lane.app_installation+' · '+s.lane.queue_namespace+' · '+s.lane.state_store:'unknown')+(s.error?'<br><span class="label">error</span>'+esc(s.error):'')+'</article>').join('');

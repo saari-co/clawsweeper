@@ -13,6 +13,7 @@ import {
   buildSaariReviewTelemetry,
   CLAWSWEEPER_RANKS,
   MAX_ROWS,
+  MAX_ENVELOPE_BYTES,
   parsePublisherArgs,
   SAARI_LANE,
   writeSaariReviewTelemetry,
@@ -34,6 +35,7 @@ function writeDoneRecord(root: string, overrides: Record<string, unknown> = {}) 
   const doneDir = join(root, "done");
   mkdirSync(doneDir, { recursive: true });
   const record = {
+    base_sha: BASE,
     submitted_head: HEAD,
     commit_sha: HEAD,
     pr_url: "https://github.com/saari-co/x-api/pull/44",
@@ -215,6 +217,7 @@ test("a clean runner exit is terminal success even when review_clean is absent o
     review_clean: undefined,
     review_finding_count: undefined,
     exit_code: 0,
+    base_sha: undefined,
     base: "e".repeat(40),
   });
   const envelope = publish({ queueRoot, reviewRoot });
@@ -582,4 +585,47 @@ test("undated clean records cannot replace a dated finding result", () => {
     const row = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW).rows[0];
     assert.equal(row?.openclaw, "failure");
   }
+});
+
+test("same-head reviews on different bases remain separate", () => {
+  const queueRoot = fixtureRoot(),
+    reviewRoot = fixtureRoot();
+  const otherBase = "d".repeat(40);
+  writeDoneRecord(queueRoot, { base_sha: otherBase });
+  writeItemArtifact(reviewRoot);
+  const rows = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW).rows;
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find((row) => row.base_sha === BASE)?.openclaw, "unknown");
+  assert.equal(rows.find((row) => row.base_sha === otherBase)?.clawsweeper, "unknown");
+});
+
+test("accumulated historical proof links stay within the encoded transport budget", () => {
+  const queueRoot = fixtureRoot(),
+    reviewRoot = fixtureRoot();
+  mkdirSync(join(queueRoot, "done"));
+  for (let n = 1; n <= MAX_ROWS; n++) {
+    for (let attempt = 0; attempt < 9; attempt++) {
+      writeFileSync(
+        join(queueRoot, "done", `${n}-${attempt}.json`),
+        JSON.stringify({
+          base_sha: BASE,
+          submitted_head: HEAD,
+          pr_url: `https://github.com/saari-co/x-api/pull/${n}`,
+          status: "completed",
+          exit_code: 0,
+          submitted_at_utc: `2026-09-13T17:5${attempt}:00Z`,
+          proof_path: `proof/${"x".repeat(350)}/${n}-${attempt}/PROOF.md`,
+        }),
+      );
+    }
+  }
+  const result = publish({ queueRoot, reviewRoot });
+  const bytes = Buffer.from(JSON.stringify(result, null, 2) + "\n");
+  assert.ok(result.rows.length > 0);
+  assert.ok(bytes.byteLength <= MAX_ENVELOPE_BYTES);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify({ encoding: "base64", content: bytes.toString("base64") })) <
+      1024 * 1024,
+  );
+  assert.ok(result.rows.every((row) => row.proof_links.length <= 8));
 });

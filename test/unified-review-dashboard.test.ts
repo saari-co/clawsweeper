@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createContext, runInContext } from "node:vm";
 import worker from "../dashboard/worker.ts";
 import {
   authorizePrivateObserver,
@@ -7,6 +8,7 @@ import {
   normalizeTenantFeed,
   privateUnifiedReviewStatus,
   unifiedReviewStatus,
+  unifiedReviewHtml,
 } from "../dashboard/unified-review-dashboard.ts";
 
 const NOW = Date.parse("2026-09-12T15:00:00Z");
@@ -440,4 +442,42 @@ test("valid Access assertion exposes private rows without serializing credential
   );
   assert.equal(body.rows[0]?.executor, "spark-2/codex");
   assert.doesNotMatch(serialized, /ghs_must_never_escape|private-key-must-never-escape|Cf-Access/);
+});
+
+test("a superseded tenant response cannot undo the latest selection", async () => {
+  const nodes = { "#sources": { innerHTML: "" }, "#rows": { innerHTML: "" } };
+  const buttons = ["all", "saari", "dinkuskit"].map((tenant) => ({
+    dataset: { tenant },
+    selected: "false",
+    addEventListener() {},
+    setAttribute(_name: string, value: string) {
+      this.selected = value;
+    },
+  }));
+  const responses: Array<(value: unknown) => void> = [];
+  const context = createContext({
+    document: {
+      querySelector: (selector: keyof typeof nodes) => nodes[selector],
+      querySelectorAll: () => buttons,
+    },
+    fetch: () => new Promise((resolve) => responses.push(resolve)),
+  });
+  const script = unifiedReviewHtml().match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  runInContext(script, context);
+  const latest = runInContext('load("saari")', context);
+  const response = (tenant: string) => ({
+    ok: true,
+    json: async () => ({
+      sources: [{ tenant, status: "available", freshness: "fresh", row_count: 0, lane: null }],
+      rows: [],
+    }),
+  });
+  responses[1](response("saari"));
+  await latest;
+  responses[0](response("dinkuskit"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(buttons.find((button) => button.selected === "true")?.dataset.tenant, "saari");
+  assert.match(nodes["#sources"].innerHTML, /saari/);
+  assert.doesNotMatch(nodes["#sources"].innerHTML, /dinkuskit/);
 });

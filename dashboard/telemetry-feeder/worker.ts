@@ -171,9 +171,9 @@ function sanitizeEnvelope(input: unknown, tenant: string): Record<string, unknow
   const generatedAt = isoDate(feed.generated_at);
   const lane = laneBoundary(feed.lane);
   if (!generatedAt || !lane || !Array.isArray(feed.rows)) return null;
-  if (feed.rows.length > MAX_TELEMETRY_ROWS * 4) return null;
+  if (feed.rows.length > MAX_TELEMETRY_ROWS) return null;
   const rows: Record<string, unknown>[] = [];
-  for (const value of feed.rows.slice(0, MAX_TELEMETRY_ROWS)) {
+  for (const value of feed.rows) {
     const row = sanitizeRow(value);
     if (!row) return null;
     rows.push(row);

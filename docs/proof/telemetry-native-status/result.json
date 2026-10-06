@@ -18,8 +18,10 @@
     "findings_total": 1,
     "native_report_clawsweeper": "blocked",
     "row_freshness": "fresh",
-    "missing_root_exit": 2
+    "missing_root_exit": 2,
+    "different_base_rows": 2,
+    "mismatched_openclaw": "unknown"
   },
-  "publisher_sha256": "3c1f180b199af67b3249dc5cb22f09aa749814647d62044759f7ef397b071bd6",
+  "publisher_sha256": "41576c3265c837b11e26341a4c5639231644dad9b72ce2a50cd7f7b3c0a7f04f",
   "limits": "Local synthetic records through actual CLI and actual dashboard consumer. No live queue, deployment, GitHub write or receiver activation."
 }

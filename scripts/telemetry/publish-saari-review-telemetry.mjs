@@ -15,6 +15,8 @@ import { renderReviewCommentFromReport } from "../../dist/clawsweeper.js";
 export const SCHEMA_VERSION = "clawsweeper.telemetry.v1";
 export const TENANT = "saari";
 export const MAX_ROWS = 500;
+// Leave transport headroom for the GitHub Contents base64 envelope.
+export const MAX_ENVELOPE_BYTES = 512 * 1024;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const DEFAULT_STALE_AFTER_SECONDS = 900;
@@ -554,8 +556,8 @@ function proofLinksFor(row) {
   return links;
 }
 
-function rowKey(repository, prNumber, headSha) {
-  return `${repository}#${prNumber}:${headSha}`;
+function rowKey(repository, prNumber, baseSha, headSha) {
+  return `${repository}#${prNumber}:${baseSha ?? "unknown"}:${headSha}`;
 }
 
 export function buildSaariReviewTelemetry(options) {
@@ -586,7 +588,7 @@ export function buildSaariReviewTelemetry(options) {
     ) {
       return;
     }
-    const key = rowKey(repository, prNumber, headSha);
+    const key = rowKey(repository, prNumber, sha(partial.base_sha), headSha);
     const existing = rowsByKey.get(key) ?? {
       repository,
       pr_number: prNumber,
@@ -636,7 +638,12 @@ export function buildSaariReviewTelemetry(options) {
         existing[field] = partial[field];
       }
     }
-    if (partial.proofPath) existing.proofPaths.push(partial.proofPath);
+    if (partial.proofPath) {
+      existing.proofPaths = [
+        ...existing.proofPaths.filter((path) => path !== partial.proofPath),
+        partial.proofPath,
+      ].slice(-7);
+    }
     if (partial.source) existing.source = partial.source;
     rowsByKey.set(key, existing);
   };
@@ -711,7 +718,7 @@ export function buildSaariReviewTelemetry(options) {
     rows.push(row);
   }
 
-  return {
+  const envelope = {
     schema_version: SCHEMA_VERSION,
     tenant: TENANT,
     generated_at: generatedAt,
@@ -719,6 +726,11 @@ export function buildSaariReviewTelemetry(options) {
     lane: { ...SAARI_LANE },
     rows,
   };
+  while (Buffer.byteLength(JSON.stringify(envelope, null, 2) + "\n", "utf8") > MAX_ENVELOPE_BYTES) {
+    if (!rows.length) throw new Error("telemetry metadata exceeds its transport budget");
+    rows.pop();
+  }
+  return envelope;
 }
 
 export function writeSaariReviewTelemetry(options) {

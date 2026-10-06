@@ -1,0 +1,19 @@
+{
+  "claim": "Actual publisher CLI history window survives the real feeder transport; oversized row inputs are rejected",
+  "input": {
+    "rows": 500,
+    "attempts_per_row": 9
+  },
+  "observed": {
+    "published_rows": 139,
+    "serialized_bytes": 523059,
+    "contents_response_bytes": 697446,
+    "valid_transport_status": 200,
+    "oversized_rows_status": 503
+  },
+  "sources": {
+    "scripts/telemetry/publish-saari-review-telemetry.mjs": "41576c3265c837b11e26341a4c5639231644dad9b72ce2a50cd7f7b3c0a7f04f",
+    "dashboard/telemetry-feeder/worker.ts": "a094997f9cbeb0c493c66cb631808e0c672b57580280e9bd3402f361a7ce2a53"
+  },
+  "limits": "Synthetic local records and actual loopback HTTP response through the real feeder handler. No external GitHub or Worker deployment."
+}

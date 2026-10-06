@@ -37,7 +37,7 @@ with lock.open('a') as held:
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
         result = {'result': 'pass' if done.returncode == 0 and output.is_file() else 'fail',
                   'exit_code': done.returncode, 'schema_sha256': hashlib.sha256(schema.read_bytes()).hexdigest(),
-                  'proof_kind': 'synthetic_complete_schema_acceptance', 'review_performed': False, 'error_markers': [marker for marker in ['invalid_json_schema', 'Invalid schema', 'unexpected argument', 'not supported', '401 Unauthorized', 'refresh_token_reused', 'usage limit', 'Rate limit'] if marker in done.stderr]} 
+                  'proof_kind': 'synthetic_complete_schema_acceptance', 'review_performed': False, 'error_markers': [marker for marker in ['invalid_json_schema', 'Invalid schema', 'unexpected argument', 'not supported', '401 Unauthorized', 'refresh_token_reused', 'usage limit', 'Rate limit'] if marker in done.stderr]}
         if output.is_file():
             raw = output.read_bytes()
             parsed = json.loads(raw)

@@ -252,8 +252,8 @@ test("consumer normalizeTenantFeed accepts the feeder passthrough", async () => 
   assert.equal(normalized.rows[0]?.rating, "B Platinum Hermit");
 });
 
-test("rows are capped at the consumer MAX_ROWS", async () => {
-  const rows = Array.from({ length: MAX_TELEMETRY_ROWS + 3 }, (_, index) => ({
+test("a complete feed at the consumer MAX_ROWS limit is accepted", async () => {
+  const rows = Array.from({ length: MAX_TELEMETRY_ROWS }, (_, index) => ({
     repository: "saari-co/x-api",
     pr_number: index + 1,
     base_sha: SHA_A,
@@ -326,4 +326,18 @@ test("deadline covers a real upstream response that stalls after headers", async
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
+});
+
+test("oversized row counts fail closed instead of silently truncating the source", async () => {
+  const source = envelope();
+  const feeder = createTelemetryFeeder({
+    fetch: async () =>
+      contentsResponse({
+        ...source,
+        rows: Array.from({ length: MAX_TELEMETRY_ROWS + 1 }, () => source.rows[0]),
+      }),
+    now: () => NOW,
+  });
+  const result = await read(await feeder(statusRequest(), env()));
+  assert.equal(result.status, 503);
 });

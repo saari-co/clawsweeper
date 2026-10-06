@@ -30,3 +30,19 @@ The CLI proof also keeps a newer attempt fresh when its native artifact is older
 and exits nonzero for a missing input root instead of publishing a healthy empty
 feed. A row's observation time is the latest valid observation across its lanes;
 it does not upgrade either lane's verdict.
+
+Final review fixes retain separate rows for different base/head pairs. The CLI
+proof confirms a success for one base is not attributed to the native report's
+different base. The publisher keeps at most seven recent proof paths per tuple
+and a recent-history window bounded by both 500 rows and 512 KiB of serialized
+JSON; those are observation-window limits, not an inventory of every PR. The
+feeder rejects an input above 500 rows rather than silently discarding rows.
+`transport.json` records an actual 4,500-record CLI run over loopback HTTP through
+the feeder: the encoded response fits the 1 MiB transport limit and succeeds,
+while a 501-row upstream response returns 503.
+
+`browser.json` records a real in-app browser race using the actual generated
+HTML and a controlled HTTP server. The Saari response arrived first; the older
+All response arrived later. Saari remained selected and the visible source
+remained Saari. Screenshot/AX evidence is retained locally and its hash is
+recorded; it is not a deployment claim.
