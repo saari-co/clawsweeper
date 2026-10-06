@@ -1,0 +1,25 @@
+{
+  "reviewer": "Codex review-rails owner; approved bounded offline inspection",
+  "at": "2026-10-06T21:10:53.053828+00:00",
+  "method": "Parse only the exact hash-bound line in isolated runtime; compare each URI component against predeclared public placeholder grammar and reserved/loopback-host rules. No credential store, network, model, or raw scanner output access.",
+  "source_head": "9d30c1016b01b0771d9f1d82010724433835985f",
+  "source_blob": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+  "source_path": "tests/unit/checkout-host-wake-client.test.ts",
+  "source_line": 154,
+  "line_sha256": "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1",
+  "native_identity_sha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+  "observed_decoders": ["PLAIN", "HTML"],
+  "checks": {
+    "reserved_or_loopback_host": true,
+    "generic_public_username": true,
+    "generic_public_password": true,
+    "ordinary_http_scheme": true,
+    "no_query_or_fragment": true,
+    "root_path_only": true,
+    "no_port": true,
+    "plain_ascii_no_encoding": true
+  },
+  "conclusion": "all_components_fit_neutral_placeholder_grammar",
+  "historical_authorship_claim": false,
+  "limits": "Does not prove historical author intent or verify credentials; establishes component neutrality only if all predeclared checks pass. No policy admission or activation."
+}

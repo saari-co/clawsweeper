@@ -1,0 +1,143 @@
+{
+  "baseSha": "bd997144517242e0a70596e15de20bbfc3314df8",
+  "headSha": "9d30c1016b01b0771d9f1d82010724433835985f",
+  "promptSha256": "488caeeb98010590f3b1ad057c796e1b53473fa69cb0a22822ee5f909b6cee70",
+  "schema": null,
+  "environment": {
+    "platform": "linux",
+    "node": "v24.18.0",
+    "network": "bubblewrap --unshare-net; no live credential verification possible",
+    "secrets": "cleared environment; production scanner private HOME"
+  },
+  "result": "refused",
+  "failure": {
+    "reason": "findings",
+    "diagnostic": {
+      "kind": "unclassified_finding",
+      "reason": "literal_not_reviewed",
+      "findingCount": 2,
+      "findingIndex": 0,
+      "detectorType": 17,
+      "decoder": "PLAIN",
+      "verified": false,
+      "scannerLine": 154,
+      "material": {
+        "kind": "blob",
+        "id": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+        "referenceCount": 1,
+        "references": [
+          {
+            "revision": "9d30c1016b01b0771d9f1d82010724433835985f",
+            "pathSha256": "ae22a98f1c5adae3713229e7bef3f6f852fb4240f1c1c7d117a27aa76bb72603",
+            "mode": "100644",
+            "role": "head"
+          }
+        ]
+      },
+      "nativeFindings": {
+        "total": 2,
+        "retained": 2,
+        "omitted": 0,
+        "truncated": false,
+        "findings": [
+          {
+            "index": 0,
+            "detectorType": 17,
+            "decoder": "PLAIN",
+            "verified": false,
+            "adjudication": "first_refusal",
+            "scannerInputLine": 154,
+            "material": {
+              "kind": "blob",
+              "id": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+              "referenceCount": 1,
+              "references": [
+                {
+                  "revision": "9d30c1016b01b0771d9f1d82010724433835985f",
+                  "pathSha256": "ae22a98f1c5adae3713229e7bef3f6f852fb4240f1c1c7d117a27aa76bb72603",
+                  "mode": "100644",
+                  "role": "head"
+                }
+              ]
+            },
+            "sourceLine": 154,
+            "sourceLineStatus": "proven"
+          },
+          {
+            "index": 1,
+            "detectorType": 17,
+            "decoder": "HTML",
+            "verified": false,
+            "adjudication": "unadjudicated",
+            "scannerInputLine": 2275,
+            "material": {
+              "kind": "patch",
+              "id": "1",
+              "from": "bd997144517242e0a70596e15de20bbfc3314df8",
+              "to": "9d30c1016b01b0771d9f1d82010724433835985f"
+            },
+            "sourceLine": null,
+            "sourceLineStatus": "unavailable"
+          }
+        ]
+      }
+    }
+  },
+  "notices": [],
+  "scans": [
+    {
+      "scannerVersion": "3.97.4",
+      "scannerSha256": "19cc61a48d8d72ded8e468145857de507673e118303e85b3b2771ea99e2b9ed1",
+      "arguments": [
+        "filesystem",
+        "<staging>",
+        "--results=verified,unknown",
+        "--fail",
+        "--fail-on-scan-errors",
+        "--no-update",
+        "--json",
+        "--no-color"
+      ],
+      "exit": 183,
+      "findings": [
+        {
+          "input": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+          "line": 154,
+          "lineSha256": "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1",
+          "unprefixedLineSha256": "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1",
+          "detector": 17,
+          "detectorName": "URI",
+          "decoder": "PLAIN",
+          "verified": false,
+          "rawSha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+          "rawV2Sha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+          "verificationErrorPresent": true
+        },
+        {
+          "input": "1",
+          "line": 2275,
+          "lineSha256": "075da0a93ca3de4c65612a4d826cfa3cb7e2283e798a4b0ae2622ff97c5fd618",
+          "unprefixedLineSha256": "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1",
+          "detector": 17,
+          "detectorName": "URI",
+          "decoder": "HTML",
+          "verified": false,
+          "rawSha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+          "rawV2Sha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+          "verificationErrorPresent": true
+        }
+      ],
+      "completion": [
+        {
+          "version": "3.97.4",
+          "chunks": 62,
+          "bytes": 445700,
+          "verified": 0,
+          "unverified": 2
+        }
+      ],
+      "staged_inputs_manifest_sha256": "07e79dca7e6c214835df7d355a2067fd3dc9fc7de4aa1305adf5a25d0136da2e",
+      "input_count": 36
+    }
+  ]
+}
