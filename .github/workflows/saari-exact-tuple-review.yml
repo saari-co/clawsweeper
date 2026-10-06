@@ -361,8 +361,13 @@ jobs:
           fi
           engine_repository="$(jq -r '.producer.engine_repository' "$config")"
           workflow_path="$(jq -r '.producer.workflow_path' "$config")"
-          reviewer_actor="$(jq -r '.reviewer_actor' <<<"$tenant")"
-          artifact_prefix="$(jq -r '.artifact_prefix' <<<"$tenant")"
+          # Validate raw JSON strings before shell substitution can strip trailing newlines.
+          reviewer_actor="$(jq -er '.reviewer_actor | select(type == "string")
+            | select(test("^[A-Za-z0-9][A-Za-z0-9_.-]{1,199}$")
+              and (test("[^A-Za-z0-9_.-]") | not))' <<<"$tenant")"
+          artifact_prefix="$(jq -er '.artifact_prefix | select(type == "string")
+            | select(test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+              and (test("[^A-Za-z0-9_.-]") | not))' <<<"$tenant")"
           if [ "$engine_repository" != "${TRUSTED_ENGINE_REPOSITORY:-}" ] \
             && [ -n "${TRUSTED_ENGINE_REPOSITORY:-}" ]; then
             echo "defining-workflow repository is not the configured exact-tuple producer." >&2

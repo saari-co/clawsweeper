@@ -881,3 +881,62 @@ test("workflow cleanup removes only its run checkout and refuses a symlink or in
   assert.equal(existsSync(join(neighbor, "keep")), true);
   assert.equal(runPinnedEngineScript(script, { ...env, GITHUB_RUN_ID: "../802" }).ok, false);
 });
+
+test("overlay admission rejects malformed values before writing the runner environment", () => {
+  const script = extractStepRunScript(
+    readText(".github/workflows/saari-exact-tuple-review.yml"),
+    "Reject stale exact-tuple identity before host work",
+  );
+  const dir = mkdtempSync(join(tmpdir(), "overlay-env-proof-"));
+  const configPath = join(dir, "overlay.json");
+  const envFile = join(dir, "env");
+  const env = {
+    REVIEW_SCOPE: "comprehensive",
+    PR_NUMBER: "7",
+    REVIEW_EPOCH: "1",
+    REPOSITORY_ID: "1000000001",
+    TARGET_REPOSITORY_ID: "1000000001",
+    BASE_SHA: BASE,
+    HEAD_SHA: HEAD,
+    MERGE_BASE_SHA: BASE,
+    TARGET_REPO: SUITE,
+    BASE_REF: "main",
+    TRUSTED_ENGINE_REPOSITORY: ENGINE_REPO,
+    CLAWSWEEPER_EXACT_TUPLE_CONFIG: configPath,
+    GITHUB_ENV: envFile,
+    GITHUB_RUN_ID: "801",
+    GITHUB_RUN_ATTEMPT: "2",
+  };
+  const original = JSON.parse(readText(OVERLAY_PATH));
+  writeFileSync(configPath, JSON.stringify(original));
+  writeFileSync(envFile, "EXISTING=preserved\n");
+  assert.equal(runPinnedEngineScript(script, env).ok, true);
+  assert.equal(
+    readText(envFile),
+    "EXISTING=preserved\nREVIEWER_ACTOR=example-reviewer-bot\nEXACT_TUPLE_ARTIFACT_NAME=example-suite-review-801-2\n",
+  );
+  for (const field of ["reviewer_actor", "artifact_prefix"]) {
+    for (const value of [
+      "",
+      null,
+      42,
+      "valid\nINJECTED=1",
+      "valid\n",
+      "valid\r",
+      "valid\u0000",
+      "bad/value",
+      "a".repeat(201),
+    ]) {
+      const malformed = structuredClone(original);
+      malformed.tenants[0][field] = value;
+      writeFileSync(configPath, JSON.stringify(malformed));
+      writeFileSync(envFile, "EXISTING=preserved\n");
+      assert.equal(
+        runPinnedEngineScript(script, env).ok,
+        false,
+        `${field}: ${JSON.stringify(value)}`,
+      );
+      assert.equal(readText(envFile), "EXISTING=preserved\n");
+    }
+  }
+});

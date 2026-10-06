@@ -10,3 +10,13 @@ Source capture matches `14191506e14f622c352cd1c21c44c34eeb1eee49`; later proof-l
 - `publication.json` binds the body validator and owning-run cleanup execution.
 
 See [README](README.md) for scenarios and limits. These controlled proofs establish local behavior, not deployment, live tenant correctness, automatic merging or live cleanup.
+
+## Overlay admission environment boundary
+
+The actual workflow admission shell was executed against a synthetic external
+JSON overlay and a real temporary `GITHUB_ENV` file. A valid overlay emitted the
+two expected values. Embedded newline injection, trailing newline, and NUL inputs
+were rejected with a nonzero exit before changing the environment file. The raw
+JSON strings are checked before shell substitution can strip trailing newlines.
+See [overlay.json](overlay.json) for the workflow hash and final-effect receipts.
+This controlled shell proof does not deploy the workflow or access host secrets.

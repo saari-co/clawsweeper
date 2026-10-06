@@ -462,7 +462,7 @@ test("a superseded tenant response cannot undo the latest selection", async () =
     },
     fetch: () => new Promise((resolve) => responses.push(resolve)),
   });
-  const script = unifiedReviewHtml().match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  const script = unifiedReviewHtml().match(/<script>([\s\S]*?)<\/script>/i)?.[1];
   assert.ok(script);
   runInContext(script, context);
   const latest = runInContext('load("saari")', context);

@@ -1,0 +1,42 @@
+{
+  "surface": "actual workflow admission shell executed with synthetic external overlay and real environment file",
+  "workflow_sha256": "cc15350730f7128208fa9a319f4f917c750a18455d02dc181bacdb2f53d1010d",
+  "cases": [
+    {
+      "field": "valid",
+      "scenario": "valid",
+      "exit_code": 0,
+      "environment_unchanged": false,
+      "passed": true
+    },
+    {
+      "field": "reviewer_actor",
+      "scenario": "'valid\\nINJECTED=1'",
+      "exit_code": 4,
+      "environment_unchanged": true,
+      "passed": true
+    },
+    {
+      "field": "artifact_prefix",
+      "scenario": "'valid\\nINJECTED=1'",
+      "exit_code": 4,
+      "environment_unchanged": true,
+      "passed": true
+    },
+    {
+      "field": "reviewer_actor",
+      "scenario": "'valid\\n'",
+      "exit_code": 4,
+      "environment_unchanged": true,
+      "passed": true
+    },
+    {
+      "field": "artifact_prefix",
+      "scenario": "'valid\\x00'",
+      "exit_code": 4,
+      "environment_unchanged": true,
+      "passed": true
+    }
+  ],
+  "limits": "Controlled local shell proof; no host overlay, secrets, runner deployment, or live review execution."
+}
