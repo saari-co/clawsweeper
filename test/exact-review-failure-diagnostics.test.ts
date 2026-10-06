@@ -215,6 +215,76 @@ test("scan diagnostics retain refusal identity without scanner output", () => {
   }
 });
 
+test("scan-only diagnostics persist bounded refusal metadata without raw process detail", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
+  try {
+    const error = Object.assign(
+      new AgentInputScanError("scanner_failed", {
+        kind: "native_contract",
+        reason: "invalid_stdout",
+      }),
+      {
+        stdout: "RAW_STDOUT_CANARY",
+        stderr: "RAW_STDERR_CANARY",
+      },
+    );
+    const output = writeExactReviewFailureDiagnostics({
+      artifactDir: root,
+      error,
+      prompt: "RAW_PROMPT_CANARY",
+      model: "RAW_MODEL_CANARY",
+      classification: "codex_execution",
+      repo: "openclaw/openclaw",
+      itemKind: "pull_request",
+      itemNumber: 1338,
+      sourceSha: "b".repeat(40),
+      retryable: false,
+      workflowExit: 1,
+      scanOnly: true,
+      env: {},
+    });
+    assert.deepEqual(readdirSync(output), ["manifest.json"]);
+    const text = readFileSync(join(output, "manifest.json"), "utf8");
+    const manifest = JSON.parse(text);
+    assert.deepEqual(manifest.failure, {
+      stage: "agent_input_scan",
+      reason_code: "scanner_failed",
+      scan: { kind: "native_contract", reason: "invalid_stdout" },
+    });
+    assert.deepEqual(manifest.process, { workflow_exit: 1 });
+    assert.equal(manifest.source.sha, "b".repeat(40));
+    assert.ok(Buffer.byteLength(text) <= 24 * 1024);
+    for (const forbidden of [
+      "RAW_STDOUT_CANARY",
+      "RAW_STDERR_CANARY",
+      "RAW_PROMPT_CANARY",
+      "RAW_MODEL_CANARY",
+    ]) {
+      assert.doesNotMatch(text, new RegExp(forbidden));
+    }
+    assert.throws(
+      () =>
+        writeExactReviewFailureDiagnostics({
+          artifactDir: join(root, "missing-diagnostic"),
+          error: new AgentInputScanError("scanner_failed"),
+          prompt: "",
+          model: "",
+          classification: "codex_execution",
+          repo: "openclaw/openclaw",
+          itemKind: "pull_request",
+          itemNumber: 1338,
+          retryable: false,
+          workflowExit: 1,
+          scanOnly: true,
+          env: {},
+        }),
+      /existing scan refusal diagnostic/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("scan refusals do not expose unrelated or nested process causes", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
   const native = spawnSync(process.execPath, ["-e", "process.exit(23)"], { encoding: "utf8" });
