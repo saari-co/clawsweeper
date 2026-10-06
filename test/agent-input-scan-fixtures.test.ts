@@ -200,6 +200,87 @@ test("native coordinate witnesses reject ambiguous, decoded and oversized inputs
   }
 });
 
+test("native inventory retains a late first refusal before truncating reviewed findings", () => {
+  const literal = "https://neutral-inventory.invalid/example";
+  const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+  const inputs = new Map<string, StagedScanInput>();
+  const findings = Array.from({ length: 21 }, (_, index) => {
+    const raw = index === 20 ? "neutral-unreviewed-marker" : literal;
+    const file = `input-${index}`;
+    inputs.set(file, {
+      kind: "blob",
+      id: "a".repeat(40),
+      bytes: Buffer.from(raw + "\n"),
+      references: [
+        {
+          source: "src/plugin-sdk/browser-subpaths.test.ts",
+          revision: "b".repeat(40),
+          mode: "100644",
+          role: "head",
+        },
+      ],
+    });
+    return {
+      SourceType: 15,
+      DetectorType: index === 20 ? 999999 : 17,
+      DetectorName: "URI",
+      DecoderName: "PLAIN",
+      Verified: false,
+      VerificationError: "neutral verification unavailable",
+      Raw: raw,
+      RawV2: raw,
+      ExtraData: null,
+      StructuredData: null,
+      SecretParts: { host: "neutral-inventory.invalid", username: "", password: "" },
+      SourceMetadata: { Data: { Filesystem: { file, line: 1 } } },
+    };
+  });
+  const result = classifyReviewedFixtureScan(
+    183,
+    Buffer.from(findings.map((finding) => JSON.stringify(finding) + "\n").join("")),
+    Buffer.from(
+      JSON.stringify({
+        level: "info-0",
+        logger: "trufflehog",
+        msg: "finished scanning",
+        trufflehog_version: "3.97.4",
+        chunks: 1,
+        bytes: 1,
+        verified_secrets: 0,
+        unverified_secrets: 21,
+      }) + "\n",
+    ),
+    inputs,
+    [
+      [
+        17,
+        "URI",
+        "PLAIN",
+        digest(literal),
+        digest(literal),
+        digest(literal),
+        "src/plugin-sdk/browser-subpaths.test.ts",
+        "100644",
+      ],
+    ],
+  );
+  assert.equal(result.kind, "refused");
+  if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") return;
+  assert.equal(result.diagnostic.findingIndex, 20);
+  const inventory = result.diagnostic.nativeFindings!;
+  assert.equal(inventory.total, 21);
+  assert.equal(inventory.retained + inventory.omitted, 21);
+  assert.equal(inventory.truncated, true);
+  assert.equal(inventory.findings[0]?.index, 20);
+  assert.equal(inventory.findings[0]?.adjudication, "first_refusal");
+  assert.equal(inventory.findings[0]?.sourceLine, 1);
+  assert.equal(inventory.findings[0]?.material?.id, "a".repeat(40));
+  assert.equal(
+    new Set(inventory.findings.map((finding) => finding.index)).size,
+    inventory.retained,
+  );
+});
+
 test("WebVNC fixture policy retains both exact native identities and source witnesses", () => {
   // Inspect only the static policy data, without copying credential-shaped fixture values.
   const source = readFileSync(

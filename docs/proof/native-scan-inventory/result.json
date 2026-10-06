@@ -1,0 +1,256 @@
+{
+  "kind": "controlled_compiled_workflow_proof",
+  "environment": {
+    "node": "v24.21.0",
+    "os": "macOS"
+  },
+  "source_blobs": {
+    "src/agent-input-scan-fixtures.ts": "7d3f21fb467fc9bd7063a95af33619a1a77c9f8f",
+    "test/agent-input-scan-fixtures.test.ts": "b3a131a64fa34fce657df1a9d16de15cad652a0d",
+    "test/exact-review-failure-diagnostics.test.ts": "9362415cce2d36be026b4d87c28a165cf8ac1cdb",
+    "test/review-command-workflow.test.ts": "8dc9e96358114670b1c73cb42cde9fab0a20405e"
+  },
+  "fixtures": "Fresh temporary Git checkout and synthetic scanner; nested base/head/blob identifiers belong to that disposable fixture, not the product PR. No real product scan inputs.",
+  "command": "pnpm run build; CLAWSWEEPER_SYNTHETIC_SCAN_PROOF_DIR=<empty-output-directory> node --test --test-name-pattern=findings-refusal test/review-command-workflow.test.ts",
+  "results": [
+    {
+      "scenario": "changed-pr-exact-findings-refusal",
+      "baseSha": "ba567884da36ab93f6cb92b376de7bfcc01a56d2",
+      "headSha": "5c6f89513821ff47553cf6197e6665cae9bf2d0a",
+      "manifest": {
+        "version": 1,
+        "classification": "agent_input_scan",
+        "retryable": false,
+        "failure": {
+          "stage": "agent_input_scan",
+          "reason_code": "findings",
+          "scan": {
+            "kind": "unclassified_finding",
+            "reason": "finding_not_reviewed",
+            "findingCount": 2,
+            "findingIndex": 0,
+            "detectorType": 999999,
+            "decoder": "PLAIN",
+            "verified": false,
+            "scannerLine": 1,
+            "material": {
+              "kind": "blob",
+              "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+              "referenceCount": 1,
+              "references": [
+                {
+                  "revision": "5c6f89513821ff47553cf6197e6665cae9bf2d0a",
+                  "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                  "mode": "100644",
+                  "role": "head"
+                }
+              ]
+            },
+            "nativeFindings": {
+              "total": 2,
+              "retained": 2,
+              "omitted": 0,
+              "truncated": false,
+              "findings": [
+                {
+                  "index": 0,
+                  "detectorType": 999999,
+                  "decoder": "PLAIN",
+                  "verified": false,
+                  "adjudication": "first_refusal",
+                  "scannerInputLine": 1,
+                  "material": {
+                    "kind": "blob",
+                    "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+                    "referenceCount": 1,
+                    "references": [
+                      {
+                        "revision": "5c6f89513821ff47553cf6197e6665cae9bf2d0a",
+                        "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                        "mode": "100644",
+                        "role": "head"
+                      }
+                    ]
+                  },
+                  "sourceLine": null,
+                  "sourceLineStatus": "unavailable"
+                },
+                {
+                  "index": 1,
+                  "detectorType": 1000000,
+                  "decoder": "HTML",
+                  "verified": false,
+                  "adjudication": "unadjudicated",
+                  "scannerInputLine": 1,
+                  "material": {
+                    "kind": "blob",
+                    "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+                    "referenceCount": 1,
+                    "references": [
+                      {
+                        "revision": "5c6f89513821ff47553cf6197e6665cae9bf2d0a",
+                        "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                        "mode": "100644",
+                        "role": "head"
+                      }
+                    ]
+                  },
+                  "sourceLine": null,
+                  "sourceLineStatus": "unavailable"
+                }
+              ]
+            }
+          }
+        },
+        "process": {
+          "status": null,
+          "signal": null,
+          "error_code": null,
+          "workflow_exit": 79
+        },
+        "source": {
+          "repository": "openclaw/openclaw",
+          "item_kind": "pull_request",
+          "item_number": 1052,
+          "sha": "5c6f89513821ff47553cf6197e6665cae9bf2d0a"
+        },
+        "omitted_files": []
+      },
+      "diagnosticFiles": [
+        "error.txt",
+        "manifest.json",
+        "stderr.tail.txt",
+        "stdout.error.txt"
+      ],
+      "diagnosticBytes": 3059,
+      "providerCalls": 0,
+      "workflowExit": 79,
+      "nonLeakage": true
+    },
+    {
+      "scenario": "changed-pr-findings-refusal",
+      "baseSha": "5a194f3493ed683339514d80c84b7a912799f3ac",
+      "headSha": "efb8d420b1a4ebc2ac00054586c4137bc8126436",
+      "manifest": {
+        "version": 1,
+        "classification": "agent_input_scan",
+        "retryable": false,
+        "failure": {
+          "stage": "agent_input_scan",
+          "reason_code": "findings",
+          "scan": {
+            "kind": "unclassified_finding",
+            "reason": "finding_not_reviewed",
+            "findingCount": 2,
+            "findingIndex": 0,
+            "detectorType": 999999,
+            "decoder": "PLAIN",
+            "verified": false,
+            "scannerLine": 1,
+            "material": {
+              "kind": "blob",
+              "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+              "referenceCount": 1,
+              "references": [
+                {
+                  "revision": "efb8d420b1a4ebc2ac00054586c4137bc8126436",
+                  "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                  "mode": "100644",
+                  "role": "head"
+                }
+              ]
+            },
+            "nativeFindings": {
+              "total": 2,
+              "retained": 2,
+              "omitted": 0,
+              "truncated": false,
+              "findings": [
+                {
+                  "index": 0,
+                  "detectorType": 999999,
+                  "decoder": "PLAIN",
+                  "verified": false,
+                  "adjudication": "first_refusal",
+                  "scannerInputLine": 1,
+                  "material": {
+                    "kind": "blob",
+                    "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+                    "referenceCount": 1,
+                    "references": [
+                      {
+                        "revision": "efb8d420b1a4ebc2ac00054586c4137bc8126436",
+                        "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                        "mode": "100644",
+                        "role": "head"
+                      }
+                    ]
+                  },
+                  "sourceLine": null,
+                  "sourceLineStatus": "unavailable"
+                },
+                {
+                  "index": 1,
+                  "detectorType": 1000000,
+                  "decoder": "HTML",
+                  "verified": false,
+                  "adjudication": "unadjudicated",
+                  "scannerInputLine": 1,
+                  "material": {
+                    "kind": "blob",
+                    "id": "530c4032464f81cd0e90ef89b9d878bf5b21d52a",
+                    "referenceCount": 1,
+                    "references": [
+                      {
+                        "revision": "efb8d420b1a4ebc2ac00054586c4137bc8126436",
+                        "pathSha256": "a33afe8bf5dfcbab7cd49ab9914eb3c7e6f692df56f3cd2dbb5e6f1b2d6d060d",
+                        "mode": "100644",
+                        "role": "head"
+                      }
+                    ]
+                  },
+                  "sourceLine": null,
+                  "sourceLineStatus": "unavailable"
+                }
+              ]
+            }
+          }
+        },
+        "process": {
+          "workflow_exit": 79
+        },
+        "source": {
+          "repository": "openclaw/openclaw",
+          "item_kind": "pull_request",
+          "item_number": 1052,
+          "sha": "efb8d420b1a4ebc2ac00054586c4137bc8126436"
+        },
+        "omitted_files": []
+      },
+      "diagnosticFiles": [
+        "manifest.json"
+      ],
+      "diagnosticBytes": 2832,
+      "providerCalls": 0,
+      "workflowExit": 79,
+      "nonLeakage": true
+    }
+  ],
+  "focused_regressions": {
+    "passed": 10,
+    "failed": 0,
+    "coverage": [
+      "two native findings",
+      "exit79 and zero provider calls",
+      "private canary exclusion",
+      "immutable repeated receipts",
+      "late first refusal index20 retained",
+      "count and pretty-print byte bounds",
+      "decoded/ambiguous/oversized mappings unavailable"
+    ]
+  },
+  "limits": [
+    "Controlled local runtime proof, not live product clearance.",
+    "No engine activation or detector/trust change."
+  ]
+}

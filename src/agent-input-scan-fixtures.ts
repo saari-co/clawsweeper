@@ -778,7 +778,18 @@ function nativeFindingInventory(
   firstRefusal: number,
 ): NativeFindingInventory {
   const retained: NativeFindingInventoryEntry[] = [];
-  for (const [index, finding] of findings.slice(0, NATIVE_FINDING_INVENTORY_MAX).entries()) {
+  // Retain the refusal before spending the budget on earlier native findings.
+  // Their original indices survive priority ordering; omitted counts remain explicit.
+  const indices = [firstRefusal];
+  for (
+    let index = 0;
+    index < findings.length && indices.length < NATIVE_FINDING_INVENTORY_MAX;
+    index++
+  ) {
+    if (index !== firstRefusal) indices.push(index);
+  }
+  for (const index of indices) {
+    const finding = findings[index]!;
     const source = object(object(object(finding.SourceMetadata)?.Data)?.Filesystem);
     const file = typeof source?.file === "string" ? source.file : undefined;
     const staged = file ? inputs.get(file) : undefined;
