@@ -589,6 +589,26 @@ interface ScanMaterialDiagnostic {
   references?: { revision: string; pathSha256: string; mode: string; role: ScanSourceRole }[];
 }
 
+interface NativeFindingInventoryEntry {
+  index: number;
+  detectorType: number | null;
+  decoder: "PLAIN" | "HTML" | "ESCAPED_UNICODE" | "OTHER";
+  verified: boolean | null;
+  adjudication: "first_refusal" | "unadjudicated";
+  scannerInputLine: number | null;
+  material: ScanMaterialDiagnostic | null;
+  sourceLine: number | null;
+  sourceLineStatus: "proven" | "unavailable";
+}
+
+interface NativeFindingInventory {
+  total: number;
+  retained: number;
+  omitted: number;
+  truncated: boolean;
+  findings: NativeFindingInventoryEntry[];
+}
+
 export type ScanRefusalDiagnostic =
   | {
       kind: "native_contract";
@@ -617,6 +637,7 @@ export type ScanRefusalDiagnostic =
       verified: boolean | null;
       scannerLine: number | null;
       material?: ScanMaterialDiagnostic;
+      nativeFindings?: NativeFindingInventory;
     };
 
 export interface ReviewedFixtureNotice {
@@ -706,6 +727,115 @@ function materialDiagnostic(input: StagedScanInput): ScanMaterialDiagnostic {
   };
 }
 
+const NATIVE_FINDING_INVENTORY_MAX = 16;
+const NATIVE_FINDING_INVENTORY_BYTES = 8 * 1024;
+const SOURCE_WITNESS_MAX_BYTES = 1024 * 1024;
+
+function safeFindingType(finding: Record<string, unknown>): number | null {
+  return typeof finding.DetectorType === "number" &&
+    Number.isInteger(finding.DetectorType) &&
+    finding.DetectorType >= 0 &&
+    finding.DetectorType <= 2_147_483_647
+    ? finding.DetectorType
+    : null;
+}
+
+function safeDecoder(value: unknown): NativeFindingInventoryEntry["decoder"] {
+  return value === "PLAIN" || value === "HTML" || value === "ESCAPED_UNICODE" ? value : "OTHER";
+}
+
+function safeScannerLine(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function sourceLineIfProven(
+  finding: Record<string, unknown>,
+  staged: StagedScanInput | undefined,
+): number | null {
+  // Decoder coordinates are not source coordinates. Only a PLAIN finding with
+  // one exact occurrence in a host-staged original blob gets a source line.
+  if (finding.DecoderName !== "PLAIN" || staged?.kind !== "blob" || !staged.bytes) return null;
+  const literal = typeof finding.RawV2 === "string" ? finding.RawV2 : undefined;
+  if (!literal) return null;
+  if (staged.bytes.length > SOURCE_WITNESS_MAX_BYTES || literal.length > 64 * 1024) return null;
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(staged.bytes);
+  } catch {
+    return null;
+  }
+  const offset = text.indexOf(literal);
+  // Include overlapping occurrences when rejecting ambiguous witnesses.
+  if (offset < 0 || text.indexOf(literal, offset + 1) !== -1) return null;
+  let line = 1;
+  for (let i = 0; i < offset; i++) if (text[i] === "\n") line++;
+  return line;
+}
+
+function nativeFindingInventory(
+  findings: readonly Record<string, unknown>[],
+  inputs: ReadonlyMap<string, StagedScanInput>,
+  firstRefusal: number,
+): NativeFindingInventory {
+  const retained: NativeFindingInventoryEntry[] = [];
+  // Retain the refusal before spending the budget on earlier native findings.
+  // Their original indices survive priority ordering; omitted counts remain explicit.
+  const indices = [firstRefusal];
+  for (
+    let index = 0;
+    index < findings.length && indices.length < NATIVE_FINDING_INVENTORY_MAX;
+    index++
+  ) {
+    if (index !== firstRefusal) indices.push(index);
+  }
+  for (const index of indices) {
+    const finding = findings[index]!;
+    const source = object(object(object(finding.SourceMetadata)?.Data)?.Filesystem);
+    const file = typeof source?.file === "string" ? source.file : undefined;
+    const staged = file ? inputs.get(file) : undefined;
+    const sourceLine = sourceLineIfProven(finding, staged);
+    const entry: NativeFindingInventoryEntry = {
+      index,
+      detectorType: safeFindingType(finding),
+      decoder: safeDecoder(finding.DecoderName),
+      verified: typeof finding.Verified === "boolean" ? finding.Verified : null,
+      adjudication: index === firstRefusal ? "first_refusal" : "unadjudicated",
+      scannerInputLine: safeScannerLine(source?.line),
+      material: staged ? materialDiagnostic(staged) : null,
+      sourceLine,
+      sourceLineStatus: sourceLine === null ? "unavailable" : "proven",
+    };
+    const candidate = [...retained, entry];
+    // Account for the actual pretty-printed depth under failure.scan.nativeFindings.
+    const preview = JSON.stringify(
+      {
+        failure: {
+          scan: {
+            nativeFindings: {
+              total: findings.length,
+              retained: candidate.length,
+              omitted: findings.length - candidate.length,
+              truncated: candidate.length < findings.length,
+              findings: candidate,
+            },
+          },
+        },
+      },
+      null,
+      2,
+    );
+    if (Buffer.byteLength(preview) > NATIVE_FINDING_INVENTORY_BYTES) break;
+    retained.push(entry);
+  }
+  return {
+    total: findings.length,
+    retained: retained.length,
+    omitted: findings.length - retained.length,
+    truncated: retained.length < findings.length,
+    findings: retained,
+  };
+}
+
 /** Classify only complete native scans whose every finding matches host fixture policy. */
 export function classifyReviewedFixtureScan(
   status: number,
@@ -761,7 +891,15 @@ export function classifyReviewedFixtureScan(
   )
     return nativeFailure("completion_mismatch");
 
-  return classifyReviewedFindings(findings, inputs, reviewedAttributions);
+  const result = classifyReviewedFindings(findings, inputs, reviewedAttributions);
+  if (result.kind === "refused" && result.diagnostic.kind === "unclassified_finding") {
+    result.diagnostic.nativeFindings = nativeFindingInventory(
+      findings,
+      inputs,
+      result.diagnostic.findingIndex,
+    );
+  }
+  return result;
 }
 
 function nativeUriParts(value: string) {
