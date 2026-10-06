@@ -1,3 +1,4 @@
+import { classifyReviewedFixtureScan } from "../dist/agent-input-scan-fixtures.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -285,6 +286,93 @@ test("scan-only diagnostics persist bounded refusal metadata without raw process
   }
 });
 
+test("scan-only diagnostics serialize bounded native finding metadata safely", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
+  try {
+    const error = new AgentInputScanError("findings", {
+      kind: "unclassified_finding",
+      reason: "finding_not_reviewed",
+      findingCount: 2,
+      findingIndex: 0,
+      detectorType: 17,
+      decoder: "PLAIN",
+      verified: false,
+      scannerLine: 7,
+      nativeFindings: {
+        total: 2,
+        retained: 2,
+        omitted: 0,
+        truncated: false,
+        findings: [
+          {
+            index: 0,
+            detectorType: 17,
+            decoder: "PLAIN",
+            verified: false,
+            adjudication: "first_refusal",
+            scannerInputLine: 7,
+            material: {
+              kind: "blob",
+              id: "b".repeat(40),
+              referenceCount: 1,
+              references: [
+                {
+                  role: "head",
+                  pathSha256: "c".repeat(64),
+                  revision: "a".repeat(40),
+                  mode: "100644",
+                },
+              ],
+            },
+            sourceLine: null,
+            sourceLineStatus: "unavailable",
+          },
+          {
+            index: 1,
+            detectorType: 18,
+            decoder: "HTML",
+            verified: false,
+            adjudication: "unadjudicated",
+            scannerInputLine: 8,
+            material: null,
+            sourceLine: null,
+            sourceLineStatus: "unavailable",
+          },
+        ],
+      },
+    });
+    const output = writeExactReviewFailureDiagnostics({
+      artifactDir: root,
+      error,
+      prompt: "RAW_PROMPT_CANARY",
+      model: "RAW_MODEL_CANARY",
+      classification: "codex_execution",
+      repo: "openclaw/openclaw",
+      itemKind: "pull_request",
+      itemNumber: 1338,
+      retryable: false,
+      workflowExit: 79,
+      scanOnly: true,
+      env: {},
+    });
+    const text = readFileSync(join(output, "manifest.json"), "utf8");
+    const manifest = JSON.parse(text);
+    assert.deepEqual(manifest.failure.scan.nativeFindings, error.scanDiagnostic?.nativeFindings);
+    assert.ok(Buffer.byteLength(text) < 24 * 1024);
+    for (const forbidden of [
+      "RAW_PROMPT_CANARY",
+      "RAW_MODEL_CANARY",
+      "matched-value",
+      "provider",
+      "/private/",
+      "source text",
+    ])
+      assert.doesNotMatch(text, new RegExp(forbidden.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("scan refusals do not expose unrelated or nested process causes", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
   const native = spawnSync(process.execPath, ["-e", "process.exit(23)"], { encoding: "utf8" });
@@ -476,4 +564,74 @@ test("pinned acquisition diagnostics preserve phase and completeness without ref
     JSON.parse(readFileSync(join(refused, "manifest.json"), "utf8")).failure.acquisition,
     undefined,
   );
+});
+
+test("dense native inventory remains within the on-disk manifest budget", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-dense-diagnostics-"));
+  try {
+    const findings = Array.from({ length: 40 }, (_, index) => ({
+      DetectorType: 999999 + index,
+      DecoderName: "HTML",
+      Verified: false,
+      RawV2: "NEUTRAL_PRIVATE_CANARY",
+      SourceMetadata: { Data: { Filesystem: { file: "input", line: index + 1 } } },
+    }));
+    const result = classifyReviewedFixtureScan(
+      183,
+      Buffer.from(findings.map((finding) => JSON.stringify(finding) + "\n").join("")),
+      Buffer.from(
+        JSON.stringify({
+          level: "info-0",
+          logger: "trufflehog",
+          msg: "finished scanning",
+          trufflehog_version: "3.97.4",
+          chunks: 1,
+          bytes: 1,
+          verified_secrets: 0,
+          unverified_secrets: 40,
+        }) + "\n",
+      ),
+      new Map([
+        [
+          "input",
+          {
+            kind: "blob",
+            id: "a".repeat(64),
+            references: Array.from({ length: 5 }, (_, i) => ({
+              source: `private-neutral-path-${i}`,
+              revision: "b".repeat(64),
+              mode: "100644",
+              role: "head" as const,
+            })),
+          },
+        ],
+      ]),
+    );
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") return;
+    const inventory = result.diagnostic.nativeFindings!;
+    assert.ok(inventory.retained >= 2 && inventory.retained < 16);
+    assert.equal(inventory.total, 40);
+    assert.equal(inventory.retained + inventory.omitted, 40);
+    assert.equal(inventory.truncated, true);
+    const output = writeExactReviewFailureDiagnostics({
+      artifactDir: root,
+      error: new AgentInputScanError("findings", result.diagnostic),
+      prompt: "",
+      model: "",
+      classification: "agent_input_scan",
+      repo: "openclaw/clawsweeper",
+      itemKind: "pull_request",
+      itemNumber: 1,
+      retryable: false,
+      workflowExit: 79,
+      scanOnly: true,
+    });
+    const text = readFileSync(join(output, "manifest.json"), "utf8");
+    assert.ok(Buffer.byteLength(text) <= 24 * 1024);
+    assert.doesNotMatch(text, /NEUTRAL_PRIVATE_CANARY|private-neutral-path/);
+    assert.deepEqual(readdirSync(output), ["manifest.json"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

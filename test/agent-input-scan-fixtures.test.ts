@@ -12,6 +12,194 @@ import {
   type StagedScanInput,
 } from "../dist/agent-input-scan-fixtures.js";
 
+test("native refusal inventory preserves first refusal and bounds unadjudicated findings", () => {
+  const findings = [
+    { DetectorType: 700, DecoderName: "PLAIN", Verified: false },
+    { DetectorType: 701, DecoderName: "HTML", Verified: true },
+    { DetectorType: 702, DecoderName: "ESCAPED_UNICODE", Verified: null },
+  ];
+  const line = (value: Record<string, unknown>) => `${JSON.stringify(value)}\n`;
+  const result = classifyReviewedFixtureScan(
+    183,
+    Buffer.from(findings.map((finding) => line(finding)).join("")),
+    Buffer.from(
+      line({
+        level: "info-0",
+        logger: "trufflehog",
+        msg: "finished scanning",
+        trufflehog_version: "3.97.4",
+        chunks: 1,
+        bytes: 3,
+        verified_secrets: 1,
+        unverified_secrets: 2,
+      }),
+    ),
+    new Map(),
+  );
+  assert.equal(result.kind, "refused");
+  if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") return;
+  assert.equal(result.reason, "findings");
+  assert.equal(result.diagnostic.findingIndex, 0);
+  assert.equal(result.diagnostic.findingCount, 3);
+  assert.equal(result.diagnostic.nativeFindings?.total, 3);
+  assert.equal(result.diagnostic.nativeFindings?.retained, 3);
+  assert.equal(result.diagnostic.nativeFindings?.omitted, 0);
+  assert.equal(result.diagnostic.nativeFindings?.truncated, false);
+  assert.deepEqual(
+    result.diagnostic.nativeFindings?.findings.map(({ index, adjudication }) => ({
+      index,
+      adjudication,
+    })),
+    [
+      { index: 0, adjudication: "first_refusal" },
+      { index: 1, adjudication: "unadjudicated" },
+      { index: 2, adjudication: "unadjudicated" },
+    ],
+  );
+});
+
+test("native refusal inventory has deterministic count and byte bounds", () => {
+  const findings = Array.from({ length: 40 }, (_, index) => ({
+    DetectorType: index,
+    DecoderName: "OTHER",
+    Verified: false,
+  }));
+  const record = (value: Record<string, unknown>) => `${JSON.stringify(value)}\n`;
+  const result = classifyReviewedFixtureScan(
+    183,
+    Buffer.from(findings.map(record).join("")),
+    Buffer.from(
+      record({
+        level: "info-0",
+        logger: "trufflehog",
+        msg: "finished scanning",
+        trufflehog_version: "3.97.4",
+        chunks: 1,
+        bytes: 40,
+        verified_secrets: 0,
+        unverified_secrets: 40,
+      }),
+    ),
+    new Map(),
+  );
+  assert.equal(result.kind, "refused");
+  if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") return;
+  const inventory = result.diagnostic.nativeFindings;
+  assert.ok(inventory);
+  assert.equal(inventory.total, 40);
+  assert.equal(inventory.retained + inventory.omitted, inventory.total);
+  assert.equal(inventory.truncated, true);
+  assert.ok(inventory.retained <= 16);
+  assert.ok(Buffer.byteLength(JSON.stringify(inventory)) <= 8 * 1024);
+});
+
+test("native inventory exposes only uniquely proven PLAIN source coordinates", () => {
+  const input: StagedScanInput = {
+    kind: "blob",
+    id: "a".repeat(40),
+    bytes: Buffer.from("header\nneutral-record\nfooter\n"),
+    references: [
+      {
+        source: "neutral/source.txt",
+        mode: "100644",
+        revision: "b".repeat(40),
+        role: "head",
+      },
+    ],
+  };
+  const findings = [
+    {
+      DetectorType: 17,
+      DecoderName: "PLAIN",
+      Verified: false,
+      RawV2: "neutral-record",
+      SourceMetadata: { Data: { Filesystem: { file: "scan-input", line: 99 } } },
+    },
+    {
+      DetectorType: 17,
+      DecoderName: "HTML",
+      Verified: false,
+      RawV2: "neutral-record",
+      SourceMetadata: { Data: { Filesystem: { file: "scan-input", line: 100 } } },
+    },
+  ];
+  const record = (value: Record<string, unknown>) => `${JSON.stringify(value)}\n`;
+  const result = classifyReviewedFixtureScan(
+    183,
+    Buffer.from(findings.map(record).join("")),
+    Buffer.from(
+      record({
+        level: "info-0",
+        logger: "trufflehog",
+        msg: "finished scanning",
+        trufflehog_version: "3.97.4",
+        chunks: 1,
+        bytes: 28,
+        verified_secrets: 0,
+        unverified_secrets: 2,
+      }),
+    ),
+    new Map([["scan-input", input]]),
+  );
+  assert.equal(result.kind, "refused");
+  if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") return;
+  const inventory = result.diagnostic.nativeFindings;
+  assert.ok(inventory);
+  assert.equal(inventory.findings[0]?.sourceLine, 2);
+  assert.equal(inventory.findings[0]?.sourceLineStatus, "proven");
+  assert.equal(inventory.findings[0]?.scannerInputLine, 99);
+  assert.equal(inventory.findings[1]?.sourceLine, null);
+  assert.equal(inventory.findings[1]?.sourceLineStatus, "unavailable");
+  assert.equal(inventory.findings[1]?.scannerInputLine, 100);
+  assert.deepEqual(inventory.findings[0]?.material?.references, [
+    {
+      role: "head",
+      revision: "b".repeat(40),
+      mode: "100644",
+      pathSha256: createHash("sha256").update("neutral/source.txt").digest("hex"),
+    },
+  ]);
+});
+
+test("native coordinate witnesses reject ambiguous, decoded and oversized inputs", () => {
+  for (const [bytes, raw, decoder] of [
+    [Buffer.from("neutral neutral"), "neutral", "PLAIN"],
+    [Buffer.from("aaaa"), "aaa", "PLAIN"],
+    [Buffer.from("neutral"), "neutral", "HTML"],
+    [Buffer.from("absent"), "neutral", "PLAIN"],
+    [Buffer.alloc(1024 * 1024 + 1, 120), "x", "PLAIN"],
+  ] as const) {
+    const finding = {
+      DetectorType: 999999,
+      DecoderName: decoder,
+      Verified: false,
+      RawV2: raw,
+      SourceMetadata: { Data: { Filesystem: { file: "input", line: 1 } } },
+    };
+    const result = classifyReviewedFixtureScan(
+      183,
+      Buffer.from(JSON.stringify(finding) + "\n"),
+      Buffer.from(
+        JSON.stringify({
+          level: "info-0",
+          logger: "trufflehog",
+          msg: "finished scanning",
+          trufflehog_version: "3.97.4",
+          chunks: 1,
+          bytes: bytes.length,
+          verified_secrets: 0,
+          unverified_secrets: 1,
+        }) + "\n",
+      ),
+      new Map([["input", { kind: "blob", id: "a".repeat(40), bytes, references: [] }]]),
+    );
+    assert.equal(result.kind, "refused");
+    if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") continue;
+    assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLine, null);
+    assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLineStatus, "unavailable");
+  }
+});
+
 test("WebVNC fixture policy retains both exact native identities and source witnesses", () => {
   // Inspect only the static policy data, without copying credential-shaped fixture values.
   const source = readFileSync(

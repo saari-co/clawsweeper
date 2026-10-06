@@ -316,15 +316,15 @@ function testScheduledCacheScenario(
           ? String.raw`
 const input = inputs.find(({ name }) => /^[a-f0-9]{40}$/.test(name));
 assert.ok(input);
-console.log(JSON.stringify({
-  DetectorType: 999999, DecoderName: "PLAIN", Verified: false,
+for (const [index, decoder] of ["PLAIN", "HTML"].entries()) console.log(JSON.stringify({
+  DetectorType: 999999 + index, DecoderName: decoder, Verified: false,
   Raw: "SYNTHETIC_MATCH_CANARY", RawV2: "SYNTHETIC_MATCH_CANARY",
   SourceMetadata: { Data: { Filesystem: { file: path.join(inputDir, input.name), line: 1 } } },
 }));
 console.error(JSON.stringify({
   level: "info-0", logger: "trufflehog", msg: "finished scanning",
   trufflehog_version: "3.97.4", chunks: 1, bytes: 1,
-  verified_secrets: 0, unverified_secrets: 1,
+  verified_secrets: 0, unverified_secrets: 2,
 }));
 process.exit(183);
 `
@@ -1170,7 +1170,25 @@ else {
           if (findingRefusal) {
             const scan = manifest.failure.scan;
             assert.equal(scan.kind, "unclassified_finding");
-            assert.equal(scan.findingCount, 1);
+            assert.equal(scan.findingCount, 2);
+            assert.equal(scan.nativeFindings.total, 2);
+            assert.equal(scan.nativeFindings.retained, 2);
+            assert.equal(scan.nativeFindings.omitted, 0);
+            assert.equal(scan.nativeFindings.truncated, false);
+            assert.deepEqual(
+              scan.nativeFindings.findings.map(
+                (finding: { index: number; decoder: string; sourceLine: number | null }) => [
+                  finding.index,
+                  finding.decoder,
+                  finding.sourceLine,
+                ],
+              ),
+              [
+                [0, "PLAIN", null],
+                [1, "HTML", null],
+              ],
+            );
+            assert.deepEqual(scan.nativeFindings.findings[1].material, scan.material);
             assert.equal(scan.detectorType, 999999);
             assert.equal(scan.material.kind, "blob");
             assert.ok(
