@@ -2031,3 +2031,48 @@ for (const verification of [false, true]) {
     }
   });
 }
+
+// Use a separate public synthetic value: actual qualified bytes remain outside proof artifacts.
+for (const decoder of ["PLAIN", "HTML"] as const) {
+  test(`Template origin exact attribution preserves ${decoder} refusal boundaries`, (t) => {
+    const source = "tests/unit/checkout-host-wake-client.test.ts";
+    const raw = ["https://", "fixture", ":", "dummy", "@", "qualification.example.invalid"].join(
+      "",
+    );
+    const entry = { raw, rawV2: raw, line: JSON.stringify(raw) + ",", decoders: [decoder] };
+    const digest = (s: string) => createHash("sha256").update(s).digest("hex");
+    const reviewedAttributions: ReviewedAttribution[] = [
+      [17, "URI", decoder, digest(raw), digest(raw), digest(entry.line), source, "100644"],
+    ];
+    for (const change of ["add", "remove", "context"] as const) {
+      const fixture = fixturePatch(t, source, [entry], change);
+      assert.equal(fixture.classify(decoder).kind, "refused");
+      assert.equal(fixture.classify(decoder, {}, { reviewedAttributions }).kind, "classified");
+      for (const override of [
+        { Verified: true },
+        { DecoderName: "BASE64" },
+        { Raw: raw + "x" },
+        { RawV2: raw + "x" },
+      ]) {
+        assert.equal(fixture.classify(decoder, override, { reviewedAttributions }).kind, "refused");
+      }
+      assert.equal(
+        fixture.classify(decoder, {}, { reviewedAttributions, complete: false }).kind,
+        "refused",
+      );
+      assert.equal(
+        fixture.classify(decoder, {}, { reviewedAttributions, duplicate: true }).kind,
+        "refused",
+      );
+    }
+    for (const [path, altered] of [
+      ["src/production.ts", entry],
+      [source, { ...entry, line: entry.line + " // changed" }],
+    ] as const) {
+      assert.equal(
+        fixturePatch(t, path, [altered]).classify(decoder, {}, { reviewedAttributions }).kind,
+        "refused",
+      );
+    }
+  });
+}

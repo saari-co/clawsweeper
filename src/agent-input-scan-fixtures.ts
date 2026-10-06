@@ -250,6 +250,9 @@ const CRON_FTP_SOURCE_SHA256S = [
 
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
+  // Template Store PR27: offline-qualified neutral origin-rejection fixture; exact native identities.
+  [17, "URI", "PLAIN", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
+  [17, "URI", "HTML", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
   // Inventory Connect rejects these synthetic credential-bearing site/verification URLs.
   // Native TruffleHog 3.97.4: PLAIN only; exact test line/path and both native identities.
   [17, "URI", "PLAIN", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53", "3ee274980dba1cc67117e838a9038067c6b42f0f81a3e32153ae87e96652cb6d", "tests/store-connect/protocol.test.mjs", "100644"],
@@ -476,7 +479,8 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
           detectorType === 17 &&
           detectorName === "URI" &&
           (decoder === "PLAIN" || decoder === "HTML")) ||
-        ((source === "src/worker/native-runtime-transport.test.ts" ||
+        ((source === "tests/unit/checkout-host-wake-client.test.ts" ||
+          source === "src/worker/native-runtime-transport.test.ts" ||
           source === "src/worker/native-runtime.test.ts") &&
           detectorType === 17 &&
           detectorName === "URI" &&

@@ -1,0 +1,100 @@
+{
+  "result": "attribution_qualified_offline",
+  "baseline": "refused",
+  "candidate": "classified",
+  "attributionChecks": [
+    {
+      "decoder": "PLAIN",
+      "name": "verified",
+      "refused": true
+    },
+    {
+      "decoder": "PLAIN",
+      "name": "decoder",
+      "refused": true
+    },
+    {
+      "decoder": "PLAIN",
+      "name": "raw",
+      "refused": true
+    },
+    {
+      "decoder": "PLAIN",
+      "name": "raw_v2",
+      "refused": true
+    },
+    {
+      "decoder": "HTML",
+      "name": "verified",
+      "refused": true
+    },
+    {
+      "decoder": "HTML",
+      "name": "decoder",
+      "refused": true
+    },
+    {
+      "decoder": "HTML",
+      "name": "raw",
+      "refused": true
+    },
+    {
+      "decoder": "HTML",
+      "name": "raw_v2",
+      "refused": true
+    },
+    {
+      "name": "duplicate",
+      "refused": true
+    },
+    {
+      "name": "incomplete",
+      "refused": true
+    },
+    {
+      "name": "extra_unqualified",
+      "refused": true
+    }
+  ],
+  "base": "bd997144517242e0a70596e15de20bbfc3314df8",
+  "head": "9d30c1016b01b0771d9f1d82010724433835985f",
+  "patchSha256": "c6cba9172582192765b2ddaa642bbb7b7218abeae978936edce43221aaf1cc04",
+  "blob": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+  "sourceLineSha256": "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1",
+  "nativeRawV2Sha256": "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138",
+  "witnesses": [
+    {
+      "file": "5fcd90782012a463f76c3d4e2ef2e2bec02dc47f",
+      "sourceLine": 154,
+      "patchLine": 2275,
+      "kind": "add"
+    }
+  ],
+  "mutations": [
+    {
+      "name": "blob_byte_without_oid_update",
+      "refused": true
+    },
+    {
+      "name": "executable_mode",
+      "refused": true
+    },
+    {
+      "name": "different_source_path",
+      "refused": true
+    },
+    {
+      "name": "missing_added_file_absence_witness",
+      "refused": true
+    },
+    {
+      "name": "altered_hunk_coordinate",
+      "refused": true
+    },
+    {
+      "name": "literal_identity_changed",
+      "refused": true
+    }
+  ],
+  "limits": "No scanner/model/network call or installed policy change. Literal processed only in memory. Exercises isolated candidate attribution and witness integrity; does not publish a review."
+}
