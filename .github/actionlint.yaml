@@ -5,5 +5,16 @@ self-hosted-runner:
     - crabbox
     - openclaw
     - clawsweeper
+    - self-hosted
+    - spark-2
 
 config-variables: null
+
+paths:
+  .github/workflows/saari-exact-tuple-review.yml:
+    ignore:
+      # actionlint 1.7.12 predates official job.workflow_sha / job.workflow_repository /
+      # job.workflow_file_path.
+      - 'property "workflow_repository" is not defined in object type'
+      - 'property "workflow_sha" is not defined in object type'
+      - 'property "workflow_file_path" is not defined in object type'

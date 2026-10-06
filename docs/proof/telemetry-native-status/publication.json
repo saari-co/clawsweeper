@@ -1,0 +1,20 @@
+{
+  "claim": "Native reviewed body is bound at validator CLI; real workflow cleanup is scoped to one run",
+  "environment": {
+    "node": "v24.21.0",
+    "platform": "darwin"
+  },
+  "observed": {
+    "unchanged_body_exit": 0,
+    "changed_body_exit": 1,
+    "owned_cleanup_exit": 0,
+    "symlink_cleanup_exit": 1,
+    "neighbor_preserved": true
+  },
+  "sources": {
+    "scripts/validate-saari-exact-tuple-report.mjs": "3f439ec1823c58a059be07c8c9a6ff54292ef357c4787d4b5953f6b5333c0182",
+    "src/clawsweeper-report-document.ts": "18d319e059a519fd50210d4db68feeb5c8d67504a03c723271501fe5acc2e330",
+    ".github/workflows/saari-exact-tuple-review.yml": "384d3b9037f36411b35bc913eea80b0d8c015d6f0e3fcbb835f03ef2915e61b6"
+  },
+  "limits": "Synthetic report and owned temporary directories; actual validator CLI and extracted workflow cleanup script. No live GitHub publication or runner cleanup."
+}

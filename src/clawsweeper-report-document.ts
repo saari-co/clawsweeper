@@ -1,3 +1,4 @@
+import { primaryBodySourceSha256 } from "./clawsweeper-primary-body.js";
 import { parseOversizedPullRequestEvidence } from "./clawsweeper-oversized-pr-policy.js";
 import {
   configSurfaceChangeFromContext,
@@ -32,6 +33,11 @@ import {
   type ReviewStructuralRecord,
 } from "./review-structural-cache.js";
 import type { CreateReportRenderingDependencies } from "./clawsweeper-report-rendering-dependencies.js";
+import {
+  exactTupleFrontMatterLines,
+  renderExactTupleIdentitySection,
+  type SaariExactTupleIdentity,
+} from "./saari-exact-tuple.js";
 import type { createReportContextRendering } from "./clawsweeper-report-context.js";
 import type { createReportCommentHelpers } from "./clawsweeper-report-comment-helpers.js";
 import {
@@ -467,6 +473,7 @@ export function createReportDocumentRendering(
     structuralRecord?: ReviewStructuralRecord | null;
     reviewLeaseOwner?: string;
     reviewLeaseCommentId?: number;
+    exactTupleIdentity?: SaariExactTupleIdentity;
   }): string {
     const labels = options.item.labels.length ? options.item.labels.join(", ") : "none";
     const reviewedAt = new Date().toISOString();
@@ -635,7 +642,7 @@ review_mode: ${options.reviewMode}
 review_status: ${reviewStatusForDecision(options.decision)}
 review_terminal_failure: ${options.decision.codexTerminalFailure === true}
 review_checkout_inspection_failed: ${options.decision.checkoutInspectionFailed === true}
-local_checkout_access: ${localCheckoutAccessForDecision(options.decision)}
+${options.exactTupleIdentity ? `${exactTupleFrontMatterLines(options.exactTupleIdentity).join("\n")}\n` : ""}local_checkout_access: ${localCheckoutAccessForDecision(options.decision)}
 local_checkout_access_source: ${localCheckoutAccessSourceForDecision(options.decision)}
 item_snapshot_hash: ${options.snapshotHash}
 review_content_digest: ${options.contentDigest}
@@ -661,6 +668,7 @@ review_structural_pull_state_digest: ${
     }
 review_structural_cache_hit: false
 item_source_revision: ${options.context.sourceRevision ?? "unknown"}
+reviewed_primary_body_sha256: ${primaryBodySourceSha256(options.context.issue) ?? "unknown"}
 review_timeline_revision: ${options.context.timelineRevision ?? "unknown"}
 review_activity_cursor: ${options.context.pullReviewActivityCursor ?? "unknown"}
 close_comment_sha256: ${options.action.closeComment ? sha256(options.action.closeComment) : "none"}
@@ -668,6 +676,7 @@ review_comment_sha256: none
 review_comment_id: unknown
 review_comment_url: unknown
 decision: ${options.decision.decision}
+${options.decision.processGates === undefined ? "" : `process_gates: ${JSON.stringify(options.decision.processGates)}\n`}
 close_reason: ${options.decision.closeReason}
 ${options.decision.oversizedPullRequestSource ? `oversized_pr_source: ${JSON.stringify(options.decision.oversizedPullRequestSource)}\n` : ""}
 ${options.decision.oversizedPullRequest ? `oversized_pull_request: ${JSON.stringify(options.decision.oversizedPullRequest)}\n` : ""}
@@ -745,7 +754,7 @@ Updated at: ${formatTimestamp(options.item.updatedAt)}
 Reviewed against: ${linkedSha(options.git.mainSha)}
 
 Codex review: ${runtimeReviewText(options.runtime)}
-
+${options.exactTupleIdentity ? `\n${renderExactTupleIdentitySection(options.exactTupleIdentity)}\n` : ""}
 Latest release at review time: ${
       options.git.latestRelease?.tagName
         ? linkedRelease(options.git.latestRelease.tagName)

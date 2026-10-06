@@ -44,9 +44,13 @@ export function writeExactReviewFailureDiagnostics(options: {
   retryable: boolean;
   workflowExit: number;
   env?: NodeJS.ProcessEnv;
+  scanOnly?: boolean;
 }): string {
   const error = record(options.error);
   const scanFailure = options.error instanceof AgentInputScanError ? options.error : undefined;
+  if (options.scanOnly && !scanFailure?.scanDiagnostic) {
+    throw new Error("Scan-only diagnostics require an existing scan refusal diagnostic.");
+  }
   const diagnosticStage = scanFailure
     ? "agent_input_scan"
     : safeCode(error.diagnosticStage, /^source_preparation$/);
@@ -58,7 +62,9 @@ export function writeExactReviewFailureDiagnostics(options: {
           /^(?:configuration_missing|setup_script_failed|source_incompatible|review_commits_unavailable|review_history_unavailable|review_blob_metadata_unavailable|review_blobs_unavailable|review_checkout_unavailable|review_commit_fetch_failed|review_checkout_failed|review_git_inspection_failed)$/,
         )
       : null;
-  const values = exactValues(options.prompt, options.model, options.env ?? process.env);
+  const values = options.scanOnly
+    ? []
+    : exactValues(options.prompt, options.model, options.env ?? process.env);
   const acquisition =
     options.error instanceof ReviewSourcePreparationError
       ? options.error.commitAcquisition
@@ -68,10 +74,12 @@ export function writeExactReviewFailureDiagnostics(options: {
     "stdout.error.txt": scanFailure ? "" : codexJsonlFailureDetail(stringValue(error.stdout)),
     "stderr.tail.txt": scanFailure ? "" : stringValue(error.stderr),
   };
-  const files = Object.entries(inputs).map(([name, value]) => {
-    const result = sanitize(value, values, FILE_LIMITS[name as keyof typeof FILE_LIMITS]);
-    return { name, ...result };
-  });
+  const files = options.scanOnly
+    ? []
+    : Object.entries(inputs).map(([name, value]) => {
+        const result = sanitize(value, values, FILE_LIMITS[name as keyof typeof FILE_LIMITS]);
+        return { name, ...result };
+      });
   const manifest = `${JSON.stringify(
     {
       version: 1,
@@ -103,9 +111,14 @@ export function writeExactReviewFailureDiagnostics(options: {
           : {}),
       },
       process: {
-        status: Number.isInteger(error.status) && Number(error.status) >= 0 ? error.status : null,
-        signal: safeCode(error.signal, /^SIG[A-Z0-9]+$/),
-        error_code: safeCode(error.errorCode, /^[A-Z][A-Z0-9_]{1,63}$/),
+        ...(options.scanOnly
+          ? {}
+          : {
+              status:
+                Number.isInteger(error.status) && Number(error.status) >= 0 ? error.status : null,
+              signal: safeCode(error.signal, /^SIG[A-Z0-9]+$/),
+              error_code: safeCode(error.errorCode, /^[A-Z][A-Z0-9_]{1,63}$/),
+            }),
         workflow_exit: options.workflowExit,
       },
       source: {

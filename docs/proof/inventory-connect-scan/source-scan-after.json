@@ -1,0 +1,97 @@
+{
+  "targetHead": "76bd894b05d90788adb04b2793bdf364ca5ee199",
+  "base": "83a500e09172474dabf4de9cabc76029f7040a99",
+  "source": "complete committed range, canonical pinned native scanner",
+  "prompt": {
+    "kind": "controlled",
+    "bytes": 71,
+    "sha256": "ec04b7c204ee8e5aafb5fc4f81351c69e8fa7375aba79b95e50ecc86c127f66f"
+  },
+  "schema": null,
+  "limits": "No model execution; hosted review must rescan its own prompt, schema, and source inputs.",
+  "verification": "canonical enabled",
+  "result": "admitted",
+  "elapsedMs": 3637,
+  "notices": [
+    {
+      "event": "agent_input_scan_classified",
+      "notice": "Reviewed synthetic fixture findings classified as non-sensitive.",
+      "fixtureSha256": "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53",
+      "source": "tests/store-connect/protocol.test.mjs",
+      "detector": "URI",
+      "findings": [
+        {
+          "blob": "f1ce4af7e3a4aa13d8c7e0109bb0de84ec37142e",
+          "scannerLine": 30,
+          "literalLine": 30,
+          "decoder": "PLAIN",
+          "role": "head",
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "event": "agent_input_scan_classified",
+      "notice": "Reviewed synthetic fixture findings classified as non-sensitive.",
+      "fixtureSha256": "c71a6ed95a91bf84af8f88ad7b75bbf01d23b5ccf8fb55e258450cf2dd998830",
+      "source": "tests/store-connect/protocol.test.mjs",
+      "detector": "URI",
+      "findings": [
+        {
+          "blob": "f1ce4af7e3a4aa13d8c7e0109bb0de84ec37142e",
+          "scannerLine": 121,
+          "literalLine": 121,
+          "decoder": "PLAIN",
+          "role": "head",
+          "occurrences": 1
+        }
+      ]
+    },
+    {
+      "event": "agent_input_scan_classified",
+      "notice": "Reviewed synthetic fixture findings classified as non-sensitive.",
+      "fixtureSha256": "5c0777a42b276eeb2f207e47c41b6508ff1885eb5665105a817f554974493c53",
+      "source": "tests/store-connect/protocol.test.mjs",
+      "detector": "URI",
+      "findings": [
+        {
+          "blob": "1",
+          "scannerLine": 33558,
+          "literalLine": 33558,
+          "decoder": "PLAIN",
+          "role": "head",
+          "occurrences": 1,
+          "patch": {
+            "from": "83a500e09172474dabf4de9cabc76029f7040a99",
+            "to": "76bd894b05d90788adb04b2793bdf364ca5ee199",
+            "sourceBlob": "f1ce4af7e3a4aa13d8c7e0109bb0de84ec37142e",
+            "sourceLine": 30
+          }
+        }
+      ]
+    },
+    {
+      "event": "agent_input_scan_classified",
+      "notice": "Reviewed synthetic fixture findings classified as non-sensitive.",
+      "fixtureSha256": "c71a6ed95a91bf84af8f88ad7b75bbf01d23b5ccf8fb55e258450cf2dd998830",
+      "source": "tests/store-connect/protocol.test.mjs",
+      "detector": "URI",
+      "findings": [
+        {
+          "blob": "1",
+          "scannerLine": 33649,
+          "literalLine": 33649,
+          "decoder": "PLAIN",
+          "role": "head",
+          "occurrences": 1,
+          "patch": {
+            "from": "83a500e09172474dabf4de9cabc76029f7040a99",
+            "to": "76bd894b05d90788adb04b2793bdf364ca5ee199",
+            "sourceBlob": "f1ce4af7e3a4aa13d8c7e0109bb0de84ec37142e",
+            "sourceLine": 121
+          }
+        }
+      ]
+    }
+  ]
+}

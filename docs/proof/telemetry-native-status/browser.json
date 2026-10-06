@@ -1,0 +1,40 @@
+{
+  "claim": "Latest tenant selection survives an older response in the real browser",
+  "environment": "Codex in-app browser against local actual generated dashboard HTML and controlled HTTP server",
+  "events": [
+    {
+      "event": "request",
+      "id": 2,
+      "tenant": "all",
+      "at": "2026-10-06T19:46:21.173Z"
+    },
+    {
+      "event": "request",
+      "id": 3,
+      "tenant": "saari",
+      "at": "2026-10-06T19:46:21.189Z"
+    },
+    {
+      "event": "response",
+      "id": 3,
+      "tenant": "saari",
+      "at": "2026-10-06T19:46:21.290Z"
+    },
+    {
+      "event": "response",
+      "id": 2,
+      "tenant": "all",
+      "at": "2026-10-06T19:46:29.174Z"
+    }
+  ],
+  "observed": {
+    "saari_aria_selected": "true",
+    "visible_source": "saari",
+    "older_all_response_cannot_restore_selection": true
+  },
+  "source_sha256": "a36bf267b8fd5741e75196d6a1fb7fe50fe2cf833b282bbd6d7969db73ce1f85",
+  "screenshot_sha256": "bd3f21272a7ddcc22d437eaf5893f881bb2a30361831887c61062a76a3d54d01",
+  "limits": "Synthetic zero-row tenant feeds. Sanitized screenshot published on the private immutable Swarm proof shelf; AX evidence retained in the task proof directory. No deployment or live tenant data.",
+  "source_commit": "14191506e14f622c352cd1c21c44c34eeb1eee49",
+  "screenshot_url": "https://github.com/saari-co/swarm-pr-assets/releases/download/clawsweeper-pr-27-14191506e14f/dashboard-race.png"
+}

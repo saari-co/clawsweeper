@@ -1,0 +1,11 @@
+{
+  "source": "live GitHub default-page check-runs API",
+  "repository": "openclaw/clawsweeper",
+  "sha": "ad9ac7f287fdf88e9de0de0ef7913d0c7b0c5e7a",
+  "total_count": 6612,
+  "page_count": 30,
+  "result": {
+    "ci": "unknown",
+    "ci_conclusion": null
+  }
+}
