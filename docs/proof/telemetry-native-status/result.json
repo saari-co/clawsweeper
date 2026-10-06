@@ -1,0 +1,25 @@
+{
+  "claim": "Actual publisher CLI and dashboard consumer do not turn an earlier clean review or title text into current success",
+  "scenario": "Synthetic older clean OpenClaw result followed by watchdog failure; native artifact title contains a pass marker",
+  "command": [
+    "scripts/telemetry/publish-saari-review-telemetry.mjs",
+    "--out",
+    "<proof-root>/feed.json",
+    "--openclaw-queue-root",
+    "<proof-root>/queue",
+    "--review-state-root",
+    "<proof-root>/review"
+  ],
+  "node": "v24.21.0",
+  "exit": 0,
+  "observed": {
+    "openclaw": "unknown",
+    "clawsweeper": "unknown",
+    "findings_total": 1,
+    "native_report_clawsweeper": "blocked",
+    "row_freshness": "fresh",
+    "missing_root_exit": 2
+  },
+  "publisher_sha256": "3c1f180b199af67b3249dc5cb22f09aa749814647d62044759f7ef397b071bd6",
+  "limits": "Local synthetic records through actual CLI and actual dashboard consumer. No live queue, deployment, GitHub write or receiver activation."
+}

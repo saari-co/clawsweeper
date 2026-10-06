@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { processGateReport } from "./process-gate-report-helper.ts";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  symlinkSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -817,4 +827,57 @@ test("host admission rejects a renamed default branch outside tenant enrollment"
     assert.equal(result.ok, false);
     assert.match(result.stderr, /enrolled tenant branch/);
   }
+});
+
+test("actual native report binds the reviewed body before exact-tuple publication", () => {
+  const dir = mkdtempSync(join(tmpdir(), "saari-body-proof-"));
+  const reportPath = join(dir, "123.md");
+  const body = "Reviewed proof body\nwith exact trailing newline\n";
+  writeFileSync(reportPath, processGateReport({}, body));
+  const options = {
+    reportPath,
+    repository: SUITE,
+    itemNumber: 123,
+    baseSha: "a".repeat(40),
+    headSha: "c".repeat(40),
+    reviewEpoch: 3,
+    reviewScope: "comprehensive",
+    reviewerActor: "example-reviewer",
+    bodySha256: createHash("sha256").update(body).digest("hex"),
+  };
+  assert.equal(validateSaariExactTupleReport(options).review_scope, "comprehensive");
+  assert.throws(
+    () =>
+      validateSaariExactTupleReport({
+        ...options,
+        bodySha256: createHash("sha256").update("proof removed").digest("hex"),
+      }),
+    /body does not match/,
+  );
+  const script = extractStepRunScript(
+    readText(".github/workflows/saari-exact-tuple-review.yml"),
+    "Validate the exact native report and live tuple",
+  );
+  assert.match(script, /--body-sha256 "\$live_body_sha256"/);
+});
+
+test("workflow cleanup removes only its run checkout and refuses a symlink or invalid identity", () => {
+  const root = mkdtempSync(join(tmpdir(), "saari-cleanup-"));
+  const own = join(root, "saari-exact-tuple-801-2");
+  const neighbor = join(root, "saari-exact-tuple-802-2");
+  mkdirSync(join(own, "checkout"), { recursive: true });
+  mkdirSync(neighbor);
+  writeFileSync(join(neighbor, "keep"), "protected fixture");
+  const script = extractStepRunScript(
+    readText(".github/workflows/saari-exact-tuple-review.yml"),
+    "Remove this run's workspace checkout",
+  );
+  const env = { GITHUB_WORKSPACE: root, GITHUB_RUN_ID: "801", GITHUB_RUN_ATTEMPT: "2" };
+  assert.equal(runPinnedEngineScript(script, env).ok, true);
+  assert.equal(existsSync(own), false);
+  assert.equal(existsSync(join(neighbor, "keep")), true);
+  symlinkSync(neighbor, own);
+  assert.equal(runPinnedEngineScript(script, env).ok, false);
+  assert.equal(existsSync(join(neighbor, "keep")), true);
+  assert.equal(runPinnedEngineScript(script, { ...env, GITHUB_RUN_ID: "../802" }).ok, false);
 });

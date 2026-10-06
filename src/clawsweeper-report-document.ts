@@ -1,3 +1,4 @@
+import { primaryBodySourceSha256 } from "./clawsweeper-primary-body.js";
 import { parseOversizedPullRequestEvidence } from "./clawsweeper-oversized-pr-policy.js";
 import {
   configSurfaceChangeFromContext,
@@ -667,6 +668,7 @@ review_structural_pull_state_digest: ${
     }
 review_structural_cache_hit: false
 item_source_revision: ${options.context.sourceRevision ?? "unknown"}
+reviewed_primary_body_sha256: ${primaryBodySourceSha256(options.context.issue) ?? "unknown"}
 review_timeline_revision: ${options.context.timelineRevision ?? "unknown"}
 review_activity_cursor: ${options.context.pullReviewActivityCursor ?? "unknown"}
 close_comment_sha256: ${options.action.closeComment ? sha256(options.action.closeComment) : "none"}

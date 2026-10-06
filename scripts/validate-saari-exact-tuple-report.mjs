@@ -92,6 +92,13 @@ export function validateSaariExactTupleReport(options) {
     throw new Error("P0-only scope cannot clear the exact-tuple consumer");
   }
 
+  if (options.bodySha256 !== undefined) {
+    if (!/^[0-9a-f]{64}$/.test(options.bodySha256)) throw new Error("live body SHA256 is invalid");
+    if (fields.get("reviewed_primary_body_sha256") !== options.bodySha256) {
+      throw new Error("report body does not match the live pull request");
+    }
+  }
+
   const identitySection = "## Bound Review Identity";
   const identityStart = markdown.indexOf(identitySection, frontmatterEnd);
   if (identityStart < 0) {
@@ -154,6 +161,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     reviewEpoch: args["review-epoch"],
     reviewScope: args["review-scope"],
     reviewerActor: args["reviewer-actor"],
+    bodySha256: args["body-sha256"],
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

@@ -12,7 +12,10 @@ const evidenceLinks = createRepositoryLinks({
   targetProfile: () => repositoryProfileFor("openclaw/openclaw"),
 });
 
-export function processGateReport(overrides: Record<string, unknown> = {}) {
+export function processGateReport(
+  overrides: Record<string, unknown> = {},
+  body: string | null = null,
+) {
   const document = createReportDocumentRendering({
     ...evidenceLinks,
     ...createReportContextRendering({} as never),
@@ -48,7 +51,7 @@ export function processGateReport(overrides: Record<string, unknown> = {}) {
       // The host stamps checkout access after parsing model output.
       localCheckoutAccess: "verified",
     },
-    context: { issue: {}, comments: [], timeline: [] },
+    context: { issue: { body }, comments: [], timeline: [] },
     git: { mainSha: "a".repeat(40), latestRelease: null, releaseStateComplete: true },
     action: { actionTaken: "kept_open" },
     exactTupleIdentity: {

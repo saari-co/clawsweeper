@@ -654,6 +654,13 @@ jobs:
           live_merge_base="$(gh api "repos/$TARGET_REPO/compare/$BASE_SHA...$HEAD_SHA" --jq '.merge_base_commit.sha')"
           test "$live_base" = "$BASE_SHA"
           test "$live_merge_base" = "$MERGE_BASE_SHA"
+          live_body_sha256="$(printf '%s' "$live_pull" | node -e '
+            const fs = require("node:fs");
+            const { createHash } = require("node:crypto");
+            const pull = JSON.parse(fs.readFileSync(0, "utf8"));
+            if (pull.body !== null && typeof pull.body !== "string") process.exit(1);
+            process.stdout.write(createHash("sha256").update(pull.body ?? "").digest("hex"));
+          ')"
           node scripts/validate-saari-exact-tuple-report.mjs \
             --report "$PRODUCER_ARTIFACTS/$PR_NUMBER.md" \
             --repository "$TARGET_REPO" \
@@ -662,7 +669,8 @@ jobs:
             --head-sha "$HEAD_SHA" \
             --review-epoch "$REVIEW_EPOCH" \
             --review-scope comprehensive \
-            --reviewer-actor "$REVIEWER_ACTOR"
+            --reviewer-actor "$REVIEWER_ACTOR" \
+            --body-sha256 "$live_body_sha256"
           if grep -Fq -- "$GH_TOKEN" "$PRODUCER_ARTIFACTS/$PR_NUMBER.md"; then
             echo "The native report contained its short-lived read token." >&2
             exit 1
@@ -719,3 +727,19 @@ jobs:
           include-hidden-files: false
           if-no-files-found: error
           retention-days: 30
+
+      - name: Remove this run's workspace checkout
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] || ! [[ "${GITHUB_RUN_ATTEMPT:-}" =~ ^[0-9]+$ ]]; then
+            echo "Invalid run identity; refusing workspace cleanup." >&2
+            exit 1
+          fi
+          test -n "${GITHUB_WORKSPACE:-}"
+          workspace_run="$GITHUB_WORKSPACE/saari-exact-tuple-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -L "$workspace_run"
+          if [ -d "$workspace_run" ]; then
+            rm -rf -- "$workspace_run"
+          fi

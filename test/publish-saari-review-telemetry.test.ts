@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { processGateReport } from "./process-gate-report-helper.ts";
+import { reviewFinding } from "./helpers.ts";
+import { renderReviewCommentFromReport } from "../dist/clawsweeper.js";
 import { normalizeTenantFeed } from "../dashboard/unified-review-dashboard.ts";
 import {
   buildSaariReviewTelemetry,
@@ -144,7 +147,8 @@ test("merged OpenClaw and ClawSweeper fixtures produce a consumer-valid envelope
   assert.deepEqual(normalized.projection.lane, SAARI_LANE);
   assert.equal(normalized.rows.length, 1);
   assert.equal(normalized.rows[0]?.openclaw, "success");
-  assert.equal(normalized.rows[0]?.clawsweeper, "success");
+  // This legacy fixture lacks a durable review lease, so canonical policy blocks it.
+  assert.equal(normalized.rows[0]?.clawsweeper, "blocked");
   assert.equal(normalized.rows[0]?.rating, "B Platinum Hermit");
   assert.equal(normalized.rows[0]?.ci, "unknown");
   assert.deepEqual(normalized.rows[0]?.proof_links, [
@@ -173,7 +177,8 @@ test("absent OpenClaw record stays unknown and is never success", () => {
   const normalized = normalizeTenantFeed("saari", envelope, NOW);
   assert.equal(normalized.rows[0]?.openclaw, "unknown");
   assert.notEqual(normalized.rows[0]?.openclaw, "success");
-  assert.equal(normalized.rows[0]?.clawsweeper, "success");
+  // This legacy fixture lacks a durable review lease, so canonical policy blocks it.
+  assert.equal(normalized.rows[0]?.clawsweeper, "blocked");
 });
 
 test("completed with an error or watchdog exit does not infer OpenClaw success", () => {
@@ -440,5 +445,141 @@ test("counts native Markdown priorities without inventing counts for unknown fin
     const row = publish({ queueRoot, reviewRoot }).rows[0];
     assert.equal(row.findings_total, total);
     assert.equal(row.findings_actionable, actionable);
+  }
+});
+
+test("a newer unknown OpenClaw result clears an older success regardless of bucket order", () => {
+  for (const newerBucket of ["done", "needs-human"]) {
+    const queueRoot = fixtureRoot();
+    const reviewRoot = fixtureRoot();
+    const record = writeDoneRecord(queueRoot);
+    const dir = join(queueRoot, newerBucket);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "aaa-newer.json"),
+      JSON.stringify({
+        ...record,
+        status: "needs-human",
+        exit_code: 75,
+        review_clean: null,
+        review_finding_count: null,
+        submitted_at_utc: "2026-09-13T17:59:00Z",
+      }),
+    );
+    const normalized = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW);
+    assert.equal(normalized.rows[0]?.openclaw, "unknown");
+  }
+});
+
+test("report prose cannot override the canonical ClawSweeper verdict", () => {
+  for (const marker of [
+    `# title clawsweeper-verdict:pass item=44 sha=${HEAD}`,
+    `<!-- clawsweeper-verdict:pass item=45 sha=${HEAD} confidence=high -->`,
+    `<!-- clawsweeper-verdict:pass item=44 sha=${"d".repeat(40)} confidence=high -->`,
+  ]) {
+    const queueRoot = fixtureRoot();
+    const reviewRoot = fixtureRoot();
+    writeItemArtifact(reviewRoot);
+    const path = join(reviewRoot, "items", "saari-co-x-api", "44.md");
+    writeFileSync(
+      path,
+      readFileSync(path, "utf8").replace(/<!-- clawsweeper-verdict:.*?-->/, marker),
+    );
+    const normalized = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW);
+    assert.equal(normalized.rows[0]?.clawsweeper, "blocked");
+  }
+});
+
+test("actual native reports project the same verdict as native publication without stored markers", () => {
+  const queueRoot = fixtureRoot();
+  const reviewRoot = fixtureRoot();
+  const report = processGateReport({ reviewFindings: [reviewFinding()] });
+  assert.equal(report.includes("clawsweeper-verdict:"), false);
+  const comment = renderReviewCommentFromReport(report, "none");
+  assert.match(comment, /clawsweeper-verdict:needs-human/);
+  const dir = join(reviewRoot, "items", "example-org-example-private-suite");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "123.md"), report);
+  const envelope = publish({ queueRoot, reviewRoot });
+  const normalized = normalizeTenantFeed("saari", envelope, NOW);
+  assert.equal(normalized.rows[0]?.clawsweeper, "blocked");
+  assert.equal(normalized.rows[0]?.findings_total, 1);
+});
+
+test("the bounded feed keeps a fresh running review ahead of historical rows", () => {
+  const queueRoot = fixtureRoot(),
+    reviewRoot = fixtureRoot();
+  const done = join(queueRoot, "done");
+  mkdirSync(done, { recursive: true });
+  for (let n = 1; n <= MAX_ROWS; n++) {
+    writeFileSync(
+      join(done, `${n}.json`),
+      JSON.stringify({
+        submitted_head: n.toString(16).padStart(40, "0"),
+        pr_url: `https://github.com/saari-co/x-api/pull/${n}`,
+        status: "completed",
+        exit_code: 0,
+        submitted_at_utc: "2026-09-12T00:00:00Z",
+      }),
+    );
+  }
+  writeRunningRecord(queueRoot);
+  const feed = publish({ queueRoot, reviewRoot });
+  assert.equal(feed.rows.length, MAX_ROWS);
+  assert.ok(feed.rows.some((row) => row.openclaw === "running"));
+  assert.equal(
+    normalizeTenantFeed("saari", feed, NOW).rows.filter((row) => row.freshness === "fresh").length,
+    1,
+  );
+});
+
+test("missing input roots cannot publish a healthy empty feed", () => {
+  const root = fixtureRoot();
+  assert.throws(
+    () => publish({ queueRoot: join(root, "missing"), reviewRoot: root }),
+    /queue root is unavailable/,
+  );
+  assert.throws(
+    () => publish({ queueRoot: root, reviewRoot: join(root, "missing") }),
+    /review root is unavailable/,
+  );
+});
+
+test("an older native artifact cannot make a fresh OpenClaw attempt stale", () => {
+  const queueRoot = fixtureRoot(),
+    reviewRoot = fixtureRoot();
+  writeDoneRecord(queueRoot, { status: "running", submitted_at_utc: "2026-09-13T17:59:00Z" });
+  writeItemArtifact(reviewRoot);
+  const path = join(reviewRoot, "items", "saari-co-x-api", "44.md");
+  writeFileSync(
+    path,
+    readFileSync(path, "utf8").replace("2026-09-13T17:55:00Z", "2026-09-01T00:00:00Z"),
+  );
+  const row = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW).rows[0];
+  assert.equal(row?.openclaw, "running");
+  assert.equal(row?.freshness, "fresh");
+});
+
+test("undated clean records cannot replace a dated finding result", () => {
+  for (const submitted_at_utc of [null, "invalid", "2099-01-01T00:00:00Z"]) {
+    const queueRoot = fixtureRoot(),
+      reviewRoot = fixtureRoot();
+    const record = writeDoneRecord(queueRoot, {
+      exit_code: 1,
+      review_clean: false,
+      review_finding_count: 1,
+    });
+    writeFileSync(
+      join(queueRoot, "done", "undated.json"),
+      JSON.stringify({
+        ...record,
+        exit_code: 0,
+        review_clean: true,
+        review_finding_count: 0,
+        submitted_at_utc,
+      }),
+    );
+    const row = normalizeTenantFeed("saari", publish({ queueRoot, reviewRoot }), NOW).rows[0];
+    assert.equal(row?.openclaw, "failure");
   }
 });

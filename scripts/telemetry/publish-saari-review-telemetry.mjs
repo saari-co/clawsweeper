@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { renderReviewCommentFromReport } from "../../dist/clawsweeper.js";
 
 export const SCHEMA_VERSION = "clawsweeper.telemetry.v1";
 export const TENANT = "saari";
@@ -329,15 +330,16 @@ function parseFrontMatter(markdown) {
   return fields;
 }
 
-function parseVerdict(markdown) {
-  const marker = /clawsweeper-verdict:([a-z0-9_-]+)([^<\n]*)/i.exec(markdown);
-  if (!marker) return null;
-  const shaMatch =
-    /\bsha=([0-9a-f]{40})\b/i.exec(marker[2] ?? "") ?? /\bsha=([0-9a-f]{40})\b/i.exec(markdown);
-  return {
-    verdict: marker[1].toLowerCase(),
-    sha: sha(shaMatch?.[1]),
-  };
+function parseVerdict(markdown, headSha, prNumber) {
+  const markers = [
+    ...markdown.matchAll(/^<!-- clawsweeper-verdict:([a-z0-9_-]+)([^<>\r\n]*) -->\r?$/gim),
+  ];
+  if (markers.length !== 1) return null;
+  const marker = markers[0];
+  const shaMatch = /\bsha=([0-9a-f]{40})\b/i.exec(marker[2]);
+  const itemMatch = /\bitem=([1-9][0-9]*)\b/.exec(marker[2]);
+  if (sha(shaMatch?.[1]) !== headSha || Number(itemMatch?.[1]) !== prNumber) return null;
+  return { verdict: marker[1].toLowerCase() };
 }
 
 function parseFindings(markdown) {
@@ -418,11 +420,18 @@ export function readClawsweeperArtifacts(reviewStateRoot) {
       continue;
     }
     const front = parseFrontMatter(markdown);
-    const verdict = parseVerdict(markdown);
-    const headSha = sha(front.pull_head_sha) ?? verdict?.sha ?? sha(front.head_sha);
+    const headSha = sha(front.pull_head_sha) ?? sha(front.head_sha);
     const identity = parsePullIdentity(front.url, front.repository);
     const prNumber = Number(front.number);
     if (!headSha || !identity?.repository || !Number.isInteger(prNumber) || prNumber < 1) continue;
+    // Stored reports do not carry comment verdict markers. Derive them through
+    // the same canonical policy used by publication, never from report prose.
+    let verdict = null;
+    try {
+      verdict = parseVerdict(renderReviewCommentFromReport(markdown, "none"), headSha, prNumber);
+    } catch (error) {
+      void error; // Malformed/unrecognized native reports remain unknown.
+    }
     const findings = parseFindings(markdown);
     artifacts.push({
       repository: identity.repository,
@@ -550,6 +559,14 @@ function rowKey(repository, prNumber, headSha) {
 }
 
 export function buildSaariReviewTelemetry(options) {
+  for (const [label, root] of [
+    ["OpenClaw queue", options.openclawQueueRoot],
+    ["ClawSweeper review", options.reviewStateRoot],
+  ]) {
+    if (typeof root !== "string" || !existsSync(root) || !statSync(root).isDirectory()) {
+      throw new Error(`${label} root is unavailable`);
+    }
+  }
   const now = options.now ?? Date.now();
   const generatedAt = new Date(now).toISOString();
   const engineSha = sha(options.engineSha);
@@ -606,7 +623,16 @@ export function buildSaariReviewTelemetry(options) {
       "observed_at",
       "prUrl",
     ]) {
-      if (partial[field] !== undefined && partial[field] !== null && partial[field] !== "unknown") {
+      if (field === "observed_at") {
+        if (
+          partial[field] &&
+          (!existing[field] || Date.parse(partial[field]) > Date.parse(existing[field]))
+        ) {
+          existing[field] = partial[field];
+        }
+        continue;
+      }
+      if (partial[field] !== undefined) {
         existing[field] = partial[field];
       }
     }
@@ -615,7 +641,16 @@ export function buildSaariReviewTelemetry(options) {
     rowsByKey.set(key, existing);
   };
 
-  for (const { record, directoryStatus } of readQueueRecords(options.openclawQueueRoot)) {
+  // Process oldest first, replacing the complete lane state even when the latest
+  // attempt is unknown. Filesystem/bucket ordering is not review chronology.
+  const queueRecords = readQueueRecords(options.openclawQueueRoot).sort((left, right) => {
+    const timestamp = ({ record }) => {
+      const value = isoDate(record.submitted_at_utc ?? record.observed_at, now);
+      return value === null ? -Infinity : Date.parse(value);
+    };
+    return timestamp(left) - timestamp(right);
+  });
+  for (const { record, directoryStatus } of queueRecords) {
     const headSha = sha(record.submitted_head) ?? sha(record.commit_sha) ?? sha(record.head_sha);
     const identity = parsePullIdentity(record.pr_url, record.repo);
     if (!headSha || !identity?.repository || !identity.prNumber) continue;
@@ -648,6 +683,10 @@ export function buildSaariReviewTelemetry(options) {
   // Cap first so --ci-source=gh cannot issue unbounded per-row check-runs lookups.
   const selected = [...rowsByKey.values()]
     .sort((left, right) => {
+      const freshness = Date.parse(right.observed_at ?? "") - Date.parse(left.observed_at ?? "");
+      if (Number.isFinite(freshness) && freshness !== 0) return freshness;
+      if (left.observed_at === null && right.observed_at !== null) return 1;
+      if (right.observed_at === null && left.observed_at !== null) return -1;
       const repo = left.repository.localeCompare(right.repository);
       if (repo !== 0) return repo;
       return left.pr_number - right.pr_number;

@@ -63,6 +63,14 @@ come from the overlay. Caller or PR stamps are rejected.
 The artifact name is `<artifact_prefix>-<run_id>-<attempt>` and contains only
 `manifest.json` plus `review/<pr>.md`.
 
+Before bundling, the producer revalidates the open PR tuple and compares the
+live body's SHA256 with `reviewed_primary_body_sha256`, authored from the native
+review context. Compacted bodies retain their upstream source digest. Missing
+or mismatched body identity refuses publication; a same-head body edit requires
+a new review. The validator's `--body-sha256` argument carries this live digest.
+The self-hosted job always removes its uniquely named workspace checkout after
+artifact handling; it refuses symlinks and invalid run identifiers.
+
 ## Optional process-gate evidence
 
 A tenant may additionally enroll its Conductor check with

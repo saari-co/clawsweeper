@@ -124,6 +124,7 @@ esac
     );
     chmodSync(gh, 0o755);
     const original = {
+      body: "Reviewed proof body",
       state: "open",
       draft: false,
       base: { repo: { full_name: "example/target", id: 42 }, ref: "main", sha: "a".repeat(40) },
