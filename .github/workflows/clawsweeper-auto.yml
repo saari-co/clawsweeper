@@ -3,7 +3,7 @@ name: ClawSweeper ready PR
 # Additive native event transport. Keep existing comment and issue workflows.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
 permissions:
   contents: read
   pull-requests: read
@@ -32,6 +32,9 @@ jobs:
                   out.write('requested=false\n')
               raise SystemExit(0)
           if os.environ['GITHUB_EVENT_NAME'] != 'pull_request_target': skip()
+          with open(os.environ['GITHUB_EVENT_PATH']) as event_file:
+              event = json.load(event_file)
+          if event.get('action') == 'edited' and 'base' not in event.get('changes', {}): skip()
           target = os.environ['TARGET_REPO']
           repo = get('repos/' + target)
           if str(repo['id']) != os.environ['TARGET_ID']: raise SystemExit('Repository identity changed')
