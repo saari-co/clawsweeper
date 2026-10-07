@@ -779,8 +779,22 @@ export function runApplyDecisionsForTest(options: {
   plansDir: string;
   reportPath: string;
   extraArgs?: string[];
+  now?: string;
 }): void {
+  const clock = options.now
+    ? [
+        "--import",
+        `data:text/javascript,${encodeURIComponent(
+          `const RealDate = Date; const now = RealDate.parse(${JSON.stringify(options.now)});
+          globalThis.Date = class extends RealDate {
+            constructor(...args) { super(...(args.length ? args : [now])); }
+            static now() { return now; }
+          };`,
+        )}`,
+      ]
+    : [];
   execFileSync(process.execPath, [
+    ...clock,
     "dist/clawsweeper.js",
     "apply-decisions",
     "--target-repo",
