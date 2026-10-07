@@ -221,6 +221,8 @@ test("apply-decisions does not promote unrelated linked open PRs", () => {
       }),
       () => {
         runApplyDecisionsForTest({
+          // Keep fixed May fixtures below the unrelated stale-age promotion gate.
+          now: "2026-05-22T12:00:00Z",
           itemsDir,
           closedDir,
           plansDir,
@@ -289,6 +291,8 @@ test("apply-decisions does not promote unrelated linked merged PRs", () => {
       }),
       () => {
         runApplyDecisionsForTest({
+          // Keep fixed May fixtures below the unrelated stale-age promotion gate.
+          now: "2026-05-22T12:00:00Z",
           itemsDir,
           closedDir,
           plansDir,
