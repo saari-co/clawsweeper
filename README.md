@@ -766,6 +766,13 @@ offline inspection found only neutral placeholder components; no whole value or
 test file is exempt from scanning. See the
 [inspection and native before/after proof](docs/proof/template27-origin-fixture/PROOF.md).
 
+The reviewed Ship decision event UUID qualifies only through its exact Privacy-938
+PLAIN attribution in `.grilltrack/events.jsonl`. Both value digests, the complete
+JSON line and blob, regular-file mode, committed references, and generated
+`decision_reopened` event identity must match. Additional UUIDs, altered content
+and verified findings still block admission. See the [native before/after and
+negative proof](docs/proof/ship19-event-uuid/README.md).
+
 One source path may contain multiple independently reviewed fixtures; each
 digest/path/mode tuple must match exactly, so source membership alone never
 qualifies a finding.
