@@ -201,7 +201,8 @@ test("reviewed event UUID follows the reviewed line when its position shifts", (
   for (const input of f.inputs.values())
     if (input.kind === "blob" && input.bytes?.includes(uuid))
       input.bytes = Buffer.from(`unrelated decision\n${line}\n`);
-  assert.equal(f.scan().kind, "classified");
+  const result = f.scan();
+  assert.equal(result.kind, "classified", JSON.stringify(result));
 });
 
 test("reviewed event UUID refuses a suspicious line added elsewhere", (t) => {
