@@ -254,7 +254,7 @@ const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
   // Ship #19: CLI-generated event_id; Privacy's keyword window crosses the reason field.
   // This is intentionally bound to the exact reviewed line and repository/path.
   // It must not become an allowlist for arbitrary event IDs or other repositories.
-  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", undefined, "dinkuskit/ship"],
+  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", [], "dinkuskit/ship"],
   // Template Store PR27: offline-qualified neutral origin-rejection fixture; exact native identities.
   [17, "URI", "PLAIN", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
   [17, "URI", "HTML", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
@@ -458,7 +458,7 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
           ((Array.isArray(sourceSha256s) &&
             sourceSha256s.length > 0 &&
             sourceSha256s.every((digest) => sha256Pattern.test(digest))) ||
-            (sourceSha256s === undefined &&
+            ((sourceSha256s === undefined || sourceSha256s.length === 0) &&
               typeof repository === "string" &&
               /^[^/\s]+\/[^/\s]+$/.test(repository)))) ||
         (source === "src/plugin-sdk/browser-subpaths.test.ts" &&
@@ -1023,7 +1023,7 @@ function classifyReviewedFindings(
       rawDigest === undefined || rawV2Digest === undefined
         ? []
         : reviewedAttributions.filter(
-            ([, , , expectedRaw, expectedRawV2, , , , , , expectedRepository]) =>
+            ([, , , expectedRaw, expectedRawV2, , , , , expectedRepository]) =>
               expectedRaw === rawDigest &&
               expectedRawV2 === rawV2Digest &&
               (expectedRepository === undefined || expectedRepository === repository),
@@ -1233,7 +1233,7 @@ function classifyReviewedFindings(
       if (detectorType === 899 || detectorType === 938) {
         const sourceSha256 = createHash("sha256").update(staged.bytes).digest("hex");
         matchingMetadata = matchingMetadata.filter(
-          (row) => row[8] === undefined || row[8].includes(sourceSha256),
+          (row) => row[8] === undefined || row[8].length === 0 || row[8].includes(sourceSha256),
         );
         if (matchingMetadata.length === 0) return refuse("source_not_reviewed");
       }

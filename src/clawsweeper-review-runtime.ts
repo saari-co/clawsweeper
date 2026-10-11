@@ -987,7 +987,7 @@ ${exactTuple}${extra}
     return runAgentCheckoutInspection({
       schemaPath: CLAWSWEEPER_DECISION_SCHEMA_PATH,
       scanSource: options.scanSource,
-      repository: options.repository,
+      ...(options.repository ? { repository: options.repository } : {}),
       initialPrompt: options.initialPrompt,
       cwd: options.openclawDir,
       env: untrustedCodexEnv({
