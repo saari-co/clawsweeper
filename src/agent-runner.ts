@@ -19,6 +19,7 @@ export interface RunAgentProcessOptions {
   // Generated diagnostic copy only; never an original input or requested export.
   diagnosticPromptPath?: string;
   scanSource: AgentScanSource;
+  repository?: string;
   model: string;
   reasoningEffort?: string;
   cwd: string;
@@ -81,6 +82,7 @@ export function runAgentProcess(options: RunAgentProcessOptions): CodexProcessRe
     cwd: options.cwd,
     prompt: options.prompt,
     source: options.scanSource,
+    ...(options.repository ? { repository: options.repository } : {}),
     timeoutMs: options.timeoutMs,
     ...(schemaPath ? { schemaPath } : {}),
   });
@@ -163,6 +165,7 @@ export function runAgentCheckoutInspection(options: {
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   scanSource: AgentScanSource;
+  repository?: string;
   initialPrompt: string;
   schemaPath?: string;
 }): CodexProcessResult {
@@ -209,6 +212,7 @@ export function runAgentCheckoutInspection(options: {
       cwd: options.cwd,
       prompt: options.initialPrompt,
       source: options.scanSource,
+      ...(options.repository ? { repository: options.repository } : {}),
       timeoutMs: remainingMs(),
       ...(options.schemaPath ? { schemaPath: options.schemaPath } : {}),
       additionalBytes: [Buffer.from(prompt), readFileSync(join(options.cwd, challenge.path))],
@@ -227,6 +231,7 @@ export function runAgentCheckoutInspection(options: {
     cwd: options.cwd,
     prompt: options.initialPrompt,
     source: options.scanSource,
+    ...(options.repository ? { repository: options.repository } : {}),
     timeoutMs: remainingMs(),
     ...(options.schemaPath ? { schemaPath: options.schemaPath } : {}),
   });

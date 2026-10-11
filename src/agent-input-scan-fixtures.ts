@@ -24,6 +24,7 @@ export type ReviewedAttribution = readonly [
   source: string,
   mode: "100644",
   sourceSha256s?: readonly string[],
+  repository?: string,
 ];
 
 // This is host policy, never an allowlist loaded from the reviewed checkout.
@@ -251,8 +252,9 @@ const CRON_FTP_SOURCE_SHA256S = [
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
   // Ship #19: CLI-generated event_id; Privacy's keyword window crosses the reason field.
-  // Bind the reviewed occurrence and complete blob, never arbitrary event IDs.
-  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", ["e9b2c64042139b1ed6400eac42b95796d10ad9782120cb88227c6f0655835d1c"]],
+  // This is intentionally bound to the exact reviewed line and repository/path.
+  // It must not become an allowlist for arbitrary event IDs or other repositories.
+  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", undefined, "dinkuskit/ship"],
   // Template Store PR27: offline-qualified neutral origin-rejection fixture; exact native identities.
   [17, "URI", "PLAIN", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
   [17, "URI", "HTML", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
@@ -426,11 +428,22 @@ const detectorNames = {
 function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): void {
   const seen = new Set<string>();
   for (const row of rows) {
-    const [detectorType, detectorName, decoder, raw, rawV2, line, source, mode, sourceSha256s] =
-      row;
+    const [
+      detectorType,
+      detectorName,
+      decoder,
+      raw,
+      rawV2,
+      line,
+      source,
+      mode,
+      sourceSha256s,
+      repository,
+    ] = row;
     const lines = typeof line === "string" ? [line] : line;
     if (
-      row.length !== (detectorType === 899 || detectorType === 938 ? 9 : 8) ||
+      row.length < 8 ||
+      row.length > (detectorType === 899 || detectorType === 938 ? 10 : 8) ||
       detectorNames[detectorType] !== detectorName ||
       !Array.isArray(lines) ||
       !lines.length ||
@@ -442,9 +455,12 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
           decoder === "PLAIN" &&
           rawV2 === createHash("sha256").update("").digest("hex") &&
           lines.length === 1 &&
-          Array.isArray(sourceSha256s) &&
-          sourceSha256s.length > 0 &&
-          sourceSha256s.every((digest) => sha256Pattern.test(digest))) ||
+          ((Array.isArray(sourceSha256s) &&
+            sourceSha256s.length > 0 &&
+            sourceSha256s.every((digest) => sha256Pattern.test(digest))) ||
+            (sourceSha256s === undefined &&
+              typeof repository === "string" &&
+              /^[^/\s]+\/[^/\s]+$/.test(repository)))) ||
         (source === "src/plugin-sdk/browser-subpaths.test.ts" &&
           detectorType === 17 &&
           detectorName === "URI" &&
@@ -866,6 +882,7 @@ export function classifyReviewedFixtureScan(
   stderr: Buffer,
   inputs: ReadonlyMap<string, StagedScanInput>,
   reviewedAttributions: readonly ReviewedAttribution[] = REVIEWED_ATTRIBUTIONS,
+  repository?: string,
 ): ClassifiedScan | RefusedScan {
   validateReviewedAttributions(reviewedAttributions);
   const nativeFailure = (
@@ -914,7 +931,7 @@ export function classifyReviewedFixtureScan(
   )
     return nativeFailure("completion_mismatch");
 
-  const result = classifyReviewedFindings(findings, inputs, reviewedAttributions);
+  const result = classifyReviewedFindings(findings, inputs, reviewedAttributions, repository);
   if (result.kind === "refused" && result.diagnostic.kind === "unclassified_finding") {
     result.diagnostic.nativeFindings = nativeFindingInventory(
       findings,
@@ -940,6 +957,7 @@ function classifyReviewedFindings(
   findings: Record<string, unknown>[],
   inputs: ReadonlyMap<string, StagedScanInput>,
   reviewedAttributions: readonly ReviewedAttribution[],
+  repository?: string,
   literalLines = new Map<string, number>(),
 ): ClassifiedScan | RefusedScan {
   const patchWitnesses = new Map<string, NonNullable<ReturnType<typeof resolvePatchWitnesses>>>();
@@ -1005,8 +1023,10 @@ function classifyReviewedFindings(
       rawDigest === undefined || rawV2Digest === undefined
         ? []
         : reviewedAttributions.filter(
-            ([, , , expectedRaw, expectedRawV2]) =>
-              expectedRaw === rawDigest && expectedRawV2 === rawV2Digest,
+            ([, , , expectedRaw, expectedRawV2, , , , , , expectedRepository]) =>
+              expectedRaw === rawDigest &&
+              expectedRawV2 === rawV2Digest &&
+              (expectedRepository === undefined || expectedRepository === repository),
           );
     const fixture = REVIEWED_FIXTURES.find(
       (entry) =>
@@ -1145,6 +1165,7 @@ function classifyReviewedFindings(
           ],
           inputs,
           reviewedAttributions,
+          repository,
           literalLines,
         );
         if (result.kind !== "classified")
@@ -1211,7 +1232,9 @@ function classifyReviewedFindings(
       if (staged?.kind !== "blob" || !staged.bytes) return refuse("material_not_reviewed");
       if (detectorType === 899 || detectorType === 938) {
         const sourceSha256 = createHash("sha256").update(staged.bytes).digest("hex");
-        matchingMetadata = matchingMetadata.filter((row) => row[8]?.includes(sourceSha256));
+        matchingMetadata = matchingMetadata.filter(
+          (row) => row[8] === undefined || row[8].includes(sourceSha256),
+        );
         if (matchingMetadata.length === 0) return refuse("source_not_reviewed");
       }
       const parts = object(finding.SecretParts);
