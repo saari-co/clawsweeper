@@ -965,6 +965,7 @@ ${exactTuple}${extra}
 
   function runReviewCheckoutInspection(options: {
     itemNumber: number;
+    repository?: string;
     openclawDir: string;
     preserveCodexAuth?: boolean;
     timeoutMs: number;
@@ -986,6 +987,7 @@ ${exactTuple}${extra}
     return runAgentCheckoutInspection({
       schemaPath: CLAWSWEEPER_DECISION_SCHEMA_PATH,
       scanSource: options.scanSource,
+      ...(options.repository ? { repository: options.repository } : {}),
       initialPrompt: options.initialPrompt,
       cwd: options.openclawDir,
       env: untrustedCodexEnv({
@@ -1128,6 +1130,7 @@ ${exactTuple}${extra}
         : undefined;
     const result = runAgentProcess({
       scanSource,
+      repository: options.item.repo,
       ...(options.promptFileBytes === 0 ? {} : { diagnosticPromptPath: promptPath }),
       label: `review-${options.item.number}-attempt-1`,
       prompt,
