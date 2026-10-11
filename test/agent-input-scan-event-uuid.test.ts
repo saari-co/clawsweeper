@@ -201,7 +201,13 @@ test("reviewed event UUID follows the reviewed line when its position shifts", (
   for (const input of f.inputs.values())
     if (input.kind === "blob" && input.bytes?.includes(uuid))
       input.bytes = Buffer.from(`unrelated decision\n${line}\n`);
-  const result = f.scan();
+  const result = f.scan(
+    f.findings.filter(
+      (finding) =>
+        (finding.SourceMetadata as { Data: { Filesystem: { file: string } } }).Data.Filesystem
+          .file !== "/scanner/patch",
+    ),
+  );
   assert.equal(result.kind, "classified", JSON.stringify(result));
 });
 
