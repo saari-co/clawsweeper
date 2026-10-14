@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { codexEnv } from "../dist/codex-env.js";
+import { codexEnv, codexModelArgs } from "../dist/codex-env.js";
 import { codexSubprocessEnv } from "../dist/repair/process-env.js";
 
 for (const builder of [codexEnv, codexSubprocessEnv]) {
@@ -124,3 +124,29 @@ for (const builder of [codexEnv, codexSubprocessEnv]) {
     }
   });
 }
+
+test("native model binding is explicit and leaves upstream defaults unchanged", () => {
+  const previousModel = process.env.CLAWSWEEPER_INTERNAL_MODEL;
+  const previousBinding = process.env.CLAWSWEEPER_CODEX_BIND_MODEL;
+  try {
+    process.env.CLAWSWEEPER_INTERNAL_MODEL = "gpt-6.1-sol";
+    delete process.env.CLAWSWEEPER_CODEX_BIND_MODEL;
+    assert.deepEqual(codexModelArgs("internal"), []);
+    assert.deepEqual(codexModelArgs("gpt-6.1-sol"), []);
+    process.env.CLAWSWEEPER_CODEX_BIND_MODEL = "1";
+    assert.deepEqual(codexModelArgs("internal"), ["--model", "gpt-6.1-sol"]);
+    assert.deepEqual(codexModelArgs("gpt-6.1-sol"), ["--model", "gpt-6.1-sol"]);
+    assert.deepEqual(codexModelArgs("explicit-model"), ["--model", "explicit-model"]);
+    assert.deepEqual(codexModelArgs(""), []);
+    assert.equal(codexEnv().CLAWSWEEPER_CODEX_BIND_MODEL, undefined);
+    delete process.env.CLAWSWEEPER_INTERNAL_MODEL;
+    assert.deepEqual(codexModelArgs("internal"), []);
+    process.env.CLAWSWEEPER_INTERNAL_MODEL = "internal";
+    assert.deepEqual(codexModelArgs("internal"), []);
+  } finally {
+    if (previousModel === undefined) delete process.env.CLAWSWEEPER_INTERNAL_MODEL;
+    else process.env.CLAWSWEEPER_INTERNAL_MODEL = previousModel;
+    if (previousBinding === undefined) delete process.env.CLAWSWEEPER_CODEX_BIND_MODEL;
+    else process.env.CLAWSWEEPER_CODEX_BIND_MODEL = previousBinding;
+  }
+});

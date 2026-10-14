@@ -31,6 +31,13 @@ export function internalCodexModel(requestedModel: string): string {
 export function codexModelArgs(requestedModel: string): string[] {
   const model = String(requestedModel ?? "").trim();
   const internalModel = process.env.CLAWSWEEPER_INTERNAL_MODEL?.trim();
+  // Native subscription consumers can bind their reviewed model per invocation.
+  // Preserve upstream configuration-owned selection for all other callers.
+  if (process.env.CLAWSWEEPER_CODEX_BIND_MODEL === "1") {
+    const selected = model === PUBLIC_CODEX_MODEL ? internalModel : model;
+    if (!selected || selected === PUBLIC_CODEX_MODEL) return [];
+    return ["--model", selected];
+  }
   if (!model || model === PUBLIC_CODEX_MODEL || (internalModel && model === internalModel))
     return [];
   return ["--model", model];
@@ -95,6 +102,7 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
     delete env.CODEX_ACCESS_TOKEN;
   }
   delete env.CLAWSWEEPER_INTERNAL_MODEL;
+  delete env.CLAWSWEEPER_CODEX_BIND_MODEL;
   if (ghToken) env.GH_TOKEN = ghToken;
   env.GIT_OPTIONAL_LOCKS = "0";
   return env;
