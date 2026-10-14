@@ -3,6 +3,17 @@
 ClawSweeper is the conservative maintenance bot for OpenClaw repositories.
 Keep changes narrow, evidence-backed, and automation-safe.
 
+## Saari PR review ownership
+
+For this Saari repository, the coding agent dispatches and tracks comprehensive
+Spark-2/OpenClaw P3 review using [the agent-owned procedure](docs/agent-owned-review.md).
+Keep exact-source review state and finding dispositions visible in the PR body.
+Native ClawSweeper is independent and advisory. An explicitly owner-authorized
+merge may proceed while either reviewer is pending or failed; never describe
+that state as clean review. This owner-selected policy overrides imported or
+shared review-completion waiting requirements for this repository only, while
+retaining CI, other task gates, finding disclosure, and human merge authority.
+
 ## Structure
 
 - Main code: `src/clawsweeper.ts`.
