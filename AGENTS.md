@@ -9,6 +9,17 @@ file. This repository does not currently maintain `AGENT.md`, `CLAUDE.md`, or
 Cursor aliases; agents that do not discover `AGENTS.md` automatically must be
 directed here rather than given a duplicated policy copy.
 
+## Saari PR review ownership
+
+For this Saari repository, the coding agent dispatches and tracks comprehensive
+Spark-2/OpenClaw P3 review using [the agent-owned procedure](docs/agent-owned-review.md).
+Keep exact-source review state and finding dispositions visible in the PR body.
+Native ClawSweeper is independent and advisory. An explicitly owner-authorized
+merge may proceed while either reviewer is pending or failed; never describe
+that state as clean review. This owner-selected policy overrides imported or
+shared review-completion waiting requirements for this repository only, while
+retaining CI, other task gates, finding disclosure, and human merge authority.
+
 ## Structure
 
 - Main code: `src/clawsweeper.ts`.
@@ -114,17 +125,14 @@ not split reports into issue/PR subtrees.
   obtain a review for the current head and body. CI, labels, readiness, and
   maintainer permissions are evidence only; the explicit-user-approval boundary
   below still controls landing.
-- Before merge or automerge, the latest ClawSweeper review must apply to the
-  current PR head and body. Resolve every accepted finding. Apply each
-  applicable `Rank-up moves:` item, or explicitly justify the exception in the
-  PR body; Rank-up moves remain optional and do not by themselves block merge.
-  Do not merge while proof is missing or while the review has an unresolved
-  contributor-facing blocker.
-- Land only after the current review and status evidence is ready for
-  maintainer look, including `proof: sufficient` or `proof: override` when the
-  proof label applies. This does not replace the user's explicit merge approval
-  in the current conversation; agents must not merge or enable/execute
-  automerge without it.
+- Follow the Saari PR review ownership policy above for dispatch and landing.
+  Completed ClawSweeper evidence must identify the reviewed head and body;
+  pending, failed, and ineligible reviews remain explicitly disclosed.
+  Resolve accepted findings within task authority or present them for the owner's
+  decision. `Rank-up moves:` remain optional and do not themselves block merge.
+- Keep changed-behavior proof and CI evidence current. Advisory review completion
+  is not a landing gate. Agents still require the user's explicit merge approval
+  and must not enable or execute automerge without it.
 
 ## Commands
 
