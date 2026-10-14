@@ -81,6 +81,9 @@ everything else requires human comparison with current main.
 
 ## Operations and runbooks
 
+- [Saari agent-owned review](agent-owned-review.md) — active fork guidance;
+  comprehensive P3 dispatch, visible evidence and advisory landing policy
+
 - [Live dashboard](live-dashboard.md) — active; public observer surface and
   operator diagnostics
 - [Queue-service split runbook](queue-service-split-runbook.md) — proposed;

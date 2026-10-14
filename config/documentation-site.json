@@ -8,6 +8,7 @@
     {
       "name": "Review and policy",
       "pages": [
+        "agent-owned-review.md",
         "commit-sweeper.md",
         "live-proof.md",
         "review-cache.md",
