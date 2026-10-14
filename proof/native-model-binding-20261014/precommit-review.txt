@@ -1,0 +1,3 @@
+autoreview scoped-clean: no accepted/actionable findings in the selected Git scope and priority
+overall: patch is correct (0.88)
+The supplied diff consistently applies explicit model binding when enabled, preserves existing selection behavior otherwise, and removes the binding flag from the subprocess environment. No actionable defects are evident. Assessment is limited to the supplied evidence; tests were not executed and unchanged caller context was unavailable.
