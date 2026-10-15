@@ -586,6 +586,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 ? { kind: "committed", baseSha: typeof baseSha === "string" ? baseSha : "", headSha: headSha ?? "" }
                 : { kind: "prompt" },
               itemNumber: item.number,
+              repository: item.repo,
               openclawDir: reviewOpenclawDir,
               preserveCodexAuth: localOnly,
               timeoutMs,

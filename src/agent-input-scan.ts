@@ -260,6 +260,7 @@ export function scanAgentInput(options: {
   cwd: string;
   prompt: string;
   source: AgentScanSource;
+  repository?: string;
   timeoutMs: number;
   schemaPath?: string;
   additionalBytes?: readonly Buffer[];
@@ -703,6 +704,8 @@ export function scanAgentInput(options: {
         result.stdout,
         result.stderr,
         inputs,
+        undefined,
+        options.repository,
       );
       if (classification.kind === "refused")
         throw new AgentInputScanError(classification.reason, classification.diagnostic);
@@ -746,6 +749,8 @@ export function scanAgentInput(options: {
           proof.stdout,
           proof.stderr,
           inputs,
+          undefined,
+          options.repository,
         );
         if (confirmation.kind === "refused")
           throw new AgentInputScanError(confirmation.reason, confirmation.diagnostic);

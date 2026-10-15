@@ -72,7 +72,8 @@ function fixture(t: test.TestContext, change: "add" | "remove" | "context" = "ad
       hash(line),
       source,
       "100644",
-      [hash(line + "\n")],
+      undefined,
+      "dinkuskit/ship",
     ],
   ] as unknown as ReviewedAttribution[];
   const findings = [...inputs]
@@ -101,7 +102,11 @@ function fixture(t: test.TestContext, change: "add" | "remove" | "context" = "ad
         },
       },
     }));
-  const scan = (rows: Record<string, unknown>[] = findings, policies = policy) =>
+  const scan = (
+    rows: Record<string, unknown>[] = findings,
+    policies = policy,
+    repository = "dinkuskit/ship",
+  ) =>
     classifyReviewedFixtureScan(
       183,
       Buffer.from(rows.map((r) => JSON.stringify(r)).join("\n") + "\n"),
@@ -119,6 +124,7 @@ function fixture(t: test.TestContext, change: "add" | "remove" | "context" = "ad
       ),
       inputs,
       policies,
+      repository,
     );
   return { inputs, findings, policy, scan };
 }
@@ -188,6 +194,38 @@ test("reviewed event UUID still refuses a second unknown secret finding", (t) =>
     ]).kind,
     "refused",
   );
+});
+
+test("reviewed event UUID follows the reviewed line when its position shifts", (t) => {
+  const f = fixture(t);
+  for (const input of f.inputs.values())
+    if (input.kind === "blob" && input.bytes?.includes(uuid))
+      input.bytes = Buffer.from(`unrelated decision\n${line}\n`);
+  const result = f.scan(
+    f.findings.filter(
+      (finding) =>
+        (finding.SourceMetadata as { Data: { Filesystem: { file: string } } }).Data.Filesystem
+          .file !== "/scanner/patch",
+    ),
+  );
+  assert.equal(result.kind, "classified", JSON.stringify(result));
+});
+
+test("reviewed event UUID refuses a suspicious line added elsewhere", (t) => {
+  const f = fixture(t);
+  const unknownUuid = "87654321-4321-4234-8234-cba987654321";
+  assert.equal(
+    f.scan([
+      ...f.findings,
+      { ...f.findings[0], Raw: unknownUuid, SecretParts: { key: unknownUuid } },
+    ]).kind,
+    "refused",
+  );
+});
+
+test("reviewed event UUID refuses the right line from another repository", (t) => {
+  const f = fixture(t);
+  assert.equal(f.scan(f.findings, f.policy, "other/repository").kind, "refused");
 });
 
 for (const variant of ["path", "source hash", "decoder"] as const)

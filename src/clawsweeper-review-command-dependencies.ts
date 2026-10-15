@@ -328,6 +328,7 @@ export interface CreateReviewCommandWorkflowDependencies {
   reviewStructuralPullStateFromContext: (context: ItemContext) => ReviewStructuralPullState | null;
   runReviewCheckoutInspection: (options: {
     scanSource: AgentScanSource;
+    repository?: string;
     initialPrompt: string;
     itemNumber: number;
     openclawDir: string;
