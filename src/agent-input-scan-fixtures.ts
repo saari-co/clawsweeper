@@ -252,7 +252,7 @@ const CRON_FTP_SOURCE_SHA256S = [
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
   // Ship #19: CLI-generated event_id; Privacy's keyword window crosses the reason field.
   // Bind the reviewed occurrence and complete blob, never arbitrary event IDs.
-  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", ["e9b2c64042139b1ed6400eac42b95796d10ad9782120cb88227c6f0655835d1c"]],
+  [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", ["e9b2c64042139b1ed6400eac42b95796d10ad9782120cb88227c6f0655835d1c", "c16070a86f786b162e7e2c413fc3049d429064f5ced8bb1ee3223c9ca4d76ac6"]],
   // Template Store PR27: offline-qualified neutral origin-rejection fixture; exact native identities.
   [17, "URI", "PLAIN", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],
   [17, "URI", "HTML", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "8522d9e4b70ffdef39339f6b181708fae92d52a2a9ca7d57a9dced6f9a8c0138", "52206c078c21946a76e18492f47fecf2b763726872a0f3a4ce3e14e8ea0d0ff1", "tests/unit/checkout-host-wake-client.test.ts", "100644"],

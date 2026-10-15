@@ -21,7 +21,11 @@ const line = JSON.stringify({
   event_id: uuid,
 });
 
-function fixture(t: test.TestContext, change: "add" | "remove" | "context" = "add") {
+function fixture(
+  t: test.TestContext,
+  change: "add" | "remove" | "context" = "add",
+  headSuffix = "",
+) {
   const root = mkdtempSync(join(tmpdir(), "reviewed-event-uuid-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const git = (...args: string[]) => execFileSync("git", args, { cwd: root });
@@ -33,7 +37,7 @@ function fixture(t: test.TestContext, change: "add" | "remove" | "context" = "ad
   mkdirSync(join(root, ".grilltrack"));
   const refs = [0, 1].map((i) => {
     const body = change === "context" || (change === "add") === (i === 1) ? line + "\n" : "";
-    writeFileSync(join(root, source), body);
+    writeFileSync(join(root, source), body + (i === 1 ? headSuffix : ""));
     writeFileSync(join(root, "other"), String(i));
     git("add", ".");
     git("commit", "-qm", "fixture");
@@ -131,6 +135,31 @@ for (const change of ["add", "remove", "context"] as const)
     if (r.kind === "classified")
       assert.ok(r.notices.every((n) => n.detector === "Privacy" && n.source === source));
   });
+
+test("reviewed event UUID permits only enumerated complete source blobs", (t) => {
+  const f = fixture(t, "context", JSON.stringify({ action: "reviewed_append" }) + "\n");
+  const headBlob = [...f.inputs.values()].find(
+    (input) => input.kind === "blob" && input.references.some((ref) => ref.role === "head"),
+  );
+  assert.ok(headBlob?.bytes);
+  assert.equal(f.scan().kind, "refused");
+
+  const row = [...f.policy[0]!];
+  row[8] = [...(f.policy[0]![8] ?? []), hash(headBlob.bytes)];
+  const policy = [row as unknown as ReviewedAttribution];
+  assert.equal(f.scan(f.findings, policy).kind, "classified");
+
+  const unreviewed = fixture(t, "context", JSON.stringify({ action: "unreviewed_append" }) + "\n");
+  assert.equal(unreviewed.scan(unreviewed.findings, policy).kind, "refused");
+  for (const override of [{ Verified: true }, { DecoderName: "HTML" }])
+    assert.equal(
+      f.scan(
+        f.findings.map((finding) => ({ ...finding, ...override })),
+        policy,
+      ).kind,
+      "refused",
+    );
+});
 
 for (const [name, override] of Object.entries({
   verified: { Verified: true },
