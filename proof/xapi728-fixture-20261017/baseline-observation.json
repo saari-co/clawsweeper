@@ -1,0 +1,56 @@
+{
+  "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+  "head": "7e5e808ec8b7acc4d9a9221a1d67e14b21ff1b26",
+  "source": "tonight-lab/tests/test_smoky_runner_storefront.py",
+  "sourceBlob": "ec5b1c5455a1c3483b54d7d3250b3716fa21f7b1",
+  "sourceSha256": "60042c3bc9b15ee8a7bd4c1769fdef58d2422f10195b1238a457c06bb297d033",
+  "sourceBytes": 65189,
+  "status": "refused",
+  "reason": "findings",
+  "diagnosticKind": "unclassified_finding",
+  "diagnosticReason": "literal_not_reviewed",
+  "observations": [
+    {
+      "detector": "URI",
+      "decoder": "PLAIN",
+      "verified": false,
+      "sourceLines": [
+        720
+      ],
+      "material": "head_blob",
+      "metadataConforms": true
+    },
+    {
+      "detector": "URI",
+      "decoder": "PLAIN",
+      "verified": false,
+      "sourceLines": [
+        720
+      ],
+      "material": "patch_or_other",
+      "metadataConforms": true
+    },
+    {
+      "detector": "URI",
+      "decoder": "PLAIN",
+      "verified": false,
+      "sourceLines": [
+        746
+      ],
+      "material": "patch_or_other",
+      "metadataConforms": true
+    },
+    {
+      "detector": "URI",
+      "decoder": "PLAIN",
+      "verified": false,
+      "sourceLines": [
+        746
+      ],
+      "material": "head_blob",
+      "metadataConforms": true
+    }
+  ],
+  "attributionRows": 2,
+  "scope": "Complete committed range and controlled prompt; real unchanged pinned scanner and verification; output observed without modifying scanner results; no model."
+}

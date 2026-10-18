@@ -1,0 +1,45 @@
+[
+  {
+    "scenario": "exact",
+    "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+    "head": "7e5e808ec8b7acc4d9a9221a1d67e14b21ff1b26",
+    "status": "admitted",
+    "notices": 4
+  },
+  {
+    "scenario": "line",
+    "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+    "head": "531c1a8ef0aa0d358dd2ee16777d9432834ce0eb",
+    "status": "refused",
+    "reason": "findings",
+    "diagnosticReason": "literal_mismatch",
+    "notices": 0
+  },
+  {
+    "scenario": "path",
+    "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+    "head": "329e496511b82408263bccb48e97e562dca0eac4",
+    "status": "refused",
+    "reason": "findings",
+    "diagnosticReason": "source_not_reviewed",
+    "notices": 0
+  },
+  {
+    "scenario": "value",
+    "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+    "head": "fdbc4d16997a5a15eff299ad86ec5fba1df91a49",
+    "status": "refused",
+    "reason": "findings",
+    "diagnosticReason": "literal_not_reviewed",
+    "notices": 0
+  },
+  {
+    "scenario": "extra-occurrence",
+    "base": "6364e9339979179374223dc7c11a1506ba3cc995",
+    "head": "fbd393040f4947102a7b3dd291ab4b956a39b19f",
+    "status": "refused",
+    "reason": "findings",
+    "diagnosticReason": "literal_mismatch",
+    "notices": 0
+  }
+]
