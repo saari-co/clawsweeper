@@ -592,6 +592,73 @@ for (const source of [
   });
 }
 
+test("separate storefront URI rows require every exact line and finding", (t) => {
+  const source = "tonight-lab/tests/test_smoky_runner_storefront.py";
+  const entries = ["redaction", "local-beacon"].map((name) => {
+    const raw = ["https://", "fixture", ":", name, "@", "storefront.example.invalid"].join("");
+    return {
+      raw,
+      rawV2: raw,
+      line: `fixture_${name.replaceAll("-", "_")} = ${JSON.stringify(raw)}`,
+      decoders: ["PLAIN"] as const,
+    };
+  });
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const policy: readonly ReviewedAttribution[] = entries.map((entry) => [
+    17,
+    "URI",
+    "PLAIN",
+    digest(entry.raw),
+    digest(entry.rawV2),
+    [digest(entry.line)],
+    source,
+    "100644",
+  ]);
+  const classify = (patch: ReturnType<typeof fixturePatch>, overrides = {}, rows = policy) =>
+    patch.classify("PLAIN", overrides, { reviewedAttributions: rows });
+  for (const change of ["add", "remove", "context"] as const)
+    assert.equal(classify(fixturePatch(t, source, entries, change)).kind, "classified");
+  const original = fixturePatch(t, source, entries);
+  assert.equal(classify(original, {}, policy.slice(0, 1)).kind, "refused");
+  for (const overrides of [{ Verified: true }, { DecoderName: "HTML" }])
+    assert.equal(classify(original, overrides).kind, "refused");
+  for (const variant of ["value", "line", "path", "extra-occurrence", "unknown-finding"] as const) {
+    const changed = entries.map((entry) => ({ ...entry }));
+    if (variant === "value" || variant === "unknown-finding") {
+      const entry = { ...changed[0]! };
+      entry.raw += "/changed";
+      entry.rawV2 = entry.raw;
+      entry.line = `changed = ${JSON.stringify(entry.raw)}`;
+      if (variant === "value") changed[0] = entry;
+      else changed.push(entry);
+    } else if (variant === "line") changed[0]!.line += " ";
+    else if (variant === "extra-occurrence")
+      changed.push({ ...changed[0]!, line: changed[0]!.line + " # extra" });
+    assert.equal(
+      classify(fixturePatch(t, variant === "path" ? source + ".other" : source, changed)).kind,
+      "refused",
+    );
+  }
+  for (const variant of ["mode", "role", "revision"] as const) {
+    const changed = fixturePatch(t, source, entries);
+    for (const [file, input] of changed.inputs) {
+      if (input.kind !== "blob") continue;
+      changed.inputs.set(file, {
+        ...input,
+        references: input.references.map((reference) => ({
+          ...reference,
+          ...(variant === "mode"
+            ? { mode: "100755" }
+            : variant === "role"
+              ? { role: "worktree" as const }
+              : { revision: "f".repeat(40) }),
+        })),
+      });
+    }
+    assert.equal(classify(changed).kind, "refused");
+  }
+});
+
 function questionPromptFixture(): ReturnType<typeof autoreviewFixtures>[number] {
   const raw = ["https://", "operator", ":", "password", "@", "example.test"].join("");
   const rawV2 = `${raw}/sign`;

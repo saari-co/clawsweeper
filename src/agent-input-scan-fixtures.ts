@@ -250,6 +250,9 @@ const CRON_FTP_SOURCE_SHA256S = [
 
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
+  // x-api #728: exact reserved-domain redaction and local-beacon test inputs.
+  [17, "URI", "PLAIN", "4dd39b153482289f80270b3893d62cd14834c92c66adc5863a35272a9932a3eb", "2c14d09cb2de85504e3921d97a6248994f6adfdd9993b2a139ec152dd791fc0a", ["bb0a75b78cf88c8a9dd2f4716d1473d22522e44594ea1b08a244e0e073b1b4dd"], "tonight-lab/tests/test_smoky_runner_storefront.py", "100644"],
+  [17, "URI", "PLAIN", "627c735e5ac369264b5dbafbbf1b3da30f0a95400c31633d149cda4791b4102a", "926bdb9b31c700b5c0dd8913544811572568b6bbcbe607aa944abefdc488be53", ["84bf6d7c185482a6843666cece096a97a41adf68d7377965f50700798cd5db7a"], "tonight-lab/tests/test_smoky_runner_storefront.py", "100644"],
   // Ship #19: CLI-generated event_id; Privacy's keyword window crosses the reason field.
   // Bind the reviewed occurrence and complete blob, never arbitrary event IDs.
   [938, "Privacy", "PLAIN", "6e31751daf97832583d6877d6f79a17eb9b74188d3916d1668d136af36a9ea45", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "ed7bda1f092e8919442f3acb5c403917f2f0decbf3e7b50d1b7ce3d67bc0ddc7", ".grilltrack/events.jsonl", "100644", ["e9b2c64042139b1ed6400eac42b95796d10ad9782120cb88227c6f0655835d1c", "c16070a86f786b162e7e2c413fc3049d429064f5ced8bb1ee3223c9ca4d76ac6"]],
@@ -446,6 +449,10 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
           sourceSha256s.length > 0 &&
           sourceSha256s.every((digest) => sha256Pattern.test(digest))) ||
         (source === "src/plugin-sdk/browser-subpaths.test.ts" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          decoder === "PLAIN") ||
+        (source === "tonight-lab/tests/test_smoky_runner_storefront.py" &&
           detectorType === 17 &&
           detectorName === "URI" &&
           decoder === "PLAIN") ||
