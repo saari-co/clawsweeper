@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to review'
+        description: "PR number to review"
         required: true
         type: string
       publish:
-        description: 'Publish review results'
+        description: "Publish review results"
         required: false
         type: boolean
         default: true
