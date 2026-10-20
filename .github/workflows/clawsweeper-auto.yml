@@ -3,7 +3,7 @@ name: ClawSweeper ready PR
 # Additive native event transport. Keep existing comment and issue workflows.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
+    types: [opened, reopened, synchronize, ready_for_review, edited, labeled]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -58,6 +58,33 @@ jobs:
           if pull['state'] != 'open' or pull['draft']: skip()
           if pull['head']['repo']['id'] != repo['id']: skip()
           if pull['base']['repo']['id'] != repo['id'] or pull['base']['ref'] != repo['default_branch']: skip()
+          # #269 sender trust/label policy. Automatic bot-authored PRs are
+          # admitted only for the identical ID-verified allowlist shared by
+          # both tenants; untrusted bot PRs are simply not admitted (no
+          # queue item, nothing executes) until a maintainer trigger.
+          TRUSTED_BOTS = {'smoky-agent[bot]': 343990805, 'dinkuskit-release[bot]': 342199489}
+          def bot_trusted(user):
+              expected = TRUSTED_BOTS.get((user or {}).get('login'))
+              if expected is None or (user or {}).get('id') != expected: return False
+              if user.get('login') == 'dinkuskit-release[bot]' and not target.startswith('dinkuskit/'): return False
+              return True
+          force_label_by = ''
+          if event_name == 'pull_request_target' and event.get('action') == 'labeled':
+              # Maintainer force-review trigger: exact label, independent
+              # human labeler with live admin/maintain/write. Drafts never
+              # admit (checked above). Admission below is the ordinary
+              # automatic tuple identity, so it dedupes into a live item.
+              if (event.get('label') or {}).get('name') != 'clawsweeper:review': skip()
+              sender = event.get('sender') or {}
+              if sender.get('type') != 'User' or not sender.get('login'): skip()
+              try:
+                  permission = get(f"repos/{target}/collaborators/{sender['login']}/permission")['permission']
+              except Exception: skip()
+              if permission not in ('admin', 'maintain', 'write'): skip()
+              force_label_by = sender['login']
+          elif event_name == 'pull_request_target':
+              author = pull.get('user') or {}
+              if author.get('type') == 'Bot' and not bot_trusted(author): skip()
           base = pull['base']['sha']
           head = pull['head']['sha']
           if any(not re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (base, head)): raise SystemExit('Invalid source tuple')
@@ -65,7 +92,7 @@ jobs:
           if event_name == 'workflow_dispatch' and os.environ.get('PUBLISH', '').lower() == 'false':
               pub = 'false'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'requested=true\npr_number={number}\nbase_sha={base}\nhead_sha={head}\npublish={pub}\n')
+              out.write(f'requested=true\npr_number={number}\nbase_sha={base}\nhead_sha={head}\npublish={pub}\nforce_label_by={force_label_by}\n')
           PYBIND
       - name: Bind request to this source workflow
         if: steps.live.outputs.requested == 'true'
@@ -76,6 +103,7 @@ jobs:
           BASE: ${{ steps.live.outputs.base_sha }}
           HEAD: ${{ steps.live.outputs.head_sha }}
           PUBLISH: ${{ steps.live.outputs.publish }}
+          FORCE_LABEL_BY: ${{ steps.live.outputs.force_label_by }}
         run: |
           python3 -I - <<'PYREQUEST' > "$RUNNER_TEMP/clawsweeper-request.json"
           import json, os
@@ -84,6 +112,12 @@ jobs:
                          origin_repository=os.environ['GITHUB_REPOSITORY'], origin_run_id=os.environ['GITHUB_RUN_ID'],
                          origin_run_attempt=os.environ['GITHUB_RUN_ATTEMPT'], comment_id='',
                          publish=(os.environ.get('PUBLISH', 'true') == 'true'))
+          if os.environ.get('FORCE_LABEL_BY'):
+              payload['force_label_by'] = os.environ['FORCE_LABEL_BY']
+              # GitHub caps repository_dispatch client_payload at 10 keys;
+              # origin_repository defaults to the target repo downstream.
+              if payload.get('origin_repository') == payload.get('target_repo'):
+                  del payload['origin_repository']
           print(json.dumps(dict(event_type='clawsweeper_native_pr', client_payload=payload)))
           PYREQUEST
       - name: Store immutable request evidence
@@ -97,26 +131,19 @@ jobs:
       - name: Dispatch to private review host
         if: steps.live.outputs.requested == 'true'
         env:
-          GH_TOKEN: ${{ secrets.CLAWSWEEPER_DISPATCH_TOKEN }}
-          CLAWSWEEPER_DO_QUEUE_MODE: ${{ vars.CLAWSWEEPER_DO_QUEUE_MODE }}
           CLAWSWEEPER_DO_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_DO_QUEUE_SECRET }}
         run: |
           set -euo pipefail
-          [ -n "$GH_TOKEN" ] || { echo 'ClawSweeper dispatch credential is not configured.' >&2; exit 1; }
-          queue_status=0
-          python3 -I - <<'PYQUEUE' || queue_status=$?
+          python3 -I - <<'PYQUEUE'
           import hashlib, hmac, json, os, sys, urllib.error, urllib.request
-          mode = os.environ.get('CLAWSWEEPER_DO_QUEUE_MODE', 'off').strip().lower()
-          if mode not in ('shadow', 'primary'):
-              print(f'ClawSweeper queue dual-write disabled (mode={mode or "off"}).')
-              raise SystemExit(0)
+          # #269 final sender: the signed queue is the only front door.
+          # Admit succeeds or this sender fails loudly — queue failure
+          # pauses reviews; there is no Actions dispatch fallback and no
+          # per-repository queue-mode variable.
           secret = os.environ.get('CLAWSWEEPER_DO_QUEUE_SECRET', '')
           if not secret:
-              message = 'ClawSweeper queue secret is not configured.'
-              if mode == 'primary':
-                  print(message, file=sys.stderr); raise SystemExit(1)
-              print(f'::warning::{message} Continuing with Actions in shadow mode.')
-              raise SystemExit(0)
+              print('ClawSweeper queue secret is not configured.', file=sys.stderr)
+              raise SystemExit(1)
           with open(os.path.join(os.environ['RUNNER_TEMP'], 'clawsweeper-request.json')) as handle:
               client_payload = json.load(handle)['client_payload']
           admit = {
@@ -139,18 +166,8 @@ jobs:
                   result = json.load(response)
               if result.get('accepted') is not True:
                   raise ValueError(f"queue rejected admit: {result.get('reason', 'unknown')}")
-              print(f"ClawSweeper queue {mode} admit accepted (deduped={result.get('deduped') is True}).")
-              raise SystemExit(86 if mode == 'primary' else 0)
+              print(f"ClawSweeper queue admit accepted (deduped={result.get('deduped') is True}).")
           except Exception as error:
-              if mode == 'primary':
-                  print(f'ClawSweeper queue primary admit failed: {error}', file=sys.stderr)
-                  raise SystemExit(1)
-              print(f'::warning::ClawSweeper queue shadow admit failed; continuing with Actions: {error}')
-              raise SystemExit(0)
+              print(f'ClawSweeper queue admit failed: {error}', file=sys.stderr)
+              raise SystemExit(1)
           PYQUEUE
-          if [ "$queue_status" -eq 86 ]; then
-            echo 'Queue is primary for this repository; skipping Actions repository_dispatch.'
-            exit 0
-          fi
-          [ "$queue_status" -eq 0 ] || exit "$queue_status"
-          gh api --method POST repos/saari-co/spark-dgx/dispatches --input "$RUNNER_TEMP/clawsweeper-request.json"
