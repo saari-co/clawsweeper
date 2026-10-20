@@ -41,9 +41,19 @@ jobs:
           if pull['state'] != 'open' or pull['draft'] or pull['base']['ref'] != metadata['default_branch']:
               raise SystemExit(0)
           # #269: comments are maintainer-only for enqueue + publish; the
-          # silent author re-review tier is removed.
-          trusted = comment.get('author_association') in {'OWNER', 'MEMBER', 'COLLABORATOR'}
-          if not trusted:
+          # silent author re-review tier is removed. #279: association
+          # alone is not live write access — require the commenter's
+          # effective admin/maintain/write permission before signing the
+          # admission, and skip (fail closed) when the lookup fails. The
+          # receiver revalidates live permission at admission regardless.
+          if comment.get('author_association') not in {'OWNER', 'MEMBER', 'COLLABORATOR'}:
+              raise SystemExit(0)
+          try:
+              permission = get(
+                  f"repos/{repo}/collaborators/{comment['user']['login']}/permission").get('permission')
+          except Exception:
+              raise SystemExit(0)
+          if permission not in ('admin', 'maintain', 'write'):
               raise SystemExit(0)
           payload = dict(target_repo=repo, repository_id=str(metadata['id']), pr=str(number),
               requested_base=pull['base']['sha'], requested_head=pull['head']['sha'],
