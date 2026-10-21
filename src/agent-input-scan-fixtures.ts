@@ -250,6 +250,14 @@ const CRON_FTP_SOURCE_SHA256S = [
 
 // oxfmt-ignore
 const REVIEWED_ATTRIBUTIONS: readonly ReviewedAttribution[] = [
+  // live-journeys #3: base and synthetic head userinfo URLs in a rejection test.
+  // Bind observed native decoder variants to exact lines and complete source blobs.
+  [17, "URI", "PLAIN", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "0f91f2a622e4b78d6de42a2cb39b819dee64ff43ce51587991a702fd9bc66e85", "runner/unit/request-policy.test.mjs", "100644", ["ffceb68365c74351a13c409076bacdc623c8464f38057e8a407521d2db461a3f"]],
+  [17, "URI", "ESCAPED_UNICODE", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "9f837074daea7b030ae86959c7c86a88e75f64df44a2bd55a6bc2a71306caa91", "runner/unit/request-policy.test.mjs", "100644", ["10bd52540a9b9ace50c9ce94eec1126a40805b4294631ac83bb1ea43d8791108"]],
+  [17, "URI", "HTML", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "9f837074daea7b030ae86959c7c86a88e75f64df44a2bd55a6bc2a71306caa91", "runner/unit/request-policy.test.mjs", "100644", ["10bd52540a9b9ace50c9ce94eec1126a40805b4294631ac83bb1ea43d8791108"]],
+  [17, "URI", "HTML", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "0f91f2a622e4b78d6de42a2cb39b819dee64ff43ce51587991a702fd9bc66e85", "runner/unit/request-policy.test.mjs", "100644", ["ffceb68365c74351a13c409076bacdc623c8464f38057e8a407521d2db461a3f"]],
+  [17, "URI", "ESCAPED_UNICODE", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "48380210960a4fd741c70d76d4b782460f6c682c2a50f279e18f4491fa883dc6", "0f91f2a622e4b78d6de42a2cb39b819dee64ff43ce51587991a702fd9bc66e85", "runner/unit/request-policy.test.mjs", "100644", ["ffceb68365c74351a13c409076bacdc623c8464f38057e8a407521d2db461a3f"]],
+  [17, "URI", "PLAIN", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "7820421d74027ef853db86d92a8852befa1e2c985a4a6106083693bfa4082a07", "9f837074daea7b030ae86959c7c86a88e75f64df44a2bd55a6bc2a71306caa91", "runner/unit/request-policy.test.mjs", "100644", ["10bd52540a9b9ace50c9ce94eec1126a40805b4294631ac83bb1ea43d8791108"]],
   // x-api #728: exact reserved-domain redaction and local-beacon test inputs.
   [17, "URI", "PLAIN", "4dd39b153482289f80270b3893d62cd14834c92c66adc5863a35272a9932a3eb", "2c14d09cb2de85504e3921d97a6248994f6adfdd9993b2a139ec152dd791fc0a", ["bb0a75b78cf88c8a9dd2f4716d1473d22522e44594ea1b08a244e0e073b1b4dd"], "tonight-lab/tests/test_smoky_runner_storefront.py", "100644"],
   [17, "URI", "PLAIN", "627c735e5ac369264b5dbafbbf1b3da30f0a95400c31633d149cda4791b4102a", "926bdb9b31c700b5c0dd8913544811572568b6bbcbe607aa944abefdc488be53", ["84bf6d7c185482a6843666cece096a97a41adf68d7377965f50700798cd5db7a"], "tonight-lab/tests/test_smoky_runner_storefront.py", "100644"],
@@ -433,12 +441,25 @@ function validateReviewedAttributions(rows: readonly ReviewedAttribution[]): voi
       row;
     const lines = typeof line === "string" ? [line] : line;
     if (
-      row.length !== (detectorType === 899 || detectorType === 938 ? 9 : 8) ||
+      row.length !==
+        (detectorType === 899 ||
+        detectorType === 938 ||
+        source === "runner/unit/request-policy.test.mjs"
+          ? 9
+          : 8) ||
       detectorNames[detectorType] !== detectorName ||
       !Array.isArray(lines) ||
       !lines.length ||
       ![raw, rawV2, ...lines].every((digest) => sha256Pattern.test(digest)) ||
       !(
+        (source === "runner/unit/request-policy.test.mjs" &&
+          detectorType === 17 &&
+          detectorName === "URI" &&
+          (decoder === "PLAIN" || decoder === "HTML" || decoder === "ESCAPED_UNICODE") &&
+          lines.length === 1 &&
+          Array.isArray(sourceSha256s) &&
+          sourceSha256s.length > 0 &&
+          sourceSha256s.every((digest) => sha256Pattern.test(digest))) ||
         (source === ".grilltrack/events.jsonl" &&
           detectorType === 938 &&
           detectorName === "Privacy" &&
@@ -1092,14 +1113,15 @@ function classifyReviewedFindings(
         continue;
       }
       if (staged.kind === "raw_diff") return refuse("material_not_reviewed");
-      const exactGitSourceEscapedAttribution =
+      const exactSourceEscapedAttribution =
         finding.DecoderName === "ESCAPED_UNICODE" &&
         exactCandidates.some(
           ([detectorType, detectorName, decoder, , , , source, mode]) =>
             detectorType === 17 &&
             detectorName === finding.DetectorName &&
             decoder === finding.DecoderName &&
-            source === "src/infra/git-source.test.ts" &&
+            (source === "src/infra/git-source.test.ts" ||
+              source === "runner/unit/request-policy.test.mjs") &&
             mode === "100644",
         );
       const reviewedEventUuid =
@@ -1112,7 +1134,7 @@ function classifyReviewedFindings(
         !patchLiteral ||
         (finding.DecoderName !== "PLAIN" &&
           finding.DecoderName !== "HTML" &&
-          (finding.DecoderName !== "ESCAPED_UNICODE" || !exactGitSourceEscapedAttribution))
+          (finding.DecoderName !== "ESCAPED_UNICODE" || !exactSourceEscapedAttribution))
       )
         return refuse("material_not_reviewed");
       // Decoder labels do not reconstruct source: this fixture still needs literal witnesses.
@@ -1216,7 +1238,11 @@ function classifyReviewedFindings(
       const [detectorType, detectorName, decoder] = matchingMetadata[0]!;
       if (typeof file !== "string" || scannerLine === null) return refuse("metadata_mismatch");
       if (staged?.kind !== "blob" || !staged.bytes) return refuse("material_not_reviewed");
-      if (detectorType === 899 || detectorType === 938) {
+      if (
+        detectorType === 899 ||
+        detectorType === 938 ||
+        matchingMetadata.some((row) => row[8] !== undefined)
+      ) {
         const sourceSha256 = createHash("sha256").update(staged.bytes).digest("hex");
         matchingMetadata = matchingMetadata.filter((row) => row[8]?.includes(sourceSha256));
         if (matchingMetadata.length === 0) return refuse("source_not_reviewed");
