@@ -72,3 +72,24 @@ unchanged review input repeatedly.
 
 OpenClaw Bay is unaffected: this is bounded host-side failure metadata; no
 dashboard, lifecycle, queue, publication, or public data contract changes.
+
+## Validation receipt
+
+- source commit: `9dccbe5432a` (`feat(scan): explain source witness refusals`)
+- validated environment: Node `24.22.1`, pnpm `12.4.1`, TruffleHog `3.97.4`
+- pinned validation: job `8922fb25`, terminal state `cleanupReady`
+- full check: `pnpm run check` passed with exit `0`; receipt root:
+  `artifacts/setup130-scan-witness-20261101/cursor-pinned-validation/`
+- focused validation: `884` tests passed. The initial zsh `PIPESTATUS`
+  wrapper returned exit `1` and is disclosed; the direct focused result passed.
+- target observation: the real Setup scan remained refused with exit `79`,
+  containing three `ambiguous_literal` and one `unsupported_decoder` reasons.
+  No fixture was qualified or admitted from that observation.
+
+The proof is prepared and tested, but not rolled out: no engine pin, receiver
+change, scanner flag, trust decision, fixture-policy change, or Setup-target
+qualification was made. The safe diagnostic records metadata only and never
+publishes raw matches, source text, decoder errors, or large logs. A future
+target capture must be treated as a new observation and pass the existing
+source-owner qualification gate. The validation job's cleanup/host-failure
+metadata does not affect OpenClaw Bay.
