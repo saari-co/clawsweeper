@@ -147,9 +147,11 @@ test("native inventory exposes only uniquely proven PLAIN source coordinates", (
   assert.ok(inventory);
   assert.equal(inventory.findings[0]?.sourceLine, 2);
   assert.equal(inventory.findings[0]?.sourceLineStatus, "proven");
+  assert.equal(inventory.findings[0]?.sourceLineReason, "unique_plain_literal");
   assert.equal(inventory.findings[0]?.scannerInputLine, 99);
   assert.equal(inventory.findings[1]?.sourceLine, null);
   assert.equal(inventory.findings[1]?.sourceLineStatus, "unavailable");
+  assert.equal(inventory.findings[1]?.sourceLineReason, "unsupported_decoder");
   assert.equal(inventory.findings[1]?.scannerInputLine, 100);
   assert.deepEqual(inventory.findings[0]?.material?.references, [
     {
@@ -161,13 +163,17 @@ test("native inventory exposes only uniquely proven PLAIN source coordinates", (
   ]);
 });
 
-test("native coordinate witnesses reject ambiguous, decoded and oversized inputs", () => {
-  for (const [bytes, raw, decoder] of [
-    [Buffer.from("neutral neutral"), "neutral", "PLAIN"],
-    [Buffer.from("aaaa"), "aaa", "PLAIN"],
-    [Buffer.from("neutral"), "neutral", "HTML"],
-    [Buffer.from("absent"), "neutral", "PLAIN"],
-    [Buffer.alloc(1024 * 1024 + 1, 120), "x", "PLAIN"],
+test("native coordinate witnesses explain unavailable attribution without exposing input", () => {
+  for (const [bytes, raw, decoder, reason] of [
+    [Buffer.from("neutral neutral"), "neutral", "PLAIN", "ambiguous_literal"],
+    [Buffer.from("aaaa"), "aaa", "PLAIN", "ambiguous_literal"],
+    [Buffer.from("neutral"), "neutral", "HTML", "unsupported_decoder"],
+    [Buffer.from("absent"), "neutral", "PLAIN", "literal_absent"],
+    [Buffer.alloc(1024 * 1024 + 1, 120), "x", "PLAIN", "source_size_limit"],
+    [Buffer.from("neutral"), "x".repeat(64 * 1024 + 1), "PLAIN", "literal_size_limit"],
+    [Buffer.from([0xff]), "neutral", "PLAIN", "invalid_source_utf8"],
+    [Buffer.from("neutral"), "", "PLAIN", "missing_literal"],
+    [undefined, "neutral", "PLAIN", "missing_source_bytes"],
   ] as const) {
     const finding = {
       DetectorType: 999999,
@@ -186,17 +192,24 @@ test("native coordinate witnesses reject ambiguous, decoded and oversized inputs
           msg: "finished scanning",
           trufflehog_version: "3.97.4",
           chunks: 1,
-          bytes: bytes.length,
+          bytes: bytes?.length ?? 0,
           verified_secrets: 0,
           unverified_secrets: 1,
         }) + "\n",
       ),
-      new Map([["input", { kind: "blob", id: "a".repeat(40), bytes, references: [] }]]),
+      new Map([
+        [
+          "input",
+          { kind: "blob", id: "a".repeat(40), ...(bytes ? { bytes } : {}), references: [] },
+        ],
+      ]),
     );
     assert.equal(result.kind, "refused");
     if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") continue;
     assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLine, null);
     assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLineStatus, "unavailable");
+    assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLineReason, reason);
+    assert.equal(JSON.stringify(result.diagnostic).includes("neutral"), false);
   }
 });
 

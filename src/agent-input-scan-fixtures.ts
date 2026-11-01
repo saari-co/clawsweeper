@@ -650,7 +650,24 @@ interface NativeFindingInventoryEntry {
   material: ScanMaterialDiagnostic | null;
   sourceLine: number | null;
   sourceLineStatus: "proven" | "unavailable";
+  sourceLineReason: SourceLineWitness["reason"];
 }
+
+type SourceLineWitness =
+  | { line: number; reason: "unique_plain_literal" }
+  | {
+      line: null;
+      reason:
+        | "unsupported_decoder"
+        | "not_staged_blob"
+        | "missing_source_bytes"
+        | "missing_literal"
+        | "source_size_limit"
+        | "literal_size_limit"
+        | "invalid_source_utf8"
+        | "literal_absent"
+        | "ambiguous_literal";
+    };
 
 interface NativeFindingInventory {
   total: number;
@@ -802,25 +819,30 @@ function safeScannerLine(value: unknown): number | null {
 function sourceLineIfProven(
   finding: Record<string, unknown>,
   staged: StagedScanInput | undefined,
-): number | null {
+): SourceLineWitness {
   // Decoder coordinates are not source coordinates. Only a PLAIN finding with
   // one exact occurrence in a host-staged original blob gets a source line.
-  if (finding.DecoderName !== "PLAIN" || staged?.kind !== "blob" || !staged.bytes) return null;
+  if (finding.DecoderName !== "PLAIN") return { line: null, reason: "unsupported_decoder" };
+  if (staged?.kind !== "blob") return { line: null, reason: "not_staged_blob" };
+  if (!staged.bytes) return { line: null, reason: "missing_source_bytes" };
   const literal = typeof finding.RawV2 === "string" ? finding.RawV2 : undefined;
-  if (!literal) return null;
-  if (staged.bytes.length > SOURCE_WITNESS_MAX_BYTES || literal.length > 64 * 1024) return null;
+  if (!literal) return { line: null, reason: "missing_literal" };
+  if (staged.bytes.length > SOURCE_WITNESS_MAX_BYTES)
+    return { line: null, reason: "source_size_limit" };
+  if (literal.length > 64 * 1024) return { line: null, reason: "literal_size_limit" };
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(staged.bytes);
   } catch {
-    return null;
+    return { line: null, reason: "invalid_source_utf8" };
   }
   const offset = text.indexOf(literal);
   // Include overlapping occurrences when rejecting ambiguous witnesses.
-  if (offset < 0 || text.indexOf(literal, offset + 1) !== -1) return null;
+  if (offset < 0) return { line: null, reason: "literal_absent" };
+  if (text.indexOf(literal, offset + 1) !== -1) return { line: null, reason: "ambiguous_literal" };
   let line = 1;
   for (let i = 0; i < offset; i++) if (text[i] === "\n") line++;
-  return line;
+  return { line, reason: "unique_plain_literal" };
 }
 
 function nativeFindingInventory(
@@ -844,7 +866,7 @@ function nativeFindingInventory(
     const source = object(object(object(finding.SourceMetadata)?.Data)?.Filesystem);
     const file = typeof source?.file === "string" ? source.file : undefined;
     const staged = file ? inputs.get(file) : undefined;
-    const sourceLine = sourceLineIfProven(finding, staged);
+    const witness = sourceLineIfProven(finding, staged);
     const entry: NativeFindingInventoryEntry = {
       index,
       detectorType: safeFindingType(finding),
@@ -853,8 +875,9 @@ function nativeFindingInventory(
       adjudication: index === firstRefusal ? "first_refusal" : "unadjudicated",
       scannerInputLine: safeScannerLine(source?.line),
       material: staged ? materialDiagnostic(staged) : null,
-      sourceLine,
-      sourceLineStatus: sourceLine === null ? "unavailable" : "proven",
+      sourceLine: witness.line,
+      sourceLineStatus: witness.line === null ? "unavailable" : "proven",
+      sourceLineReason: witness.reason,
     };
     const candidate = [...retained, entry];
     // Account for the actual pretty-printed depth under failure.scan.nativeFindings.

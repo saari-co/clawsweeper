@@ -120,7 +120,7 @@ test("Codex subprocess prevents pnpm deploy from installing target Git hooks", (
       JSON.stringify({
         name: "clawsweeper-hook-fixture",
         version: "1.0.0",
-        scripts: { prepare: "node scripts/prepare.mjs" },
+        scripts: { postinstall: "node scripts/prepare.mjs" },
       }),
     );
     fs.writeFileSync(path.join(root, "pnpm-workspace.yaml"), 'packages:\n  - "."\n');
@@ -151,7 +151,7 @@ test("Codex subprocess prevents pnpm deploy from installing target Git hooks", (
 
     const safe = deploy("safe", codexSubprocessEnv());
     assert.equal(safe.status, 0, safe.stderr || safe.stdout);
-    assert.doesNotMatch(safe.stdout, /prepare\$/);
+    assert.doesNotMatch(safe.stdout, /postinstall\$/);
     const hooks = spawnSync("git", ["config", "--local", "--get", "core.hooksPath"], {
       cwd: root,
       encoding: "utf8",
