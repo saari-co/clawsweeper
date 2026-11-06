@@ -1,69 +1,29 @@
 # ClawSweeper Orchestration
 
-Read when changing command intake, repair job creation, workflow dispatch,
-worker-capacity routing, automerge, issue implementation, or generated repair
-state.
+Read when changing command intake, exact review dispatch, queue capacity,
+publication, or apply state.
 
-ClawSweeper should stay simple at the orchestration boundary:
-
-1. Intake normalizes events and commands into a job or exact review request.
-2. The scheduler chooses priority and worker capacity.
-3. Codex owns review, repair, rebase, CI diagnosis, and narrow implementation.
-4. Deterministic code owns auth, repo boundaries, worker caps, exact-head merge
-   safety, and GitHub mutations.
-5. Comments, records, ledgers, and dashboards are generated status surfaces,
-   not independent sources of truth.
-
-## Canonical Job Intent
-
-Repair jobs carry `job_intent` in frontmatter. This is the durable routing
-contract shared by comment commands, automerge, issue implementation,
-commit-finding repair, manual repair jobs, and low-signal cleanup.
-
-Current intents:
-
-- `repair_cluster`: ordinary manually or scheduler-created repair work
-- `automerge_pr`: maintainer-approved PR repair/automerge loop
-- `implement_issue`: ClawSweeper-generated issue implementation PR lane
-- `commit_finding`: repair job created by the retired commit-review lane (kept
-  so existing jobs stay executable)
-- `low_signal_pr_cleanup`: narrow stale/low-signal PR cleanup
-
-Older `source` values remain for compatibility, but new code should make
-decisions from `job_intent` first and only fall back to `source` for legacy
-jobs. Unknown intents fail job validation.
-
-## Worker Lanes
-
-`job_intent` maps to worker capacity:
-
-- `automerge_pr` -> `automerge_repair`
-- `implement_issue` -> `issue_implementation`
-- all other repair jobs -> `repair`
-
-`repair:dispatch` derives the default live-worker cap from the job intent when
-the caller does not pass `--max-live-workers` or set
-`CLAWSWEEPER_MAX_LIVE_WORKERS`. Workflows may still pass an explicit cap when
-they intentionally want a narrower lane.
+1. Intake normalizes events and review commands into exact review requests.
+2. The durable queue chooses priority and worker capacity.
+3. Codex owns read-only review.
+4. Deterministic code owns authorization, repository boundaries, capacity,
+   source-freshness checks, and apply mutations.
+5. Comments, records, ledgers, and dashboards are projections, not independent
+   sources of truth.
 
 ## Review execution and publication
 
 Each review starts one Codex process. Codex owns request and stream recovery;
 ClawSweeper preserves the final error classification and lets the durable queue
-own any fresh review attempt. The app-server worker reports a failed turn with
-the turn's own error (`Codex turn failed: <message>`) and an interrupted turn as
-`Codex turn interrupted.`; failure diagnostics read an app-server turn error from
-its `turn/completed` notification ahead of captured stderr, as they read native
-`turn.failed` events. The repair lane's review/fix iteration budget is
-separate from transport recovery.
+own any fresh review attempt. Failure diagnostics read native `turn.failed`
+events ahead of captured stderr.
 
 On POSIX, the shared Codex spawn helper kills remaining group members when the
 direct child exits naturally, including descendants holding output pipes open.
 Requested termination retains the existing graceful interval and worker-owned
 final cleanup, including asynchronous errors after the leader exits. Result
 capture still waits for stdio to close. Repeated signals do not interrupt
-escalation, and the app-server worker also finishes group cleanup after
-completed or failed turns before it exits.
+escalation.
 
 The shared OpenClaw source setup script bounds only its network Codex tag fetch.
 Its default deadline is two minutes; the first present setting among
@@ -75,10 +35,12 @@ this one fetch owner, which stops Git's process group before returning and leave
 Git low-speed settings untouched. Existing cache, pin validation, and retry
 classification remain unchanged.
 
-A batch publisher hydrates only the complete record tuples named by its review
-artifacts, reconciles those selected tuples against current GitHub state, then
-publishes the records and synchronizes their comments in the same job. It does not download the repository-wide snapshot, pull source Git
-history, reconcile unrelated records, or dispatch another comment-sync run.
+A batch publisher hydrates only the complete canonical record tuple for each
+claimed item, inside its isolated preparation worker. The batch heartbeat and
+preparation deadline cover those reads. It reconciles each selected tuple against
+current GitHub state, then publishes the records and synchronizes their comments
+in the same job. It does not download the repository-wide snapshot, pull source
+Git history, reconcile unrelated records, or dispatch another comment-sync run.
 Scheduled comment synchronization remains a recovery path.
 Explicit-item planning uses the same requested item set for focused hydration
 and selection. Repository-wide planning still loads the repository snapshot.
@@ -91,8 +53,7 @@ webhook intake, repository-dispatch fallback, manual dispatch, and scheduled
 runs use the same behavior.
 
 The activity observer is intentionally lossy and may cancel older in-progress
-observer runs. Review, repair, automerge, apply, and command-router jobs are
-not lossy.
+observer runs. Review, apply, and command-router jobs are not lossy.
 
 ## What Must Stay Deterministic
 
@@ -101,10 +62,9 @@ Do not move these checks into model judgment:
 - maintainer/write authorization
 - target repository allow/deny boundaries
 - protected labels and maintainer-authored close guards
-- stale item drift and exact-head merge checks
+- stale item drift and exact-head review identity
 - worker-budget enforcement
-- final GitHub comments, labels, closes, pushes, and merges
-- no direct local edits to foreign PRs by a human operator
+- final GitHub comments, labels, and closes
 
-Codex can decide what code needs to change; deterministic code decides whether
-the resulting mutation is allowed and applies it.
+Codex proposes a disposition; deterministic code decides whether the resulting
+apply mutation is allowed and applies it.

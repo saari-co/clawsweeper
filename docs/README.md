@@ -21,16 +21,15 @@ manual.
 | Set up a development checkout                       | [Contributing](../CONTRIBUTING.md)            | [Local run](../README.md#local-run)                 |
 | Understand review and scheduling                    | [Scheduler](scheduler.md)                     | [Automation limits](limits.md)                      |
 | Add or operate a target repository                  | [Target repositories](target-repositories.md) | [Target dispatcher](target-dispatcher.md)           |
-| Inspect production without mutation                 | [Live dashboard](live-dashboard.md)           | [OpenClaw Bay](openclaw-bay-demo.md)                |
+| Inspect production without mutation                 | [Live dashboard](live-dashboard.md)           | [Public observer API](public-api.md)                |
 | Inspect observer routes and configuration ownership | [Public observer API](public-api.md)          | [Operator configuration](operator-configuration.md) |
-| Operate repair or automerge                         | [Repair entry point](repair/README.md)        | [Repair operations](repair/operations.md)           |
 | Prepare proof for a change                          | [Contributing](../CONTRIBUTING.md)            | [Agent instructions](../AGENTS.md)                  |
 | Review a local committed range                      | [Local branch review](commit-sweeper.md)      | `pnpm local-review -- --base origin/main`           |
+| Qualify the full local review artifact              | [Private local package](local-package.md)     | Build, pack, and install outside the checkout       |
 
 Production mutation commands are intentionally not repeated here. Follow the
-linked runbook, confirm its status and source of truth, and keep all execution,
-fix, merge, automerge, deployment, and queue gates closed unless the current
-operator has explicit authority to open them.
+linked runbook, confirm its status and source of truth, and keep deployment,
+queue, and apply gates closed unless the current operator has explicit authority.
 
 ## Document lifecycle
 
@@ -57,12 +56,21 @@ everything else requires human comparison with current main.
   execution behavior
 - [State storage](state-storage.md) — active; Worker, R2, and Git-backed state
   ownership
+- [Canonical body tiering](canonical-body-tiering.md) — proposed; preserve records
+  while moving exact bodies from SQLite to the existing R2 bucket
 - [Action ledger](action-ledger.md) — active; mutation receipts and replay
   boundaries
-- [Work lane](work-lane.md) — active; bounded workflow admission
+- [Issue review advisory labels](work-lane.md) — active; structured review labels
 - [Review cache](review-cache.md) — active; reusable review-state contract
+- [Intake triage](intake-triage.md) — active; bounded preliminary classification
+- [Manual Coverage credential probe](coverage-credential-probe.md) — active;
+  fixed read-only credential comparison, safety guard, and evidence limits
+- [Local review preflight summary](portable-review-receipt.md) — proposed
+  local-range export; bounded advisory PR-body handoff and review-content reader
 - [GitHub webhook read model](github-webhook-read-model.md) — active; signed
-  ingress, App subscriptions, snapshot freshness, repair, and safety boundary
+  ingress, App subscriptions, snapshot freshness, and safety boundary
+- [Review authority contract](review-authority.md) — proposed integration;
+  inert acquisition binding, role classifier, and caller migration boundaries
 
 ## Configuration and repository onboarding
 
@@ -88,18 +96,19 @@ everything else requires human comparison with current main.
   operator diagnostics
 - [Queue-service split runbook](queue-service-split-runbook.md) — proposed;
   unapproved production migration plan
-- [Repair operations](repair/operations.md) — active; canonical repair operator
-  procedures, trust checks, gates, and token boundaries
 - [Local ClawSweeper skill](local-clawsweeper-skill.md) — active; read-only
   local exact-item or committed-range review
 
+- [Input-scan refusal diagnostics](input-scan-diagnostics.md) — active; exact-run,
+  read-only inspection of sanitized failure metadata
+
 ## Dashboards and observability
 
-- [Live dashboard](live-dashboard.md) — active; Worker status and operational
-  telemetry
+- [Live dashboard](live-dashboard.md) — active; Worker status, operational
+  telemetry, and resumable observational coverage census ownership/proof limits
+- [Agent performance metrics](agent-performance-metrics.md) — execution timing, repeated work, chart ownership and observation limits
 - [GitHub publication egress telemetry](github-egress-telemetry.md) — active;
   wire denominator, credential attribution, completeness, and retention
-- [OpenClaw Bay](openclaw-bay-demo.md) — active; public six-lane visualization
 - [Triage dashboard](triage-dashboard.md) — active; cached issue triage
 - [PR proof triage](pr-proof-triage-dashboard.md) — active; maintainer proof
   inspection
@@ -109,11 +118,11 @@ everything else requires human comparison with current main.
 - [Contributing](../CONTRIBUTING.md) — active; setup, scope, PR evidence, and
   author-owned review loop
 - [Agent instructions](../AGENTS.md) — active and binding for coding agents
+- [Changelog fragments](../changelog.d/README.md) — active; one-bullet
+  ClawSweeper release-note fragments and the release-time stitch
 - [PR review comments](pr-review-comments.md) — active; review-thread handling
 - [Related issue discovery](related-issue-discovery.md) — active; duplicate and
   adjacent-report context
-- [Live proof](live-proof.md) — retired for automatic generation;
-  compatibility-only validation, rendering, publication, and retraction
 
 `docs/proof/**` contains inspectable artifacts for specific changes. Those
 files support their recorded claim but do not override current runbooks.
@@ -131,25 +140,6 @@ Keep a heavy binary only when an active canonical document embeds or links it,
 or when runtime or test tooling consumes it. Prefer one current compressed
 poster or WebP over accumulated before/after sets.
 
-## Repair and automerge
-
-- [Repair entry point](repair/README.md) — active; concepts, task map, and local
-  command reference
-- [Repair operations](repair/operations.md) — active; canonical operator
-  procedures
-- [Internal feature map](repair/internal-features.md) — active implementation
-  reference, not an operator runbook
-- [Steerable repair architecture](steerable-repair-automation.md) — active;
-  end-to-end protocol and control boundaries
-- [Trusted PR repair](repair/auto-update-prs.md) — active; autofix/automerge
-  contract
-- [Automatic issue PRs](repair/automatic-issue-prs.md) — active; guarded issue
-  implementation intake
-- [Automerge flow](repair/automerge-flow.md) — active; state machine
-- [Automerge proof](repair/automerge-e2e.md) — active; controlled proof harness
-- [Containment validation history](repair/containment-validation-todo.md) —
-  historical; completed July 2026 work
-
 ## Close policy
 
 - [Implemented-on-main paired close policy](implemented-on-main-close-policy.md)
@@ -165,7 +155,6 @@ poster or WebP over accumulated before/after sets.
 
 ## Security and special-purpose surfaces
 
-- [Spam scanner](spam-scanner.md) — active; trust and classification boundary
 - Security-sensitive work must use maintainer security handling rather than a
   normal public PR or public documentation page.
 
@@ -179,8 +168,8 @@ Review the relevant pages in the same change when any of these surfaces move:
   apply membership: target-repository and dispatcher docs
 - exact-review queue schema, retry classification, publication capacity,
   batching, direct publication, or state writing: scheduler, limits, dashboard,
-  Bay, and queue runbooks
-- dashboard route, projection, or public-field changes: dashboard and Bay docs
+  and queue runbooks
+- dashboard route, projection, or public-field changes: dashboard docs
 - publication GitHub request paths, credential selection, or egress fields:
   GitHub egress telemetry and public API docs
 - mutation, close, proof, repair, or merge policy changes: policy pages,
@@ -197,7 +186,8 @@ selected configuration-derived claims in
 CI path. Add a manifest claim when volatile production configuration is quoted
 as a concrete value in prose. Stage newly added files before running the check
 so its repository inventory matches the proposed commit rather than unrelated
-untracked workspace contents.
+untracked workspace contents. `pnpm run check:changelog` runs in the same static
+check and validates pending `changelog.d/` fragments.
 
 The check deliberately does not crawl external URLs, infer policy, assign
 ownership, or treat historical proof commands and paths as current contracts.

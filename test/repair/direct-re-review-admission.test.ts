@@ -18,41 +18,18 @@ const options = {
   additionalPrompt: "Review this PR.",
 };
 
-test("verified review intake preserves explicit denied or selected proof scope through JSON", () => {
-  const unrestricted = directReReviewIntake(options);
-  assert.equal(Object.hasOwn(unrestricted.decision, "proofAllowedScenarios"), false);
-  for (const proofAllowedScenarios of [
-    [],
-    ["web-ui-chat-proof"],
-    ["telegram-bot-e2e-proof"],
-    ["web-ui-chat-proof", "telegram-bot-e2e-proof"],
-  ] as const) {
-    const intake = directReReviewIntake({
-      ...options,
-      proofAllowedScenarios: [...proofAllowedScenarios],
-    });
-    const restored = validateDirectReReviewIntake(JSON.parse(JSON.stringify(intake)));
-    assert.ok(restored);
-    assert.deepEqual(restored.decision.proofAllowedScenarios, proofAllowedScenarios);
-  }
+test("verified review intake preserves its canonical identity through JSON", () => {
+  const intake = directReReviewIntake(options);
+  assert.deepEqual(validateDirectReReviewIntake(JSON.parse(JSON.stringify(intake))), intake);
 });
 
-test("malformed proof scope cannot become an unrestricted admitted review", () => {
+test("historical command intake retains canonical identity despite retired journey metadata", () => {
   const intake = directReReviewIntake(options);
-  for (const scope of [
-    null,
-    undefined,
-    "web-ui-chat-proof",
-    ["unknown"],
-    ["web-ui-chat-proof", "web-ui-chat-proof"],
-    ["web-ui-chat-proof", "telegram-bot-e2e-proof", "unknown"],
-  ]) {
-    assert.equal(
-      validateDirectReReviewIntake({
-        ...intake,
-        decision: { ...intake.decision, proofAllowedScenarios: scope },
-      }),
-      null,
-    );
+  for (const bayJourneyDeliveryId of ["historical-delivery", null, { legacy: true }]) {
+    const restored = validateDirectReReviewIntake({
+      ...intake,
+      decision: { ...intake.decision, bayJourneyDeliveryId },
+    });
+    assert.deepEqual(restored, intake);
   }
 });

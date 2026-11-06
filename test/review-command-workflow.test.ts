@@ -20,26 +20,34 @@ import { useFakeScanner } from "./agent-input-scan-helpers.ts";
 import { runAgentCheckoutInspection, runAgentProcess } from "../dist/agent-runner.js";
 import { createReviewActionLedger } from "../dist/clawsweeper-review-ledger.js";
 import { readAllSpooledActionEvents } from "../dist/action-ledger.js";
-import { closeDecision, reviewFinding } from "./helpers.ts";
+import { closeDecision, reviewFinding, withMockGh, withReviewRecord } from "./helpers.ts";
 import { AgentInputScanError, agentInputScanFailureExitCode } from "../dist/agent-input-scan.js";
 import { prepareOpenClawCodexSourceForReview } from "../dist/openclaw-codex-source.js";
-import { reviewStatusForDecision } from "../dist/clawsweeper-report-document.js";
+import {
+  reviewStatusForDecision,
+  updateReviewStructuralFrontMatter,
+} from "../dist/clawsweeper-report-document.js";
 import { previousClawSweeperReviewFromComment } from "../dist/clawsweeper-review-comments.js";
-import { createContextHydration } from "../dist/clawsweeper-context-hydration.js";
-import { asRecord } from "../dist/clawsweeper-item-policy.js";
+import { hydratePullRequestReviewSource } from "../dist/clawsweeper-context-hydration.js";
+import { withGitHubRun } from "../dist/clawsweeper-github-runtime.js";
 import {
   materializePullRequestReviewTree,
   removePullRequestReviewTree,
   ReviewGitError,
 } from "../dist/clawsweeper-review-blobs.js";
 import { ReviewSourcePreparationError } from "../dist/review-source-preparation.js";
-import { ValidationRecoveryRequiredError } from "../dist/repair/validation-recovery.js";
+import { ValidationRecoveryRequiredError } from "../dist/validation-recovery.js";
 import { reviewOutputItemBudget } from "../dist/review-output-policy.js";
+import { serializeReviewPreflightPayload } from "../dist/review-preflight-contract.js";
+import {
+  withHostedPreflightSource,
+  withLocalPreflightSource,
+} from "../dist/review-preflight-display.js";
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 
 import { parseArgs } from "../dist/clawsweeper-args.js";
 import {
   createReviewCommandWorkflow,
-  reviewCommandProofBinding,
   localExactBootstrapReviewCommentBody,
   withRunnerPreflightProvenance,
 } from "../dist/clawsweeper-review-command-workflow.js";
@@ -49,8 +57,7 @@ import {
   suppliedReviewStartLeaseFromArgs,
 } from "../dist/clawsweeper-review-lease.js";
 import { PUBLIC_CODEX_MODEL } from "../dist/codex-env.js";
-import { proofFixture } from "./helpers/command-proof-fixtures.ts";
-import { verifyCommandProof } from "../dist/repair/proof-receipt-verification.js";
+import { itemContentDigest } from "../dist/clawsweeper-source-revision.js";
 import {
   createReviewStructuralRecord,
   type ReviewStructuralSnapshot,
@@ -63,6 +70,9 @@ const LEASE_OWNER = "github-run-123-1";
 const LEASE_COMMENT_ID = 456;
 const PRIOR_ACTIVITY_AT = "2026-08-07T10:00:00Z";
 const RESERVED_AT = "2026-08-07T10:05:00Z";
+const HELD_LEASE_EXPIRES_AT = "2026-08-07T11:00:00Z";
+const CURRENT_TARGET_SHA = "a".repeat(40);
+const REVIEWED_TARGET_SHA = "b".repeat(40);
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -79,14 +89,6 @@ const safeFixtureQuote = fixtureQuote.replace(
   reviewedUri,
   "[reviewed synthetic URI omitted; inspect test/action-ledger-runtime.test.ts]",
 );
-
-function replaceFrontMatterValue(markdown: string, key: string, value: string): string {
-  const line = `${key}: ${value}`;
-  const pattern = new RegExp(`^${key}:\\s*.*$`, "m");
-  return pattern.test(markdown)
-    ? markdown.replace(pattern, line)
-    : markdown.replace(/^---\n/, `---\n${line}\n`);
-}
 
 function structuralRecord(
   activityUpdatedAt: string,
@@ -124,51 +126,6 @@ function structuralRecord(
   return record;
 }
 
-test("evidence-triggered full review requires its trusted source action and complete subject binding", () => {
-  const fixture = proofFixture();
-  const verified = verifyCommandProof(fixture);
-  assert.notEqual(verified.outcome, "inconclusive");
-  if (verified.outcome === "inconclusive") throw new Error(verified.reason);
-  const prompt = verified.reviewContext;
-  for (const sourceAction of [
-    undefined,
-    "",
-    "re_review",
-    "manual",
-    "internal",
-    "scheduled_normal_backfill",
-  ]) {
-    assert.throws(
-      () => reviewCommandProofBinding(sourceAction, prompt),
-      /lost its trusted source action; full review required/,
-      String(sourceAction),
-    );
-  }
-  assert.equal(reviewCommandProofBinding("scheduled_normal_backfill", "ordinary review"), null);
-  assert.deepEqual(reviewCommandProofBinding("command_proof_result", prompt), {
-    headSha: fixture.claim.headSha,
-    bodySha256: fixture.claim.bodySha256,
-    baseRefSha256: digest(fixture.claim.targetBranch),
-    baseSha: fixture.claim.baseSha,
-    requestId: fixture.claim.requestId,
-    scenario: fixture.claim.scenario,
-  });
-  for (const invalid of [
-    "",
-    "ordinary review",
-    prompt.replace(" base=" + digest("main"), ""),
-    prompt.replace("base=" + digest("main"), "base=unknown"),
-    prompt.replace(" base_sha=" + fixture.claim.baseSha, ""),
-    prompt.replace("base_sha=" + fixture.claim.baseSha, "base_sha=unknown"),
-    "prefix\n" + prompt,
-  ]) {
-    assert.throws(
-      () => reviewCommandProofBinding("command_proof_result", invalid),
-      /missing its exact-subject binding/,
-    );
-  }
-});
-
 test("exact local bootstrap rejects a same-number report from another repository", () => {
   const report = [
     "---",
@@ -178,8 +135,6 @@ test("exact local bootstrap rejects a same-number report from another repository
     "---",
     "Foreign report",
   ].join("\n");
-  const frontMatterValue = (markdown: string, key: string): string | undefined =>
-    markdown.match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim();
   let renderCalls = 0;
   const render = () => {
     renderCalls += 1;
@@ -190,7 +145,6 @@ test("exact local bootstrap rejects a same-number report from another repository
     localExactBootstrapReviewCommentBody(
       report,
       { repo: "openclaw/clawsweeper", number: ITEM_NUMBER },
-      frontMatterValue,
       render,
     ),
     "rendered review history",
@@ -199,7 +153,6 @@ test("exact local bootstrap rejects a same-number report from another repository
     localExactBootstrapReviewCommentBody(
       report,
       { repo: "openclaw/openclaw", number: ITEM_NUMBER },
-      frontMatterValue,
       render,
     ),
     "",
@@ -208,7 +161,6 @@ test("exact local bootstrap rejects a same-number report from another repository
     localExactBootstrapReviewCommentBody(
       report,
       { repo: "openclaw/clawsweeper", number: ITEM_NUMBER + 1 },
-      frontMatterValue,
       render,
     ),
     "",
@@ -219,7 +171,7 @@ test("exact local bootstrap rejects a same-number report from another repository
 test("cache preflight promotes legacy carried reports to runner-owned provenance", () => {
   const legacy = "---\nreview_status: complete\nlocal_checkout_access: unverified\n---\nLegacy";
 
-  const promoted = withRunnerPreflightProvenance(legacy, replaceFrontMatterValue);
+  const promoted = withRunnerPreflightProvenance(legacy);
 
   assert.match(promoted, /^local_checkout_access: verified$/m);
   assert.match(promoted, /^local_checkout_access_source: runner_preflight_v1$/m);
@@ -258,11 +210,18 @@ const scheduledScenarios = [
   "changed-pr-clean",
   "changed-pr-proof-invalid-cursor",
   "changed-pr-proof-maintainer-change",
+  "changed-pr-write-access",
   "changed-pr-partial-json-findings",
   "changed-pr-partial-json-incomplete-source",
   "changed-pr-partial-json-generic",
   "content-clean",
+  "content-held",
+  "content-target-drift",
+  "content-target-drift-expired",
   "fresh-refusal",
+  "closed-before-selection",
+  "closed-pinned-before-selection",
+  "empty-batch-selection",
 ];
 
 interface OutputBudgetCase {
@@ -275,17 +234,28 @@ function testScheduledCacheScenario(
   scenario: string,
   publicationCase?: PublicationCacheCase,
   outputCase?: OutputBudgetCase,
+  preflightCase?: {
+    local: boolean;
+    missing?: boolean;
+    metadata?: boolean;
+    stale?: boolean;
+    hostedPrior?: boolean;
+  },
 ) {
-  const name = outputCase
-    ? `${scenario} ${outputCase.localOnly ? "local" : "hosted"} ${outputCase.retention} ${outputCase.surface} run admission`
-    : publicationCase
-      ? `${scenario} publication policy ${publicationCase.name}`
-      : `scheduled ${scenario} preserves admission and terminal ledger classification`;
+  const name = preflightCase
+    ? `preflight display ${scenario} ${JSON.stringify(preflightCase)}`
+    : outputCase
+      ? `${scenario} ${outputCase.localOnly ? "local" : "hosted"} ${outputCase.retention} ${outputCase.surface} run admission`
+      : publicationCase
+        ? `${scenario} publication policy ${publicationCase.name}`
+        : `scheduled ${scenario} preserves admission and terminal ledger classification`;
   test(name, (t) => {
     const refuseScan = scenario.endsWith("refusal");
     const findingRefusal = scenario.includes("findings-refusal");
+    const closedBeforeSelection = scenario.startsWith("closed-");
     const invalidProofPrior = scenario.startsWith("changed-pr-proof-");
     const proofMaintainerChange = scenario === "changed-pr-proof-maintainer-change";
+    const writeAccessAuthor = scenario === "changed-pr-write-access";
     const sourceIncompatible = scenario.endsWith("source-incompatible");
     const codexFailure = scenario.endsWith("codex-failure") || sourceIncompatible;
     const exactFailure = scenario.includes("exact");
@@ -304,11 +274,20 @@ function testScheduledCacheScenario(
       ? scenario.slice("changed-pr-partial-json-".length)
       : null;
     const changedPr = scenario.startsWith("changed-pr-");
-    const isPullRequest = changedPr || cacheRecovery;
+    const isPullRequest = changedPr || cacheRecovery || Boolean(preflightCase);
     const fresh = scenario === "fresh-refusal" || changedPr;
     const publicationCacheMiss = publicationCase?.compatible === false;
     const contentPath = scenario.startsWith("content-");
-    const hydrated = fresh || contentPath || cacheRecovery || publicationCacheMiss;
+    const hydrated =
+      fresh ||
+      contentPath ||
+      cacheRecovery ||
+      publicationCacheMiss ||
+      Boolean(preflightCase?.local);
+    const heldElsewhere = scenario === "content-held";
+    // Only the target branch moved since the last full issue review.
+    const targetDrift = scenario.startsWith("content-target-drift");
+    const targetDriftExpired = scenario === "content-target-drift-expired";
     if (refuseScan && !earlyScanRefusal)
       useFakeScanner(
         t,
@@ -323,7 +302,7 @@ for (const [index, decoder] of ["PLAIN", "HTML"].entries()) console.log(JSON.str
 }));
 console.error(JSON.stringify({
   level: "info-0", logger: "trufflehog", msg: "finished scanning",
-  trufflehog_version: "3.97.4", chunks: 1, bytes: 1,
+  trufflehog_version: "3.99.4", chunks: 1, bytes: 1,
   verified_secrets: 0, unverified_secrets: 2,
 }));
 process.exit(183);
@@ -345,7 +324,8 @@ process.exit(183);
     mkdirSync(target);
     const mediaCase = outputCase?.surface === "media";
     const cumulativeCase = outputCase?.surface === "cumulative";
-    const twoItems = partialJsonFailure || mediaCase || cumulativeCase;
+    const twoItems =
+      partialJsonFailure || mediaCase || cumulativeCase || scenario === "empty-batch-selection";
     const oversized =
       outputCase?.surface === "report"
         ? "x".repeat((outputCase.retention === "debug" ? 64 : 16) * 1024 * 1024 + 1)
@@ -376,11 +356,7 @@ else {
         mkdirSync(artifactDir);
         const item = reviewOutputItemBudget("debug", 2);
         const reserved =
-          2 *
-            (item.promptFileBytes +
-              item.resultFileBytes +
-              item.streamFileBytes * 2 +
-              item.threadStateBytes) +
+          2 * (item.promptFileBytes + item.resultFileBytes + item.streamFileBytes * 2) +
           item.metadataBytes +
           item.reportsBytes;
         const existing = join(artifactDir, "existing");
@@ -407,6 +383,26 @@ else {
     git("add", ".");
     git("commit", "-qm", "change");
     const headSha = git("rev-parse", "HEAD");
+    const preflightPull = {
+      number: ITEM_NUMBER,
+      state: "open",
+      additions: preflightCase?.metadata ? 50_001 : 1,
+      deletions: 1,
+      changed_files: 1,
+      base: { sha: baseSha, repo: { full_name: REPO } },
+      head: { sha: headSha, repo: { full_name: "fork-owner/project" } },
+      body: preflightCase?.missing
+        ? "No advisory"
+        : serializeReviewPreflightPayload({
+            v: 1,
+            repo: REPO,
+            base: baseSha,
+            head: preflightCase?.stale ? baseSha : headSha,
+            tool: { name: "private-tool", version: "private-version" },
+            completion: "failed",
+            summary: "private-advisory-marker",
+          }),
+    };
     if (fetchFailure) git("remote", "add", "origin", join(root, "unavailable.git"));
     if (blobMetadataFailure) {
       const blob = git("rev-parse", `${headSha}:value.ts`);
@@ -519,7 +515,38 @@ else {
       created_at: RESERVED_AT,
       updated_at: RESERVED_AT,
     };
-    const priorMarkdown = `---\n${publicationCase?.cachedPolicy ?? ""}decision: keep_open\nreview_status: complete\n---\nCached review\n${oversized}`;
+    const activityCursor =
+      scenario === "changed-pr-proof-invalid-cursor"
+        ? "unusable-cursor"
+        : `v2:0:${digest("activity")}`;
+    let priorMarkdown = withReviewRecord(
+      `---\nrepository: ${REPO}\nnumber: ${ITEM_NUMBER}\ntype: ${item.kind}\n${preflightCase ? `pull_head_sha: ${headSha}\n` : ""}${targetDrift ? `main_sha: ${REVIEWED_TARGET_SHA}\nreview_structural_target_head_sha: ${REVIEWED_TARGET_SHA}\n` : ""}${publicationCase?.cachedPolicy ?? ""}decision: keep_open\nreview_status: complete\nreview_activity_cursor: ${activityCursor}\n---\nCached review\n${oversized}`,
+      {
+        decision: "keep_open",
+        closeReason: "none",
+        summary: "Cached review",
+      },
+    );
+    if (preflightCase)
+      priorMarkdown = (
+        preflightCase.hostedPrior ? withHostedPreflightSource : withLocalPreflightSource
+      )(priorMarkdown, {
+        repo: REPO,
+        number: ITEM_NUMBER,
+        targetDir: target,
+        pull: {
+          ...preflightPull,
+          body: serializeReviewPreflightPayload({
+            v: 1,
+            repo: REPO,
+            base: baseSha,
+            head: headSha,
+            tool: { name: "old", version: "1" },
+            completion: "complete",
+            summary: "old summary",
+          }),
+        },
+      });
     if (publicationCase) {
       mkdirSync(itemsDir);
       writeFileSync(join(itemsDir, `${ITEM_NUMBER}.md`), priorMarkdown);
@@ -534,7 +561,7 @@ else {
     let reviewTreeAttempts = 0;
     let reviewTreeCleanupCalls = 0;
     const privateReviewRoots = new Set<string>();
-    let blobMetadataCalls = 0;
+    const blobMetadataRequests = join(root, "blob-metadata-requests.jsonl");
     let earlyHydrationError: unknown;
     let activeReviewMutationRunner = null;
 
@@ -569,7 +596,6 @@ else {
       root,
       targetRepo: () => REPO,
       repoRelativePath: () => `records/openclaw-openclaw/items/${ITEM_NUMBER}.md`,
-      sha256: digest,
       isRuntimeBudgetError: () => false,
     });
     const providerCalls = join(root, "provider-calls");
@@ -581,7 +607,7 @@ else {
     );
 
     const dependencies = {
-      ghJson: () => ({}),
+      ghJson: () => (preflightCase ? preflightPull : {}),
       get activeReviewMutationRunner() {
         return activeReviewMutationRunner;
       },
@@ -589,12 +615,11 @@ else {
         activeReviewMutationRunner = value;
       },
       ...ledgerOwner,
-      CodexReviewError: class extends Error {},
       actionLedgerItemKey: (value: { repo: string; number: number }) =>
         `${value.repo}#${value.number}`,
-      asRecord,
       bulkFilerPolicyInvalidatesCachedReview: () => false,
-      bulkFilerRepositoryPermission: () => (proofMaintainerChange ? "maintain" : null),
+      bulkFilerRepositoryPermission: () =>
+        proofMaintainerChange ? "maintain" : writeAccessAuthor ? "write" : null,
       buildLocalRangeReview: () => {
         throw new Error("local range must not run");
       },
@@ -603,37 +628,27 @@ else {
         if (!hydrated) throw new Error("scheduled structural cache hit must not hydrate");
         if (cacheRecovery) assert.equal(reviewTreeAttempts, 1);
         if (fetchFailure || blobMetadataFailure || earlyScanRefusal || cacheRecovery) {
-          const unavailable = () => {
-            throw new Error("unexpected fixture dependency");
-          };
-          const hydration = createContextHydration(
-            new Proxy(
-              {
-                asRecord,
-                stringOrUndefined: (value: unknown) =>
-                  typeof value === "string" ? value : undefined,
-                isSafeGitBranchName: (branch: string) => branch === "main",
-                targetRepo: () => REPO,
-                ghJson: () => {
-                  blobMetadataCalls += 1;
-                  throw new Error("fixture blob metadata is unavailable");
-                },
-              },
-              { get: (target, key) => Reflect.get(target, key) ?? unavailable },
-            ) as Parameters<typeof createContextHydration>[0],
-          );
+          const ghScript = `const { appendFileSync } = require("node:fs");
+appendFileSync(${JSON.stringify(blobMetadataRequests)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+process.stderr.write("fixture blob metadata is unavailable\\n");
+process.exitCode = 1;
+`;
           try {
-            hydration.hydratePullRequestReviewSource({
-              itemNumber: ITEM_NUMBER,
-              targetDir: target,
-              pullRequest: {
-                base: {
-                  ref: "main",
-                  sha: invalidBase ? "invalid" : fetchFailure ? "e".repeat(40) : baseSha,
-                },
-                head: missingHead ? {} : { sha: headSha },
-              },
-            });
+            withMockGh(root, ghScript, () =>
+              withGitHubRun(() =>
+                hydratePullRequestReviewSource({
+                  itemNumber: ITEM_NUMBER,
+                  targetDir: target,
+                  pullRequest: {
+                    base: {
+                      ref: "main",
+                      sha: invalidBase ? "invalid" : fetchFailure ? "e".repeat(40) : baseSha,
+                    },
+                    head: missingHead ? {} : { sha: headSha },
+                  },
+                }),
+              ),
+            );
           } catch (error) {
             earlyHydrationError = error;
             throw error;
@@ -667,14 +682,24 @@ else {
         reviewPolicy: POLICY,
         reviewModel: PUBLIC_CODEX_MODEL,
         itemSourceRevision: priorRecord.sourceRevision,
-        contentDigest: fresh ? digest("old-content") : digest("content"),
-        lastFullReviewAt: new Date(Date.now() - 60_000).toISOString(),
+        contentDigest: fresh
+          ? digest("old-content")
+          : targetDrift
+            ? itemContentDigest(item, context, {
+                mainSha: REVIEWED_TARGET_SHA,
+                releaseStateComplete: true,
+                latestRelease: null,
+              })
+            : digest("content"),
+        lastFullReviewAt: new Date(
+          Date.now() - (targetDriftExpired ? 25 * 60 * 60_000 : 60_000),
+        ).toISOString(),
         lastFullReviewDecision: "keep_open",
         structuralRecord: (fresh || contentPath) && !cacheRecovery ? null : priorRecord,
       }),
       fetchReviewStructuralRecord: ({ onPullIdentity }) => {
         structuralFetches += 1;
-        if (pull) onPullIdentity?.({ baseSha, headSha });
+        if (pull) onPullIdentity?.({ baseSha: baseSha, headSha });
         return currentRecord;
       },
       finishReviewActionLedgerItem: (options: { completionReason?: string }) => {
@@ -683,26 +708,29 @@ else {
       },
       freshDedicatedReviewStartLeases: (options: { headSha: string }) => {
         assert.equal(options.headSha, isPullRequest ? headSha : priorRecord.sourceRevision);
+        const supplied = {
+          comment: leaseComment,
+          startedAt: RESERVED_AT,
+          expiresAt: "2026-08-07T11:05:00Z",
+          owner: LEASE_OWNER,
+          commentId: LEASE_COMMENT_ID,
+        };
+        if (!heldElsewhere) return [supplied];
+        // A lower server comment id wins the election over the supplied lease.
+        const winnerId = LEASE_COMMENT_ID - 1;
         return [
           {
-            comment: leaseComment,
+            comment: { ...leaseComment, id: winnerId },
             startedAt: RESERVED_AT,
-            expiresAt: "2026-08-07T11:05:00Z",
-            owner: LEASE_OWNER,
-            commentId: LEASE_COMMENT_ID,
+            expiresAt: HELD_LEASE_EXPIRES_AT,
+            owner: "github-run-122-1",
+            commentId: winnerId,
           },
+          supplied,
         ];
       },
-      frontMatterValue: (_markdown: string, key: string) =>
-        outputCase?.surface === "history" && key === "review_status"
-          ? "complete"
-          : key === "review_activity_cursor"
-            ? scenario === "changed-pr-proof-invalid-cursor"
-              ? "unusable-cursor"
-              : `v2:0:${digest("activity")}`
-            : undefined,
       gitInfo: () => ({
-        mainSha: "a".repeat(40),
+        mainSha: CURRENT_TARGET_SHA,
         releaseStateComplete: true,
         latestRelease: null,
       }),
@@ -719,8 +747,9 @@ else {
       isSuppliedReviewStartLease,
       reviewLeaseStillMatchesContext,
       liveClawSweeperReviewDigest: () => digest("previous"),
-      stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
-      itemContentDigest: () => (changedPr ? digest("different-content") : digest("content")),
+      itemContentDigest: targetDrift
+        ? itemContentDigest
+        : () => (changedPr ? digest("different-content") : digest("content")),
       extractLatestClawSweeperReview: () => context.previousClawSweeperReview,
       extractClawSweeperReviewCommentBody: (body: string) =>
         previousClawSweeperReviewFromComment(
@@ -769,8 +798,10 @@ else {
         throw new Error("scheduled delivery must not post a second lease");
       },
       previousClawSweeperReviewDigestFromReport: () => digest("previous"),
-      replaceFrontMatterValue,
-      renderReviewCommentFromReport: () => "x".repeat(4 * 1024 * 1024 + 1),
+      renderReviewCommentFromReport: () =>
+        outputCase?.surface === "history"
+          ? "x".repeat(4 * 1024 * 1024 + 1)
+          : "rendered review history",
       repoFromArgs: () => ({ owner: "openclaw", repo: "openclaw" }),
       reportFileName: (_repo, number) => `${number}.md`,
       reportReviewFindings: () => [],
@@ -795,6 +826,8 @@ else {
       prepareMediaProofArtifacts: () => ({ manifestPath: null, summaryPath: null, artifacts: [] }),
       reviewEnvironment: () => ({ GH_TOKEN: "synthetic-inspection-token" }),
       buildReviewPrompt: (_item, reviewContext, _git, _additionalPrompt, runtimeHints) => {
+        if (preflightCase)
+          assert.doesNotMatch(JSON.stringify(reviewContext), /private-advisory-marker/);
         assert.equal(runtimeHints.hasGitHubToken, true);
         if (publicationCacheMiss)
           assert.deepEqual(reviewContext.previousClawSweeperReview, {
@@ -803,17 +836,19 @@ else {
         return { text: "Review the current item." };
       },
       itemSnapshotHash: () => digest("snapshot"),
-      codexFailureLogKind: () => "codex_execution",
       codexReviewFailureRetryable: (error: unknown) =>
         !(error instanceof AgentInputScanError) && !sourceIncompatible,
-      codexFailureDecision: () => {
+      codexReviewFailure: () => {
         if (codexFailure || preparationFailure || checkoutUnavailable)
-          return closeDecision({
-            decision: "keep_open",
-            closeReason: null,
-            summary: "Codex review failed: source preparation.",
-            localCheckoutAccess: "unverified",
-          });
+          return {
+            decision: closeDecision({
+              decision: "keep_open",
+              closeReason: "none",
+              summary: "Codex review failed: source preparation.",
+              localCheckoutAccess: "unverified",
+            }),
+            logKind: "codex_execution",
+          };
         throw new Error("scan refusal must not become a decision");
       },
       runCodex: ({
@@ -836,8 +871,14 @@ else {
           assert.equal(serviceTier, "");
         }
         if (scenario === "changed-pr-proof-maintainer-change") {
-          assert.equal(reasoningEffort, "high");
+          assert.equal(reasoningEffort, "medium");
           assert.equal(serviceTier, "fast");
+        }
+        if (writeAccessAuthor) {
+          assert.equal(reasoningEffort, "medium");
+          assert.equal(serviceTier, "fast");
+          // Write access alone selects priority service; it is not maintainer authorship.
+          assert.equal(reviewItem.authorAssociation, "CONTRIBUTOR");
         }
         generationCalls += 1;
         if (isPullRequest) {
@@ -892,12 +933,12 @@ else {
           throw new Error("generic second-item failure");
         }
         assert.ok(
-          isPullRequest || publicationCacheMiss,
+          isPullRequest || publicationCacheMiss || targetDriftExpired,
           "compatible unchanged input must use the cache",
         );
         return closeDecision({
           decision: "keep_open",
-          closeReason: null,
+          closeReason: "none",
           localCheckoutAccess: "verified",
           ...(invalidProofPrior
             ? {
@@ -920,25 +961,33 @@ else {
       },
       verifyRegressionProvenance: (decision) => decision,
       reviewActionForDecision: () => ({ actionTaken: "none" }),
-      markdownFor: ({ decision }) =>
-        `---\nreview_status: ${reviewStatusForDecision(decision)}\ndecision: keep_open\n---\nFresh Codex review\n${decision.reviewFindings.map((finding) => finding.title).join("\n")}\n${oversized}`,
+      markdownFor: ({ item: reviewItem, decision }) =>
+        withReviewRecord(
+          `---\nrepository: ${reviewItem.repo}\nnumber: ${reviewItem.number}\ntype: ${reviewItem.kind}\n${preflightCase ? `pull_head_sha: ${headSha}\n` : ""}review_status: ${reviewStatusForDecision(decision)}\ndecision: ${decision.decision}\n---\nFresh Codex review\n${decision.reviewFindings.map((finding) => finding.title).join("\n")}\n${oversized}`,
+          decision,
+        ),
       selectCandidates: () => ({
-        candidates: twoItems
-          ? [
-              { ...item },
-              {
-                ...item,
-                number: ITEM_NUMBER + 1,
-                url: `https://github.com/${REPO}/pull/${ITEM_NUMBER + 1}`,
-              },
-            ]
-          : [{ ...item }],
+        candidates:
+          closedBeforeSelection || scenario === "empty-batch-selection"
+            ? []
+            : twoItems
+              ? [
+                  { ...item },
+                  {
+                    ...item,
+                    number: ITEM_NUMBER + 1,
+                    url: `https://github.com/${REPO}/pull/${ITEM_NUMBER + 1}`,
+                  },
+                ]
+              : [{ ...item }],
         scannedPages: 1,
       }),
       suppliedReviewStartLeaseFromArgs,
       targetRepo: () => REPO,
       updateBulkFilerDetectedFrontMatter: (markdown: string) => markdown,
-      updateReviewStructuralFrontMatter: (markdown: string) => markdown,
+      updateReviewStructuralFrontMatter: targetDrift
+        ? updateReviewStructuralFrontMatter
+        : (markdown: string) => markdown,
     } as never;
 
     try {
@@ -952,50 +1001,64 @@ else {
           "--item-numbers",
           twoItems ? `${ITEM_NUMBER},${ITEM_NUMBER + 1}` : String(ITEM_NUMBER),
           "--readonly-openclaw",
+          ...(scenario === "closed-pinned-before-selection"
+            ? ["--expected-source-revision", "c".repeat(64)]
+            : []),
         ];
         reviewCommand(
           parseArgs(
-            outputCase
+            preflightCase
               ? [
                   ...commonArgs,
-                  ...(outputCase.retention === "none" ? [] : ["--artifact-dir", artifactDir]),
-                  "--output-retention",
-                  outputCase.retention,
+                  "--artifact-dir",
+                  artifactDir,
                   "--skip-start-comment",
-                  ...(outputCase.localOnly ? ["--local-only"] : []),
-                  ...(!outputCase.localOnly && !fresh
-                    ? ["--review-source-action", "scheduled_normal_backfill"]
-                    : []),
-                  ...(cumulativeCase ? ["--result-format", "json"] : []),
-                  ...(mediaCase || outputCase.localOnly
-                    ? []
+                  ...(preflightCase.local
+                    ? ["--local-only"]
                     : [
                         "--review-lease-owner",
                         LEASE_OWNER,
                         "--review-lease-comment-id",
                         String(LEASE_COMMENT_ID),
                       ]),
+                  "--review-source-action",
+                  "scheduled_normal_backfill",
                 ]
-              : partialJsonFailure
-                ? [...commonArgs, "--local-only", "--result-format", "json"]
-                : [
+              : outputCase
+                ? [
                     ...commonArgs,
-                    "--artifact-dir",
-                    artifactDir,
+                    ...(outputCase.retention === "none" ? [] : ["--artifact-dir", artifactDir]),
+                    "--output-retention",
+                    outputCase.retention,
                     "--skip-start-comment",
-                    "--review-lease-owner",
-                    LEASE_OWNER,
-                    "--review-lease-comment-id",
-                    String(LEASE_COMMENT_ID),
-                    "--review-source-action",
-                    invalidProofPrior ? "command_proof_result" : "scheduled_normal_backfill",
-                    ...(invalidProofPrior
-                      ? [
-                          "--additional-prompt",
-                          `<!-- command-proof-assessment-v1 head=${headSha} body=${digest("body")} base=${digest("main")} base_sha=${baseSha} request=${digest("request")} scenario=web-ui-chat-proof -->\nProof assessment`,
-                        ]
+                    ...(outputCase.localOnly ? ["--local-only"] : []),
+                    ...(!outputCase.localOnly && !fresh
+                      ? ["--review-source-action", "scheduled_normal_backfill"]
                       : []),
-                  ],
+                    ...(cumulativeCase ? ["--result-format", "json"] : []),
+                    ...(mediaCase || outputCase.localOnly
+                      ? []
+                      : [
+                          "--review-lease-owner",
+                          LEASE_OWNER,
+                          "--review-lease-comment-id",
+                          String(LEASE_COMMENT_ID),
+                        ]),
+                  ]
+                : partialJsonFailure
+                  ? [...commonArgs, "--local-only", "--result-format", "json"]
+                  : [
+                      ...commonArgs,
+                      "--artifact-dir",
+                      artifactDir,
+                      "--skip-start-comment",
+                      "--review-lease-owner",
+                      LEASE_OWNER,
+                      "--review-lease-comment-id",
+                      String(LEASE_COMMENT_ID),
+                      "--review-source-action",
+                      "scheduled_normal_backfill",
+                    ],
           ),
         );
       };
@@ -1177,15 +1240,21 @@ else {
             assert.equal(scan.nativeFindings.truncated, false);
             assert.deepEqual(
               scan.nativeFindings.findings.map(
-                (finding: { index: number; decoder: string; sourceLine: number | null }) => [
+                (finding: {
+                  index: number;
+                  decoder: string;
+                  sourceLine: number | null;
+                  sourceLineReason: string;
+                }) => [
                   finding.index,
                   finding.decoder,
                   finding.sourceLine,
+                  finding.sourceLineReason,
                 ],
               ),
               [
-                [0, "PLAIN", null],
-                [1, "HTML", null],
+                [0, "PLAIN", null, "literal_absent"],
+                [1, "HTML", null, "unsupported_decoder"],
               ],
             );
             assert.deepEqual(scan.nativeFindings.findings[1].material, scan.material);
@@ -1304,6 +1373,9 @@ else {
         assert.equal(generationCalls, 0);
         assert.equal(checkoutInspectionCalls, 0);
         assert.equal(hydrationCalls, 1);
+        const blobMetadataCalls = existsSync(blobMetadataRequests)
+          ? readFileSync(blobMetadataRequests, "utf8").trim().split("\n").length
+          : 0;
         assert.equal(blobMetadataCalls, blobMetadataFailure ? 1 : 0);
         assert.equal(cachedCompletions, 0);
         assert.equal(existsSync(providerCalls), false);
@@ -1334,8 +1406,10 @@ else {
         if (nativeFailure) {
           assert.ok(Number.isInteger(manifest.process.status) && manifest.process.status > 0);
           const detail = readFileSync(join(output, "stderr.tail.txt"), "utf8");
-          if (fetchFailure) assert.match(detail, /REDACTED_PATH/);
-          else assert.match(detail, /\.git\/worktrees\/[^\r\n]+Not a directory/);
+          if (fetchFailure) assert.match(detail, /REDACTED/);
+          // Git versions report either a relative or an absolute worktree path.
+          // Exact environment-value redaction can also replace its prefix.
+          if (nativeCheckoutFailure) assert.match(detail, /Not a directory/);
           assert.equal(detail.includes(root), false);
         } else {
           assert.equal(manifest.process.status, null);
@@ -1379,7 +1453,76 @@ else {
         }
         return;
       }
+      if (heldElsewhere) {
+        execute();
+        // Another worker holds the elected lease. The workflow retries when that lease expires.
+        assert.deepEqual(
+          JSON.parse(readFileSync(join(artifactDir, "coordination-held.json"), "utf8")),
+          { retry_at: HELD_LEASE_EXPIRES_AT },
+        );
+        assert.equal(generationCalls, 0);
+        assert.equal(cachedCompletions, 0);
+        assert.equal(existsSync(join(artifactDir, `${ITEM_NUMBER}.md`)), false);
+        return;
+      }
+      if (scenario === "empty-batch-selection") {
+        assert.throws(execute, /A supplied review lease requires exactly one selected item/);
+        assert.equal(generationCalls, 0);
+        return;
+      }
       execute();
+
+      if (preflightCase) {
+        const report = readFileSync(join(artifactDir, `${ITEM_NUMBER}.md`), "utf8");
+        if (preflightCase.local) {
+          assert.match(report, preflightCase.missing ? /Source unknown\./ : /Source matches\./);
+          assert.equal(report.match(/## Local preflight source/g)?.length, 1);
+          assert.doesNotMatch(report, /## Preflight source/);
+        } else {
+          assert.doesNotMatch(report, /## Local preflight source/);
+          const comment = renderReviewCommentFromReport(report, "none");
+          if (preflightCase.metadata) {
+            assert.doesNotMatch(report, /## Preflight source/);
+            assert.doesNotMatch(comment, /### Preflight source/);
+          } else {
+            const state = preflightCase.missing
+              ? "unknown"
+              : preflightCase.stale
+                ? "stale"
+                : "matches";
+            assert.match(report, new RegExp(`Source ${state}\\.`));
+            assert.equal(report.match(/## Preflight source/g)?.length, 1);
+            assert.match(comment, new RegExp(`### Preflight source\\n\\nSource ${state}\\.`));
+            assert.match(comment, /Completion is self-reported/);
+            assert.doesNotMatch(comment, /private-advisory-marker|private-tool|private-version/);
+          }
+        }
+        assert.doesNotMatch(report, /private-advisory-marker|private-tool|private-version/);
+        assert.equal(generationCalls, fresh && !preflightCase.metadata ? 1 : 0);
+        assert.equal(
+          hydrationCalls,
+          preflightCase.metadata ? 0 : preflightCase.local || hydrated ? 1 : 0,
+        );
+        if (preflightCase.local)
+          assert.equal(structuralFetches, 0, "local-only cannot enter hosted structural probes");
+        assert.equal(startCommentCalls, 0);
+        assert.equal(existsSync(providerCalls), false);
+        return;
+      }
+
+      if (closedBeforeSelection) {
+        assert.equal(generationCalls, 0);
+        assert.equal(hydrationCalls, 0);
+        assert.equal(startCommentCalls, 0);
+        assert.equal(existsSync(join(artifactDir, `${ITEM_NUMBER}.md`)), false);
+        assert.equal(existsSync(join(artifactDir, "failure-diagnostics")), false);
+        const metrics = JSON.parse(
+          readFileSync(join(artifactDir, "review-cache-metrics.json"), "utf8"),
+        );
+        assert.equal(metrics.candidates, 0);
+        assert.equal(metrics.completed, 0);
+        return;
+      }
 
       if (publicationCase) {
         assert.equal(readFileSync(join(itemsDir, `${ITEM_NUMBER}.md`), "utf8"), priorMarkdown);
@@ -1406,6 +1549,20 @@ else {
         assert.match(report, /Cached review/);
       }
 
+      if (targetDriftExpired) {
+        assert.equal(hydrationCalls, 1);
+        assert.equal(generationCalls, 1);
+        assert.equal(cachedCompletions, 0);
+        assert.match(
+          readFileSync(join(artifactDir, `${ITEM_NUMBER}.md`), "utf8"),
+          /Fresh Codex review/,
+        );
+        const metrics = JSON.parse(
+          readFileSync(join(artifactDir, "review-cache-metrics.json"), "utf8"),
+        );
+        assert.equal(metrics.content_cache_hits, 0);
+        return;
+      }
       if (isPullRequest) {
         assert.equal(hydrationCalls, 1);
         assert.equal(generationCalls, 1);
@@ -1466,7 +1623,21 @@ else {
       assert.equal(existsSync(carriedReportPath), true);
       const carriedReport = readFileSync(carriedReportPath, "utf8");
       assert.match(carriedReport, /^local_checkout_access: verified$/m);
+      if (targetDrift) {
+        // The carried verdict still names the target commit that was actually reviewed,
+        // and its structural anchor cannot let the 14-day structural stage reuse it.
+        assert.match(carriedReport, new RegExp(`^main_sha: ${REVIEWED_TARGET_SHA}$`, "m"));
+        assert.match(
+          carriedReport,
+          new RegExp(`^review_structural_target_head_sha: ${REVIEWED_TARGET_SHA}$`, "m"),
+        );
+      }
       assert.match(carriedReport, /^local_checkout_access_source: runner_preflight_v1$/m);
+      assert.match(carriedReport, new RegExp(`^review_lease_owner: ${LEASE_OWNER}$`, "m"));
+      assert.match(
+        carriedReport,
+        new RegExp(`^review_lease_comment_id: ${LEASE_COMMENT_ID}$`, "m"),
+      );
       const metrics = JSON.parse(
         readFileSync(join(artifactDir, "review-cache-metrics.json"), "utf8"),
       );
@@ -1494,6 +1665,31 @@ else {
 }
 
 for (const scenario of scheduledScenarios) testScheduledCacheScenario(scenario);
+
+for (const scenario of ["changed-pr-clean", "structural-clean", "content-clean"]) {
+  testScheduledCacheScenario(scenario, undefined, undefined, { local: true });
+  testScheduledCacheScenario(scenario, undefined, undefined, { local: true, missing: true });
+  testScheduledCacheScenario(scenario, undefined, undefined, { local: false });
+  testScheduledCacheScenario(scenario, undefined, undefined, {
+    local: false,
+    missing: true,
+    hostedPrior: true,
+  });
+  testScheduledCacheScenario(scenario, undefined, undefined, {
+    local: false,
+    stale: true,
+    hostedPrior: true,
+  });
+  testScheduledCacheScenario(scenario, undefined, undefined, { local: true, hostedPrior: true });
+}
+testScheduledCacheScenario("changed-pr-clean", undefined, undefined, {
+  local: true,
+  metadata: true,
+});
+testScheduledCacheScenario("changed-pr-clean", undefined, undefined, {
+  local: false,
+  metadata: true,
+});
 
 for (const retention of ["none", "summary", "debug"] as const) {
   testScheduledCacheScenario("changed-pr-clean", undefined, {

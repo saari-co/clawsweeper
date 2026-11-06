@@ -1,13 +1,13 @@
-import { escapeRegExp } from "./clawsweeper-text.js";
 import {
   requireRecord as objectValue,
   requireString as stringValue,
   rejectUnexpectedKeys,
 } from "./value-coerce.js";
-import { createHash } from "node:crypto";
+import { sha256 } from "./content-hash.js";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, relative } from "node:path";
-import { parseReportFrontMatter } from "./report-front-matter.js";
+import { parseReportFrontMatter, replaceFrontMatterValue } from "./report-front-matter.js";
+import { readReviewRecord, requireReviewRecord } from "./review-record.js";
 
 export type MaintainerDecisionKind =
   | "none"
@@ -121,6 +121,7 @@ const OWNER_KEYS = new Set(["person", "reason", "confidence"]);
 export function parseMaintainerDecision(
   value: unknown,
   path = "maintainerDecision",
+  source: "model" | "stored" = "stored",
 ): MaintainerDecision {
   const record = objectValue(value, path);
   rejectUnexpectedKeys(record, DECISION_KEYS, path);
@@ -133,7 +134,11 @@ export function parseMaintainerDecision(
     parseMaintainerDecisionOption(entry, `${path}.options[${index}]`),
   );
   if (options.length > 3) throw new Error(`${path}.options must contain at most 3 options`);
-  const likelyOwner = parseMaintainerDecisionOwner(record.likelyOwner, `${path}.likelyOwner`);
+  const likelyOwner = parseMaintainerDecisionOwner(
+    record.likelyOwner,
+    `${path}.likelyOwner`,
+    source,
+  );
 
   if (!required) {
     if (kind !== "none") throw new Error(`${path}.kind must be none when no decision is required`);
@@ -144,12 +149,19 @@ export function parseMaintainerDecision(
     if (kind === "none") throw new Error(`${path}.kind must identify the required decision`);
     if (!question) throw new Error(`${path}.question must not be empty`);
     if (!rationale) throw new Error(`${path}.rationale must not be empty`);
-    if (options.length === 0) throw new Error(`${path}.options must contain at least 1 option`);
+    if (options.length < 2) throw new Error(`${path}.options must contain at least 2 options`);
+    const optionKeys = options.map((option) =>
+      JSON.stringify([option.title.toLowerCase(), option.body.toLowerCase()]),
+    );
+    if (new Set(optionKeys).size !== options.length) {
+      throw new Error(`${path}.options must contain distinct options`);
+    }
     if (options.filter((option) => option.recommended).length !== 1) {
       throw new Error(`${path}.options must contain exactly 1 recommended option`);
     }
     if (!likelyOwner.person) throw new Error(`${path}.likelyOwner.person must not be empty`);
-    if (!likelyOwner.reason) throw new Error(`${path}.likelyOwner.reason must not be empty`);
+    if (source === "stored" && !likelyOwner.reason)
+      throw new Error(`${path}.likelyOwner.reason must not be empty`);
   }
 
   return { required, kind, question, rationale, options, likelyOwner };
@@ -167,39 +179,19 @@ export function emptyMaintainerDecision(): MaintainerDecision {
 }
 
 export function maintainerDecisionFromReport(markdown: string): MaintainerDecision | null {
-  return maintainerDecisionFromFrontMatter(frontMatter(markdown));
-}
-
-function maintainerDecisionFromFrontMatter(
-  frontmatter: Record<string, string>,
-): MaintainerDecision | null {
-  const raw = frontmatter.maintainer_decision;
-  if (!raw || raw === "none" || raw === "unknown") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("maintainer_decision must contain valid JSON");
-  }
-  return parseMaintainerDecision(parsed, "maintainer_decision");
-}
-
-export function maintainerDecisionBlocksClose(markdown: string): boolean {
-  try {
-    return maintainerDecisionFromReport(markdown)?.required === true;
-  } catch {
-    return true;
-  }
+  return requireReviewRecord(markdown).decision.maintainerDecision;
 }
 
 export function buildDecisionPacketFromReport(
   markdown: string,
   options: DecisionPacketBuildOptions = {},
 ): DecisionPacket | null {
+  const record = readReviewRecord(markdown);
+  if (!record) return null;
   const parsedFrontmatter = readFrontMatter(markdown);
   if (parsedFrontmatter.ambiguous) return null;
   const frontmatter = parsedFrontmatter.values;
-  const decision = maintainerDecisionFromFrontMatter(frontmatter);
+  const decision = record.decision.maintainerDecision;
   const repo = frontmatter.repository;
   const kind = frontmatter.type;
   const number = numberValue(frontmatter.number);
@@ -247,7 +239,7 @@ export function buildDecisionPacketFromReport(
       ...(headSha ? { headSha } : {}),
     },
     lane: decision.kind,
-    priority: priorityValue(frontmatter.triage_priority),
+    priority: priorityValue(record.decision.triagePriority),
     question: decision.question,
     rationale: decision.rationale,
     options: decision.options,
@@ -264,50 +256,61 @@ export function buildDecisionPacketFromReport(
 }
 
 export function renderDecisionPacketPublicBlock(markdown: string): string {
-  const packet = buildDecisionPacketFromReport(markdown);
+  const record = readReviewRecord(markdown);
+  let packet: Pick<MaintainerDecision, "question" | "rationale" | "options"> | null;
+  try {
+    const decision = record?.decision.maintainerDecision;
+    packet = decision
+      ? decision.required && decision.kind !== "none"
+        ? decision
+        : null
+      : buildDecisionPacketFromReport(markdown);
+  } catch {
+    return "The stored maintainer decision is invalid. Run a fresh review before resolving it.";
+  }
   if (!packet) return "";
   const recommendation = packet.options.find((option) => option.recommended);
-  const tableCell = (value: string) =>
+  // Report-provided text renders inline: escape HTML openers and keep each value on one line.
+  const inline = (value: string) =>
     value
-      .replace(/\\/g, "\\\\")
       .replace(/<(?=[a-z/!?])/gi, "&lt;")
-      .replace(/\r?\n|\r/g, "<br>")
-      .replace(/\|/g, "\\|")
+      .replace(/\s+/g, " ")
       .trim();
-  if (!recommendation) {
+  const lines = [`- **Question:** ${inline(packet.question)}`];
+  if (recommendation) {
+    lines.push(
+      `- **Recommendation:** **${inline(recommendation.title)}:** ${inline(recommendation.body)}`,
+    );
+  } else if (packet.options.length) {
     // A packet without a flagged recommendation is still an outstanding maintainer
-    // choice; show the question and any available options instead of hiding it.
-    const optionCells = packet.options.length
-      ? packet.options
-          .map((option) => `**${tableCell(option.title)}:** ${tableCell(option.body)}`)
-          .join("<br>")
-      : "Maintainer decision needed.";
-    return [
-      "| Question | Options |",
-      "|---|---|",
-      `| ${tableCell(packet.question)} | ${optionCells} |`,
-      "",
-      `Why: ${packet.rationale}`,
-    ].join("\n");
+    // choice; show the options instead of hiding it.
+    lines.push(
+      "- **Options:**",
+      ...packet.options.map((option) => `  - **${inline(option.title)}:** ${inline(option.body)}`),
+    );
+  } else {
+    lines.push("- **Options:** Maintainer decision needed.");
   }
-  return [
-    "| Question | Recommendation |",
-    "|---|---|",
-    `| ${tableCell(packet.question)} | **${tableCell(recommendation.title)}:** ${tableCell(recommendation.body)} |`,
-    "",
-    `Why: ${packet.rationale}`,
-  ].join("\n");
+  lines.push(`- **Why:** ${inline(packet.rationale)}`);
+  return lines.join("\n");
 }
 
 export function syncDecisionPacketRecord(
   options: DecisionPacketSyncOptions,
 ): DecisionPacketSyncResult {
-  const packet = buildDecisionPacketFromReport(options.markdown, {
-    reportPath: repoRelativePath(options.repoRoot, options.reportPath),
-    ...(options.generatedAt ? { generatedAt: options.generatedAt } : {}),
-    ...(options.reportUrl ? { reportUrl: options.reportUrl } : {}),
-    ...(options.subjectState ? { subjectState: options.subjectState } : {}),
-  });
+  let packet: DecisionPacket | null;
+  try {
+    packet = buildDecisionPacketFromReport(options.markdown, {
+      reportPath: repoRelativePath(options.repoRoot, options.reportPath),
+      ...(options.generatedAt ? { generatedAt: options.generatedAt } : {}),
+      ...(options.reportUrl ? { reportUrl: options.reportUrl } : {}),
+      ...(options.subjectState ? { subjectState: options.subjectState } : {}),
+    });
+  } catch {
+    // Legacy decisions can fail current validation. Drop only the derived
+    // sidecar; keep the report's invalid decision and its fresh-review hold.
+    packet = null;
+  }
   const frontmatter = readFrontMatter(options.markdown);
   const reportNumber = reportNumberFromPath(options.reportPath);
   const metadataNumber = frontmatter.ambiguous ? null : numberValue(frontmatter.values.number);
@@ -327,7 +330,7 @@ export function syncDecisionPacketRecord(
   mkdirSync(dirname(packetPath), { recursive: true });
   const json = `${JSON.stringify(packet, null, 2)}\n`;
   writeFileSync(packetPath, json, "utf8");
-  const packetSha256 = createHash("sha256").update(json).digest("hex");
+  const packetSha256 = sha256(json);
   return {
     markdown: replacePacketFrontmatter(
       options.markdown,
@@ -350,13 +353,18 @@ function parseMaintainerDecisionOption(value: unknown, path: string): Maintainer
   return { title, body, recommended: booleanValue(record.recommended, `${path}.recommended`) };
 }
 
-function parseMaintainerDecisionOwner(value: unknown, path: string): MaintainerDecisionOwner {
+function parseMaintainerDecisionOwner(
+  value: unknown,
+  path: string,
+  source: "model" | "stored",
+): MaintainerDecisionOwner {
   const record = objectValue(value, path);
   rejectUnexpectedKeys(record, OWNER_KEYS, path);
   return {
     person: stringValue(record.person, `${path}.person`).trim(),
-    reason: stringValue(record.reason, `${path}.reason`).trim(),
-    confidence: enumValue(record.confidence, CONFIDENCES, `${path}.confidence`),
+    reason: source === "model" ? "" : stringValue(record.reason, `${path}.reason`).trim(),
+    confidence:
+      source === "model" ? "low" : enumValue(record.confidence, CONFIDENCES, `${path}.confidence`),
   };
 }
 
@@ -368,12 +376,6 @@ function booleanValue(value: unknown, path: string): boolean {
 function enumValue<T extends string>(value: unknown, values: ReadonlySet<T>, path: string): T {
   if (typeof value === "string" && values.has(value as T)) return value as T;
   throw new Error(`${path} has invalid value`);
-}
-
-function frontMatter(markdown: string): Record<string, string> {
-  const parsed = readFrontMatter(markdown);
-  if (parsed.ambiguous) throw new Error("report front matter is ambiguous");
-  return parsed.values;
 }
 
 function readFrontMatter(markdown: string): {
@@ -399,13 +401,6 @@ function replacePacketFrontmatter(markdown: string, path: string, sha256: string
     "decision_packet_sha256",
     sha256,
   );
-}
-
-function replaceFrontMatterValue(markdown: string, key: string, value: string): string {
-  const line = `${key}: ${value}`;
-  const pattern = new RegExp(`^${escapeRegExp(key)}:\\s*.*$`, "m");
-  if (pattern.test(markdown)) return markdown.replace(pattern, line);
-  return markdown.replace(/^---\r?\n/, `---\n${line}\n`);
 }
 
 function numberValue(value: string | undefined): number | null {

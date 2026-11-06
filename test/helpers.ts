@@ -1,3 +1,4 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -6,8 +7,11 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
 
-import { renderReviewCommentFromReport } from "../dist/clawsweeper.js";
+import { reviewPromptForTest } from "../dist/clawsweeper.js";
+import { frontMatterValue, reportWithoutReviewRecord } from "../dist/report-front-matter.js";
+import { reviewRecordFrontMatterLine } from "../dist/review-record.js";
 import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
+import { reviewDecisionParser } from "../dist/clawsweeper-decision-parser.js";
 
 export const tmpPrefix = join(tmpdir(), "clawsweeper-test-");
 export const emptyReviewedPrActivityCursor =
@@ -36,6 +40,11 @@ export function item(overrides = {}) {
   };
 }
 
+/** Assembled static review prompt for one item kind and target repository. */
+export function reviewPrompt(kind: "issue" | "pull_request", repo = "openclaw/openclaw"): string {
+  return reviewPromptForTest(item({ kind, repo }), { issue: {}, comments: [], timeline: [] }, git);
+}
+
 export function closeDecision(overrides = {}) {
   return {
     decision: "close",
@@ -43,6 +52,7 @@ export function closeDecision(overrides = {}) {
     confidence: "high",
     summary: "Current main already implements this.",
     changeSummary: "Requests confirmation that the feature works on current main.",
+    changeExample: { scenario: "", before: "", after: "" },
     systemContext: "",
     architectureDiagram: "",
     evidence: [
@@ -94,14 +104,39 @@ export function closeDecision(overrides = {}) {
     ],
     risks: [],
     bestSolution: "Keep the implementation as-is.",
-    maintainerDecision: {
-      required: false,
-      kind: "none",
-      question: "",
-      rationale: "",
-      options: [],
-      likelyOwner: { person: "", reason: "", confidence: "low" },
-    },
+    maintainerDecision: [
+      "unconfirmed_product_direction",
+      "unsponsored_feature_request",
+      "clawhub",
+      "not_actionable_in_repo",
+    ].includes(String((overrides as { closeReason?: unknown }).closeReason))
+      ? {
+          required: true,
+          kind: "product_direction",
+          question: "Should a maintainer close this scope?",
+          rationale: "Scope rejection needs a maintainer decision.",
+          options: [
+            { title: "Keep open", body: "Preserve this scope.", recommended: true },
+            {
+              title: "Close manually",
+              body: "A maintainer may reject this scope.",
+              recommended: false,
+            },
+          ],
+          likelyOwner: {
+            person: "@maintainer",
+            reason: "Repository product owner.",
+            confidence: "high",
+          },
+        }
+      : {
+          required: false,
+          kind: "none",
+          question: "",
+          rationale: "",
+          options: [],
+          likelyOwner: { person: "", reason: "", confidence: "low" },
+        },
     triagePriority: "P2",
     impactLabels: [],
     maturityLabels: [],
@@ -124,9 +159,6 @@ export function closeDecision(overrides = {}) {
       "Yes. Current main can be checked by inspecting src/example.ts and git blame evidence.",
     solutionAssessment:
       "Yes. Keeping the implementation as-is is the narrowest maintainable outcome.",
-    visionFit: "not_applicable",
-    visionFitReason: "Vision-fit assessment is not needed for this implemented close decision.",
-    visionFitEvidence: [],
     implementationComplexity: "not_applicable",
     autoImplementationCandidate: "none",
     rootCauseCluster: {
@@ -142,6 +174,19 @@ export function closeDecision(overrides = {}) {
       applied: true,
       status: "found_applied",
       summary: "Found AGENTS.md and applied relevant repository review guidance.",
+    },
+    productReview: {
+      kind: "not_applicable",
+      userProblem: "",
+      fixScope: "not_applicable",
+      worthIt: "not_applicable",
+      reason: "Product review does not apply to this issue cleanup decision.",
+    },
+    provenance: [],
+    testingReview: {
+      proofPath: "not_applicable",
+      lowValueTests: [],
+      missingE2e: "",
     },
     reviewFindings: [],
     securityReview: {
@@ -161,28 +206,6 @@ export function closeDecision(overrides = {}) {
       overallTier: "NA",
       summary: "PR readiness rating is not applicable to this issue cleanup decision.",
       nextSteps: [],
-    },
-    telegramVisibleProof: {
-      status: "not_needed",
-      summary: "This non-PR issue triage does not need Telegram visible proof.",
-    },
-    liveProofPlan: {
-      status: "not_applicable",
-      surface: "none",
-      terminalCompletion: "not_applicable",
-      reason: "This non-PR issue triage does not need live proof.",
-      payoff: {
-        kind: "static_text",
-        justification: "No recording payoff exists for this non-PR issue triage.",
-      },
-      entry: "",
-      steps: [],
-    },
-    mantisRecommendation: {
-      status: "not_recommended",
-      scenario: "none",
-      reason: "Mantis proof is not useful for this issue triage.",
-      maintainerComment: "",
     },
     featureShowcase: {
       status: "none",
@@ -261,8 +284,13 @@ export function reportFrontMatter(overrides = {}) {
   if (values.type === "pull_request" && !Object.hasOwn(values, "reviewed_at")) {
     Object.assign(values, { reviewed_at: "2026-05-01T00:00:00Z" });
   }
+  // Current reports always carry a typed next step. Pass `next_step: undefined` for a legacy report.
+  if (values.type === "pull_request" && !Object.hasOwn(values, "next_step")) {
+    Object.assign(values, { next_step: JSON.stringify({ kind: "none", text: "" }) });
+  }
   return `---
 ${Object.entries(values)
+  .filter(([, value]) => value !== undefined)
   .map(([key, value]) => `${key}: ${value}`)
   .join("\n")}
 ---
@@ -333,6 +361,127 @@ ${values.nextSteps}
 `;
 }
 
+/** A pull request report with a recorded proof assessment. */
+export function pullRequestProofReport(options: {
+  author: string;
+  association: string;
+  status?: "missing" | "mock_only" | "insufficient" | "sufficient";
+  securityAttention?: boolean;
+  authorityChainProofRequired?: boolean;
+  labels?: string[];
+  frontMatter?: Record<string, unknown>;
+  sections?: string;
+  decision?: Record<string, unknown>;
+}): string {
+  const status = options.status ?? "missing";
+  const sufficient = status === "sufficient";
+  const proofTier = sufficient ? "A" : status === "missing" ? "F" : "D";
+  const report = `${reviewReportFrontMatter({
+    type: "pull_request",
+    number: "119610",
+    decision: "keep_open",
+    close_reason: "none",
+    review_status: "complete",
+    confidence: "high",
+    author: options.author,
+    author_association: options.association,
+    labels: JSON.stringify(options.labels ?? ["clawsweeper:automerge"]),
+    work_candidate: "none",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+    ...options.frontMatter,
+  })}
+
+## Summary
+
+Keep this focused pull request open for maintainer review.
+
+## What This Changes
+
+Keeps pull request evidence checks aligned with their actual scope.
+
+## Best Possible Solution
+
+Continue normal maintainer review.
+
+${realBehaviorProofReportSection({
+  status,
+  evidenceKind: sufficient ? "terminal" : "none",
+  needsContributorAction: !sufficient,
+  summary: options.authorityChainProofRequired
+    ? sufficient
+      ? "Authority-chain proof required: a terminal trace shows the nearest forbidden principal rejected before provider I/O."
+      : "Authority-chain proof required: the nearest forbidden principal was not exercised before provider I/O."
+    : sufficient
+      ? "The maintainer supplied terminal output from the changed production path."
+      : "The reviewer did not find contributor-supplied live proof.",
+})}
+
+${prRatingReportSection({
+  overallTier: proofTier,
+  proofTier,
+  patchTier: "A",
+  summary: "The model capped readiness based on its recorded proof assessment.",
+  nextSteps: sufficient ? "- none" : "- Add real behavior proof.",
+})}
+
+${
+  options.securityAttention
+    ? `## Security Review
+
+Status: needs_attention
+
+Summary: The changed authorization boundary requires maintainer review.
+
+`
+    : ""
+}${options.sections ?? ""}## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`;
+  return withReviewRecord(report, {
+    decision: "keep_open",
+    closeReason: "none",
+    summary: "Keep this focused pull request open for maintainer review.",
+    changeSummary: "Keeps pull request evidence checks aligned with their actual scope.",
+    bestSolution: "Continue normal maintainer review.",
+    realBehaviorProof: {
+      status,
+      evidenceKind: sufficient ? "terminal" : "none",
+      needsContributorAction: !sufficient,
+      summary: options.authorityChainProofRequired
+        ? sufficient
+          ? "Authority-chain proof required: a terminal trace shows the nearest forbidden principal rejected before provider I/O."
+          : "Authority-chain proof required: the nearest forbidden principal was not exercised before provider I/O."
+        : sufficient
+          ? "The maintainer supplied terminal output from the changed production path."
+          : "The reviewer did not find contributor-supplied live proof.",
+    },
+    prRating: {
+      overallTier: proofTier,
+      proofTier,
+      patchTier: "A",
+      summary: "The model capped readiness based on its recorded proof assessment.",
+      nextSteps: sufficient ? [] : ["Add real behavior proof."],
+    },
+    securityReview: {
+      status: options.securityAttention ? "needs_attention" : "not_applicable",
+      summary: options.securityAttention
+        ? "The changed authorization boundary requires maintainer review."
+        : "",
+      concerns: [],
+    },
+    overallCorrectness: "patch is correct",
+    overallConfidenceScore: 0.9,
+    ...options.decision,
+  });
+}
+
 export function detailsBody(markdown, summary) {
   const marker = `<summary>${summary}</summary>`;
   let markerIndex = markdown.indexOf(marker);
@@ -391,8 +540,8 @@ export function auditRecord(number, overrides = {}) {
   };
 }
 
-export function workPlanCandidateReport(overrides = {}) {
-  const frontmatter = {
+export function workPlanCandidateReport(overrides = {}, decisionOverrides = {}) {
+  const frontmatter: Record<string, unknown> = {
     number: 321,
     repository: "openclaw/clawsweeper",
     type: "issue",
@@ -418,7 +567,7 @@ export function workPlanCandidateReport(overrides = {}) {
   ) {
     Object.assign(frontmatter, { review_activity_cursor: emptyReviewedPrActivityCursor });
   }
-  return `---
+  const report = `---
 ${Object.entries(frontmatter)
   .map(([key, value]) => `${key}: ${value}`)
   .join("\n")}
@@ -434,6 +583,47 @@ The dashboard has queue_fix_pr candidates but no generated coding plan.
 
 Render generated plan markdown from existing report fields.
 `;
+  return withReviewRecord(report, {
+    decision: frontmatter.decision,
+    closeReason: frontmatter.close_reason ?? "none",
+    confidence: frontmatter.confidence ?? "high",
+    triagePriority: frontmatter.triage_priority ?? "none",
+    summary: "The dashboard has queue_fix_pr candidates but no generated coding plan.",
+    workCandidate: frontmatter.work_candidate,
+    workConfidence: frontmatter.work_confidence,
+    workPriority: frontmatter.work_priority,
+    workPrompt: "Render generated plan markdown from existing report fields.",
+    workLikelyFiles: JSON.parse(String(frontmatter.work_likely_files)),
+    workValidation: JSON.parse(String(frontmatter.work_validation)),
+    workClusterRefs: JSON.parse(String(frontmatter.work_cluster_refs)),
+    fixedSha: frontmatter.fixed_sha ?? null,
+    fixedRelease: frontmatter.fixed_release ?? null,
+    fixedAt: frontmatter.fixed_at ?? null,
+    ...(frontmatter.next_step
+      ? { nextStep: JSON.parse(String(frontmatter.next_step)) }
+      : { nextStep: { kind: "none", text: "" } }),
+    ...(frontmatter.root_cause_cluster
+      ? { rootCauseCluster: JSON.parse(String(frontmatter.root_cause_cluster)) }
+      : {}),
+    ...(frontmatter.merge_risk_options
+      ? { mergeRiskOptions: JSON.parse(String(frontmatter.merge_risk_options)) }
+      : {}),
+    ...(frontmatter.fixed_pr_url
+      ? {
+          fixedPullRequest: {
+            repo: String(frontmatter.repository),
+            number: Number(frontmatter.fixed_pr_number),
+            url: String(frontmatter.fixed_pr_url),
+            title: "",
+            mergedAt: String(frontmatter.fixed_pr_merged_at),
+            sha: null,
+            confidence: frontmatter.fixed_pr_confidence,
+            source: frontmatter.fixed_pr_source,
+          },
+        }
+      : {}),
+    ...decisionOverrides,
+  });
 }
 
 export function implementedCloseReport(overrides = {}) {
@@ -470,30 +660,47 @@ export function verifiedImplementationPullRequestReport(overrides = {}) {
 }
 
 export function stalePullRequestReport(overrides = {}) {
-  return `${workPlanCandidateReport({
-    repository: "openclaw/openclaw",
-    number: 330,
-    type: "pull_request",
-    title: "Stale F PR",
-    url: "https://github.com/openclaw/openclaw/pull/330",
-    author: "reporter",
-    author_association: "CONTRIBUTOR",
-    decision: "keep_open",
-    close_reason: "none",
-    confidence: "high",
-    action_taken: "kept_open",
-    work_candidate: "manual_review",
-    work_status: "manual_review",
-    item_snapshot_hash: "reviewed-snapshot",
-    item_created_at: "2026-02-01T00:00:00Z",
-    item_updated_at: "2026-05-01T00:00:00Z",
-    reviewed_at: "2026-05-01T00:00:00Z",
-    labels: JSON.stringify(["status: 📣 needs proof"]),
-    pr_rating_overall: "F",
-    pr_rating_proof: "F",
-    pr_rating_patch: "F",
-    ...overrides,
-  })}\n\n## Real Behavior Proof\n\nStatus: missing\nEvidence kind: none\nNeeds contributor action: true\nSummary: No live proof was supplied.\n\n## PR Rating\n\nOverall tier: F\nProof tier: F\nPatch tier: F\nSummary: The PR is not merge-ready.\nNext rank-up steps:\n- Rebase and provide proof.\n`;
+  return `${workPlanCandidateReport(
+    {
+      repository: "openclaw/openclaw",
+      number: 330,
+      type: "pull_request",
+      title: "Stale F PR",
+      url: "https://github.com/openclaw/openclaw/pull/330",
+      author: "reporter",
+      author_association: "CONTRIBUTOR",
+      decision: "keep_open",
+      close_reason: "none",
+      confidence: "high",
+      action_taken: "kept_open",
+      work_candidate: "manual_review",
+      work_status: "manual_review",
+      item_snapshot_hash: "reviewed-snapshot",
+      item_created_at: "2026-02-01T00:00:00Z",
+      item_updated_at: "2026-05-01T00:00:00Z",
+      reviewed_at: "2026-05-01T00:00:00Z",
+      labels: JSON.stringify(["status: 📣 needs proof"]),
+      pr_rating_overall: "F",
+      pr_rating_proof: "F",
+      pr_rating_patch: "F",
+      ...overrides,
+    },
+    {
+      realBehaviorProof: {
+        status: "missing",
+        evidenceKind: "none",
+        needsContributorAction: true,
+        summary: "No live proof was supplied.",
+      },
+      prRating: {
+        overallTier: "F",
+        proofTier: "F",
+        patchTier: "F",
+        summary: "The PR is not merge-ready.",
+        nextSteps: ["Rebase and provide proof."],
+      },
+    },
+  )}\n\n## Real Behavior Proof\n\nStatus: missing\nEvidence kind: none\nNeeds contributor action: true\nSummary: No live proof was supplied.\n\n## PR Rating\n\nOverall tier: F\nProof tier: F\nPatch tier: F\nSummary: The PR is not merge-ready.\nNext rank-up steps:\n- Rebase and provide proof.\n`;
 }
 
 export function stripProofAndRatingFrontMatter(report: string): string {
@@ -501,6 +708,23 @@ export function stripProofAndRatingFrontMatter(report: string): string {
     /\n(?:real_behavior_proof_status|pr_rating_overall|pr_rating_proof|pr_rating_patch):[^\n]*/g,
     "",
   );
+}
+
+// Front matter value for a typed root-cause cluster that names one canonical PR.
+// A duplicate/superseded PR close needs this; prose PR links never count.
+export function canonicalPullRequestClusterForTest(
+  canonicalUrl: string,
+  currentItemRelationship: "duplicate" | "superseded" = "superseded",
+): string {
+  return JSON.stringify({
+    confidence: "high",
+    canonicalRef: canonicalUrl,
+    currentItemRelationship,
+    summary: "The canonical PR carries the same change.",
+    members: [
+      { ref: canonicalUrl, relationship: "canonical", reason: "Canonical PR for this work." },
+    ],
+  });
 }
 
 export function lowSignalCloseReport(overrides = {}) {
@@ -524,6 +748,7 @@ export function lowSignalCloseReport(overrides = {}) {
 
 export function promotionGhMock(options: {
   number: number;
+  kind?: "issue" | "pull_request";
   title?: string;
   body?: string;
   draft?: boolean;
@@ -578,12 +803,17 @@ export function promotionGhMock(options: {
   assignees?: unknown[];
   requestedReviewers?: unknown[];
   requestedTeams?: unknown[];
+  lastEditedAt?: string | null;
+  editorType?: "User" | "Bot";
   linkedPulls?: Record<number, unknown>;
   linkedPullsAfterProof?: Record<number, unknown>;
   linkedPullsAfterCommentRead?: Record<number, unknown>;
   linkedPullHangAfterProof?: boolean;
   linkedIssues?: Record<number, unknown>;
   defaultBranch?: string;
+  mainSha?: string;
+  mainComparisonStatus?: string;
+  mainShaAfterProof?: string;
   postHeadPathChanges?: Record<string, string | null>;
   deletedMainPaths?: string[];
   pathLookupError?: string;
@@ -594,12 +824,13 @@ export function promotionGhMock(options: {
   const comments = options.comments ?? [
     {
       id: 9000 + options.number,
+      node_id: `IC_${9000 + options.number}`,
       html_url: `https://github.com/openclaw/openclaw/pull/${options.number}#issuecomment-${
         9000 + options.number
       }`,
       created_at: "2026-05-01T01:00:00Z",
       updated_at: "2026-05-01T01:00:00Z",
-      user: { login: "clawsweeper[bot]" },
+      user: { login: "clawsweeper[bot]", type: "Bot" },
       body: options.comment,
     },
   ];
@@ -651,10 +882,11 @@ export function promotionGhMock(options: {
 	const reviewThreadReadStatePath = join(__dirname, "..", "review-thread-read-" + number);
 	const mutationComment = (id, body) => ({
 	  id,
+	  node_id: "IC_" + id,
 	  html_url: "https://github.com/openclaw/openclaw/pull/" + number + "#issuecomment-" + id,
 	  created_at: "2026-05-01T01:00:00Z",
 	  updated_at: "2026-05-01T02:00:00Z",
-	  user: { login: "clawsweeper[bot]" },
+	  user: { login: "clawsweeper[bot]", type: "Bot" },
 	  body
 	});
 	const writeMutationComment = () => {
@@ -737,6 +969,12 @@ export function promotionGhMock(options: {
 	  }
 	  console.log(JSON.stringify({ total_count: openPrCount, incomplete_results: authorSearchIncomplete, items: [] }));
 	} else if (args[0] === "api" && args[1] === "graphql") {
+	  const query = args.find(arg => arg.startsWith("query=")) || "";
+	  if (query.includes("nodes(ids:")) {
+	    const ids = JSON.parse(query.split("nodes(ids:")[1].split(")")[0]);
+	    console.log(JSON.stringify({ data: { nodes: ids.map(id => ({ id, lastEditedAt: null, userContentEdits: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } })) } }));
+	    process.exit(0);
+	  }
 	  const currentReviewThreads =
 	    reviewThreadsAfterFirstRead && existsSync(reviewThreadReadStatePath)
 	      ? reviewThreadsAfterFirstRead
@@ -746,6 +984,9 @@ export function promotionGhMock(options: {
 	    data: {
 	      repository: {
 	        pullRequest: {
+	          id: "PR_" + number,
+	          lastEditedAt: ${JSON.stringify(options.lastEditedAt ?? null)},
+	          editor: { __typename: ${JSON.stringify(options.editorType ?? "User")} },
 	          reviewThreads: {
 	            nodes: currentReviewThreads,
 	            pageInfo: { hasNextPage: false, endCursor: null }
@@ -813,7 +1054,7 @@ export function promotionGhMock(options: {
     labels,
     assignees: ${JSON.stringify(options.assignees ?? [])},
     comments: ${options.trackCommentActivity ? "liveComments().length" : "issueCommentCount"},
-    pull_request: { url: "https://api.github.com/repos/openclaw/openclaw/pulls/" + number }
+    pull_request: ${options.kind === "issue" ? "null" : '{ url: "https://api.github.com/repos/openclaw/openclaw/pulls/" + number }'}
   }));
 } else if (args[0] === "api" && new RegExp("/pulls/" + number + "$").test(path)) {
   console.log(JSON.stringify({
@@ -866,6 +1107,10 @@ export function promotionGhMock(options: {
 	  console.log(JSON.stringify({ commit: { committer: { date: headCommittedAt } } }));
 	} else if (args[0] === "api" && path === "repos/openclaw/openclaw") {
 	  console.log(JSON.stringify({ default_branch: defaultBranch }));
+	} else if (args[0] === "api" && path === "repos/openclaw/openclaw/commits/" + defaultBranch) {
+	  console.log(JSON.stringify({ sha: proofHasRun() ? ${JSON.stringify(options.mainShaAfterProof ?? options.mainSha ?? "a".repeat(40))} : ${JSON.stringify(options.mainSha ?? "a".repeat(40))} }));
+	} else if (args[0] === "api" && path.startsWith("repos/openclaw/openclaw/compare/")) {
+	  console.log(JSON.stringify({ status: ${JSON.stringify(options.mainComparisonStatus ?? "ahead")} }));
 	} else if (args[0] === "api" && path.startsWith("repos/openclaw/openclaw/commits?")) {
 	  if (pathLookupError) {
 	    console.error(pathLookupError);
@@ -955,6 +1200,8 @@ export function promotionGhMock(options: {
   console.log(JSON.stringify(slurp ? [pullReviewComments] : pullReviewComments));
 } else if (args[0] === "api" && new RegExp("/pulls/" + number + "/(files|commits)(?:\\\\?|$)").test(path)) {
   console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/labels?per_page=100") {
+  console.log("[[]]");
 } else if (args[0] === "pr" && args[1] === "close" && args[2] === String(number)) {
   if (closeCommandLogPath) appendFileSync(closeCommandLogPath, args.join(" ") + "\\n");
   if (${JSON.stringify(options.closeCommandError ?? "")}) { console.error(${JSON.stringify(options.closeCommandError ?? "")}); process.exit(1); }
@@ -996,13 +1243,49 @@ export function reportWithSyncedReviewComment(
         "---",
         `review_comment_sha256: ${sha256ForTest(comment)}`,
         `review_comment_id: ${9000 + number}`,
-        `review_comment_url: https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-${9000 + number}`,
+        `review_comment_url: https://github.com/${frontMatterValue(report, "repository")}/issues/${number}#issuecomment-${9000 + number}`,
         "review_comment_synced_at: 2026-05-01T01:00:00Z",
         "",
       ].join("\n"),
     ),
     comment,
   };
+}
+
+/** Writes exactly one typed record as the last front-matter line. */
+export function withReviewRecord(report: string, decision: Record<string, unknown> = {}): string {
+  report = reportWithoutReviewRecord(report);
+  const subject = {
+    repo: frontMatterValue(report, "repository"),
+    number: Number(frontMatterValue(report, "number")),
+    kind: frontMatterValue(report, "type"),
+  };
+  const {
+    oversizedPullRequest,
+    oversizedPullRequestSource,
+    localCheckoutAccess,
+    checkoutInspectionFailed,
+    codexTerminalFailure,
+    fixedPullRequest,
+    ...schemaFields
+  } = decision;
+  // The model parser normalizes schema fields only; the record writer validates
+  // runner-owned evidence after it is restored to the complete decision.
+  const parsedDecision = reviewDecisionParser.parseStoredDecisionFields(
+    closeDecision(schemaFields),
+    subject,
+  );
+  Object.assign(parsedDecision, {
+    oversizedPullRequest,
+    oversizedPullRequestSource,
+    localCheckoutAccess,
+    checkoutInspectionFailed,
+    codexTerminalFailure,
+    fixedPullRequest,
+  });
+  const line = reviewRecordFrontMatterLine({ decision: parsedDecision }, subject);
+  assert.ok(line, "fixture decision must be a valid review record");
+  return report.replace(/\n---\n/, () => `\n${line}\n---\n`);
 }
 
 export function withMockCodexProof(

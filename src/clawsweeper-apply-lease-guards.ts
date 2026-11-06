@@ -2,28 +2,29 @@ import type { CreateApplyDecisionWorkflowDependencies } from "./clawsweeper-appl
 import { trimMiddle } from "./clawsweeper-text.js";
 import type { AcquiredReviewStartLease, Item } from "./clawsweeper-types.js";
 import { GitHubRateLimitError } from "./github-retry.js";
-import { freshExactHeadReviewStartLease } from "./repair/comment-router-core.js";
+import { freshExactHeadReviewStartLease } from "./repair/comment-router/admission.js";
 import { generationReadKey, type LiveReadGeneration } from "./live-read-generation.js";
+import { asRecord } from "./value-coerce.js";
+import { frontMatterValue } from "./report-front-matter.js";
+import { reviewLeaseRevisionFromReport } from "./clawsweeper-record-metadata.js";
 
 type ActiveApplyMutationLease = { itemNumber: number; lease: AcquiredReviewStartLease } | null;
 
 type ApplyLeaseGuardDependencies = Pick<
   CreateApplyDecisionWorkflowDependencies,
-  | "asRecord"
-  | "frontMatterValue"
   | "ghJson"
   | "GitHubRuntimeBudgetError"
   | "issueReviewCommentState"
   | "liveIssueSourceRevision"
   | "PATCHABLE_REVIEW_COMMENT_AUTHORS"
   | "postReviewStartStatusComment"
-  | "reviewLeaseRevisionFromReport"
   | "shouldPreserveReviewStartLease"
   | "targetRepo"
 > & {
   canonicalBoundStaleReviewReason: (
     markdown: string,
     comment: Record<string, unknown> | undefined,
+    liveLease?: AcquiredReviewStartLease | null,
   ) => string | null;
   closeDelayMs: number;
   currentReviewActivityBlock: () => string | null;
@@ -40,12 +41,10 @@ type ApplyLeaseGuardDependencies = Pick<
 };
 
 export function createApplyLeaseGuards({
-  asRecord,
   canonicalBoundStaleReviewReason,
   closeDelayMs,
   currentReviewActivityBlock,
   dryRun,
-  frontMatterValue,
   getActiveApplyMutationLease,
   ghJson,
   GitHubRuntimeBudgetError,
@@ -60,7 +59,6 @@ export function createApplyLeaseGuards({
   postReviewStartStatusComment,
   reportReviewRevision,
   requiresApplyMutationLease,
-  reviewLeaseRevisionFromReport,
   setActiveApplyMutationLease,
   shouldPreserveReviewStartLease,
   targetRepo,
@@ -101,6 +99,10 @@ export function createApplyLeaseGuards({
     // live lease remains preserved and blocks the older artifact.
     return {
       comment: reviewComment,
+      currentLease:
+        lease?.owner && lease.commentId !== null
+          ? { owner: lease.owner, commentId: lease.commentId, headSha }
+          : null,
       leaseComments,
       headSha,
       lease,
@@ -148,6 +150,7 @@ export function createApplyLeaseGuards({
           leaseComments: refreshed.leaseComments,
           headSha: headAfter,
           lease: null,
+          currentLease: null,
           preserve: false,
           blockReason: `${item.kind === "pull_request" ? "PR head" : "issue source revision"} changed since context capture or during the apply-time review lease check; next apply will retry`,
         };
@@ -159,6 +162,7 @@ export function createApplyLeaseGuards({
           leaseComments: refreshed.leaseComments,
           headSha: headAfter,
           lease: null,
+          currentLease: null,
           preserve: false,
           blockReason: `live issue source revision ${headAfter} differs from reviewed revision ${reportReviewRevision}`,
         };
@@ -184,6 +188,7 @@ export function createApplyLeaseGuards({
         leaseComments: [],
         headSha: "",
         lease: null,
+        currentLease: null,
         preserve: false,
         blockReason: `apply-time review lease check failed; next apply will retry: ${detail}`,
       };
@@ -234,6 +239,7 @@ export function createApplyLeaseGuards({
       return canonicalBoundStaleReviewReason(
         markdownBeforeApplyDecisionMutations,
         refreshed.reviewComment,
+        lease,
       );
     } catch (error) {
       if (error instanceof GitHubRuntimeBudgetError || error instanceof GitHubRateLimitError)

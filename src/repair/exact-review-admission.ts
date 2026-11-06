@@ -3,8 +3,13 @@ import { oversizedPullRequestAdmission } from "../clawsweeper-oversized-pr-polic
 import { classifyScheduledReviewNoop } from "../scheduled-review-noop.js";
 import { ghRetryKind } from "../github-retry.js";
 import { ghErrorText, ghTextWithRetry } from "./github-cli.js";
-import { skipAutomaticEndorReview } from "./endor-automerge-intake.js";
 import { issueSourceRevisionSha256 } from "./issue-source-guard.js";
+import { readExactReviewLiveItem } from "./exact-review-live-item.js";
+import {
+  isExplicitReviewRequest,
+  requiresMaintainerReviewRequest,
+  verifiedMaintainerAuthorAssociation,
+} from "../maintainer-review-policy.js";
 
 type Output = (values: Record<string, string>) => void;
 
@@ -72,25 +77,12 @@ export function exactReviewAdmission(output: Output): void {
     decision: JSON.stringify(decision),
   });
 
-  let issue: Record<string, unknown>;
+  let issue: Record<string, unknown> | null;
   try {
     // Keep every admission read in this process so the native public-read
     // owner can spend its single App fallback allowance across the whole step.
-    issue = JSON.parse(read(`issues/${number}`));
+    issue = readExactReviewLiveItem(repo, Number(number), rootToken);
   } catch (error) {
-    if (/HTTP 404|Not Found/i.test(ghErrorText(error))) {
-      try {
-        readRepository();
-      } catch (repositoryError) {
-        console.error(ghErrorText(repositoryError));
-        throw error;
-      }
-      output({ ...terminal, terminal_missing: "true" });
-      console.error(
-        `::notice::Completing ${repo}#${number} because the repository is accessible but the item is missing.`,
-      );
-      return;
-    }
     if (ghRetryKind(error) === "throttle") {
       console.error(ghErrorText(error));
       const retryAt = retry(20, true);
@@ -101,10 +93,57 @@ export function exactReviewAdmission(output: Output): void {
     }
     throw error;
   }
+  if (!issue) {
+    output({ ...terminal, terminal_missing: "true" });
+    console.error(
+      `::notice::Completing ${repo}#${number} because the item is no longer in this repository.`,
+    );
+    return;
+  }
 
   const open = issue.state === "open";
   const locked = issue.locked === true;
   const pullRequest = Boolean(issue.pull_request);
+  const author = (issue.user as { login?: unknown } | undefined)?.login;
+  if (
+    open &&
+    !locked &&
+    issue.author_association === "CONTRIBUTOR" &&
+    typeof author === "string" &&
+    /^[A-Za-z0-9-]+$/.test(author) &&
+    !isExplicitReviewRequest(decision)
+  ) {
+    try {
+      const permission = JSON.parse(read(`collaborators/${author}/permission`));
+      issue.author_association = verifiedMaintainerAuthorAssociation({
+        authorAssociation: issue.author_association,
+        repositoryPermission: permission.permission,
+      });
+    } catch {
+      // Installation tokens may redact membership. Keep the public association
+      // when repository permission metadata is unavailable.
+      console.error(
+        "::notice::Repository permission metadata unavailable; using the item's author association.",
+      );
+    }
+  }
+  if (
+    open &&
+    !locked &&
+    requiresMaintainerReviewRequest(issue) &&
+    !isExplicitReviewRequest(decision)
+  ) {
+    output({
+      ...terminal,
+      scheduled_semantic_noop: "true",
+      review_hold: "maintainer_request_required",
+      item_kind: pullRequest ? "pull_request" : "issue",
+    });
+    console.error(
+      `::notice::Skipping automatic review of ${repo}#${number}: maintainer review requires an explicit request.`,
+    );
+    return;
+  }
   const hasCommandContext = Boolean(decision.commandStatusMarker || decision.statusCommentId);
   let issueComments: unknown[] | undefined;
   if (open && !locked && !pullRequest && (hasCommandContext || decision.expectedSourceRevision)) {
@@ -123,14 +162,6 @@ export function exactReviewAdmission(output: Output): void {
     }
   }
   output({ item_kind: pullRequest ? "pull_request" : "issue" });
-  if (open && !locked && skipAutomaticEndorReview(repo, issue, decision)) {
-    // Reuse the early policy no-op path: no write token, checkout or review lease.
-    output({ ...terminal, scheduled_semantic_noop: "true" });
-    console.error(
-      `::notice::Skipping ordinary automatic review of ${repo}#${number}; the repair loop owns Endor reviews.`,
-    );
-    return;
-  }
   let liveHeadSha = "";
   if (open && !locked && pullRequest) {
     const observedAt = new Date().toISOString();

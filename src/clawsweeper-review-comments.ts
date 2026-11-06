@@ -21,6 +21,19 @@ import {
   reviewRankUpMovesForReviewer,
   type ReviewHistoryCycle,
 } from "./review-history.js";
+import { asRecord, login } from "./value-coerce.js";
+import { CLAWSWEEPER_BOT_LOGINS } from "./clawsweeper-bot-identity.js";
+import { clearInPlaceReviewStartStatus } from "./review-comment-markers.js";
+
+export const CLAWSWEEPER_BOT_AUTHORS: ReadonlySet<string> = new Set(
+  [...CLAWSWEEPER_BOT_LOGINS, process.env.CLAWSWEEPER_COMMENT_AUTHOR_LOGIN]
+    .filter((login): login is string => typeof login === "string" && login.length > 0)
+    .map((login) => login.toLowerCase()),
+);
+
+export function isClawSweeperComment(value: unknown): boolean {
+  return CLAWSWEEPER_BOT_AUTHORS.has((login(asRecord(value).user) ?? "").toLowerCase());
+}
 
 export interface ReviewCommentContext {
   isClawSweeperComment: (value: unknown) => boolean;
@@ -40,10 +53,6 @@ const AUTOMATION_NOISE_PATTERNS = [
   /clawsweeper-repair:close:/i,
   /^ClawSweeper status: review started\./i,
 ] as const;
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
 
 export function rawCommentBody(value: unknown): string {
   const body = asRecord(value).body;
@@ -123,7 +132,7 @@ export function previousClawSweeperReviewFromComment(
   context: ReviewCommentContext,
 ): PreviousClawSweeperReview {
   const comment = asRecord(value);
-  const body = rawCommentBody(value);
+  const body = clearInPlaceReviewStartStatus(rawCommentBody(value));
   const verdictMarker = htmlMarkerWithPrefix(body, "clawsweeper-verdict:");
   const actionMarker = htmlMarkerWithPrefix(body, "clawsweeper-action:");
   const { ledger: history, coverage: historyCoverage } = reviewHistoryForReviewer(body);

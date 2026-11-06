@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { once } from "node:events";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { withQuietReviewStartStatusLease } from "../dist/clawsweeper-review-comment-state.js";
+import { isBackgroundReviewDecision } from "../dist/clawsweeper-review-lease.js";
 import test from "node:test";
 
 import {
@@ -11,6 +16,76 @@ import {
   runReviewPlaceholderRecovery,
   selectReviewPlaceholderComment,
 } from "../dist/review-placeholder-recovery.js";
+
+for (const state of ["open", "closed"] as const) {
+  test(`crashed in-place lease recovery on an ${state} item preserves the durable review`, async () => {
+    const original =
+      "Codex review: keep open.\n\nPrior findings stay available.\n\n<!-- clawsweeper-review item=42 -->";
+    const leased = withQuietReviewStartStatusLease(original, {
+      number: 42,
+      kind: "issue",
+      title: "fixture",
+      headSha: "a".repeat(64),
+      leaseOwner: "dead-worker",
+      startedAt: "2026-08-14T08:00:00Z",
+      leaseExpiresAt: "2026-08-14T09:00:00Z",
+    });
+    const comment = {
+      id: 4201,
+      body: leased,
+      updated_at: "2026-08-14T08:00:00Z",
+      user: { login: "clawsweeper[bot]", type: "Bot" },
+    };
+    const writes: string[] = [];
+    let enqueues = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.endsWith("/github-read-model/placeholders")) {
+        const query = JSON.parse(String(init?.body));
+        return Response.json({
+          usable: true,
+          candidates:
+            query.state === state
+              ? [{ number: 42, item: { number: 42, state, labels: [] }, comments: [comment] }]
+              : [],
+        });
+      }
+      if (url.pathname.endsWith("/github-read-model/repair"))
+        return Response.json({ accepted: true });
+      if (url.pathname === "/internal/exact-review/enqueue") {
+        assert.equal(isBackgroundReviewDecision(JSON.parse(String(init?.body)).decision), true);
+        enqueues++;
+        return Response.json({ queued: true });
+      }
+      if (url.pathname === "/repos/openclaw/openclaw/issues/42") return Response.json({ state });
+      if (url.pathname === "/repos/openclaw/openclaw/issues/comments/4201") {
+        if (!init?.method || init.method === "GET") return Response.json(comment);
+        writes.push(init.method);
+        assert.equal(init.method, "PATCH");
+        assert.equal(JSON.parse(String(init.body)).body, original);
+        return Response.json({ ...comment, body: original });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    const result = await runReviewPlaceholderRecovery({
+      now: new Date("2026-08-14T12:00:00Z"),
+      fetchImpl,
+      env: {
+        GH_TOKEN: "fixture-read",
+        TARGET_WRITE_TOKEN: "fixture-write",
+        CLAWSWEEPER_WEBHOOK_SECRET: "fixture-secret",
+        TARGET_REPO: "openclaw/openclaw",
+        QUEUE_URL: "https://queue.example.test",
+        GITHUB_API_URL: "https://api.github.test",
+      },
+    });
+    assert.equal(result.orphaned, 1);
+    assert.equal(result.errors, 0);
+    assert.equal(enqueues, state === "open" ? 1 : 0);
+    assert.deepEqual(writes, state === "closed" ? ["PATCH"] : []);
+    assert.equal(comment.body, leased);
+  });
+}
 
 test("placeholder snapshot and repair poll choose the same recovery with fewer GitHub reads", async () => {
   const now = new Date("2026-08-14T12:00:00.000Z");
@@ -103,36 +178,25 @@ test("placeholder snapshot and repair poll choose the same recovery with fewer G
   assert.equal(polled.githubReads, 3);
 });
 
-test("scheduled placeholder recovery also performs bounded recovery-label reconciliation", () => {
-  const source = readFileSync("src/review-placeholder-recovery.ts", "utf8");
-  const cli = source.slice(source.indexOf("if (invokedPath && invokedPath ==="));
-  const runner = source.slice(source.indexOf("export async function runReviewPlaceholderRecovery"));
-
-  assert.match(cli, /runReviewPlaceholderRecovery\(\{ reconcileRecoveryLabels: true \}\)/);
-  assert.match(runner, /if \(options\.reconcileRecoveryLabels && targetWriteToken\)/);
-  assert.match(runner, /runReviewRecoveryLabelBackfill\(\{/);
-  assert.match(runner, /github,[\s\S]*fetchComments: fetchReviewComments/);
-  assert.match(runner, /review-recovery label reconciliation skipped:/);
-});
-
-test("the scheduled reconciler reuses recovery transport to clear an exact-head completed PR", async () => {
+test("the scheduled recovery CLI clears the recovery label of an exact-head completed PR", async () => {
   const head = "da73f50fbca83cc89f3e8f33f61e27963351403b";
+  const requests: string[] = [];
   let deletions = 0;
-  const fetchImpl = async (
-    input: string | URL | Request,
-    init?: RequestInit,
-  ): Promise<Response> => {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://loopback.invalid");
+    requests.push(`${request.method} ${url.pathname}`);
+    const json = (value: unknown) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(value));
+    };
     if (url.pathname === "/search/issues") {
-      const query = url.searchParams.get("q") ?? "";
-      return Response.json(
-        query.includes("label:")
+      json(
+        (url.searchParams.get("q") ?? "").includes("label:")
           ? { total_count: 1, items: [{ number: 112370, pull_request: {} }] }
           : { total_count: 0, items: [] },
       );
-    }
-    if (url.pathname === "/repos/openclaw/openclaw/issues/112370/comments") {
-      return Response.json([
+    } else if (url.pathname === "/repos/openclaw/openclaw/issues/112370/comments") {
+      json([
         {
           body: [
             "ClawSweeper review: keep open.",
@@ -143,36 +207,43 @@ test("the scheduled reconciler reuses recovery transport to clear an exact-head 
           user: { login: "clawsweeper[bot]", type: "Bot" },
         },
       ]);
-    }
-    if (url.pathname === "/repos/openclaw/openclaw/pulls/112370") {
-      return Response.json({ head: { sha: head } });
-    }
-    if (
+    } else if (url.pathname === "/repos/openclaw/openclaw/pulls/112370") {
+      json({ head: { sha: head } });
+    } else if (
+      request.method === "DELETE" &&
       url.pathname === "/repos/openclaw/openclaw/issues/112370/labels/clawsweeper-recovery-stuck"
     ) {
-      assert.equal(init?.method, "DELETE");
-      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer target-token");
-      deletions += 1;
-      return new Response(null, { status: 204 });
+      // Label writes must use the target write token, not the read token.
+      if (request.headers.authorization === "Bearer target-token") deletions += 1;
+      response.writeHead(204).end();
+    } else {
+      response.writeHead(404).end();
     }
-    throw new Error(`unexpected request: ${init?.method ?? "GET"} ${url.pathname}`);
-  };
-
-  await runReviewPlaceholderRecovery({
-    env: {
-      GH_TOKEN: "read-token",
-      TARGET_WRITE_TOKEN: "target-token",
-      CLAWSWEEPER_WEBHOOK_SECRET: "webhook-secret",
-      GITHUB_API_URL: "https://api.github.test",
-      QUEUE_URL: "https://queue.test",
-      TARGET_REPO: "openclaw/openclaw",
-    },
-    fetchImpl: fetchImpl as typeof fetch,
-    now: new Date("2026-08-05T12:00:00.000Z"),
-    reconcileRecoveryLabels: true,
   });
-
-  assert.equal(deletions, 1);
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const child = spawn(process.execPath, ["dist/review-placeholder-recovery.js"], {
+      env: {
+        PATH: process.env.PATH,
+        GH_TOKEN: "read-token",
+        TARGET_WRITE_TOKEN: "target-token",
+        CLAWSWEEPER_WEBHOOK_SECRET: "webhook-secret",
+        GITHUB_API_URL: `http://127.0.0.1:${port}`,
+        QUEUE_URL: `http://127.0.0.1:${port}`,
+        TARGET_REPO: "openclaw/openclaw",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", (chunk) => (output += chunk));
+    child.stderr.on("data", (chunk) => (output += chunk));
+    const [status] = await once(child, "exit");
+    assert.equal(deletions, 1, `${output}\n${requests.join("\n")}`);
+    assert.equal(status, 0, output);
+  } finally {
+    server.close();
+  }
 });
 
 const now = new Date("2026-07-17T12:00:00.000Z");

@@ -1,8 +1,13 @@
 import { PUBLIC_CODEX_MODEL } from "./codex-env.js";
 import {
   ACCEPTED_LARGE_LABEL,
+  BULK_FILED_LABEL,
   CLOSE_PROTECTED_LABEL_NAMES,
+  NEEDS_MAINTAINER_REVIEW_LABEL,
+  NEEDS_PRODUCT_DECISION_LABEL,
+  NEEDS_SECURITY_REVIEW_LABEL,
   PR_AUTO_CLOSE_EXEMPT_LABEL_NAMES,
+  SECURITY_BOUNDARY_MERGE_RISK_LABEL,
 } from "./repair/exact-review-guard-labels.js";
 import type {
   AgentsPolicyStatusKind,
@@ -12,20 +17,18 @@ import type {
   DataModelCompatibility,
   DecisionKind,
   FeatureShowcaseStatus,
+  FixedPullRequestSource,
   ImpactLabelName,
   ImplementationComplexity,
   ItemCategory,
-  LiveProofPlanStatus,
-  LiveProofPayoffKind,
-  LiveProofSurface,
-  LiveProofTerminalCompletion,
-  MantisRecommendationScenario,
-  MantisRecommendationStatus,
   MaturityLabelName,
-  MergeRiskLabelName,
   MergeRiskOptionCategory,
   OverallCorrectness,
   PrRatingTier,
+  ProductFixScope,
+  ProductReviewKind,
+  ProductWorthIt,
+  ProvenanceVerdict,
   PrStatusLabelKind,
   RealBehaviorProofEvidenceKind,
   RealBehaviorProofStatus,
@@ -34,9 +37,8 @@ import type {
   RootCauseRelationship,
   SecurityConcernSeverity,
   SecurityReviewStatus,
-  TelegramVisibleProofStatus,
+  TestingProofPath,
   TriagePriority,
-  VisionFitStatus,
   WorkCandidateKind,
 } from "./clawsweeper-types.js";
 
@@ -65,7 +67,6 @@ export const DEFAULT_AUTHOR_PR_BUDGET_MAX_CLOSES_PER_RUN = 5;
 export const DEFAULT_BULK_FILER_THRESHOLD = 10;
 export const DEFAULT_BULK_FILER_WINDOW_DAYS = 7;
 export const BULK_FILER_SEARCH_TIMEOUT_MS = 15_000;
-export const BULK_FILED_LABEL = "clawsweeper:bulk-filed";
 export const BULK_FILED_LABEL_DEFINITION = {
   name: BULK_FILED_LABEL,
   color: "6E7781",
@@ -84,7 +85,7 @@ export const DEFAULT_REASONING_EFFORT = "medium";
 // per item to high reasoning and fast service.
 export const DEFAULT_SERVICE_TIER = "";
 export const DEFAULT_REVIEW_CODEX_TIMEOUT_MS = 1_200_000;
-export const REVIEW_POLICY_VERSION = "2026-09-23-policy-v26";
+export const REVIEW_POLICY_VERSION = "2026-10-10-policy-v43";
 export const REVIEW_COMMENT_MARKER_PREFIX = "<!-- clawsweeper-review";
 export const REVIEW_START_STATUS_MARKER_PREFIX = "<!-- clawsweeper-review-status";
 export const ACCEPTED_LARGE_LABEL_DEFINITION = {
@@ -92,24 +93,21 @@ export const ACCEPTED_LARGE_LABEL_DEFINITION = {
   color: "5319E7",
   description: "Maintainer accepts this pull request exceeding the review size limit.",
 };
-export const MERGE_READY_LABEL = "clawsweeper:merge-ready";
 export const PR_AUTO_CLOSE_EXEMPT_LABELS = new Set<string>(PR_AUTO_CLOSE_EXEMPT_LABEL_NAMES);
 export const WAITING_ON_AUTHOR_LABEL = "status: ⏳ waiting on author";
 export const PROOF_OVERRIDE_LABEL = "proof: override";
 export const AUTHORITY_CHAIN_PROOF_MARKER = "Authority-chain proof required:";
 export const PROOF_SUFFICIENT_LABEL = "proof: sufficient";
 export const PROOF_NUDGE_MARKER_PREFIX = "<!-- clawsweeper-proof-nudge";
-export const LIVE_VERIFICATION_MARKER = "<!-- clawsweeper-live-verification -->";
-export const LIVE_PROOF_RECORDING_MARKER = "<!-- clawsweeper-live-proof-recording -->";
 export const PROOF_SUFFICIENT_LABEL_COLOR = "1A7F37";
 export const PROOF_SUFFICIENT_LABEL_DESCRIPTION = "Contributor real behavior proof is sufficient.";
 export const FEATURE_SHOWCASE_LABEL = "feature: ✨ showcase";
 export const FEATURE_SHOWCASE_LABEL_COLOR = "A371F7";
 export const FEATURE_SHOWCASE_LABEL_DESCRIPTION =
   "ClawSweeper spotlight: unusually compelling feature idea for maintainer attention.";
+export const IDEA_ARCHIVE_LABEL = "clawsweeper:idea-archive";
 export const IDEA_ARCHIVE_LABEL_COLOR = "8250DF";
-export const IDEA_ARCHIVE_LABEL_DESCRIPTION =
-  "Parked feature idea eligible for automatic community or maintainer revival.";
+export const IDEA_ARCHIVE_LABEL_DESCRIPTION = "Parked feature idea awaiting a maintainer decision.";
 export const PROOF_MEDIA_LABELS = [
   {
     evidenceKind: "screenshot",
@@ -183,6 +181,8 @@ export const PR_RATING_LABELS = [
 }[];
 export const PR_RATING_LABEL_NAMES = new Set<string>(PR_RATING_LABELS.map((label) => label.name));
 export const PR_STATUS_LABELS = [
+  // Retired lane: never selected. Kept so status sync recognizes the label still
+  // on older PRs and replaces it with the current status.
   {
     kind: "automerge_armed",
     name: "status: 🚀 automerge armed",
@@ -221,6 +221,12 @@ export const PR_STATUS_LABELS = [
     description: "ClawSweeper has contributor-facing work open and is waiting for author action.",
   },
   {
+    kind: "waiting_on_maintainer",
+    name: "status: ⏳ waiting on maintainer",
+    color: "FBCA04",
+    description: "Only explicit maintainer approvals or decisions remain; merge is still blocked.",
+  },
+  {
     kind: "ready_for_maintainer_look",
     name: "status: 👀 ready for maintainer look",
     color: "2DA44E",
@@ -233,11 +239,6 @@ export const PR_STATUS_LABELS = [
   description: string;
 }[];
 export const PR_STATUS_LABEL_NAMES = new Set<string>(PR_STATUS_LABELS.map((label) => label.name));
-export const LEGACY_TELEGRAM_VISIBLE_PROOF_LABEL = "mantis: telegram-visible-proof";
-export const TELEGRAM_VISIBLE_PROOF_LABEL = "proof: telegram-e2e";
-export const TELEGRAM_VISIBLE_PROOF_LABEL_COLOR = "57606A";
-export const TELEGRAM_VISIBLE_PROOF_LABEL_DESCRIPTION =
-  "This PR needs Telegram Test Server proof with the repository E2E skill.";
 export const PRIORITY_LABELS = [
   {
     priority: 0,
@@ -356,7 +357,7 @@ export const MERGE_RISK_LABELS = [
       "🚨 Merging this PR could break OAuth, tokens, provider routing, model choice, or credentials.",
   },
   {
-    name: "merge-risk: 🚨 security-boundary",
+    name: SECURITY_BOUNDARY_MERGE_RISK_LABEL,
     color: "B60205",
     description:
       "🚨 Merging this PR could weaken sandboxing, authorization, credentials, or sensitive data.",
@@ -379,10 +380,11 @@ export const MERGE_RISK_LABELS = [
     description: "🚨 Merging this PR has meaningful risk outside the owned taxonomy.",
   },
 ] as const satisfies readonly {
-  name: MergeRiskLabelName;
+  name: string;
   color: string;
   description: string;
 }[];
+export type MergeRiskLabelName = (typeof MERGE_RISK_LABELS)[number]["name"];
 export const MERGE_RISK_LABEL_NAMES: ReadonlySet<string> = new Set(
   MERGE_RISK_LABELS.map((label) => label.name),
 );
@@ -406,6 +408,7 @@ export const GOOD_FIRST_ISSUE_LABEL_DEFINITION = {
   color: "7057FF",
   description: "Good for newcomers",
 } as const;
+export const QUEUEABLE_FIX_LABEL = "clawsweeper:queueable-fix";
 export const ISSUE_ADVISORY_LABELS = [
   {
     name: "issue-rating: 🦀 challenger crab",
@@ -482,7 +485,7 @@ export const ISSUE_ADVISORY_LABELS = [
     description: "ClawSweeper does not recommend queueing a new automated fix PR for this issue.",
   },
   {
-    name: "clawsweeper:queueable-fix",
+    name: QUEUEABLE_FIX_LABEL,
     color: "0E8A16",
     description: "ClawSweeper marked this issue as an existing queue_fix_pr work candidate.",
   },
@@ -492,17 +495,17 @@ export const ISSUE_ADVISORY_LABELS = [
     description: "ClawSweeper found a clear likely implementation shape for this issue.",
   },
   {
-    name: "clawsweeper:needs-maintainer-review",
+    name: NEEDS_MAINTAINER_REVIEW_LABEL,
     color: "FBCA04",
     description: "ClawSweeper marked this issue as needing maintainer review before automation.",
   },
   {
-    name: "clawsweeper:needs-product-decision",
+    name: NEEDS_PRODUCT_DECISION_LABEL,
     color: "FBCA04",
     description: "ClawSweeper marked this issue as needing a product or behavior decision.",
   },
   {
-    name: "clawsweeper:needs-security-review",
+    name: NEEDS_SECURITY_REVIEW_LABEL,
     color: "B60205",
     description: "ClawSweeper marked this issue as needing security-sensitive review.",
   },
@@ -510,9 +513,12 @@ export const ISSUE_ADVISORY_LABELS = [
 export const ISSUE_ADVISORY_LABEL_NAMES = new Set(
   ISSUE_ADVISORY_LABELS.map((label) => label.name.toLowerCase()),
 );
+export const BULK_FILER_UNCOUNTED_ISSUE_RATING_LABELS = [
+  "issue-rating: 🦀 challenger crab",
+  "issue-rating: 🦞 diamond lobster",
+] as const satisfies readonly (typeof ISSUE_ADVISORY_LABELS)[number]["name"][];
 export const STALE_LABEL = "stale";
 export const NO_STALE_LABEL = "no-stale";
-export const QUEUEABLE_FIX_LABEL = "clawsweeper:queueable-fix";
 export const ISSUE_STALE_PROTECTION_LABEL = {
   name: NO_STALE_LABEL,
   color: "6E7781",
@@ -521,10 +527,21 @@ export const ISSUE_STALE_PROTECTION_LABEL = {
 export const PROTECTED_LABELS = new Set<string>(CLOSE_PROTECTED_LABEL_NAMES);
 export const APPLY_PROTECTED_LABELS = new Set<string>([
   ...CLOSE_PROTECTED_LABEL_NAMES,
-  "clawsweeper:needs-security-review",
-  "clawsweeper:needs-maintainer-review",
-  "clawsweeper:needs-product-decision",
+  NEEDS_MAINTAINER_REVIEW_LABEL,
+  NEEDS_PRODUCT_DECISION_LABEL,
 ]);
+// The runtime sets these sources only after GitHub confirms the merged fixing PR.
+export const GITHUB_VERIFIED_FIXED_PULL_REQUEST_SOURCES = new Set<FixedPullRequestSource>([
+  "GitHub closing PR reference",
+  "GitHub linked-issue current closing PR",
+  "GitHub reviewed implementation landing",
+  "GitHub commit PR lookup",
+]);
+export function isGitHubVerifiedFixedPullRequestSource(
+  value: unknown,
+): value is FixedPullRequestSource {
+  return GITHUB_VERIFIED_FIXED_PULL_REQUEST_SOURCES.has(value as FixedPullRequestSource);
+}
 export const ALLOWED_REASONS = new Set<CloseReason>([
   "implemented_on_main",
   "mostly_implemented_on_main",
@@ -544,18 +561,32 @@ export const ALLOWED_REASONS = new Set<CloseReason>([
   "incoherent",
   "stale_insufficient_info",
 ]);
+
+/** These proposals need a separate coverage witness, never just a relationship signal. */
+export const PR_CLOSE_COVERAGE_PROOF_REASONS = [
+  "duplicate_or_superseded",
+  "obsolete_fix_pr",
+] as const;
+export function requiresPrCloseCoverageProof(
+  reason: unknown,
+): reason is "duplicate_or_superseded" | "obsolete_fix_pr" {
+  return PR_CLOSE_COVERAGE_PROOF_REASONS.some((candidate) => candidate === reason);
+}
+
+export function requiresMaintainerProductClose(reason: unknown): boolean {
+  return [
+    "unconfirmed_product_direction",
+    "unsponsored_feature_request",
+    "clawhub",
+    "not_actionable_in_repo",
+  ].includes(String(reason));
+}
 export const ALL_REASONS = new Set<CloseReason>([...ALLOWED_REASONS, "none"]);
 export const DECISIONS = new Set<DecisionKind>(["close", "keep_open"]);
 export const WORK_CANDIDATES = new Set<WorkCandidateKind>([
   "none",
   "manual_review",
   "queue_fix_pr",
-]);
-export const VISION_FIT_STATUSES = new Set<VisionFitStatus>([
-  "aligned",
-  "rejected",
-  "unclear",
-  "not_applicable",
 ]);
 export const IMPLEMENTATION_COMPLEXITIES = new Set<ImplementationComplexity>([
   "small",
@@ -567,7 +598,6 @@ export const IMPLEMENTATION_COMPLEXITIES = new Set<ImplementationComplexity>([
 export const AUTO_IMPLEMENTATION_CANDIDATES = new Set<AutoImplementationCandidate>([
   "none",
   "strict_bug",
-  "vision_fit",
 ]);
 export const TRIAGE_PRIORITIES = new Set<TriagePriority>(["P0", "P1", "P2", "P3", "none"]);
 export const ITEM_CATEGORIES = new Set<ItemCategory>([
@@ -668,40 +698,45 @@ export const REAL_BEHAVIOR_PROOF_EVIDENCE_KINDS = new Set<RealBehaviorProofEvide
   "none",
   "not_applicable",
 ]);
-export const TELEGRAM_VISIBLE_PROOF_STATUSES = new Set<TelegramVisibleProofStatus>([
-  "needed",
-  "not_needed",
-]);
-export const LIVE_PROOF_PLAN_STATUSES = new Set<LiveProofPlanStatus>([
-  "recommended",
-  "not_applicable",
-  "declined_suspicious",
-]);
-export const LIVE_PROOF_SURFACES = new Set<LiveProofSurface>(["browser", "terminal", "none"]);
-export const LIVE_PROOF_TERMINAL_COMPLETIONS = new Set<LiveProofTerminalCompletion>([
-  "exit_zero",
-  "ready_while_running",
+// Proof statuses that leave a stalled pull request unproven.
+export const STALLED_UNPROVEN_PROOF_STATUSES = new Set(["missing", "mock_only", "insufficient"]);
+export const PRODUCT_REVIEW_KINDS = new Set<ProductReviewKind>([
+  "bug_fix",
+  "preference",
+  "feature",
+  "refactor",
+  "performance",
+  "test_only",
+  "docs",
+  "maintenance",
   "not_applicable",
 ]);
-export const LIVE_PROOF_PAYOFF_KINDS = new Set<LiveProofPayoffKind>([
-  "progressive_output",
-  "ui_interaction",
-  "tui_or_color",
-  "animation",
-  "static_text",
+export const PRODUCT_FIX_SCOPES = new Set<ProductFixScope>([
+  "complete",
+  "partial",
+  "not_applicable",
 ]);
-export const MANTIS_RECOMMENDATION_STATUSES = new Set<MantisRecommendationStatus>([
-  "recommended",
-  "not_recommended",
+export const PRODUCT_WORTH_IT_VALUES = new Set<ProductWorthIt>([
+  "yes",
+  "no",
+  "needs_maintainer",
+  "not_applicable",
 ]);
-export const MANTIS_RECOMMENDATION_SCENARIOS = new Set<MantisRecommendationScenario>([
+export const PROVENANCE_VERDICTS = new Set<ProvenanceVerdict>([
+  "respects",
+  "overrides_with_reason",
+  "overrides_without_reason",
+  "unknown",
+]);
+export const TESTING_PROOF_PATHS = new Set<TestingProofPath>([
+  "shipped_entry_point",
+  "in_process_harness",
+  "unit_only",
   "none",
-  "discord_status_reactions",
-  "discord_thread_attachment",
-  "web_ui_chat_proof",
-  "slack_desktop_smoke",
-  "visual_task",
+  "not_applicable",
 ]);
+export const MAX_PROVENANCE_ENTRIES = 8;
+export const MAX_LOW_VALUE_TESTS = 10;
 export const FEATURE_SHOWCASE_STATUSES = new Set<FeatureShowcaseStatus>(["showcase", "none"]);
 export const OVERALL_CORRECTNESS_VALUES = new Set<OverallCorrectness>([
   "patch is correct",
@@ -739,6 +774,7 @@ export const DECISION_SCHEMA_KEYS = new Set([
   "confidence",
   "summary",
   "changeSummary",
+  "changeExample",
   "systemContext",
   "architectureDiagram",
   "evidence",
@@ -761,20 +797,17 @@ export const DECISION_SCHEMA_KEYS = new Set([
   "requiresProductDecision",
   "reproductionAssessment",
   "solutionAssessment",
-  "visionFit",
-  "visionFitReason",
-  "visionFitEvidence",
   "implementationComplexity",
   "autoImplementationCandidate",
   "rootCauseCluster",
   "agentsPolicyStatus",
+  "productReview",
+  "provenance",
+  "testingReview",
   "reviewFindings",
   "securityReview",
   "realBehaviorProof",
   "prRating",
-  "telegramVisibleProof",
-  "liveProofPlan",
-  "mantisRecommendation",
   "featureShowcase",
   "overallCorrectness",
   "overallConfidenceScore",
@@ -835,34 +868,22 @@ export const PR_RATING_SCHEMA_KEYS = new Set([
   "summary",
   "nextSteps",
 ]);
-export const TELEGRAM_VISIBLE_PROOF_SCHEMA_KEYS = new Set(["status", "summary"]);
-export const LIVE_PROOF_PLAN_SCHEMA_KEYS = new Set([
-  "status",
-  "surface",
-  "terminalCompletion",
+export const CHANGE_EXAMPLE_SCHEMA_KEYS = new Set(["scenario", "before", "after"]);
+export const PRODUCT_REVIEW_SCHEMA_KEYS = new Set([
+  "kind",
+  "userProblem",
+  "fixScope",
+  "worthIt",
   "reason",
-  "payoff",
-  "entry",
-  "steps",
 ]);
-export const LIVE_PROOF_PAYOFF_SCHEMA_KEYS = new Set(["kind", "justification"]);
-export const LIVE_PROOF_STEP_SCHEMA_KEYS = {
-  goto: new Set(["action", "path"]),
-  click: new Set(["action", "target"]),
-  fill: new Set(["action", "target", "value"]),
-  press: new Set(["action", "key"]),
-  wait_for: new Set(["action", "target"]),
-  wait: new Set(["action", "seconds"]),
-  expect_text: new Set(["action", "text"]),
-  run: new Set(["action", "command"]),
-  expect_output: new Set(["action", "text"]),
-} as const;
-export const MANTIS_RECOMMENDATION_SCHEMA_KEYS = new Set([
-  "status",
-  "scenario",
-  "reason",
-  "maintainerComment",
+export const PROVENANCE_ENTRY_SCHEMA_KEYS = new Set([
+  "area",
+  "introducedBy",
+  "originalReason",
+  "verdict",
 ]);
+export const TESTING_REVIEW_SCHEMA_KEYS = new Set(["proofPath", "lowValueTests", "missingE2e"]);
+export const LOW_VALUE_TEST_SCHEMA_KEYS = new Set(["file", "reason"]);
 export const FEATURE_SHOWCASE_SCHEMA_KEYS = new Set(["status", "reason"]);
 export const ROOT_CAUSE_CLUSTER_SCHEMA_KEYS = new Set([
   "confidence",
@@ -879,13 +900,7 @@ export const AGENTS_POLICY_STATUS_SCHEMA_KEYS = new Set([
   "status",
   "summary",
 ]);
-export const MERGE_RISK_OPTION_SCHEMA_KEYS = new Set([
-  "title",
-  "body",
-  "category",
-  "recommended",
-  "automergeInstruction",
-]);
+export const MERGE_RISK_OPTION_SCHEMA_KEYS = new Set(["title", "body", "category", "recommended"]);
 export const REVIEW_METRIC_SCHEMA_KEYS = new Set(["label", "value", "reason"]);
 export const LABEL_JUSTIFICATION_SCHEMA_KEYS = new Set(["label", "reason"]);
 export const SECURITY_CONCERN_SCHEMA_KEYS = new Set([
@@ -918,21 +933,21 @@ export const LIKELY_OWNER_SCHEMA_KEYS = new Set([
 export const REVIEW_SECTIONS = {
   summary: "Summary",
   changeSummary: "What This Changes",
+  changeExample: "Change Example",
   systemContext: "System Context",
   architectureDiagram: "Architecture Diagram",
   bestSolution: "Best Possible Solution",
   maintainerDecision: "Maintainer Decision",
   reproductionAssessment: "Reproduction Assessment",
   solutionAssessment: "Solution Assessment",
-  visionFit: "Vision Fit",
   rootCauseCluster: "Root-Cause Cluster",
+  productReview: "Product Review",
+  provenance: "Provenance",
+  testingReview: "Testing Review",
   reviewFindings: "Review Findings",
   securityReview: "Security Review",
   realBehaviorProof: "Real Behavior Proof",
   prRating: "PR Rating",
-  telegramVisibleProof: "Telegram Visible Proof",
-  liveProof: "Live Proof",
-  mantisRecommendation: "Mantis Recommendation",
   featureShowcase: "Feature Showcase",
   agentsPolicyStatus: "AGENTS.md Policy Status",
   workCandidate: "Work Candidate",

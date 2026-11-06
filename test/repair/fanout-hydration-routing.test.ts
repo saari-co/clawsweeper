@@ -4,7 +4,7 @@ import test from "node:test";
 import { parse } from "yaml";
 
 test("only normal-review fanout uses identities; hot intake skips preflight and audit retains hydration", () => {
-  const workflow = parse(readFileSync(".github/workflows/sweep.yml", "utf8"));
+  const workflow = parse(readFileSync(".github/workflows/target-fanout.yml", "utf8"));
   const fanout = workflow.jobs["target-fanout"];
   const full = fanout.steps.find(
     (step: { uses?: string }) => step.uses === "./.github/actions/setup-state",
@@ -16,16 +16,16 @@ test("only normal-review fanout uses identities; hot intake skips preflight and 
     (step: { name?: string }) => step.name === "Dispatch selected targets",
   );
   assert.equal(full.if, "${{ github.event.schedule == '37 */6 * * *' }}");
-  assert.equal(identity.if, "${{ github.event.schedule == '41 * * * *' }}");
+  assert.equal(identity.if, "${{ github.event.schedule == '14/20 * * * *' }}");
   const nodeSetup = fanout.steps.find((step: { uses?: string }) =>
     step.uses?.startsWith("actions/setup-node@"),
   );
   assert.match(nodeSetup.uses, /^actions\/setup-node@[0-9a-f]{40}$/);
   assert.equal(nodeSetup.if, identity.if);
-  for (const schedule of ["41 * * * *", "4/20 * * * *", "37 */6 * * *"]) {
+  for (const schedule of ["14/20 * * * *", "4/20 * * * *", "37 */6 * * *"]) {
     const matches = (condition: string) =>
       condition === "${{ github.event.schedule == '" + schedule + "' }}";
-    assert.equal(matches(identity.if), schedule === "41 * * * *");
+    assert.equal(matches(identity.if), schedule === "14/20 * * * *");
     assert.equal(matches(full.if), schedule === "37 */6 * * *");
   }
   assert.equal(identity.run, "node scripts/prepare-worker-coverage-manifest.ts");
@@ -43,12 +43,15 @@ test("only normal-review fanout uses identities; hot intake skips preflight and 
     "${{ github.event.schedule == '37 */6 * * *' && '.artifacts/worker-records-manifest.json' || '.artifacts/worker-coverage-manifest.json' }}",
   );
   assert.match(dispatch.run, /--coverage-tracked-items-manifest "\$COVERAGE_MANIFEST"/);
-  const otherHydrations = Object.entries(workflow.jobs).flatMap(([name, job]) =>
-    name === "target-fanout"
-      ? []
-      : ((job as { steps?: Array<{ uses?: string; name?: string }> }).steps ?? []).filter((step) =>
-          step.uses?.endsWith("/.github/actions/setup-state"),
-        ),
+  assert.match(dispatch.run, /--workflow audit\.yml(?:\s|$)/);
+  assert.doesNotMatch(dispatch.run, /audit_dashboard/);
+  const jobs = ["sweep.yml", "review-plan.yml", "audit.yml"].flatMap((file) =>
+    Object.values<{ steps?: Array<{ uses?: string; name?: string }> }>(
+      parse(readFileSync(`.github/workflows/${file}`, "utf8")).jobs,
+    ),
+  );
+  const otherHydrations = jobs.flatMap((job) =>
+    (job.steps ?? []).filter((step) => step.uses?.endsWith("/.github/actions/setup-state")),
   );
   assert.ok(otherHydrations.length >= 5);
   assert.ok(otherHydrations.every((step) => step.name !== "Prepare canonical coverage identities"));

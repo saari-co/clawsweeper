@@ -1,8 +1,14 @@
+import { sha256 } from "./content-hash.js";
+import { GitHubItemMovedError } from "./github-item-identity.js";
+import {
+  isExplicitReviewRequest,
+  requiresMaintainerReviewRequest,
+} from "./maintainer-review-policy.js";
 import {
   createOversizedPrFreshnessGuard,
   parseOversizedPrSourceSnapshot,
 } from "./clawsweeper-oversized-pr-freshness.js";
-import { REVIEW_SECTIONS } from "./clawsweeper-policy.js";
+import { REVIEW_SECTIONS, requiresPrCloseCoverageProof } from "./clawsweeper-policy.js";
 import {
   oversizedPrCloseEnabled,
   parseOversizedPullRequestEvidence,
@@ -13,6 +19,10 @@ import { dirname, join, resolve } from "node:path";
 import { reportPublicationPolicy } from "./manual-publication-policy.js";
 import { assertManualPublicationAuthority } from "./manual-publication-authority.js";
 import { createApplyCandidateGuards } from "./clawsweeper-apply-candidate-guards.js";
+import {
+  unreadableReviewRecordReason,
+  validateReportClose,
+} from "./clawsweeper-apply-close-decision.js";
 import { executeApplyClose } from "./clawsweeper-apply-close-execution.js";
 import {
   createApplyCloseGuards,
@@ -52,6 +62,7 @@ import {
   DEFAULT_REASONING_EFFORT,
   DEFAULT_SERVICE_TIER,
   STALE_INSUFFICIENT_INFO_MIN_AGE_DAYS,
+  isGitHubVerifiedFixedPullRequestSource,
 } from "./clawsweeper-policy.js";
 import { rawCommentBody } from "./clawsweeper-review-comments.js";
 import { DurableReviewPublicationBlockedError } from "./clawsweeper-review-comment-publication.js";
@@ -69,11 +80,7 @@ import type {
   ReportEntry,
   ReviewCommentRenderOptions,
 } from "./clawsweeper-types.js";
-import {
-  maintainerDecisionFromReport,
-  type DecisionPacketSubjectState,
-  type MaintainerDecision,
-} from "./decision-packets.js";
+import { type DecisionPacketSubjectState, type MaintainerDecision } from "./decision-packets.js";
 import {
   GitHubRateLimitError,
   isGitHubNotFoundError,
@@ -92,7 +99,29 @@ import {
 import { isAutoCloseAllowed, repositoryProfileFor } from "./repository-profiles.js";
 import { stableJson } from "./stable-json.js";
 import { LiveReadGeneration, type GenerationBoundValue } from "./live-read-generation.js";
-import { parsePrHydrationSnapshot } from "./pr-hydration-snapshot.js";
+import { asRecord, login } from "./value-coerce.js";
+import {
+  frontMatterStringArray,
+  frontMatterValue,
+  replaceFrontMatterValue,
+  replaceSectionValue,
+} from "./report-front-matter.js";
+import {
+  exactEventReviewLeaseDisposition,
+  hasVerifiedLocalCheckoutAccess,
+  isApplyCloseCandidateReport,
+  isLiveRecheckCloseGuardReport,
+  isPairBlockedCloseReport,
+  isRetryableCloseSkipReport,
+  isRetryableKeptOpenCloseReport,
+  isRetryablePrCloseCoverageProofReport,
+  reviewLeaseRevisionFromReport,
+  shouldProbeClosedStateReport,
+  shouldSyncReviewComment,
+} from "./clawsweeper-record-metadata.js";
+import { lockedConversationApplyReason } from "./clawsweeper-item-policy.js";
+import { prAutoCloseExemptDecisionReason } from "./clawsweeper-apply-guard-activity.js";
+import { reportReviewDecision } from "./report-review-decision.js";
 
 export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWorkflowDependencies) {
   const {
@@ -124,30 +153,18 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     discardIssueLabelMutationBatch,
     duplicateCanonicalPullRequestBlockReason,
     ensureDir,
-    exactEventReviewLeaseDisposition,
     fetchItem,
     fetchReviewedPrActivityCursor,
     finishApplyMutationAttempt,
     flushIssueLabelMutationBatch,
     freshPullRequestReviewHead,
-    frontMatterStringArray,
-    frontMatterValue,
     ghJson,
     GitHubRuntimeBudgetError,
     guardedOpenApplyProofFields,
-    hasVerifiedLocalCheckoutAccess,
-    isApplyCloseCandidateReport,
-    isLiveRecheckCloseGuardReport,
     isMaintainerAuthorAssociation,
-    isPairBlockedCloseReport,
-    isRetryableCloseSkipReport,
-    isRetryableKeptOpenCloseReport,
-    isRetryablePrCloseCoverageProofReport,
     issueReviewComment,
     isVerifiedFixedCloseReason,
     liveIssueSourceRevision,
-    login,
-    lockedConversationApplyReason,
     lowSignalUnmergeablePrApplyBlockReasonSafe,
     markedReviewCommentBody,
     mutationErrorMessage,
@@ -157,7 +174,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     orderedApplyItemNumbers,
     pairCloseKey,
     PR_CLOSE_COVERAGE_PROOF_SCHEMA_PATH,
-    prAutoCloseExemptDecisionReason,
     prCloseCoverageProofPromptTemplate,
     pullHeadShaFromContext,
     recordApplyActionEvents,
@@ -168,19 +184,13 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     removeCurrentCursorTraceItem,
     removeIssueLabel,
     renderReviewCommentFromReport,
-    replaceFrontMatterValue,
     repoFromArgs,
-    reportDecision,
     reportEntriesForDir,
     reviewCommentBodyDigest,
     reviewCommentHashMatches,
-    reviewLeaseRevisionFromReport,
-    reviewSectionValue,
     ROOT,
     runtimeBudgetExceeded,
     sameAuthorCounterpartApplyReason,
-    shouldProbeClosedStateReport,
-    shouldSyncReviewComment,
     staleCanonicalCommentSyncPendingReason,
     stalePullRequestReviewComment,
     stalePullRequestReviewHead,
@@ -191,7 +201,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     targetRepo,
     updateReviewCommentMetadata,
     upsertReviewComment,
-    validateCloseDecision,
     withGuardReadOptions,
   } = dependencies;
 
@@ -448,6 +457,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       itemNumber: number;
       lease: AcquiredReviewStartLease;
     } | null = null;
+    const currentPublicationLease = (): AcquiredReviewStartLease | null =>
+      activeApplyMutationLease?.lease ?? null;
     const releaseActiveApplyMutationLease = (): void => {
       const active = activeApplyMutationLease;
       activeApplyMutationLease = null;
@@ -562,6 +573,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       let publishedIssueLabelMutation = false;
       let rememberSelfMutationUpdatedAt = (
         _options: {
+          ownedWriteUpdatedAt?: string | undefined;
           postReviewActivityStartedAtMs?: number;
           requiresReviewedPrActivityCursor?: boolean;
         } = {},
@@ -732,27 +744,21 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         }
       };
       examinedItemNumbers.push(number);
-      const decision = frontMatterValue(markdown, "decision");
-      let closeReason = frontMatterValue(markdown, "close_reason") as CloseReason | undefined;
+      const unreadableRecordReason = unreadableReviewRecordReason(markdown);
+      const { decision, closeReason: reviewedCloseReason } = unreadableRecordReason
+        ? {}
+        : reportReviewDecision(markdown);
+      let closeReason = reviewedCloseReason;
       const action = frontMatterValue(markdown, "action_taken");
       const changedSinceReviewDuplicateCommentRepair =
         action === "skipped_changed_since_review" &&
         decision === "close" &&
-        closeReason === "duplicate_or_superseded";
+        requiresPrCloseCoverageProof(closeReason);
       let staleCanonicalCommentSyncPending = action === "retry_stale_canonical_comment_sync";
       let storedHash = frontMatterValue(markdown, "item_snapshot_hash");
       let storedUpdatedAt = frontMatterValue(markdown, "item_updated_at");
       const storedAuthorAssociation = frontMatterValue(markdown, "author_association");
       let requiredMaintainerDecision: MaintainerDecision | null;
-      const shouldProbeClosedState = shouldProbeClosedStateReport(markdown);
-      const isRetryableSkippedClose = isRetryableCloseSkipReport(markdown);
-      const isLiveRecheckGuardClose = isLiveRecheckCloseGuardReport(markdown);
-      const isUpgradedCloseCandidate =
-        isRetryableSkippedClose ||
-        isLiveRecheckGuardClose ||
-        isRetryablePrCloseCoverageProofReport(markdown) ||
-        isRetryableKeptOpenCloseReport(markdown) ||
-        isPairBlockedCloseReport(markdown);
       const oversizedMetadataDecision = closeReason === "oversized_pull_request" &&
         parseOversizedPullRequestEvidence(frontMatterValue(markdown, "oversized_pull_request")) !== null;
       let oversizedActivityGuard: ReturnType<typeof createOversizedPrFreshnessGuard> | undefined;
@@ -820,22 +826,21 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         const pairedEntry = openReportEntry(issueNumber);
         if (!pairedEntry) return "implemented-on-main paired closeout requires an independently reviewed linked issue report";
         if (reportPublicationPolicy(pairedEntry.markdown)) return "linked issue publication policy forbids paired closeout";
-        const parentFixedPrNumber = frontMatterValue(markdown, "fixed_pr_number");
-        const parentFixedPrUrl = frontMatterValue(markdown, "fixed_pr_url");
-        const pairedFixedPrNumber = frontMatterValue(pairedEntry.markdown, "fixed_pr_number");
-        const pairedFixedPrUrl = frontMatterValue(pairedEntry.markdown, "fixed_pr_url");
-        const pairedFixedPrConfidence = frontMatterValue(pairedEntry.markdown, "fixed_pr_confidence");
-        const pairedFixedPrSource = frontMatterValue(pairedEntry.markdown, "fixed_pr_source");
-        const pairedFixedPrMergedAt = frontMatterValue(pairedEntry.markdown, "fixed_pr_merged_at");
+        const unreadablePairedRecordReason = unreadableReviewRecordReason(pairedEntry.markdown);
+        if (unreadablePairedRecordReason) {
+          return `linked issue #${issueNumber}: ${unreadablePairedRecordReason}`;
+        }
+        const parentFixedPr = reportReviewDecision(markdown).fixedPullRequestFields;
+        const pairedFixedPr = reportReviewDecision(pairedEntry.markdown).fixedPullRequestFields;
         if (
-          !parentFixedPrNumber ||
-          parentFixedPrNumber !== pairedFixedPrNumber ||
-          !parentFixedPrUrl ||
-          parentFixedPrUrl !== pairedFixedPrUrl ||
-          pairedFixedPrConfidence !== "high" ||
-          !pairedFixedPrSource?.includes("GitHub ") ||
-          !pairedFixedPrMergedAt ||
-          pairedFixedPrMergedAt === "unknown"
+          !parentFixedPr.number ||
+          parentFixedPr.number !== pairedFixedPr.number ||
+          !parentFixedPr.url ||
+          parentFixedPr.url !== pairedFixedPr.url ||
+          pairedFixedPr.confidence !== "high" ||
+          !isGitHubVerifiedFixedPullRequestSource(pairedFixedPr.source) ||
+          !pairedFixedPr.mergedAt ||
+          pairedFixedPr.mergedAt === "unknown"
         ) {
           return "implemented-on-main paired closeout requires the linked issue's independent review to cite the same GitHub-verified fixing pull request";
         }
@@ -881,8 +886,28 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         actionTaken: ActionTaken,
         reason: string,
         liveGuardVerified = false,
-        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified" | "oversizedClosePolicyDeferred"> = {},
+        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified" | "oversizedClosePolicyDeferred" | "closePolicyHoldVerified"> = {},
       ): boolean => {
+        const { closePolicyHoldVerified, ...otherPublicationProof } = publicationProof;
+        let policyHoldVerified = false;
+        if (emitEventApplyProof && !dryRun && closePolicyHoldVerified) {
+          const activityBlock = currentReviewActivityBlock();
+          if (activityBlock) return recordReviewLeaseSkip(activityBlock);
+          const refreshed = fetchApplyItem(number, { bypassGenerationCache: true });
+          const context = collectApplyItemContext(refreshed.item, {
+            fullTimelineForRelations: true,
+            reviewCacheDigest: true,
+            bypassGenerationCache: true,
+          });
+          currentContext = liveReadGeneration.bind(context);
+          const contextState = asRecord(context.issue).state;
+          policyHoldVerified = refreshed.state === "open" && contextState === "open" && completeReviewActivityReceiptMatches(context);
+          // Re-read source at the receipt boundary: an unchanged head/cursor does not
+          // prove that a PR body stayed equal while the policy was being evaluated.
+          if (refreshed.state !== "open" || (typeof contextState === "string" && contextState !== "open") || (!policyHoldVerified && reviewHasCompleteActivityIdentity && context[completeActivityContextSymbol])) {
+            return markApplySkipped("skipped_changed_since_review", "reviewed source or activity changed before close-policy hold");
+          }
+        }
         markApplyChecked();
         results.push({
           number,
@@ -893,7 +918,12 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             liveGuardVerified,
           }),
           ...eventApplyDispositionProof(actionTaken),
-          ...publicationProof,
+          ...otherPublicationProof,
+          // Only the policy owner can positively prove a no-mutation hold.
+          // Failed reads and incomplete evidence never acquire this receipt.
+          ...(policyHoldVerified
+            ? { guardedOpenStateVerified: true, closePolicyHoldVerified: true }
+            : {}),
         });
         processedCount += 1;
         maybeLogProgress(`skipped #${number}: ${reason}`);
@@ -903,7 +933,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         actionTaken: ActionTaken,
         reason: string,
         liveGuardVerified = false,
-        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified" | "oversizedClosePolicyDeferred"> = {},
+        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified" | "oversizedClosePolicyDeferred" | "closePolicyHoldVerified"> = {},
       ): boolean => {
         markdown = replaceFrontMatterValue(markdown, "action_taken", actionTaken);
         return recordApplySkipped(actionTaken, reason, liveGuardVerified, publicationProof);
@@ -921,6 +951,20 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         }
         continue;
       }
+      // A promotion removes a record that does not read, so do this check before a promotion.
+      if (unreadableRecordReason) {
+        if (markApplySkipped("skipped_changed_since_review", unreadableRecordReason)) break;
+        continue;
+      }
+      const shouldProbeClosedState = shouldProbeClosedStateReport(markdown);
+      const isRetryableSkippedClose = isRetryableCloseSkipReport(markdown);
+      const isLiveRecheckGuardClose = isLiveRecheckCloseGuardReport(markdown);
+      const isUpgradedCloseCandidate =
+        isRetryableSkippedClose ||
+        isLiveRecheckGuardClose ||
+        isRetryablePrCloseCoverageProofReport(markdown) ||
+        isRetryableKeptOpenCloseReport(markdown) ||
+        isPairBlockedCloseReport(markdown);
       const markLabelSyncAuthSkipped = (labelKind: string): boolean => {
         const reason = `GitHub rejected ${labelKind} label sync with Requires authentication`;
         return staleCanonicalCommentSyncPending
@@ -930,22 +974,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             )
           : markApplySkipped("kept_open", reason);
       };
-      try {
-        requiredMaintainerDecision = maintainerDecisionFromReport(markdown);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const reason = `invalid maintainer_decision: ${detail}`;
-        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
-        if (!dryRun) {
-          captureApplyCanonicalBaseline(path);
-          writeFileSync(path, markdown, "utf8");
-        }
-        results.push({ number, action: "kept_open", reason });
-        processedCount += 1;
-        maybeLogProgress(`skipped #${number}: ${reason}`);
-        if (processedCount >= processedLimit) break;
-        continue;
-      }
+      const { maintainerDecision } = reportReviewDecision(markdown);
+      requiredMaintainerDecision = maintainerDecision;
       if (closeReason === "oversized_pull_request" &&
           (dryRun || syncCommentsOnly || !oversizedPrCloseEnabled() || !closeReasonEnabled(closeReason, applyCloseReasons))) {
         const policyReason = syncCommentsOnly
@@ -993,7 +1023,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       try {
         liveItem = fetchApplyItem(number);
       } catch (error) {
-        if (!isGitHubNotFoundError(error)) throw error;
+        if (!(error instanceof GitHubItemMovedError) && !isGitHubNotFoundError(error)) throw error;
         // A repository lookup can return the same 404 when the repo is missing or
         // inaccessible. Confirm repo access before treating this as an item miss.
         ghJson<unknown>(["api", `repos/${targetRepo()}`]);
@@ -1027,6 +1057,12 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         continue;
       }
       const { item, state } = liveItem;
+      if (state === "open" && exactEventPublication && process.env.EXACT_REVIEW_DECISION &&
+        requiresMaintainerReviewRequest(item) &&
+        !isExplicitReviewRequest(JSON.parse(process.env.EXACT_REVIEW_DECISION))) {
+        if (markApplySkipped("skipped_maintainer_authored", "maintainer review requires an explicit request", true)) break;
+        continue;
+      }
       if (
         state === "open" &&
         decision === "close" &&
@@ -1048,9 +1084,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       const previousLabels = [...item.labels];
       const reportLabelsBeforeApply = frontMatterStringArray(markdown, "labels");
       const markdownBeforeApplyDecisionMutations = markdown;
-      const persistedPrHydrationSnapshot = parsePrHydrationSnapshot(
-        frontMatterValue(markdownBeforeApplyDecisionMutations, "pr_hydration_snapshot"),
-      );
       let currentContext: GenerationBoundValue<ItemContext> | undefined;
       let currentClosingPullRequests: unknown[] | undefined;
       let clawSweeperLabelsChanged = false;
@@ -1077,17 +1110,13 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       };
       const currentItemContext = (): ItemContext => {
         if (oversizedMetadataDecision) {
-          currentContext ??= liveReadGeneration.bind(oversizedPullRequestContext(dependencies.asRecord(ghJson(["api", `repos/${repo}/pulls/${number}`]))));
+          currentContext ??= liveReadGeneration.bind(oversizedPullRequestContext(asRecord(ghJson(["api", `repos/${repo}/pulls/${number}`]))));
           return liveReadGeneration.value(currentContext);
         }
         currentContext ??= liveReadGeneration.bind(
           collectApplyItemContext(item, {
             fullTimelineForRelations: true,
             reviewCacheDigest: true,
-            prHydrationSnapshot: persistedPrHydrationSnapshot,
-            prCommentActivityRevision:
-              persistedPrHydrationSnapshot?.commentActivityRevision ?? null,
-            requireFullyValidatedPrHydrationSnapshot: true,
           }),
         );
         return liveReadGeneration.value(currentContext);
@@ -1195,6 +1224,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       let canonicalBoundStaleReviewReason: (
         sourceMarkdown: string,
         comment: Record<string, unknown> | undefined,
+        liveLease?: AcquiredReviewStartLease | null,
       ) => string | null;
       const {
         acquireApplyMutationLease,
@@ -1291,6 +1321,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       if (initialCanonicalCommentSyncGuard.skipCurrentItem) continue;
       rememberSelfMutationUpdatedAt = (
         options?: {
+          /** `updated_at` GitHub returned for the ClawSweeper write itself (the comment). */
+          ownedWriteUpdatedAt?: string | undefined;
           postReviewActivityStartedAtMs?: number;
           requiresReviewedPrActivityCursor?: boolean;
         },
@@ -1317,10 +1349,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         const receiptContext = collectApplyItemContext(automationItem, {
           fullTimelineForRelations: true,
           reviewCacheDigest: true,
-          prHydrationSnapshot: persistedPrHydrationSnapshot,
-          prCommentActivityRevision:
-            persistedPrHydrationSnapshot?.commentActivityRevision ?? null,
-          requireFullyValidatedPrHydrationSnapshot: true,
         });
         const allowsPostReviewAutomationActivity =
           options?.postReviewActivityStartedAtMs !== undefined;
@@ -1359,6 +1387,11 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         if (!completeActivityContext) return false;
         selfMutationItemReceipts.push({
           updatedAt: automationItemUpdatedAt,
+          // GitHub can report the item's updated_at before it reflects this write, then move it
+          // to the write's own time. Keep both so the final gate recognizes either.
+          ...(options?.ownedWriteUpdatedAt && options.ownedWriteUpdatedAt !== automationItemUpdatedAt
+            ? { ownedWriteUpdatedAt: options.ownedWriteUpdatedAt }
+            : {}),
           sourceRevision: receiptContext.sourceRevision ?? "",
           activityReceipt: stableJson(completeActivityContext),
           allowsPostReviewAutomationActivity,
@@ -1390,12 +1423,12 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       const {
         coverageProofState,
         currentAuthorPrBudgetApplyGate,
-        candidateObsoleteFixPrBlockReason,
+        candidateObsoleteFixPrBlock,
         currentPrCloseCoverageProofGateBlock,
-        candidateStaleVersionBugBlockReason,
+        candidateStaleVersionBugBlock,
       } = candidateGuards;
-      const currentObsoleteFixPrBlockReason = () => dependencies.obsoleteFixPrApplyBlockReasonSafe(number, item);
-      const currentStaleVersionBugBlockReason = () => dependencies.staleVersionBugApplyBlockReasonSafe(number, item);
+      const currentObsoleteFixPrBlock = () => dependencies.obsoleteFixPrApplyBlockSafe(number, item);
+      const currentStaleVersionBugBlock = () => dependencies.staleVersionBugApplyBlockSafe(number, item);
       const recordRuntimeBudgetYield = (reason: string): void => {
         discardIssueLabelBatch();
         if (clawSweeperLabelsChanged && !dryRun && !issueLabelBatchActive) {
@@ -1422,9 +1455,9 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           processedCount,
           storedUpdatedAt,
         }),
-        currentObsoleteFixPrBlockReason,
+        currentObsoleteFixPrBlock,
         currentPrCloseCoverageProofGateBlock,
-        currentStaleVersionBugBlockReason,
+        currentStaleVersionBugBlock,
         fileEntries,
         isRetryableSkippedClose,
         item,
@@ -1527,7 +1560,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         if (recordActiveReviewLeaseSkip(earlyLeaseState.lease.expiresAt)) break;
         continue;
       }
-      const earlyStaleReason = refreshedReviewStaleReason(existingReviewComment);
+      const earlyStaleReason = refreshedReviewStaleReason(existingReviewComment, earlyLeaseState.currentLease);
       if (state === "open" && earlyStaleReason) {
         if (recordRefreshedReviewStaleReason(earlyStaleReason, existingReviewComment)) break;
         continue;
@@ -1561,8 +1594,8 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           applyKind,
           closeReason,
           currentAuthorPrBudgetApplyGate,
-          currentObsoleteFixPrBlockReason: candidateObsoleteFixPrBlockReason,
-          currentStaleVersionBugBlockReason: candidateStaleVersionBugBlockReason,
+          currentObsoleteFixPrBlock: candidateObsoleteFixPrBlock,
+          currentStaleVersionBugBlock: candidateStaleVersionBugBlock,
           isCloseProposal,
           item,
           markdown,
@@ -1572,12 +1605,15 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           storedUpdatedAt,
           syncCommentsOnly,
         });
+      const recordClosePolicyBlock = (block: NonNullable<ReturnType<typeof applyClosePolicy>["block"]>): boolean => {
+        return block.preserveOriginalAction
+          ? recordApplySkipped("kept_open", block.reason, false, { closePolicyHoldVerified: block.closePolicyHoldVerified === true })
+          : markApplySkipped("kept_open", block.reason, false, { closePolicyHoldVerified: block.closePolicyHoldVerified === true });
+      };
       const earlyClosePolicy = applyClosePolicy("before-canonical");
       markdown = earlyClosePolicy.markdown;
       if (earlyClosePolicy.block) {
-        const stopped = earlyClosePolicy.block.preserveOriginalAction
-          ? recordApplySkipped("kept_open", earlyClosePolicy.block.reason)
-          : markApplySkipped("kept_open", earlyClosePolicy.block.reason);
+        const stopped = recordClosePolicyBlock(earlyClosePolicy.block);
         if (stopped) break;
         continue;
       }
@@ -1587,9 +1623,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       const lateClosePolicy = applyClosePolicy("after-canonical");
       markdown = lateClosePolicy.markdown;
       if (lateClosePolicy.block) {
-        const stopped = lateClosePolicy.block.preserveOriginalAction
-          ? recordApplySkipped("kept_open", lateClosePolicy.block.reason)
-          : markApplySkipped("kept_open", lateClosePolicy.block.reason);
+        const stopped = recordClosePolicyBlock(lateClosePolicy.block);
         if (stopped) break;
         continue;
       }
@@ -1610,13 +1644,14 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           previousLabels,
           suppressAutomationMarkers,
         }),
-        reviewSectionValue(markdown, "closeComment"),
+        reportReviewDecision(markdown).publishedCloseComment,
       ]);
       const markedReviewCommentForApply = (body: string): string =>
         markedReviewCommentBody(number, body);
       const staleReviewCommentReason = canonicalBoundStaleReviewReason(
         markdown,
         existingReviewComment,
+        earlyLeaseState.currentLease,
       );
       if (state === "open" && staleReviewCommentReason) {
         if (staleCanonicalCommentSyncPending) {
@@ -1647,6 +1682,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         continue;
       }
       const {
+        driftDiagnostics,
         labelSyncFreshEnough,
         reviewedSourceFresh,
         retryCloseCoverageCommandStatusOnlyUpdate,
@@ -1669,7 +1705,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         requiresApplyMutationLease,
         storedHash,
       });
-      const markChangedSinceReview = createApplyChangedSinceReviewMarker(dependencies, {
+      const markChangedSinceReview = createApplyChangedSinceReviewMarker({
         dryRun,
         emitEventApplyProof,
         getMarkdown: () => markdown,
@@ -1688,8 +1724,9 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           ? stalePullRequestReviewHead(markdown, currentItemContext())
           : null;
       const guardedReviewAction = isGuardedApplyReviewAction(action, isLiveRecheckGuardClose);
-      const markReviewedSourceDrift = () =>
-        markChangedSinceReview({
+      const markReviewedSourceDrift = () => {
+        console.error(`[apply] source drift #${number} ${JSON.stringify(driftDiagnostics())}`);
+        return markChangedSinceReview({
           ...applyReviewedSourceDriftEvidence(dependencies, {
             currentItemContext,
             item,
@@ -1697,6 +1734,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           }),
           preserveAction: guardedReviewAction ? action : undefined,
         });
+      };
       let currentPrStatusKind: PrStatusLabelKind | null = null;
       let lockedMetadataOnly = false;
       if (state === "open") {
@@ -1710,7 +1748,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           if (recordReviewLeaseSkip(lateLeaseState.blockReason)) break;
           continue;
         }
-        const lateStaleReason = refreshedReviewStaleReason(lateLeaseState.comment);
+        const lateStaleReason = refreshedReviewStaleReason(lateLeaseState.comment, lateLeaseState.currentLease);
         if (lateStaleReason) {
           if (recordRefreshedReviewStaleReason(lateStaleReason, lateLeaseState.comment)) break;
           continue;
@@ -1890,6 +1928,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           completeReviewActivityReceiptMatches,
           currentProofState: () => ({
             ...coverageProofState,
+            acceptedUpdatedAt: reviewedSourceFresh() ? item.updatedAt : undefined,
             storedHash,
             storedUpdatedAt,
           }),
@@ -2078,19 +2117,21 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       );
       if (
         isCloseProposal &&
-        closeReason === "duplicate_or_superseded" &&
+        requiresPrCloseCoverageProof(closeReason) &&
         !syncCommentsOnly &&
         (applyKind === "all" || item.kind === applyKind) &&
         closeReasonEnabled(closeReason, applyCloseReasons)
       ) {
-        const preSyncReportValidation = validateCloseDecision(
+        const preSyncReportValidation = validateReportClose(
+          dependencies,
           {
             repo,
             kind: item.kind,
             labels: item.labels,
             authorAssociation: item.authorAssociation,
           },
-          reportDecision(markdown, closeReason),
+          markdown,
+          closeReason,
           { requireCloseComment: !isRetryableSkippedClose },
         );
         const preSyncValidationPassed =
@@ -2260,6 +2301,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             const latestStaleSyncReason = canonicalBoundStaleReviewReason(
               markdown,
               existingReviewComment,
+              latestLeaseState.currentLease,
             );
             if (latestStaleSyncReason) {
               markdown = replaceFrontMatterValue(
@@ -2323,7 +2365,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 markedReviewComment,
                 existingReviewComment,
                 undefined,
-                { suppressAutomationMarkers },
+                { suppressAutomationMarkers, preserveReviewStartLease: currentPublicationLease() },
               );
               oversizedActivityGuard?.recordOwnComment(syncedComment);
               if (oversizedActivityGuard) {
@@ -2331,7 +2373,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 // Persist the original baseline and exact write identity before any further reads.
                 persistOversizedActivityReceipt();
               }
-              rememberSelfMutationUpdatedAt();
+              rememberSelfMutationUpdatedAt({ ownedWriteUpdatedAt: commentUpdatedAt(syncedComment) });
               deferredSelfMutationReceipt = false;
               syncReasons.push("updated durable Codex review comment");
               if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
@@ -2631,12 +2673,19 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         const storedHash = frontMatterValue(reviewMarkdown, "review_comment_sha256");
         const storedId = Number(frontMatterValue(reviewMarkdown, "review_comment_id"));
         const storedUrl = frontMatterValue(reviewMarkdown, "review_comment_url");
-        if (!storedHash || !Number.isSafeInteger(storedId) || storedId <= 0 || !storedUrl) {
+        // A paired report whose record does not read has no comment that apply can verify.
+        if (
+          !storedHash ||
+          !Number.isSafeInteger(storedId) ||
+          storedId <= 0 ||
+          !storedUrl ||
+          unreadableReviewRecordReason(reviewMarkdown)
+        ) {
           return null;
         }
         const reviewComment = issueReviewComment(reviewNumber, [
           renderReviewCommentFromReport(reviewMarkdown, reviewCloseReason),
-          reviewSectionValue(reviewMarkdown, "closeComment"),
+          reportReviewDecision(reviewMarkdown).publishedCloseComment,
         ]);
         if (
           commentId(reviewComment) !== storedId ||
@@ -2678,15 +2727,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         pairedIssueDurableReviewCommentUpdatedAt: (pairedNumber) => {
           const pairedMarkdown = openReportEntry(pairedNumber)?.markdown;
           if (!pairedMarkdown) return null;
-          const pairedCloseReason = reportDecision(
-            pairedMarkdown,
-            "implemented_on_main",
-          ).closeReason;
-          return durableReviewCommentUpdatedAt(
-            pairedMarkdown,
-            pairedNumber,
-            pairedCloseReason,
-          );
+          return durableReviewCommentUpdatedAt(pairedMarkdown, pairedNumber, "implemented_on_main");
         },
         closeDelayMs,
         closeLimitReached: closedCount >= limit,
@@ -2694,18 +2735,18 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         closedDir,
         currentApplyMutationLeaseBlockReason: currentApplyMutationBoundaryBlockReason,
         currentAuthorPrBudgetApplyGate: () => currentAuthorPrBudgetApplyGate(true),
-        currentObsoleteFixPrBlockReason,
+        currentObsoleteFixPrBlock,
         currentSameAuthorPairBlockReason,
         setCloseMutationPolicyGuard: (guard) => {
           currentCloseMutationPolicyGuard = (mutationNumber) => {
             const block = guard(mutationNumber);
             if (!block) return null;
-            recordApplyMutationGuardReason = () => markApplySkipped(block.actionTaken, block.reason);
+            recordApplyMutationGuardReason = () => markApplySkipped(block.actionTaken, block.reason, false, { closePolicyHoldVerified: block.closePolicyHoldVerified === true });
             return block.reason;
           };
         },
         currentPrCloseCoverageProofGateBlock,
-        currentStaleVersionBugBlockReason,
+        currentStaleVersionBugBlock,
         currentDurableReviewCommentUpdatedAt: () =>
           durableReviewCommentUpdatedAt(markdown, number, appliedCloseReason),
         deferPairedIssueForThisRun: (pairedNumber) => {
@@ -2767,10 +2808,10 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           // Finish only our pending notice; never replace a newer canonical review.
           if (!liveComment || !commentBodyMatches(liveComment, markedReviewComment)) return;
           const completedBody = markedReviewCommentForApply(renderReviewCommentFromReport(markdown, "oversized_pull_request", renderOptions));
-          const completedComment = upsertReviewComment(number, completedBody, liveComment, undefined, { suppressAutomationMarkers });
+          const completedComment = upsertReviewComment(number, completedBody, liveComment, undefined, { suppressAutomationMarkers, preserveReviewStartLease: currentPublicationLease() });
           markdown = updateReviewCommentMetadata(markdown, completedComment, completedBody);
-          markdown = dependencies.replaceSectionValue(markdown, REVIEW_SECTIONS.closeComment, completedBody);
-          markdown = replaceFrontMatterValue(markdown, "close_comment_sha256", dependencies.sha256(completedBody));
+          markdown = replaceSectionValue(markdown, REVIEW_SECTIONS.closeComment, completedBody);
+          markdown = replaceFrontMatterValue(markdown, "close_comment_sha256", sha256(completedBody));
           writeReportMarkdown(join(closedDir, file), markdown);
           } catch (error) {
             // Closing already succeeded; a notice failure must not recreate an open record.

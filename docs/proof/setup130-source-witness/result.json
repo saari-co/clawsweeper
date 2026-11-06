@@ -1,0 +1,217 @@
+{
+  "engine_base": "bb90b25f456957319a1da44e949f2ea9b748f4cb",
+  "node": "24.22.1",
+  "native_scanner": "3.97.4",
+  "focused_tests": {
+    "passed": 463,
+    "failed": 0,
+    "duration_ms": 67529.478834
+  },
+  "native_proof": {
+    "passed": true,
+    "scenarios": [
+      {
+        "scenario": "unique",
+        "base": "330448c8982c71033e576c48ca653361c0c5fd94",
+        "head": "49351a5b0693dc4720be5da49efcddd986c05ce5",
+        "exit": 79,
+        "diagnostic": {
+          "kind": "unclassified_finding",
+          "reason": "literal_not_reviewed",
+          "findingCount": 3,
+          "findingIndex": 0,
+          "detectorType": 17,
+          "decoder": "PLAIN",
+          "verified": false,
+          "scannerLine": 7,
+          "material": {
+            "kind": "patch",
+            "id": "1",
+            "from": "330448c8982c71033e576c48ca653361c0c5fd94",
+            "to": "49351a5b0693dc4720be5da49efcddd986c05ce5"
+          },
+          "nativeFindings": {
+            "total": 3,
+            "retained": 3,
+            "omitted": 0,
+            "truncated": false,
+            "findings": [
+              {
+                "index": 0,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "first_refusal",
+                "scannerInputLine": 7,
+                "material": {
+                  "kind": "patch",
+                  "id": "1",
+                  "from": "330448c8982c71033e576c48ca653361c0c5fd94",
+                  "to": "49351a5b0693dc4720be5da49efcddd986c05ce5"
+                },
+                "sourceLine": null,
+                "sourceLineStatus": "unavailable",
+                "sourceLineReason": "not_staged_blob"
+              },
+              {
+                "index": 1,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "unadjudicated",
+                "scannerInputLine": 1,
+                "material": {
+                  "kind": "blob",
+                  "id": "a7c56770eb07c72df59db0ac31034775946a5cf0",
+                  "referenceCount": 1,
+                  "references": [
+                    {
+                      "revision": "330448c8982c71033e576c48ca653361c0c5fd94",
+                      "pathSha256": "8753fcfdb2eea78a6429d76c6b3ba8d2cba223110090f56040d01efef98882a6",
+                      "mode": "100644",
+                      "role": "base"
+                    }
+                  ]
+                },
+                "sourceLine": 1,
+                "sourceLineStatus": "proven",
+                "sourceLineReason": "unique_plain_literal"
+              },
+              {
+                "index": 2,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "unadjudicated",
+                "scannerInputLine": 2,
+                "material": {
+                  "kind": "blob",
+                  "id": "8af401fd3d3c2d5fcb25ee553caf37e84ae74378",
+                  "referenceCount": 1,
+                  "references": [
+                    {
+                      "revision": "49351a5b0693dc4720be5da49efcddd986c05ce5",
+                      "pathSha256": "8753fcfdb2eea78a6429d76c6b3ba8d2cba223110090f56040d01efef98882a6",
+                      "mode": "100644",
+                      "role": "head"
+                    }
+                  ]
+                },
+                "sourceLine": 2,
+                "sourceLineStatus": "proven",
+                "sourceLineReason": "unique_plain_literal"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "scenario": "repeated",
+        "base": "091092f0cb4121dd614453e97cb8508aa7a93e7d",
+        "head": "b9dca63e2093819f2c38c9cbbc466ab2d8a73b7e",
+        "exit": 79,
+        "diagnostic": {
+          "kind": "unclassified_finding",
+          "reason": "literal_not_reviewed",
+          "findingCount": 3,
+          "findingIndex": 0,
+          "detectorType": 17,
+          "decoder": "PLAIN",
+          "verified": false,
+          "scannerLine": 1,
+          "material": {
+            "kind": "blob",
+            "id": "389d6ef3caeee02f25166a30469d497bd3b09105",
+            "referenceCount": 1,
+            "references": [
+              {
+                "revision": "091092f0cb4121dd614453e97cb8508aa7a93e7d",
+                "pathSha256": "8753fcfdb2eea78a6429d76c6b3ba8d2cba223110090f56040d01efef98882a6",
+                "mode": "100644",
+                "role": "base"
+              }
+            ]
+          },
+          "nativeFindings": {
+            "total": 3,
+            "retained": 3,
+            "omitted": 0,
+            "truncated": false,
+            "findings": [
+              {
+                "index": 0,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "first_refusal",
+                "scannerInputLine": 1,
+                "material": {
+                  "kind": "blob",
+                  "id": "389d6ef3caeee02f25166a30469d497bd3b09105",
+                  "referenceCount": 1,
+                  "references": [
+                    {
+                      "revision": "091092f0cb4121dd614453e97cb8508aa7a93e7d",
+                      "pathSha256": "8753fcfdb2eea78a6429d76c6b3ba8d2cba223110090f56040d01efef98882a6",
+                      "mode": "100644",
+                      "role": "base"
+                    }
+                  ]
+                },
+                "sourceLine": null,
+                "sourceLineStatus": "unavailable",
+                "sourceLineReason": "ambiguous_literal"
+              },
+              {
+                "index": 1,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "unadjudicated",
+                "scannerInputLine": 7,
+                "material": {
+                  "kind": "patch",
+                  "id": "1",
+                  "from": "091092f0cb4121dd614453e97cb8508aa7a93e7d",
+                  "to": "b9dca63e2093819f2c38c9cbbc466ab2d8a73b7e"
+                },
+                "sourceLine": null,
+                "sourceLineStatus": "unavailable",
+                "sourceLineReason": "not_staged_blob"
+              },
+              {
+                "index": 2,
+                "detectorType": 17,
+                "decoder": "PLAIN",
+                "verified": false,
+                "adjudication": "unadjudicated",
+                "scannerInputLine": 2,
+                "material": {
+                  "kind": "blob",
+                  "id": "4d868aabb960647a0196abe84ed2969927f254ca",
+                  "referenceCount": 1,
+                  "references": [
+                    {
+                      "revision": "b9dca63e2093819f2c38c9cbbc466ab2d8a73b7e",
+                      "pathSha256": "8753fcfdb2eea78a6429d76c6b3ba8d2cba223110090f56040d01efef98882a6",
+                      "mode": "100644",
+                      "role": "head"
+                    }
+                  ]
+                },
+                "sourceLine": null,
+                "sourceLineStatus": "unavailable",
+                "sourceLineReason": "ambiguous_literal"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "limitations": [
+    "synthetic source only",
+    "does not qualify Setup130 findings",
+    "no engine rollout or trust policy change"
+  ]
+}

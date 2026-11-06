@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { sha256 } from "../content-hash.ts";
+import { reportWithoutHydrationCache } from "../report-hydration-cache.ts";
 
 export type RecordTupleIdentity = {
   repository: string;
@@ -55,6 +56,13 @@ export function chooseRecordTupleWinner(options: {
   local: RecordTupleContents;
   remote: RecordTupleContents;
 }): RecordTupleWinner {
+  // A retired cache field cannot make an otherwise unchanged review conflict.
+  // Callers retain the original bytes separately for the authoritative CAS.
+  options = {
+    base: withoutHydrationCache(options.base),
+    local: withoutHydrationCache(options.local),
+    remote: withoutHydrationCache(options.remote),
+  };
   const localChanged = !recordTupleContentsEqual(options.base, options.local);
   const remoteChanged = !recordTupleContentsEqual(options.base, options.remote);
 
@@ -440,7 +448,7 @@ function validatePacketReference(
   if (tuple.packet === null) {
     throw tupleError(tuple.paths, `${label} references a missing decision packet`);
   }
-  const actual = createHash("sha256").update(tuple.packet).digest("hex");
+  const actual = sha256(tuple.packet);
   if (actual !== digest) {
     throw tupleError(tuple.paths, `${label} decision packet digest mismatch`);
   }
@@ -643,4 +651,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function tupleError(paths: RecordTuplePaths, detail: string): Error {
   return new RecordTupleError(`Invalid record tuple ${paths.key}: ${detail}`);
+}
+
+function withoutHydrationCache(tuple: RecordTupleContents): RecordTupleContents {
+  return {
+    ...tuple,
+    item: tuple.item === null ? null : reportWithoutHydrationCache(tuple.item),
+    closed: tuple.closed === null ? null : reportWithoutHydrationCache(tuple.closed),
+  };
 }

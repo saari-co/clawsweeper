@@ -14,6 +14,7 @@ import {
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { parse } from "yaml";
+import { MAX_MEDIA_PROOF_TIMEOUT_MS } from "../../src/media-proof-budget.ts";
 
 // Run the actual workflow shell and curl helper against an isolated HTTP peer.
 // Only expensive review/GitHub commands are replaced by harmless process fixtures.
@@ -52,9 +53,13 @@ for (const scenario of scenarios) {
   mkdirSync(join(cwd, "scripts"), { recursive: true });
   mkdirSync(join(cwd, "bin"));
   symlinkSync(resolve("dist"), join(cwd, "dist"), "dir");
+  // test/control-plane-curl.test.ts owns retry timing; this proof needs only the
+  // attempt count, so its copy skips the up-to-62 s backoff waits.
+  const helper = readFileSync("scripts/control-plane-curl.sh", "utf8");
+  assert.ok(helper.includes('sleep "$delay"'), "control-plane helper backoff sleep");
   writeFileSync(
     join(cwd, "scripts/control-plane-curl.sh"),
-    readFileSync("scripts/control-plane-curl.sh"),
+    helper.replace('sleep "$delay"', "sleep 0"),
   );
   writeFileSync(join(cwd, "output"), "");
   const oversized = scenario.includes("oversized");
@@ -81,6 +86,7 @@ cat "$PROOF_ROOT/pull.json"
   );
   writeFileSync(join(cwd, "bin/pnpm"), templateFixture(), { mode: 0o700 });
   const requests = [];
+  const statuses = [];
   const server = createServer(async (request, response) => {
     let body = "";
     for await (const part of request) body += part;
@@ -89,7 +95,7 @@ cat "$PROOF_ROOT/pull.json"
     assert.equal(request.url, "/internal/exact-review/heartbeat");
     assert.equal(request.method, "POST");
     assert.deepEqual(
-      { ...payload, phase: undefined },
+      { ...payload, phase: undefined, generation_start: undefined },
       {
         item_key: "example/project#1",
         lease_id: "synthetic-lease",
@@ -99,6 +105,7 @@ cat "$PROOF_ROOT/pull.json"
         run_attempt: 1,
         source_head_sha: "a".repeat(40),
         phase: undefined,
+        generation_start: undefined,
       },
     );
     let status = 200;
@@ -122,6 +129,7 @@ cat "$PROOF_ROOT/pull.json"
     if (scenario === "service-failure" || (scenario === "retry-current" && requests.length === 1))
       status = 503;
     if (scenario === "transport-failure") {
+      statuses.push("transport");
       request.socket.destroy();
       return;
     }
@@ -132,6 +140,7 @@ cat "$PROOF_ROOT/pull.json"
       status = 409;
       error = "lease_superseded";
     }
+    statuses.push(status);
     response.writeHead(status, { "content-type": "application/json", "retry-after": "0" });
     response.end(JSON.stringify(error ? { error } : { ok: status === 200 }));
   });
@@ -142,11 +151,19 @@ cat "$PROOF_ROOT/pull.json"
     target_checkout_dir: "target",
     codex_timeout_ms: "10000",
     media_proof_timeout_ms: "0",
+    media_preprocessing_reserve_seconds: String(MAX_MEDIA_PROOF_TIMEOUT_MS / 1000),
   };
-  const shell = step.run.replace(/\$\{\{ steps.target.outputs.(\w+) \}\}/g, (_, key) => {
-    assert.ok(Object.hasOwn(replacements, key), key);
-    return replacements[key];
-  });
+  // Untrusted values reach the script only through step env; resolve those
+  // `steps.target.outputs.*` expressions and blank every other env entry.
+  const stepEnv = Object.fromEntries(
+    Object.entries(step.env).map(([key, value]) => {
+      const output = /^\$\{\{ steps\.target\.outputs\.(\w+) \}\}$/.exec(String(value))?.[1];
+      if (!output) return [key, ""];
+      assert.ok(Object.hasOwn(replacements, output), output);
+      return [key, replacements[output]];
+    }),
+  );
+  const shell = step.run;
   assert.ok(!shell.includes("${{"));
   const log = openSync(join(cwd, "shell.log"), "w");
   let child;
@@ -156,7 +173,7 @@ cat "$PROOF_ROOT/pull.json"
       detached: true,
       stdio: ["ignore", log, log],
       env: {
-        ...Object.fromEntries(Object.keys(step.env).map((key) => [key, ""])),
+        ...stepEnv,
         PATH: join(cwd, "bin") + ":" + process.env.PATH,
         HOME: cwd,
         TMPDIR: cwd,
@@ -212,7 +229,20 @@ cat "$PROOF_ROOT/pull.json"
     assert.equal(outputs.superseded === "true", superseded);
     assert.equal(requests.length === 0, scenario === "invalid-tuple");
     if (scenario === "service-failure" || scenario === "transport-failure")
-      assert.equal(requests.length, 4);
+      assert.equal(requests.length, 6);
+    // The startup check, and its retries until accepted, charges generation
+    // start; periodic heartbeats after an accepted start never do.
+    const accepted = statuses.indexOf(200);
+    const generationStarts = requests.map((payload) => payload.generation_start);
+    if (guarded && !baselineRef) {
+      generationStarts.forEach((value, index) =>
+        assert.equal(
+          value,
+          accepted === -1 || index <= accepted ? true : undefined,
+          `${scenario} request ${index}`,
+        ),
+      );
+    }
     if (launched) {
       for (const file of ["started", "descendant"]) {
         const pid = Number(readFileSync(join(cwd, file), "utf8"));
@@ -230,6 +260,7 @@ cat "$PROOF_ROOT/pull.json"
       code,
       launched,
       requests: requests.length,
+      generationStartRequests: generationStarts.filter((value) => value === true).length,
       superseded: outputs.superseded === "true",
       mayPublish,
       processesReaped: true,

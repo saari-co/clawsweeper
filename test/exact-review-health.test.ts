@@ -3,10 +3,12 @@ import test from "node:test";
 
 import {
   projectExactReviewHandoff,
-  summarizeExactReviewHandoff,
   summarizeExactReviewPublicationHealth,
   summarizeExactReviewPressure,
 } from "../dashboard/exact-review-health.ts";
+import { summarizeExactReviewHandoff } from "./fixtures/exact-review-read-model-old.ts";
+import { exactReviewQueueStats } from "../dashboard/exact-review-read-model.ts";
+import type { ExactReviewQueueState } from "../dashboard/exact-review-queue.ts";
 
 const NOW = Date.parse("2026-07-13T02:00:00.000Z");
 const DISPATCH_LEASE_MS = 10 * 60_000;
@@ -163,8 +165,106 @@ test("exact-review handoff health surfaces paused and blocked dispatchers with p
   assert.equal(blocked.status, "stalled");
   assert.equal(blocked.reason, "dispatcher_blocked");
   const blockedMessage =
-    "The dispatcher cannot verify workflow availability while reviews are pending.";
+    "The dispatcher is backing off after a failed attempt while reviews are pending.";
   assert.equal(blocked.message, blockedMessage);
+});
+
+test("expired dispatcher backoff distinguishes a due retry from ineligible work", () => {
+  const key = "openclaw/openclaw#1";
+  const state: ExactReviewQueueState = {
+    items: {
+      [key]: {
+        key,
+        state: "pending",
+        createdAt: NOW - 60_000,
+        updatedAt: NOW - 60_000,
+        nextAttemptAt: NOW,
+        decision: { targetRepo: "openclaw/openclaw", itemNumber: 1 },
+      },
+    },
+    dispatcher: { state: "blocked", checkedAt: NOW - 60_000, retryAt: NOW },
+  };
+  const health = (capacity = 4, targetCapacity = 4, scheduledCapacity = 4) =>
+    exactReviewQueueStats(
+      state,
+      NOW,
+      capacity,
+      targetCapacity,
+      4,
+      DISPATCH_LEASE_MS,
+      EXECUTION_LEASE_MS,
+      15 * 60_000,
+      20 * 60_000,
+      new Set(),
+      null,
+      scheduledCapacity,
+    ).handoff_health;
+
+  assert.equal(health().reason, "dispatcher_retry_due");
+  assert.equal(health().status, "degraded");
+  assert.equal(state.dispatcher?.state, "blocked");
+
+  state.items[key]!.nextAttemptAt = NOW + 60_000;
+  assert.equal(health().reason, "handoff_current");
+  state.items[key]!.nextAttemptAt = NOW;
+  assert.equal(health(0).reason, "handoff_current");
+  assert.equal(health(4, 0).reason, "handoff_current");
+  state.dispatcher!.githubCredentialCircuits = {
+    openclaw: {
+      poolKey: "target_app:openclaw",
+      scope: "target_app",
+      targetOwner: "openclaw",
+      observedAt: NOW - 1_000,
+      retryAt: NOW + 60_000,
+      provenance: "fallback",
+      authoritative: false,
+    },
+  };
+  assert.equal(health().reason, "handoff_current");
+  delete state.dispatcher!.githubCredentialCircuits;
+
+  state.items[key]!.decision.sourceAction = "scheduled_hot_intake";
+  assert.equal(health(4, 4, 0).reason, "handoff_current");
+  state.items[key]!.decision.sourceAction = "manual";
+  state.dispatcher!.reviewAdmissionNextAt = NOW + 1;
+  assert.equal(health().reason, "handoff_current");
+  delete state.dispatcher!.reviewAdmissionNextAt;
+
+  state.dispatcher!.retryAt = NOW + 1;
+  assert.equal(health().reason, "dispatcher_blocked");
+  state.dispatcher!.state = "paused";
+  assert.equal(health().reason, "dispatcher_paused");
+  state.dispatcher!.retryAt = NOW - 1;
+  assert.equal(health().reason, "dispatcher_retry_due");
+  state.dispatcher!.state = "active";
+  assert.equal(health().reason, "handoff_current");
+});
+
+test("unknown dispatcher deadlines retain warnings and actual claim stalls take precedence", () => {
+  for (const retryAt of [undefined, Number.NaN]) {
+    assert.equal(
+      summarize({
+        dispatcher: { state: "blocked", retryAt },
+        items: [{ state: "pending", createdAt: NOW, updatedAt: NOW }],
+      }).reason,
+      "dispatcher_blocked",
+    );
+  }
+  assert.equal(
+    summarize({
+      dispatcher: { state: "blocked", retryAt: NOW },
+      dispatchablePending: true,
+      items: [
+        {
+          state: "dispatching",
+          createdAt: NOW - 300_000,
+          updatedAt: NOW - 300_000,
+          dispatchedAt: NOW - 300_000,
+        },
+      ],
+    }).reason,
+    "claim_stalled",
+  );
 });
 
 test("exact-review handoff health derives legacy dispatch age from its active lease", () => {
@@ -330,4 +430,34 @@ test("idle publication activity is healthy regardless of retired writer history"
     { last_15_minutes: { net_drain_rate_per_hour: 10 } },
   );
   assert.deepEqual(delayed, { status: "degraded", reason: "oldest_pending_over_1h" });
+});
+
+test("retained stale revisions keep age-based publication severity, not dead-letter severity", () => {
+  const flow = { last_15_minutes: { net_drain_rate_per_hour: 0 } };
+  const held = (age: number, deadLetters = 0) =>
+    summarizeExactReviewPublicationHealth(
+      {
+        pending: 0,
+        active: 0,
+        parked: 1 + deadLetters,
+        oldest_pending_age_seconds: null,
+        parked_reasons: {
+          stale_revision: 1,
+          ...(deadLetters ? { dead_letter_capacity: deadLetters } : {}),
+        },
+        oldest_stale_revision_age_seconds: age,
+      },
+      flow,
+    );
+  assert.deepEqual(held(60), { status: "healthy", reason: null });
+  assert.deepEqual(held(3_600), { status: "degraded", reason: "stale_revision_over_1h" });
+  assert.deepEqual(held(6 * 3_600), { status: "critical", reason: "stale_revision_over_6h" });
+  assert.deepEqual(held(60, 1), { status: "critical", reason: "dead_letter_capacity" });
+  assert.deepEqual(
+    summarizeExactReviewPublicationHealth(
+      { pending: 0, active: 0, parked: 1, oldest_pending_age_seconds: null },
+      flow,
+    ),
+    { status: "critical", reason: "dead_letter_capacity" },
+  );
 });

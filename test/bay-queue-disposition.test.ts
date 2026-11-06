@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { exactReviewQueueBayProjection } from "../dashboard/exact-review-read-model.ts";
+import {
+  exactReviewQueueBayProjectionFromStats,
+  exactReviewQueueStats as queueCensus,
+} from "../dashboard/exact-review-read-model.ts";
 import { publicStatusProjection } from "../dashboard/worker.ts";
 import { unclaimedExactReviewQueueItem } from "./dashboard-worker-harness.ts";
 
@@ -19,9 +22,13 @@ test("Bay retains exhausted, recoverable and unscheduled parked dispositions wit
     ...exhausted,
     key: "openclaw/gogcli#990003",
     decision: { ...exhausted.decision, itemNumber: 990003 },
-    parkedReason: "dead_letter_capacity",
+    parkedReason: "dead_letter_capacity" as const,
   };
-  const projection = exactReviewQueueBayProjection([exhausted, retry, attention] as never);
+  const projection = exactReviewQueueBayProjectionFromStats(
+    queueCensus({
+      items: Object.fromEntries([exhausted, retry, attention].map((item) => [item.key, item])),
+    }),
+  );
   assert.equal(projection.complete, true);
   assert.deepEqual(
     projection.items.map((item) => item.queue_disposition),
@@ -68,81 +75,14 @@ test("Bay retains exhausted, recoverable and unscheduled parked dispositions wit
   assert.equal(hidden.exact_review_queue.bay_projection.activity.items, undefined);
 });
 
-test("browser reference sanitizer preserves only bounded queue dispositions", async () => {
-  const { bayHtml } = await import("../dashboard/bay-page.ts");
-  const { runInNewContext } = await import("node:vm");
-  const html = bayHtml();
-  const names = [
-    "bayObject",
-    "strictBayReviewFailure",
-    "strictBayCount",
-    "strictBayTimestamp",
-    "strictBayRepository",
-    "strictBayItemNumber",
-    "strictBayAction",
-    "strictBayReferenceTiming",
-    "strictBayReference",
-  ];
-  const dictionary = html
-    .split("\n")
-    .find((line) => line.trimStart().startsWith("var BAY_REVIEW_FAILURE_EXPLANATIONS="));
-  assert.ok(dictionary);
-  const source =
-    dictionary +
-    "\n" +
-    names
-      .map((name) => {
-        const line = html
-          .split("\n")
-          .find((line) => line.trimStart().startsWith(`function ${name}(`));
-        assert.ok(line, name);
-        return line;
-      })
-      .join("\n");
-  const parse = runInNewContext(source + "\nstrictBayReference", {
-    STAGES: ["repairing", "reviewing"],
-    MAX_BAY_COUNT: 10000,
-  });
-  const base = {
-    repository: "openclaw/gogcli",
-    item_number: 990001,
-    stage: "repairing",
-    source: "queue",
-    legacy_batch_path: false,
-  };
-  for (const disposition of ["parked_exhausted", "parked", "retry_scheduled"]) {
-    assert.equal(
-      parse({ ...base, queue_disposition: disposition }, false).queue_disposition,
-      disposition,
-    );
-  }
-  for (const disposition of ["__proto__", "private-debug-value", 42, null]) {
-    assert.equal(
-      parse({ ...base, queue_disposition: disposition }, false).queue_disposition,
-      undefined,
-    );
-  }
-  assert.equal(
-    parse({ ...base, source: "live", queue_disposition: "parked_exhausted" }, false)
-      .queue_disposition,
-    undefined,
-  );
-});
-
-test("dispatch recovery exhaustion stays neutral queue attention without claiming a review ran", async () => {
+test("dispatch recovery exhaustion stays a neutral parked disposition", () => {
   const item = unclaimedExactReviewQueueItem(990097, "990097");
   item.state = "parked";
   item.parkedReason = "dispatch_rejected";
   item.parkedRecoveryAttempts = 3;
   item.reviewFailureAttempts = 0;
-  const projection = exactReviewQueueBayProjection([item]);
+  const projection = exactReviewQueueBayProjectionFromStats(
+    queueCensus({ items: Object.fromEntries([item].map((item) => [item.key, item])) }),
+  );
   assert.equal(projection.items[0]?.queue_disposition, "parked");
-  const { bayReviewStatusScript } = await import("../dashboard/bay-review-status.ts");
-  const { runInNewContext } = await import("node:vm");
-  const status = runInNewContext(bayReviewStatusScript + ";bayReviewStatus")({
-    ...projection.items[0],
-    source: "queue",
-  });
-  assert.equal(status.type, "Stopped queue work");
-  assert.doesNotMatch(JSON.stringify(status), /Stopped review|Review stopped|Retries exhausted/);
 });

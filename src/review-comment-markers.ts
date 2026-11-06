@@ -1,3 +1,19 @@
+// Workflow steps run src/workflow-bot-comments.ts from source, and it imports
+// this module, so this module has no imports.
+
+// Why a review comment carries a needs-human verdict (`hold=` marker attribute).
+// The repair router routes on this value. It must not read review prose for this decision.
+export type NeedsHumanHold =
+  | "normalization_failed"
+  | "review_identity"
+  | "maintainer_decision"
+  | "review_failed"
+  | "security"
+  | "proof"
+  | "not_opted_in"
+  | "blocked"
+  | "undecided";
+
 export function validReviewLeaseIdentity(
   owner: string | null | undefined,
   commentId: string | null | undefined,
@@ -7,6 +23,45 @@ export function validReviewLeaseIdentity(
     owner?.trim() !== "unknown" &&
     /^[1-9]\d*$/.test(commentId ?? "") &&
     Number.isSafeInteger(Number(commentId))
+  );
+}
+
+// The trailing marker of the comment that holds an item's review-start lease.
+export function reviewStartLeaseCommentMarker(itemNumber: number): string {
+  return `<!-- clawsweeper-review-lease item=${itemNumber} -->`;
+}
+
+// The trailing marker of a command status comment that holds the lease.
+export function commandReviewStartLeaseCommentMarker(itemNumber: number): string {
+  return `<!-- clawsweeper-command-review-lease item=${itemNumber} -->`;
+}
+
+export function hasReviewStartLeaseCommentMarker(body: string, itemNumber: number): boolean {
+  return (
+    body.includes(reviewStartLeaseCommentMarker(itemNumber)) ||
+    body.includes(commandReviewStartLeaseCommentMarker(itemNumber))
+  );
+}
+
+export const REVIEW_STARTED_STATUS = "ClawSweeper status: review started.";
+
+// A combined lease ends at the durable identity, never at a dedicated lease
+// identity. Only remove that canonical tail; quoted markers are review text.
+export function clearInPlaceReviewStartStatus(body: string, itemNumber?: number): string {
+  const tail =
+    /<!--\s*clawsweeper-review-status:started\s+item=([1-9]\d*)\b[^>]*-->\s*(<!--\s*clawsweeper-review\s+item=([1-9]\d*)\s*-->\s*)$/i.exec(
+      body,
+    );
+  if (
+    !tail ||
+    tail[1] !== tail[3] ||
+    (itemNumber !== undefined && Number(tail[1]) !== itemNumber)
+  ) {
+    return body;
+  }
+  return (body.slice(0, tail.index) + tail[2]).replace(
+    /^ClawSweeper status: review started\.(?:\r?\n){2}/,
+    "",
   );
 }
 

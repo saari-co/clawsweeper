@@ -33,7 +33,7 @@ test("batch claim emits arbitrary target metadata after Worker admission", () =>
 const response = (value) => new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
 globalThis.fetch = async (url) => {
   if (String(url).endsWith("/publication-batches/claim")) {
-    return response({ claimed: true, batch: { batch_id: "batch-target-proof", lease_owner: "proof-worker", lease_expires_at: "2026-08-25T16:00:00.000Z", items: [member] }, configured_batch_size: 1, batch_wait_ms: 0 });
+    return response({ claimed: true, batch: { batch_id: "batch-target-proof", lease_owner: "proof-worker", lease_expires_at: "2026-08-25T16:00:00.000Z", items: [member] }, configured_batch_size: 3, batch_wait_ms: 0 });
   }
   if (String(url).endsWith("/publication-batches/fetch")) {
     return response({ batch: { batch_id: "batch-target-proof", lease_owner: "proof-worker", lease_expires_at: "2026-08-25T16:00:00.000Z", items: [member] }, items: [member], superseded: 0 });
@@ -62,7 +62,10 @@ globalThis.fetch = async (url) => {
     );
     assert.equal(result.status, 0, result.stderr);
     assert.equal(existsSync(manifestPath), true);
-    assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).items.length, 1);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    assert.equal(manifest.items.length, 1);
+    // The dashboard shows the Worker lease size, not the workflow item cap.
+    assert.equal(manifest.configuredBatchSize, 3);
     const outputs = readFileSync(outputPath, "utf8");
     assert.match(outputs, /^claimed=true$/m);
     assert.match(outputs, /^batch_id=batch-target-proof$/m);
@@ -71,6 +74,49 @@ globalThis.fetch = async (url) => {
     assert.match(outputs, /^target_owner=openclaw$/m);
     assert.match(outputs, /^target_repositories=private-tool$/m);
     assert.match(outputs, /^records_repo_slugs=openclaw-private-tool$/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("batch claim treats an all-stale fetched batch as terminal", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-batch-cli-stale-"));
+  try {
+    const outputPath = join(root, "github-output");
+    const preloadPath = join(root, "fetch-preload.cjs");
+    writeFileSync(
+      preloadPath,
+      `const batch = { batch_id: "batch-stale-proof", lease_owner: "proof-worker", lease_expires_at: "2026-08-25T16:00:00.000Z", items: [] };
+globalThis.fetch = async (url) => {
+  if (String(url).endsWith("/publication-batches/claim")) return Response.json({ claimed: true, batch, configured_batch_size: 1, batch_wait_ms: 0 });
+  if (String(url).endsWith("/publication-batches/fetch")) return Response.json({ batch, items: [], superseded: 1 });
+  throw new Error("unexpected mock fetch target: " + url);
+};
+`,
+    );
+    const result = spawnSync(
+      process.execPath,
+      ["--require", preloadPath, "dist/repair/exact-review-batch-cli.js", "claim"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CLAWSWEEPER_WEBHOOK_SECRET: "proof-secret",
+          EXACT_REVIEW_QUEUE_URL: "https://queue.example.test",
+          EXACT_REVIEW_BATCH_ID: "batch-stale-proof",
+          EXACT_REVIEW_BATCH_LEASE_OWNER: "proof-worker",
+          EXACT_REVIEW_BATCH_MAX_ITEMS: "1",
+          EXACT_REVIEW_BATCH_MANIFEST: join(root, "manifest.json"),
+          GITHUB_OUTPUT: outputPath,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const outputs = readFileSync(outputPath, "utf8");
+    assert.match(outputs, /^item_count=0$/m);
+    // No member needs a target-owner credential.
+    assert.doesNotMatch(outputs, /^target_owner=/m);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -308,6 +354,125 @@ globalThis.fetch = async (url, init) => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const command of ["complete", "release"] as const) {
+  for (const scenario of ["mixed", "replayed", "empty"] as const) {
+    test(`batch ${command} reports submitted outcomes separately from ${scenario} acknowledgements`, () => {
+      const root = mkdtempSync(join(tmpdir(), "clawsweeper-batch-cli-summary-"));
+      try {
+        const outcomes =
+          scenario === "empty"
+            ? []
+            : [
+                { kind: "eligible", postEffectsComplete: true },
+                { kind: "superseded" },
+                { kind: "retryable_failure", reasonCode: "github_transient" },
+                { kind: "refresh_required", reasonCode: "artifact_expired" },
+                { kind: "permanent_failure", reasonCode: "tuple_protocol_invalid" },
+              ];
+        const items = outcomes.map((outcome, index) => {
+          const itemNumber = 820 + index;
+          const outcomePath = join(root, `${index}.json`);
+          writeFileSync(outcomePath, JSON.stringify(outcome));
+          return {
+            ...batchMember(`openclaw/openclaw#${itemNumber}@publish:${itemNumber}0:1`, itemNumber),
+            outcomePath,
+          };
+        });
+        const manifestPath = join(root, "manifest.json");
+        const receiptPath = join(root, "receipt.json");
+        const completionPath = join(root, "completion.json");
+        const preloadPath = join(root, "fetch-preload.cjs");
+        const batchId = `batch-summary-${scenario}`;
+        const accepted = scenario === "mixed" ? 2 : 0;
+        const skipped = items.length - accepted;
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({
+            batchId,
+            leaseOwner: "proof-worker",
+            leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+            configuredBatchSize: 5,
+            batchWaitMs: 0,
+            items,
+          }),
+        );
+        writeFileSync(
+          receiptPath,
+          JSON.stringify({
+            batchId,
+            publishedItemKeys: items.slice(0, 1).map((item) => item.itemKey),
+            outcomes: [],
+          }),
+        );
+        writeFileSync(
+          preloadPath,
+          `const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.env.EXACT_REVIEW_BATCH_MANIFEST, "utf8"));
+const wireItems = manifest.items.map((item) => ({ item_key: item.itemKey, revision: item.revision, claim_generation: item.claimGeneration, decision: item.decision }));
+const batch = { batch_id: manifest.batchId, lease_owner: manifest.leaseOwner, lease_expires_at: manifest.leaseExpiresAt, items: [] };
+globalThis.fetch = async (url, init) => {
+  if (String(url).endsWith("/publication-batches/fetch")) return Response.json({ batch, items: wireItems, superseded: 0 });
+  if (!String(url).endsWith("/publication-batches/complete")) throw new Error("unexpected mock fetch target: " + url);
+  fs.writeFileSync(process.env.BATCH_CLI_COMPLETION, init.body);
+  return Response.json({ accepted: ${accepted}, skipped: ${skipped}, batch });
+};
+`,
+        );
+        const result = spawnSync(
+          process.execPath,
+          ["--require", preloadPath, "dist/repair/exact-review-batch-cli.js", command],
+          {
+            cwd: process.cwd(),
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              CLAWSWEEPER_WEBHOOK_SECRET: "proof-secret",
+              EXACT_REVIEW_QUEUE_URL: "https://queue.example.test",
+              EXACT_REVIEW_BATCH_MANIFEST: manifestPath,
+              EXACT_REVIEW_BATCH_RECEIPT: receiptPath,
+              BATCH_CLI_COMPLETION: completionPath,
+            },
+          },
+        );
+        assert.equal(result.status, 0, result.stderr);
+        const summary = JSON.parse(result.stdout);
+        const count = scenario === "empty" ? 0 : 1;
+        assert.deepEqual(summary, {
+          ok: true,
+          batch_id: batchId,
+          [command === "complete" ? "accepted" : "released"]: accepted,
+          skipped,
+          submitted_outcomes: {
+            published: count,
+            superseded: count,
+            retryable_failure: count,
+            refresh_required: count,
+            permanent_failure: count,
+          },
+        });
+        if (scenario === "empty") {
+          assert.equal(existsSync(completionPath), false);
+        } else {
+          assert.deepEqual(
+            JSON.parse(readFileSync(completionPath, "utf8")).items.map(
+              (item: { terminal_outcome: string }) => item.terminal_outcome,
+            ),
+            [
+              "published",
+              "superseded",
+              "retryable_failure",
+              "refresh_required",
+              "permanent_failure",
+            ],
+          );
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 const publicationFailureCases = [
   {
@@ -714,8 +879,13 @@ globalThis.fetch = async (url, init) => {
   }
 });
 
-for (const command of ["complete", "release"] as const) {
-  test(`batch ${command} preserves a target-app circuit on a fallback completion`, () => {
+for (const [command, activeLease] of [
+  ["complete", false],
+  ["release", false],
+  ["complete", true],
+  ["release", true],
+] as const) {
+  test(`batch ${command} preserves ${activeLease ? "a verified active lease deadline" : "a target-app circuit on a fallback completion"}`, () => {
     const root = mkdtempSync(join(tmpdir(), `clawsweeper-batch-cli-${command}-scope-`));
     try {
       const member = batchMember(`openclaw/openclaw#814@publish:8140:1`, 814);
@@ -725,6 +895,12 @@ for (const command of ["complete", "release"] as const) {
       const observationsPath = join(root, "github-rate-limits.jsonl");
       const preloadPath = join(root, "fetch-preload.cjs");
       const retryAt = new Date(Date.now() + 60_000).toISOString();
+      const outcomePath = join(root, "member-outcome.json");
+      if (activeLease)
+        writeFileSync(
+          outcomePath,
+          JSON.stringify({ kind: "retryable_failure", reasonCode: "review_lease_active", retryAt }),
+        );
       writeFileSync(
         manifestPath,
         JSON.stringify({
@@ -733,7 +909,7 @@ for (const command of ["complete", "release"] as const) {
           leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(),
           configuredBatchSize: 1,
           batchWaitMs: 0,
-          items: [{ ...member, outcomePath: join(root, "missing-outcome.json") }],
+          items: [{ ...member, outcomePath }],
         }),
       );
       writeFileSync(
@@ -797,10 +973,9 @@ globalThis.fetch = async (url, init) => {
           revision: member.revision,
           claim_generation: member.claimGeneration,
           terminal_outcome: "retryable_failure",
-          reason_code: "github_rate_limit",
-          pool_class: "target_app",
+          reason_code: activeLease ? "review_lease_active" : "github_rate_limit",
           retry_at: retryAt,
-          attempted: false,
+          ...(!activeLease ? { pool_class: "target_app", attempted: false } : {}),
         },
       ]);
     } finally {

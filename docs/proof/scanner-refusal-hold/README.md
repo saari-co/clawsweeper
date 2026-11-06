@@ -1,5 +1,8 @@
 # Scanner refusal hold proof
 
+Historical evidence only: the one-off manual proof driver has been retired.
+Commands below record the original run, not a supported current entrypoint.
+
 Claim: a newly observed terminal input-scanner refusal retains the existing queue row as a durable automatic-review hold. Only a fresh verified re-review, a newly dispatched explicit item request, or an intentional retry-policy epoch change can release it. Automatic source changes cannot.
 
 Surface: production Worker signed enqueue/complete/stats routes, real workerd with SQLite persistence, the owning workflow's continuation gate, and the compiled scheduled-enqueue CLI over a locally trusted HTTPS endpoint. Fixture-only routes seed leases and invoke the production alarm. GitHub responses are synthetic loopback data; the production entrypoint is unchanged.
@@ -21,8 +24,6 @@ Limits: this exercises seeded leases and synthetic GitHub responses, not a live 
 The approved workflow simplification removes the broad manual batch/shard and immediate-apply inputs, five unreachable matrix jobs, and their runtime packaging. The proof executes the remaining planner Bash with controlled capacity responses and the real enqueue CLI against workerd; it also checks that explicit selection and the separate apply job remain. Failed-review retries use automatic queue intake, retain their prompt/timeout/source pin, and cannot release a scanner hold as manual requests. `scripts/e2e/exact-review-noop-read-scope.mjs` additionally exercises the compiled issue admission with matching and changed pinned source, including the required comment reads. Already-running older workflow revisions remain outside the new routing until they finish.
 
 Opaque manual API request IDs retain the existing named/UUID contract: callers use a new unique ID for a new explicit request. The failed ID remains on the held decision, so replay cannot release it after short-lived delivery receipts expire. Numeric workflow IDs keep the older-run fence. The runtime proof exercises both contracts.
-
-`node scripts/e2e/implementation-backfill.mjs` executes the actual planner backfill Bash, shared dispatcher, and compiled canonical-report candidate discovery for `vision_fit` and non-core `viable` reports. It verifies bounded dispatch and rejection of manual record/comment-only reports; only outbound GitHub dispatch is captured locally. The planner reads prior canonical reports, while the dedicated strict-bug backfill and exact publication hooks remain. Existing intake owns live item validation and deduplication.
 
 Verified command timestamps must be strictly later than both the refusal and any failed command timestamp. GitHub timestamp precision makes same-second requests ambiguous, so all remain held regardless of command ID or refusal origin. A later command or edit can retry. The real Worker proof exercises both automatic-origin and command-origin refusals: tied verified commands are rejected, the production alarm leaves the row parked with zero new dispatches, and a later-second command is admitted. The redacted `authority_proof` observations in `result.json` record actual timestamps, responses, and dispatch deltas.
 

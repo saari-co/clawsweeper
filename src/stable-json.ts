@@ -15,8 +15,7 @@
  *      keys such as `changedFiles` and `checksDigest`. A digest computed on one
  *      runner would then not match the same input on another.
  *
- * `stableJsonCodeUnit` / `sortStableCodeUnit` are retained as explicit aliases;
- * they are equivalent to the unsuffixed pair.
+ * `stableJsonCodeUnit` is an explicit alias of `stableJson`.
  *
  * One caveat: array-index-like keys ("0", "2", "10") are not emitted in code-unit
  * order. `Object.fromEntries` rebuilds the object and the engine re-applies its
@@ -32,31 +31,20 @@ export function stableJson(value: unknown): string {
 }
 
 export function sortStable(value: unknown): unknown {
-  return sortStableWith(value, compareCodeUnits);
+  if (Array.isArray(value)) return value.map((item) => sortStable(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => compareCodeUnits(left, right))
+      .map(([key, item]) => [key, sortStable(item)]),
+  );
 }
 
 export function stableJsonCodeUnit(value: unknown): string {
   return stableJson(value);
 }
 
-export function sortStableCodeUnit(value: unknown): unknown {
-  return sortStable(value);
-}
-
 /** Total order over UTF-16 code units; never returns 0 for distinct strings. */
 export function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function sortStableWith(
-  value: unknown,
-  compareKeys: (left: string, right: string) => number,
-): unknown {
-  if (Array.isArray(value)) return value.map((item) => sortStableWith(item, compareKeys));
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .sort(([left], [right]) => compareKeys(left, right))
-      .map(([key, item]) => [key, sortStableWith(item, compareKeys)]),
-  );
 }

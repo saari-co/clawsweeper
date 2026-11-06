@@ -14,17 +14,20 @@ import {
 import { syncBuiltinESMExports } from "node:module";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
+import { parse } from "yaml";
 
 import {
   enforceExpectedIssueSourceRevisionForTest,
-  failedReviewRetryEligibilityForTest,
-  itemSourceRevisionSha256ForTest,
-  isInfrastructureFailedReviewForTest,
   main,
   preserveFailedReviewRetryMetadataForTest,
   reviewRetryActionNeedsItemEventForTest,
 } from "../dist/clawsweeper.js";
-import { tmpPrefix, withMockGh, workPlanCandidateReport } from "./helpers.ts";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
+import {
+  failedReviewRetryEligibility,
+  isInfrastructureFailedReview,
+} from "../dist/clawsweeper-record-metadata.js";
+import { tmpPrefix, withMockGh, withReviewRecord, workPlanCandidateReport } from "./helpers.ts";
 import { readAllSpooledActionEvents } from "../dist/action-ledger.js";
 
 const TEST_WORKFLOW_REPO = "openclaw/clawsweeper";
@@ -55,6 +58,30 @@ Codex review failed: timeout.
 `;
 }
 
+test("corrupt failed review records are skipped without blocking later eligible retries", () => {
+  const valid = withReviewRecord(failedReviewReport(), {
+    decision: "keep_open",
+    closeReason: "none",
+    summary: "Codex review failed: timeout.",
+  });
+  const corrupt = valid.replace(/^review_record: \{/m, "review_record: {broken");
+  assert.equal(isInfrastructureFailedReview(corrupt), false);
+  const results = [corrupt, valid].map((markdown) =>
+    failedReviewRetryEligibility({
+      markdown,
+      liveState: "open",
+      liveHeadSha: "abc123def456",
+      now: Date.parse("2026-07-10T16:00:00Z"),
+      maxAttempts: 3,
+      cooldownMs: 0,
+    }),
+  );
+  assert.deepEqual(
+    results.map((result) => result.action),
+    ["skipped_non_infrastructure_failure", "planned_failed_review_retry"],
+  );
+});
+
 function failedIssueRetryFixture(root: string, number: number) {
   const itemsDir = join(root, "items");
   const reportPath = join(root, "failed-review-retry-report.json");
@@ -77,7 +104,7 @@ function failedIssueRetryFixture(root: string, number: number) {
     comments: 0,
     pull_request: null,
   };
-  const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+  const sourceRevision = itemSourceRevisionSha256(issue, []);
   mkdirSync(itemsDir, { recursive: true });
   writeFileSync(
     itemPath,
@@ -305,9 +332,9 @@ test("failed review retry eligibility requires infrastructure failure and matchi
   const markdown = failedReviewReport();
   const now = Date.parse("2026-06-05T20:00:00Z");
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), true);
+  assert.equal(isInfrastructureFailedReview(markdown), true);
   assert.deepEqual(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown,
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -327,7 +354,7 @@ test("failed review retry eligibility requires infrastructure failure and matchi
     },
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown,
       liveState: "open",
       liveHeadSha: "def456abc123",
@@ -338,7 +365,7 @@ test("failed review retry eligibility requires infrastructure failure and matchi
     "skipped_stale_head",
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown: failedReviewReport({ review_status: "complete" }),
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -348,7 +375,7 @@ test("failed review retry eligibility requires infrastructure failure and matchi
     }).action,
     "skipped_not_failed_review",
   );
-  const uncertain = failedReviewRetryEligibilityForTest({
+  const uncertain = failedReviewRetryEligibility({
     markdown: failedReviewReport({
       failed_review_retry_status: "dispatching",
       failed_review_retry_count: 0,
@@ -368,7 +395,7 @@ test("failed review retry eligibility requires infrastructure failure and matchi
 
 test("failed review retry does not redispatch locked or closed no-action items", () => {
   const now = Date.parse("2026-07-10T16:00:00Z");
-  const locked = failedReviewRetryEligibilityForTest({
+  const locked = failedReviewRetryEligibility({
     markdown: failedReviewReport({
       number: 64319,
       type: "issue",
@@ -391,7 +418,7 @@ test("failed review retry does not redispatch locked or closed no-action items",
     },
   );
 
-  const closed = failedReviewRetryEligibilityForTest({
+  const closed = failedReviewRetryEligibility({
     markdown: failedReviewReport({ number: 3050 }),
     liveState: "closed",
     now,
@@ -419,7 +446,7 @@ test("failed issue reviews retry at a matching live source revision", () => {
     cooldownMs: 45 * 60 * 1000,
   };
 
-  assert.deepEqual(failedReviewRetryEligibilityForTest(options), {
+  assert.deepEqual(failedReviewRetryEligibility(options), {
     repo: "openclaw/openclaw",
     number: 4242,
     action: "planned_failed_review_retry",
@@ -429,14 +456,14 @@ test("failed issue reviews retry at a matching live source revision", () => {
     attempts: 0,
   });
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       ...options,
       liveSourceRevision: "new-source-revision",
     }).action,
     "skipped_stale_revision",
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       ...options,
       markdown: failedReviewReport({
         type: "issue",
@@ -447,7 +474,7 @@ test("failed issue reviews retry at a matching live source revision", () => {
     "skipped_missing_report_revision",
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       ...options,
       markdown: failedReviewReport({
         type: "issue",
@@ -462,7 +489,7 @@ test("failed issue reviews retry at a matching live source revision", () => {
     "skipped_retry_cooldown",
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       ...options,
       markdown: failedReviewReport({
         type: "issue",
@@ -528,7 +555,44 @@ test("failed review retry eligibility treats Codex rate limits as infrastructure
     ].join("\n"),
   );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), true);
+  assert.equal(isInfrastructureFailedReview(markdown), true);
+});
+
+test("failed review retry matches only the provider model-capacity diagnostic", () => {
+  const retryOptions = {
+    liveState: "open",
+    liveHeadSha: "abc123def456",
+    now: Date.parse("2026-06-05T20:00:00Z"),
+    maxAttempts: 2,
+    cooldownMs: 45 * 60 * 1000,
+  };
+  const capacity = failedReviewReport().replace(
+    "Codex worker timed out after 600000ms with ETIMEDOUT.",
+    "Codex final output did not end with its newline frame. ERROR: Selected model is at capacity. Please try a different model.",
+  );
+  assert.equal(isInfrastructureFailedReview(capacity), true);
+  assert.equal(
+    failedReviewRetryEligibility({ markdown: capacity, ...retryOptions }).action,
+    "planned_failed_review_retry",
+  );
+
+  // Reports carry the item title in front matter and in the heading; even the full
+  // provider diagnostic as a title must not make a permanent failure retryable.
+  for (const title of ["Selected model is at capacity", "Service is at capacity"]) {
+    const titled = failedReviewReport({ title })
+      .replace("Render work plans", title)
+      .replace("Codex review failed: timeout.", "Codex review failed: codex execution failed.")
+      .replace("- **failure reason:** timeout", "- **failure reason:** codex execution failed")
+      .replace("Codex worker timed out after 600000ms with ETIMEDOUT.", "Codex execution failed.");
+    assert.match(titled, new RegExp(`^title: .*${title}`, "m"));
+    assert.match(titled, new RegExp(`^# .*${title}`, "m"));
+    assert.equal(isInfrastructureFailedReview(titled), false, title);
+    assert.equal(
+      failedReviewRetryEligibility({ markdown: titled, ...retryOptions }).action,
+      "skipped_non_infrastructure_failure",
+      title,
+    );
+  }
 });
 
 test("failed review retry eligibility treats checkout inspection failures as infrastructure", () => {
@@ -539,9 +603,9 @@ test("failed review retry eligibility treats checkout inspection failures as inf
       "Read-only checkout inspection failed before model review.",
     );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), true);
+  assert.equal(isInfrastructureFailedReview(markdown), true);
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown,
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -567,9 +631,9 @@ test("failed review retry eligibility treats model access failures as terminal",
       ].join("\n"),
     );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), false);
+  assert.equal(isInfrastructureFailedReview(markdown), false);
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown,
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -591,7 +655,7 @@ test("failed review retry eligibility rejects ambiguous terminal-failure metadat
     ].join("\n"),
   );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), false);
+  assert.equal(isInfrastructureFailedReview(markdown), false);
 });
 
 test("failed review retry ignores terminal-looking text outside dedicated evidence", () => {
@@ -604,7 +668,7 @@ test("failed review retry ignores terminal-looking text outside dedicated eviden
     ].join("\n"),
   );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), true);
+  assert.equal(isInfrastructureFailedReview(markdown), true);
 });
 
 test("failed review retry ignores terminal-looking text injected into rendered evidence", () => {
@@ -616,7 +680,7 @@ test("failed review retry ignores terminal-looking text injected into rendered e
     ].join("\n"),
   );
 
-  assert.equal(isInfrastructureFailedReviewForTest(markdown), true);
+  assert.equal(isInfrastructureFailedReview(markdown), true);
 });
 
 test("failed review retry eligibility enforces cooldown and max attempts per head", () => {
@@ -633,7 +697,7 @@ test("failed review retry eligibility enforces cooldown and max attempts per hea
   });
 
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown: recent,
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -644,7 +708,7 @@ test("failed review retry eligibility enforces cooldown and max attempts per hea
     "skipped_retry_cooldown",
   );
   assert.equal(
-    failedReviewRetryEligibilityForTest({
+    failedReviewRetryEligibility({
       markdown: exhausted,
       liveState: "open",
       liveHeadSha: "abc123def456",
@@ -679,7 +743,7 @@ test("failed issue retry dispatch binds the expected source revision", () => {
       comments: 0,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     mkdirSync(itemsDir, { recursive: true });
     writeFileSync(
       join(itemsDir, "4343.md"),
@@ -1018,7 +1082,7 @@ test("definite failed dispatch clears uncertainty without consuming the retry at
     assert.match(markdown, /^failed_review_retry_status: dispatch_failed$/m);
     assert.match(markdown, /^failed_review_retry_count: 0$/m);
     assert.equal(
-      failedReviewRetryEligibilityForTest({
+      failedReviewRetryEligibility({
         markdown,
         liveState: "open",
         liveSourceRevision: fixture.sourceRevision,
@@ -1073,13 +1137,24 @@ test("expected issue source revision aborts drift and writes a requeue marker", 
 });
 
 test("automatic retries retain their issue pin in exact queue execution", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  assert.match(workflow, /expectedSourceRevision: payload.expected_source_revision/);
-  assert.match(workflow, /EXPECTED_SOURCE_REVISION:.*expectedSourceRevision/);
-  assert.match(workflow, /--expected-source-revision "\$EXPECTED_SOURCE_REVISION"/);
-  assert.match(workflow, /artifacts\/event\/source-revision-mismatch.json/);
-  assert.match(workflow, /source_revision_changed=true/);
-  assert.doesNotMatch(workflow, /requeue-source-revision-drift:/);
+  const jobs = parse(readFileSync(".github/workflows/sweep.yml", "utf8")).jobs as Record<
+    string,
+    { steps?: Array<{ id?: string; run?: string; env?: Record<string, string> }> }
+  >;
+  const steps = Object.values(jobs).flatMap((job) => job.steps ?? []);
+  const review = steps.find((step) => step.id === "review-exact-event-item");
+  assert.equal(
+    review?.env?.EXPECTED_SOURCE_REVISION,
+    "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).expectedSourceRevision || '' }}",
+  );
+  assert.ok(review?.run?.includes('--expected-source-revision "$EXPECTED_SOURCE_REVISION"'));
+  assert.ok(review?.run?.includes('echo "source_revision_changed=true" >> "$GITHUB_OUTPUT"'));
+  const noop = steps.filter((step) =>
+    step.env?.SCHEDULED_SEMANTIC_NOOP?.includes(
+      "steps.review-exact-event-item.outputs.source_revision_changed == 'true'",
+    ),
+  );
+  assert.ok(noop.length > 0);
 });
 
 test("failed retry metadata survives a repeated failure at the same revision", () => {

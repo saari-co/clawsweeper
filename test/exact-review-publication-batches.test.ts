@@ -1,3 +1,4 @@
+import { decodeStoredJson } from "../dashboard/stored-json.ts";
 import assert from "node:assert/strict";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { TestStorage } from "./exact-review-test-storage.ts";
@@ -18,7 +19,7 @@ import {
   ExactReviewLifecycleProjectionStore,
 } from "../dashboard/exact-review-lifecycle.ts";
 import { ExactReviewQueue as RuntimeExactReviewQueue } from "../dashboard/exact-review-queue.ts";
-import worker from "../dashboard/worker.ts";
+import worker, { publicExactReviewQueueProjection } from "../dashboard/worker.ts";
 
 class ExactReviewQueue extends RuntimeExactReviewQueue {
   constructor(
@@ -116,6 +117,110 @@ test("direct publication canonically stores, dedupes, and ratchets revisions", a
       [2, "published"],
     ],
   );
+});
+
+test("direct publication upgrades legacy receipt identities once and preserves retries", async () => {
+  const storage = new TestStorage();
+  const original = new ExactReviewDirectPublicationStore(storage);
+  original.ensureSchemaSync();
+  const plan = await validateDirectPublicationPlan(directPlan("openclaw/openclaw#5", 1));
+  original.accept(plan, 1_000);
+  storage.exec(`
+    DROP INDEX exact_review_direct_publication_target_revision;
+    ALTER TABLE exact_review_direct_publication_plans DROP COLUMN canonical_target_key;
+    ALTER TABLE exact_review_direct_publication_plans DROP COLUMN fence_key;
+  `);
+
+  const upgraded = new ExactReviewDirectPublicationStore(storage);
+  upgraded.ensureSchemaSync();
+  const receipt = upgraded.get(plan.fenceKey, plan.revision);
+  assert.equal(receipt?.canonicalTargetKey, plan.canonicalTargetKey);
+  assert.equal(receipt?.fenceKey, plan.fenceKey);
+  assert.equal(upgraded.accept(plan, 1_001).outcome, "deduped");
+
+  const changes = storage.scalar("SELECT total_changes() AS value");
+  upgraded.ensureSchemaSync();
+  assert.equal(storage.scalar("SELECT total_changes() AS value"), changes);
+  assert.equal(upgraded.accept(plan, 1_002).outcome, "deduped");
+});
+
+test("tuple revisions include every section but exclude other tuples", async () => {
+  const storage = new TestStorage();
+  const store = new ExactReviewDirectPublicationStore(storage);
+  store.ensureSchemaSync();
+  store.accept(await validateDirectPublicationPlan(directPlan("openclaw/openclaw#1", 1)), 1_000);
+  store.accept(await validateDirectPublicationPlan(directPlan("openclaw/openclaw#2", 1)), 1_000);
+  storage.run(
+    "UPDATE exact_review_canonical_records SET revision = 9 WHERE item_id = 1 AND section = 'decision-packets'",
+  );
+  storage.run("UPDATE exact_review_canonical_records SET revision = 100 WHERE item_id = 2");
+  store.accept(await validateDirectPublicationPlan(directPlan("openclaw/openclaw#1", 2)), 1_001);
+  assert.equal(store.readCanonical("openclaw-openclaw", "items", 1)?.revision, 10);
+});
+
+test("record slugs retain tombstoned repositories and reflect later writes", async () => {
+  const storage = new TestStorage();
+  const store = new ExactReviewDirectPublicationStore(storage);
+  store.ensureSchemaSync();
+  assert.deepEqual(store.listRecordRepoSlugs(), []);
+  store.accept(await validateDirectPublicationPlan(directPlan("z/repo#1", 1)), 1_000);
+  store.accept(await validateDirectPublicationPlan(directPlan("a/repo#1", 1)), 1_000);
+  storage.run(
+    "UPDATE exact_review_record_export_index SET deleted = 1, digest = NULL WHERE repo_slug = 'z-repo'",
+  );
+  assert.deepEqual(store.listRecordRepoSlugs(), [
+    { repoSlug: "a-repo", revision: 6 },
+    { repoSlug: "z-repo", revision: 3 },
+  ]);
+  store.accept(await validateDirectPublicationPlan(directPlan("z/repo#2", 1)), 1_001);
+  assert.deepEqual(store.listRecordRepoSlugs(), [
+    { repoSlug: "a-repo", revision: 6 },
+    { repoSlug: "z-repo", revision: 9 },
+  ]);
+});
+
+test("record export merges section pages with both revision bounds and tombstones", async () => {
+  const storage = new TestStorage();
+  const store = new ExactReviewDirectPublicationStore(storage);
+  store.ensureSchemaSync();
+  store.accept(await validateDirectPublicationPlan(directPlan("a/repo#1", 1)), 1_000);
+  store.accept(await validateDirectPublicationPlan(directPlan("a/repo#2", 1)), 1_001);
+  const options = {
+    repoSlug: "a-repo",
+    sections: ["closed", "items", "closed"] as const,
+    sinceRevision: 1,
+    cursor: 0,
+    limit: 1,
+    maxBytes: 100_000,
+    maxSourceBytes: 100_000,
+    maxRecords: 1,
+  };
+  const first = await store.exportRecords(options);
+  assert.deepEqual(
+    first.records.map((row) => [row.section, row.id, row.deleted]),
+    [["closed", "1", true]],
+  );
+  assert.equal(first.nextCursor, 2);
+  const second = await store.exportRecords({ ...options, cursor: first.nextCursor! });
+  assert.deepEqual(
+    second.records.map((row) => [row.section, row.id, row.deleted]),
+    [["items", "2", false]],
+  );
+  assert.equal(second.nextCursor, 4);
+  const last = await store.exportRecords({ ...options, cursor: second.nextCursor! });
+  assert.deepEqual(
+    last.records.map((row) => [row.section, row.id, row.deleted]),
+    [["closed", "2", true]],
+  );
+  assert.equal(last.nextCursor, null);
+  assert.deepEqual((await store.exportRecords({ ...options, sections: [] })).records, []);
+  assert.equal(store.snapshotRecordCount("a-repo", 3), 1);
+  assert.deepEqual(store.snapshotRecordIdentities("a-repo", 3), [{ section: "items", id: "1" }]);
+  assert.equal(store.snapshotRecordCount("a-repo", 6), 2);
+  assert.deepEqual(store.snapshotRecordIdentities("a-repo", 6), [
+    { section: "items", id: "1" },
+    { section: "items", id: "2" },
+  ]);
 });
 
 test("direct publication makes section moves canonical with sibling and stale-sidecar tombstones", async () => {
@@ -526,6 +631,36 @@ test("publication batches atomically select ready items without duplicate active
   assert.equal(batches.fetch("batch-1", "wrong-worker", 1_500), null);
 });
 
+test("publication batch startup migrations write only rows that change", () => {
+  const storage = new TestStorage();
+  const batches = new ExactReviewPublicationBatchStore(storage);
+  batches.ensureSchemaSync();
+  batches.claim({
+    batchId: "batch-1",
+    leaseOwner: "worker-1",
+    leaseExpiresAt: 2_000,
+    now: 1_000,
+    maxItems: 2,
+    candidates,
+  });
+  const changes = () =>
+    Number([...storage.sql.exec("SELECT total_changes() AS n")][0]?.n ?? Number.NaN);
+  // An undersized pre-column cap and a missing fencing generation still get backfilled once.
+  storage.run(
+    "UPDATE exact_review_publication_batches SET configured_batch_size = 1 WHERE batch_id = ?",
+    "batch-1",
+  );
+  storage.run("DELETE FROM exact_review_publication_batch_generations");
+  const beforeBackfill = changes();
+  batches.ensureSchemaSync();
+  assert.equal(changes() - beforeBackfill, 3);
+  assert.equal(batches.fetch("batch-1", "worker-1", 1_500)?.configuredBatchSize, 2);
+  // Every later Durable Object start must not rewrite unchanged rows.
+  const beforeRestart = changes();
+  batches.ensureSchemaSync();
+  assert.equal(changes() - beforeRestart, 0);
+});
+
 test("publication batch store replays the exact lease for the same identity", () => {
   const storage = new TestStorage();
   const batches = new ExactReviewPublicationBatchStore(storage);
@@ -885,6 +1020,61 @@ test("bounded cleanup preserves active batches and open dead letters", () => {
   assert.equal(stats.leased, 1);
   assert.equal(stats.activeItems, 1);
   assert.equal(storage.scalar("SELECT COUNT(*) AS value FROM exact_review_queue_dead_letters"), 1);
+});
+
+test("publication history and cleanup merge terminal states with global timestamp and id ordering", () => {
+  const storage = new TestStorage();
+  const batches = new ExactReviewPublicationBatchStore(storage);
+  batches.ensureSchemaSync();
+  for (const [batchId, state, completedAt] of [
+    ["a-completed", "completed", 2_000],
+    ["b-expired", "expired", 2_000],
+    ["c-completed", "completed", 2_000],
+    ["d-expired", "expired", 2_000],
+    ["e-newer", "completed", 2_001],
+    ["active", "leased", null],
+  ] as const) {
+    storage.run(
+      `INSERT INTO exact_review_publication_batches
+         (batch_id, state, lease_owner, lease_expires_at, configured_batch_size,
+          attempt, created_at, completed_at)
+       VALUES (?, ?, 'worker', 20_000, 2, 1, 1_000, ?)`,
+      batchId,
+      state,
+      completedAt,
+    );
+    storage.run(
+      `INSERT INTO exact_review_publication_batch_items
+         (batch_id, item_key, revision, claim_generation, terminal_outcome)
+       VALUES (?, ?, 1, 1, 'lease_expired')`,
+      batchId,
+      `${batchId}-terminal`,
+    );
+  }
+  storage.run(
+    `INSERT INTO exact_review_publication_batch_items
+       (batch_id, item_key, revision, claim_generation)
+     VALUES ('active', 'active-unfinished', 1, 1)`,
+  );
+
+  assert.deepEqual(
+    batches.observability(3_000, 3).batches.map((batch) => batch.batchId),
+    ["active", "e-newer", "d-expired", "c-completed"],
+  );
+  const before = batches.stats(3_000, { completedTtlMs: 1_000, cleanupLimit: 0 });
+  assert.equal(before.reclaimedItemsRetained, 6);
+  assert.deepEqual(before.cleanup, { deletedThisPass: 0, eligibleRemaining: 4, limit: 0 });
+
+  const after = batches.stats(3_000, { completedTtlMs: 1_000, cleanupLimit: 2 });
+  assert.deepEqual(after.cleanup, { deletedThisPass: 2, eligibleRemaining: 2, limit: 2 });
+  assert.equal(after.reclaimedItemsRetained, 4);
+  assert.equal(after.activeItems, 1);
+  assert.equal(after.completed, 2);
+  assert.equal(after.expired, 1);
+  assert.deepEqual(
+    batches.observability(3_000, 10).batches.map((batch) => batch.batchId),
+    ["active", "e-newer", "d-expired", "c-completed"],
+  );
 });
 
 test("cleanup retains fencing generations when a batch id is reused", () => {
@@ -1313,9 +1503,10 @@ for (const [limit, command] of [
       await h.queue.alarm();
       const after = await h.publicationStats();
       const protectedCommand = command === "producer";
+      // An unpruned stale row is excluded from claims, so stats hold it as parked.
       assert.deepEqual(
-        [after.pending, after.completed_total],
-        limit === 1 ? [protectedCommand ? 4 : 3, 1] : [2, 2],
+        [after.pending, after.completed_total, after.parked_reasons.stale_revision ?? 0],
+        limit === 1 ? [protectedCommand ? 3 : 2, 1, 1] : [2, 2, 0],
       );
       const remaining = await h.post("/publications/reconcile");
       assert.equal(remaining.stale_revision_eligible, limit === 1 ? 1 : 0);
@@ -1440,7 +1631,7 @@ test("batch claims retain lifecycle identity until canonical routing is durable"
       member.revision,
     ),
   )[0] as { projection_json: string };
-  const projection = JSON.parse(row.projection_json) as {
+  const projection = JSON.parse(decodeStoredJson(row.projection_json)) as {
     admission: { deliveryId: string };
     claims: Array<{ claimGeneration: number; runId: string; runAttempt: number }>;
     reviewResults: Array<{
@@ -2452,6 +2643,57 @@ test("historical missing successor evidence is not reconstructed after completio
   assert.equal(result.sample[0].successor_fence_state, "missing");
 });
 
+test("a retained stale command row is reported as parked stale_revision, not ready", async (t) => {
+  const f = await successorGuardFixture(t, 108769);
+  // A non-command successor leaves no acknowledgement driver behind.
+  const b = await f.enqueue("b", 2, { address: null });
+  const legacy = await f.state();
+  delete legacy.items[f.a.key].publicationSuccessorWitness;
+  await f.h.storage.put("exact-review-queue", legacy);
+  f.h.restart();
+  await f.publish(b);
+  await f.expire();
+  await f.assertRetained();
+  const heldCreatedAt = (await f.state()).items[f.a.key].createdAt;
+  const publicationLane = async () =>
+    (await (await f.h.queue.fetch(new Request("https://queue/stats"))).json()).lanes.publication;
+
+  f.h.now = heldCreatedAt + 90 * 60_000;
+  await f.h.queue.alarm();
+  assert.equal((await publicationLane()).health.reason, "stale_revision_over_1h");
+
+  f.h.now = heldCreatedAt + 7 * 60 * 60_000;
+  await f.h.queue.alarm();
+  await f.assertRetained();
+  const claim = await f.h.claim({ claim_id: "guard-108769-held", lease_owner: "held-worker" });
+  assert.equal(claim.claimed, false, JSON.stringify(claim));
+  const stats = await (await f.h.queue.fetch(new Request("https://queue/stats"))).json();
+  const lane = stats.lanes.publication;
+  assert.equal(Object.keys((await f.state()).items).length, 1);
+  assert.equal(lane.pending, 0);
+  assert.equal(lane.ready, 0);
+  assert.equal(lane.backoff, 0);
+  assert.equal(lane.oldest_ready_at, null);
+  assert.equal(lane.next_attempt_at, null);
+  assert.equal(lane.parked, 1);
+  assert.deepEqual(lane.parked_reasons, { stale_revision: 1 });
+  assert.deepEqual(lane.health, { status: "critical", reason: "stale_revision_over_6h" });
+  // The public lane keeps its closed-reason totals; this fixture's 1970 clock
+  // cannot make the whole public projection complete.
+  const projected = publicExactReviewQueueProjection(stats).lanes.publication;
+  assert.equal(projected.parked, 1);
+  assert.equal(projected.parked_reasons.stale_revision, 1);
+  assert.equal(projected.parked_reasons.unknown, 0);
+  assert.equal(projected.pending, projected.ready + projected.backoff);
+
+  // Observation only: a newer revision still owns the fenced cleanup.
+  await f.enqueue("d", 4);
+  await f.h.queue.alarm();
+  assert.equal(f.projectionA()?.terminalDisposition?.kind, "superseded");
+  assert.equal((await f.state()).items[f.a.key], undefined);
+  assert.equal((await publicationLane()).parked_reasons.stale_revision, undefined);
+});
+
 test("retained successor resolves the exact mixed-case lifecycle admission target", async (t) => {
   const f = await successorGuardFixture(t, 108764, false, "openclaw/OpenClaw");
   const b = await f.enqueue("b", 2);
@@ -2972,6 +3214,7 @@ test("rollout dispatches one full batch workflow without admitting legacy publis
   });
   const dispatches: unknown[] = [];
   const regularDispatches: unknown[] = [];
+  let failBatchDispatch = false;
   let signalBatchDispatch!: () => void;
   let releaseBatchDispatch!: () => void;
   const batchDispatchStarted = new Promise<void>((resolve) => {
@@ -3021,6 +3264,7 @@ test("rollout dispatches one full batch workflow without admitting legacy publis
     ) {
       assert.equal(new Headers(init?.headers).get("authorization"), "Bearer test-token");
       dispatches.push(JSON.parse(String(init?.body)));
+      if (failBatchDispatch) return new Response("dispatch rejected", { status: 422 });
       signalBatchDispatch();
       await batchDispatchRelease;
       return new Response(null, { status: 204 });
@@ -3067,6 +3311,8 @@ test("rollout dispatches one full batch workflow without admitting legacy publis
     assert.match(String(dispatch?.inputs.dispatch_id), /^publication-batch-dispatch:/);
     assert.equal(dispatch?.inputs.dispatched_at, "1970-01-01T01:56:40.000Z");
     const dispatchedStats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(dispatchedStats.publication_handoff.dispatch_state, "dispatching");
+    assert.equal(dispatchedStats.publication_handoff.dispatch_wait_seconds, null);
     assert.equal(
       dispatchedStats.lanes.publication.batches.dispatch_pending_until,
       "1970-01-01T01:57:40.000Z",
@@ -3147,6 +3393,12 @@ test("rollout dispatches one full batch workflow without admitting legacy publis
     assert.match(secondDispatch.inputs.dispatch_id, /^publication-batch-dispatch:/);
     assert.equal(secondDispatch.inputs.dispatched_at, "1970-01-01T02:14:20.000Z");
     assert.equal(partialStorage.scheduledAlarm(), 8_660_000);
+    now += 15_000;
+    const waitingStats = await (
+      await partialQueue.fetch(new Request("https://queue/stats"))
+    ).json();
+    assert.equal(waitingStats.publication_handoff.dispatch_state, "awaiting_claim");
+    assert.equal(waitingStats.publication_handoff.dispatch_wait_seconds, 15);
 
     const multiOwnerStorage = new TestStorage();
     const multiOwnerQueue = new ExactReviewQueue(
@@ -3165,6 +3417,25 @@ test("rollout dispatches one full batch workflow without admitting legacy publis
     await multiOwnerQueue.fetch(publicationRequest("delivery-owner-b2", 117, "1016", "bbb/repo"));
     await multiOwnerQueue.alarm();
     assert.equal(dispatches.length, 3);
+
+    failBatchDispatch = true;
+    const failedQueue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      {
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PUBLICATION_BATCH_SIZE: "2",
+      },
+    );
+    await failedQueue.fetch(publicationRequest("delivery-failed-1", 118, "1017"));
+    await failedQueue.fetch(publicationRequest("delivery-failed-2", 119, "1018"));
+    await failedQueue.alarm();
+    const failedStats = await (await failedQueue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(failedStats.lanes.publication.batches.last_dispatch_succeeded, false);
+    assert.equal(failedStats.lanes.publication.batches.dispatch_pending_until, null);
+    assert.equal(failedStats.publication_handoff.dispatch_state, "dispatch_failed");
+    assert.equal(failedStats.publication_handoff.dispatch_wait_seconds, null);
   } finally {
     Date.now = originalNow;
     globalThis.fetch = originalFetch;
@@ -3300,37 +3571,53 @@ test("batch rollout wakes a retryable publication at its next eligibility time",
   assert.equal(storage.scheduledAlarm(), 9_030_000);
 });
 
-test("batch protocol routes require the shared internal signature", async () => {
+test("batch and canonical maintenance routes require the shared internal signature and forward exact payloads", async () => {
   const secret = "test-secret";
-  const body = JSON.stringify({ claim_id: "claim-authenticated", lease_owner: "worker-1" });
-  let forwardedPath = "";
-  const env = {
-    CLAWSWEEPER_WEBHOOK_SECRET: secret,
-    EXACT_REVIEW_QUEUE: {
-      idFromName: () => "global",
-      get: () => ({
-        fetch: async (request: Request) => {
-          forwardedPath = new URL(request.url).pathname;
-          return new Response(JSON.stringify({ ok: true }));
-        },
+  for (const [path, payload] of [
+    ["/publication-batches/claim", { claim_id: "claim-authenticated", lease_owner: "worker-1" }],
+    [
+      "/canonical-bodies/maintenance",
+      {
+        action: "migrate",
+        execute: true,
+        expectedDeploymentSha: "e".repeat(40),
+        reviewedPreviewSha256: "f".repeat(64),
+      },
+    ],
+  ] as const) {
+    const body = JSON.stringify(payload);
+    let forwardedPath = "",
+      forwardedBody = "";
+    const env = {
+      CLAWSWEEPER_WEBHOOK_SECRET: secret,
+      EXACT_REVIEW_QUEUE: {
+        idFromName: () => "global",
+        get: () => ({
+          fetch: async (request: Request) => {
+            forwardedPath = new URL(request.url).pathname;
+            forwardedBody = await request.text();
+            return new Response(JSON.stringify({ ok: true }));
+          },
+        }),
+      },
+    };
+    const url = "https://clawsweeper.openclaw.ai/internal/exact-review" + path;
+    const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
+    assert.equal(unauthorized.status, 401);
+    assert.equal(forwardedPath, "");
+    const signature = "sha256=" + createHmac("sha256", secret).update(body).digest("hex");
+    const authorized = await worker.fetch(
+      new Request(url, {
+        method: "POST",
+        headers: { "x-clawsweeper-exact-review-signature": signature },
+        body,
       }),
-    },
-  };
-  const url = "https://clawsweeper.openclaw.ai/internal/exact-review/publication-batches/claim";
-  const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
-  assert.equal(unauthorized.status, 401);
-
-  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-  const authorized = await worker.fetch(
-    new Request(url, {
-      method: "POST",
-      headers: { "x-clawsweeper-exact-review-signature": signature },
-      body,
-    }),
-    env,
-  );
-  assert.equal(authorized.status, 200);
-  assert.equal(forwardedPath, "/publication-batches/claim");
+      env,
+    );
+    assert.equal(authorized.status, 200);
+    assert.equal(forwardedPath, path);
+    assert.equal(forwardedBody, body);
+  }
 });
 
 test("batch claims reject partial dispatch metadata", async () => {
@@ -3583,6 +3870,12 @@ test("reservation-to-claim observability traces one batch without exposing lease
   assert.equal(batch.items[0].reservation_to_claim_ms, 1_000);
   assert.equal(batch.items[0].enqueue_to_claim_ms, 2_000);
   assert.equal(observability.delay_buckets.metric, "reservation_to_claim_ms");
+  assert.equal(stats.publication_handoff.dispatch_state, "idle");
+  assert.equal(stats.publication_handoff.sample_count, 1);
+  assert.equal(stats.publication_handoff.retained_batches, 1);
+  assert.equal(stats.publication_handoff.delay_buckets[0].count, 1);
+  assert.equal(stats.publication_handoff.first_claim_at, batch.claimed_at);
+  assert.equal(stats.publication_handoff.dispatch_wait_seconds, null);
   assert.ok(
     observability.alerts.some((alert: { kind: string }) => alert.kind === "github_throttle"),
   );
@@ -3811,7 +4104,7 @@ test("queue fetch terminalizes a stale batch revision before dispatch", async (t
       1,
     ),
   )[0] as { projection_json: string };
-  const lifecycle = JSON.parse(lifecycleRow.projection_json) as {
+  const lifecycle = JSON.parse(decodeStoredJson(lifecycleRow.projection_json)) as {
     terminalDisposition: { kind: string } | null;
     reviewResults: Array<{ outcome: string }>;
   };
@@ -4213,7 +4506,7 @@ test("oldest publication aging deadline drives the alarm and then its owner clai
   }
 });
 
-test("Bay no-progress recovery backs off without duplicating an aged publication owner", async () => {
+test("an aged publication retains one owner through dispatch and heartbeat", async () => {
   const originalFetch = globalThis.fetch;
   const originalNow = Date.now;
   let now = 20_000_000;
@@ -4271,76 +4564,23 @@ test("Bay no-progress recovery backs off without duplicating an aged publication
       EXACT_REVIEW_PUBLICATION_BATCH_LEASE_MS: "600000",
       EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0",
     };
-    let queue = new ExactReviewQueue({ storage }, env);
-    await queue.fetch(publicationRequest("bay-backoff-aged", 170, "1170", "aged/repo"));
-    const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
-    const stalledIdentity = {
-      canonicalTargetKey: "openclaw/openclaw#9170",
-      fenceKey: "openclaw/openclaw#9170@exact:1",
-      revision: 1,
-    };
-    lifecycle.recordAdmission({
-      ...stalledIdentity,
-      deliveryId: "bay-backoff-stalled",
-      sourceAction: "opened",
-      commandOriginated: false,
-      statusMarker: null,
-      statusCommentId: null,
-      triggeredAt: now,
-      observedAt: now,
-    });
-    lifecycle.markBayTelemetryPending(stalledIdentity);
-    storage.run(
-      `UPDATE ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
-          SET projection_json = ?
-        WHERE canonical_target_key = ? AND fence_key = ? AND revision = ?`,
-      "{",
-      stalledIdentity.canonicalTargetKey,
-      stalledIdentity.fenceKey,
-      stalledIdentity.revision,
-    );
-
+    const queue = new ExactReviewQueue({ storage }, env);
+    await queue.fetch(publicationRequest("aged-publication", 170, "1170", "aged/repo"));
     now += 60_000;
     await queue.alarm();
     assert.equal(dispatches.length, 1);
-    const stalledRetryAt = now + 60_000;
-    assert.equal(storage.scheduledAlarm(), stalledRetryAt);
+    const nextWakeAt = storage.scheduledAlarm();
     now += 2_000;
     await storage.setAlarm(now);
     await queue.alarm();
     assert.equal(dispatches.length, 1);
-    assert.equal(storage.scheduledAlarm(), stalledRetryAt);
-    const trafficIdentity = {
-      canonicalTargetKey: "openclaw/openclaw#9180",
-      fenceKey: "openclaw/openclaw#9180@exact:1",
-      revision: 1,
-    };
-    lifecycle.recordAdmission({
-      ...trafficIdentity,
-      deliveryId: "bay-backoff-traffic",
-      sourceAction: "opened",
-      commandOriginated: false,
-      statusMarker: null,
-      statusCommentId: null,
-      triggeredAt: now,
-      observedAt: now,
-    });
-    const traffic = await queue.fetch(
-      batchRequest("/lifecycle/terminal-disposition", {
-        canonical_target_key: trafficIdentity.canonicalTargetKey,
-        fence_key: trafficIdentity.fenceKey,
-        revision: trafficIdentity.revision,
-        kind: "failure",
-      }),
-    );
-    assert.equal(traffic.status, 200);
-    assert.equal(storage.scheduledAlarm(), stalledRetryAt);
+    assert.equal(storage.scheduledAlarm(), nextWakeAt);
     const dispatch = dispatches[0]!;
     now += 10_000;
     const staleClaim = await (
       await queue.fetch(
         batchRequest("/publication-batches/claim", {
-          claim_id: "claim-bay-backoff-stale",
+          claim_id: "claim-aged-stale",
           lease_owner: "worker-stale",
           max_items: 1,
           dispatch_id: "publication-batch-dispatch:stale",
@@ -4354,7 +4594,7 @@ test("Bay no-progress recovery backs off without duplicating an aged publication
     const claim = await (
       await queue.fetch(
         batchRequest("/publication-batches/claim", {
-          claim_id: "claim-bay-backoff",
+          claim_id: "claim-aged",
           lease_owner: "worker-1",
           max_items: 1,
           dispatch_id: dispatch.inputs.dispatch_id,
@@ -4381,7 +4621,7 @@ test("Bay no-progress recovery backs off without duplicating an aged publication
     const competingClaim = await (
       await queue.fetch(
         batchRequest("/publication-batches/claim", {
-          claim_id: "claim-bay-backoff-competing",
+          claim_id: "claim-aged-competing",
           lease_owner: "worker-2",
           max_items: 1,
         }),
@@ -4390,110 +4630,11 @@ test("Bay no-progress recovery backs off without duplicating an aged publication
     assert.equal(competingClaim.claimed, false);
     assert.equal(competingClaim.batch, null);
 
-    now = stalledRetryAt;
+    now += 60_000;
     await queue.alarm();
     const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
     assert.equal(dispatches.length, 1);
     assert.equal(stats.lanes.publication.batches.active_items, 1);
-    assert.equal(storage.scheduledAlarm(), now + 60_000);
-
-    const progressingStorage = new TestStorage();
-    const progressingQueue = new ExactReviewQueue({ storage: progressingStorage }, {});
-    await progressingQueue.fetch(new Request("https://queue/stats"));
-    const progressingLifecycle = new ExactReviewLifecycleProjectionStore(progressingStorage);
-    for (let index = 0; index < 257; index += 1) {
-      const identity = {
-        canonicalTargetKey: `openclaw/openclaw#${9_500 + index}`,
-        fenceKey: `openclaw/openclaw#${9_500 + index}@exact:1`,
-        revision: 1,
-      };
-      progressingLifecycle.recordAdmission({
-        ...identity,
-        deliveryId: `bay-backoff-progress:${index}`,
-        sourceAction: "opened",
-        commandOriginated: false,
-        statusMarker: null,
-        statusCommentId: null,
-        triggeredAt: now,
-        observedAt: now,
-      });
-      progressingLifecycle.markBayTelemetryPending(identity);
-    }
-    progressingStorage.failSqlMatchingAfter(/INSERT INTO exact_review_lifecycle_projection_v1/, 1);
-    await progressingQueue.alarm();
-    assert.equal(progressingStorage.scheduledAlarm(), now + 1_000);
-
-    const clearedStorage = new TestStorage();
-    const clearedQueue = new ExactReviewQueue({ storage: clearedStorage }, {});
-    await clearedQueue.fetch(new Request("https://queue/stats"));
-    const clearedLifecycle = new ExactReviewLifecycleProjectionStore(clearedStorage);
-    const clearedIdentity = {
-      canonicalTargetKey: "openclaw/openclaw#9800",
-      fenceKey: "openclaw/openclaw#9800@exact:1",
-      revision: 1,
-    };
-    clearedLifecycle.recordAdmission({
-      ...clearedIdentity,
-      deliveryId: "bay-backoff-cleared",
-      sourceAction: "opened",
-      commandOriginated: false,
-      statusMarker: null,
-      statusCommentId: null,
-      triggeredAt: now,
-      observedAt: now,
-    });
-    clearedLifecycle.markBayTelemetryPending(clearedIdentity);
-    clearedStorage.run(
-      `UPDATE ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
-          SET projection_json = ?
-        WHERE canonical_target_key = ? AND fence_key = ? AND revision = ?`,
-      "{",
-      clearedIdentity.canonicalTargetKey,
-      clearedIdentity.fenceKey,
-      clearedIdentity.revision,
-    );
-    await clearedQueue.alarm();
-    assert.equal(clearedStorage.scheduledAlarm(), now + 60_000);
-    clearedStorage.run(
-      `DELETE FROM ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
-        WHERE canonical_target_key = ? AND fence_key = ? AND revision = ?`,
-      clearedIdentity.canonicalTargetKey,
-      clearedIdentity.fenceKey,
-      clearedIdentity.revision,
-    );
-    await clearedQueue.fetch(new Request("https://queue/stats"));
-    const laterIdentity = {
-      canonicalTargetKey: "openclaw/openclaw#9801",
-      fenceKey: "openclaw/openclaw#9801@exact:1",
-      revision: 1,
-    };
-    clearedLifecycle.recordAdmission({
-      ...laterIdentity,
-      deliveryId: "bay-backoff-later",
-      sourceAction: "opened",
-      commandOriginated: false,
-      statusMarker: null,
-      statusCommentId: null,
-      triggeredAt: now,
-      observedAt: now,
-    });
-    clearedLifecycle.markBayTelemetryPending(laterIdentity);
-    await clearedQueue.fetch(new Request("https://queue/stats"));
-    assert.equal(clearedStorage.scheduledAlarm(), now + 1_000);
-
-    if (process.env.CLAWSWEEPER_EVIDENCE_TRANSCRIPT === "1") {
-      console.log(
-        `BAY_RECOVERY_BACKOFF_PROOF=${JSON.stringify({
-          no_progress_alarm_delay_ms: 60_000,
-          dispatch_count: dispatches.length,
-          stale_claimed: staleClaim.claimed,
-          heartbeat_status: heartbeat.status,
-          active_items: stats.lanes.publication.batches.active_items,
-          progress_alarm_delay_ms: 1_000,
-          cleared_deadline_alarm_delay_ms: 1_000,
-        })}`,
-      );
-    }
   } finally {
     globalThis.fetch = originalFetch;
     Date.now = originalNow;
@@ -5014,7 +5155,10 @@ test("retryable batch completion releases ownership and preserves queue retry po
       member.revision,
     ),
   )[0] as { projection_json: string };
-  assert.equal(JSON.parse(lifecycleRow.projection_json).terminalDisposition?.kind, "requeue");
+  assert.equal(
+    JSON.parse(decodeStoredJson(lifecycleRow.projection_json)).terminalDisposition?.kind,
+    "requeue",
+  );
 
   const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
   assert.equal(stats.lanes.publication.pending, 1);
@@ -5154,6 +5298,95 @@ test("batch completion refreshes deterministic invalid artifacts", async () => {
     "artifact_retention_recovery",
   );
   assert.equal(state.items["openclaw/openclaw#127"].decision.publication, undefined);
+});
+
+test("batch refresh supersedes an older command instead of overwriting a queued newer one", async () => {
+  const storage = new TestStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    { EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1" },
+  );
+  const command = (commentId: number) => ({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 128,
+    itemKind: "issue",
+    sourceEvent: "issues",
+    sourceAction: "re_review",
+    supersedesInProgress: false,
+    sourceCommentId: commentId,
+    sourceCommentUpdatedAt: new Date(Date.parse("2026-09-04T10:00:00Z") + commentId).toISOString(),
+    commandBodyDigest: String(commentId % 10).repeat(64),
+    commandOrigin: "hosted_webhook",
+    sourceCommentVerified: true,
+    commandStatusMarker: `<!-- clawsweeper-command-status:128:re_review:command-${commentId} -->`,
+  });
+  const older = command(1);
+  const published = JSON.parse(await publicationRequest("older-command", 128, "1028").text());
+  published.decision = {
+    ...published.decision,
+    ...older,
+    sourceAction: "exact_review_artifact_publish",
+    publication: { ...published.decision.publication, producerDecision: older },
+  };
+  await queue.fetch(
+    new Request("https://queue/enqueue", { method: "POST", body: JSON.stringify(published) }),
+  );
+  const claim = await (
+    await queue.fetch(
+      batchRequest("/publication-batches/claim", {
+        claim_id: "claim-older-command",
+        lease_owner: "worker-1",
+        max_items: 1,
+      }),
+    )
+  ).json();
+  const member = claim.batch.items[0];
+  const newer = command(2);
+  await queue.fetch(
+    new Request("https://queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({ delivery_id: "newer-command", decision: newer }),
+    }),
+  );
+
+  const completion = await (
+    await queue.fetch(
+      batchRequest("/publication-batches/complete", {
+        batch_id: claim.batch.batch_id,
+        lease_owner: "worker-1",
+        items: [
+          {
+            item_key: member.item_key,
+            revision: member.revision,
+            claim_generation: member.claim_generation,
+            terminal_outcome: "refresh_required",
+            reason_code: "invalid_artifact",
+          },
+        ],
+      }),
+    )
+  ).json();
+
+  assert.equal(completion.accepted, 1, JSON.stringify(completion));
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, Record<string, any>>;
+  };
+  assert.deepEqual(state.items["openclaw/openclaw#128"]?.decision, newer);
+  // The older command's publication stays only as its terminal acknowledgement.
+  assert.equal(state.items[member.item_key]?.terminalFinalization?.disposition, "superseded");
+  assert.equal(
+    state.items[member.item_key]?.decision.publication.producerDecision.commandStatusMarker,
+    older.commandStatusMarker,
+  );
+  assert.equal(
+    new ExactReviewLifecycleProjectionStore(storage).read(
+      "openclaw/openclaw#128",
+      member.item_key,
+      member.revision,
+    )?.terminalDisposition?.kind,
+    "superseded",
+  );
 });
 
 test("credential circuits persist, preserve healthy owners, and defer unattempted members without retry charge", async (t) => {

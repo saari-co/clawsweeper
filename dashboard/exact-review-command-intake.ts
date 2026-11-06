@@ -8,7 +8,6 @@ import { exactReviewBaseDecisionFrom } from "./exact-review-decision.ts";
 const COMMAND_INTAKE_TABLE = "exact_review_command_intakes";
 const COMMAND_WATERMARK_TABLE = "exact_review_command_watermarks";
 const COMMAND_RECEIPT_TABLE = "exact_review_command_receipts";
-const COMMAND_BAY_JOURNEY_TABLE = "exact_review_command_bay_journeys";
 const ITEM_REVISION_TABLE = "exact_review_item_revisions";
 const COMMAND_INTAKE_LIMIT = 16;
 const COMMAND_RETRY_BASE_MS = 15_000;
@@ -37,7 +36,6 @@ export type ExactReviewCommandAdmission =
       accepted: true;
       deduped: boolean;
       commandVersionId: string;
-      bayJourneyDeliveryId?: string;
     }
   | {
       accepted: false;
@@ -88,12 +86,6 @@ export class ExactReviewCommandIntakeStore {
          ON ${COMMAND_RECEIPT_TABLE} (outcome, observed_at, command_version_id)`,
     );
     this.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS ${COMMAND_BAY_JOURNEY_TABLE} (
-         command_version_id TEXT PRIMARY KEY,
-         bay_journey_delivery_id TEXT NOT NULL
-       ) STRICT`,
-    );
-    this.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS ${ITEM_REVISION_TABLE} (
          item_key TEXT PRIMARY KEY,
          last_revision INTEGER NOT NULL CHECK (last_revision >= 0)
@@ -109,11 +101,8 @@ export class ExactReviewCommandIntakeStore {
     return this.storage.transactionSync(() => {
       const receipt = firstRow(
         this.storage.sql.exec(
-          `SELECT receipt.outcome, receipt.detail, journey.bay_journey_delivery_id
-             FROM ${COMMAND_RECEIPT_TABLE} receipt
-             LEFT JOIN ${COMMAND_BAY_JOURNEY_TABLE} journey
-               ON journey.command_version_id = receipt.command_version_id
-            WHERE receipt.command_version_id = ?`,
+          `SELECT outcome, detail FROM ${COMMAND_RECEIPT_TABLE}
+            WHERE command_version_id = ?`,
           intake.commandVersionId,
         ),
       );
@@ -130,9 +119,6 @@ export class ExactReviewCommandIntakeStore {
           accepted: true,
           deduped: true,
           commandVersionId: intake.commandVersionId,
-          ...(typeof receipt.bay_journey_delivery_id === "string"
-            ? { bayJourneyDeliveryId: receipt.bay_journey_delivery_id }
-            : {}),
         };
       }
 
@@ -211,15 +197,6 @@ export class ExactReviewCommandIntakeStore {
         sourceCommentKey,
         now,
       );
-      if (intake.decision.bayJourneyDeliveryId) {
-        this.storage.sql.exec(
-          `INSERT INTO ${COMMAND_BAY_JOURNEY_TABLE}
-             (command_version_id, bay_journey_delivery_id)
-           VALUES (?, ?)`,
-          intake.commandVersionId,
-          intake.decision.bayJourneyDeliveryId,
-        );
-      }
       this.storage.sql.exec(
         `INSERT INTO ${COMMAND_INTAKE_TABLE}
            (command_version_id, source_comment_key, source_updated_at, record_json, next_attempt_at)
@@ -234,9 +211,6 @@ export class ExactReviewCommandIntakeStore {
         accepted: true,
         deduped: false,
         commandVersionId: intake.commandVersionId,
-        ...(intake.decision.bayJourneyDeliveryId
-          ? { bayJourneyDeliveryId: intake.decision.bayJourneyDeliveryId }
-          : {}),
       };
     });
   }
@@ -423,23 +397,16 @@ export class ExactReviewCommandIntakeStore {
   pruneTerminalReceipts(now: number) {
     this.storage.sql.exec(
       `DELETE FROM ${COMMAND_RECEIPT_TABLE}
-        WHERE outcome != 'pending' AND observed_at <= ?`,
+        WHERE outcome IN ('completed', 'rejected', 'superseded') AND observed_at <= ?`,
       now - EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS,
-    );
-    this.storage.sql.exec(
-      `DELETE FROM ${COMMAND_BAY_JOURNEY_TABLE}
-        WHERE command_version_id NOT IN (SELECT command_version_id FROM ${COMMAND_RECEIPT_TABLE})`,
     );
   }
 
-  allocateItemRevision(
-    itemKey: string,
-    minimumRevision: number,
-    lifecycleRevision: number,
-    publicationRevision: number,
-  ) {
+  // Durable per-item counter: the result is at least `minimumRevision` and
+  // above every prior allocation and every retained revision passed in.
+  allocateItemRevision(itemKey: string, minimumRevision: number, ...retainedRevisions: number[]) {
     const canonicalKey = itemKey.split("@publish:")[0]!.toLowerCase();
-    const floor = Math.max(0, minimumRevision - 1, lifecycleRevision, publicationRevision);
+    const floor = Math.max(0, minimumRevision - 1, ...retainedRevisions);
     this.storage.sql.exec(
       `INSERT INTO ${ITEM_REVISION_TABLE} (item_key, last_revision)
        VALUES (?, ?)
@@ -486,13 +453,21 @@ export class ExactReviewCommandIntakeStore {
 function parseRecord(value: unknown): ExactReviewCommandIntakeRecord | null {
   try {
     const parsed = JSON.parse(String(value || "")) as ExactReviewCommandIntakeRecord;
-    return validateDirectReReviewIntake(parsed.intake) &&
-      ["verify_pending", "enqueue_pending", "effects_pending"].includes(parsed.stage) &&
-      Number.isSafeInteger(parsed.attempts) &&
-      parsed.attempts >= 0 &&
-      Number.isFinite(parsed.nextAttemptAt)
-      ? parsed
-      : null;
+    const intake = validateDirectReReviewIntake(parsed.intake);
+    if (
+      !intake ||
+      !["verify_pending", "enqueue_pending", "effects_pending"].includes(parsed.stage) ||
+      !Number.isSafeInteger(parsed.attempts) ||
+      parsed.attempts < 0 ||
+      !Number.isFinite(parsed.nextAttemptAt)
+    ) {
+      return null;
+    }
+    parsed.intake = intake;
+    if (parsed.verifiedDecision) {
+      Reflect.deleteProperty(parsed.verifiedDecision, "bayJourneyDeliveryId");
+    }
+    return parsed;
   } catch {
     return null;
   }

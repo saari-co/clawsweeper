@@ -10,7 +10,8 @@ import { ExactReviewLifecycleProjectionStore } from "../dashboard/exact-review-l
 import {
   exactReviewParkedOperatorEligible,
   exactReviewParkedRecoveryAt,
-  exactReviewQueueBayProjection,
+  exactReviewQueueBayProjectionFromStats,
+  exactReviewQueueStats as queueCensus,
 } from "../dashboard/exact-review-read-model.ts";
 import { TestStorage } from "./exact-review-test-storage.ts";
 import {
@@ -112,12 +113,15 @@ test("scheduled-first PRs bind source identity before dispatch and remain stoppe
 test("scheduled source binding preserves issues, bound PRs, and closed-target cleanup", async () => {
   for (const scenario of ["issue", "bound", "closed", "incomplete"] as const) {
     const reads: string[] = [];
-    const h = createExactReviewAdmissionHarness((_repo, _number, kind) => {
-      reads.push(kind);
-      return jsonResponse(
-        scenario === "closed" ? { state: "closed" } : { state: "open", head: { sha: head } },
-      );
-    });
+    const h = createExactReviewAdmissionHarness(
+      (_repo, _number, kind) => {
+        reads.push(kind);
+        return jsonResponse(
+          scenario === "closed" ? { state: "closed" } : { state: "open", head: { sha: head } },
+        );
+      },
+      { rawPullResponse: scenario === "incomplete" },
+    );
     await withExactReviewAdmissionHarness(h, async () => {
       const identity =
         scenario === "bound"
@@ -147,8 +151,10 @@ test("scheduled source binding preserves issues, bound PRs, and closed-target cl
         assert.equal(item.decision.sourceHeadSha, undefined);
       } else {
         assert.equal(item.state, "dispatching");
-        assert.equal(item.leaseDecision?.sourceBaseSha, identity.sourceBaseSha);
-        assert.equal(item.leaseDecision?.sourceContentRevision, identity.sourceContentRevision);
+        if (scenario === "bound") {
+          assert.equal(item.leaseDecision?.sourceBaseSha, "b".repeat(40));
+          assert.match(item.leaseDecision?.sourceContentRevision ?? "", /^[a-f0-9]{64}$/);
+        }
         if (scenario === "issue") assert.equal(item.leaseDecision?.sourceHeadSha, undefined);
       }
       assert.deepEqual(reads, [scenario === "issue" ? "issue" : "pull_request"]);
@@ -304,10 +310,15 @@ test("pinned incompatible PR survives restart and dedupes both scheduled lanes",
   assert.equal(exactReviewParkedRecoveryAt(stopped), null);
   assert.equal(exactReviewParkedOperatorEligible(stopped), true);
   assert.equal(h.lifecycle.read(key, key, 1)?.terminalDisposition?.kind, "failure");
-  assert.deepEqual(exactReviewQueueBayProjection([stopped]).items?.[0]?.review_failure, {
-    stage: "source_preparation",
-    reason: "source_incompatible",
-  });
+  assert.deepEqual(
+    exactReviewQueueBayProjectionFromStats(
+      queueCensus({ items: Object.fromEntries([stopped].map((item) => [item.key, item])) }),
+    ).items?.[0]?.review_failure,
+    {
+      stage: "source_preparation",
+      reason: "source_incompatible",
+    },
+  );
   const restarted = new ExactReviewQueue(
     { storage: h.storage },
     { hostedTargetPredicate: () => true, hostedPublicTargetProbe: async () => "public" },

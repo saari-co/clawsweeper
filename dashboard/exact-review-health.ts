@@ -1,3 +1,5 @@
+import { exactReviewDispatcherRetryAt } from "./exact-review-queue-shared.ts";
+
 export type ExactReviewPhase = "pending" | "dispatching" | "leased";
 export type ExactReviewReviewRecoveryReason =
   | "claim_timeout"
@@ -18,6 +20,7 @@ export type ExactReviewHealthItem = {
 
 export type ExactReviewHealthDispatcher = {
   state?: "active" | "paused" | "blocked" | "unknown";
+  retryAt?: number;
 };
 
 export type ExactReviewPhaseSummary = {
@@ -41,7 +44,8 @@ export type ExactReviewHandoffHealth = {
     | "claim_delayed"
     | "claim_stalled"
     | "dispatcher_paused"
-    | "dispatcher_blocked";
+    | "dispatcher_blocked"
+    | "dispatcher_retry_due";
   message: string;
   observed_at: string;
   warning_after_seconds: number;
@@ -83,81 +87,19 @@ export type ExactReviewPublicationLaneSummary = {
   active: number;
   parked: number;
   oldest_pending_age_seconds: number | null;
+  parked_reasons?: Record<string, number>;
+  // Age of the oldest retained stale-revision row counted in `parked`.
+  oldest_stale_revision_age_seconds?: number | null;
 };
 
 const PHASES: ExactReviewPhase[] = ["pending", "dispatching", "leased"];
-
-export function summarizeExactReviewHandoff({
-  items,
-  dispatcher,
-  now = Date.now(),
-  capacity,
-  dispatchLeaseMs,
-  executionLeaseMs,
-  shedSinceReset = 0,
-}: {
-  items: ExactReviewHealthItem[];
-  dispatcher?: ExactReviewHealthDispatcher;
-  now?: number;
-  capacity: number;
-  dispatchLeaseMs: number;
-  executionLeaseMs: number;
-  shedSinceReset?: number;
-}): ExactReviewHandoffHealth {
-  const safeNow = finiteTimestamp(now, Date.now());
-  const safeLeaseMs = Math.max(1_000, finiteNumber(dispatchLeaseMs, 10 * 60_000));
-  const safeExecutionLeaseMs = Math.max(1_000, finiteNumber(executionLeaseMs, 130 * 60_000));
-  const phaseValues: Record<ExactReviewPhase, ExactReviewHandoffPhaseCensus> = {
-    pending: { count: 0, oldestAt: null, oldestKey: null },
-    dispatching: { count: 0, oldestAt: null, oldestKey: null },
-    leased: { count: 0, oldestAt: null, oldestKey: null },
-  };
-  const recoveryReasons: Record<ExactReviewReviewRecoveryReason, number> = {
-    claim_timeout: 0,
-    execution_timeout: 0,
-    workflow_cancelled: 0,
-    workflow_failed: 0,
-  };
-
-  for (const item of items) {
-    const recoveryReason = String(item.reviewRecoveryReason || "");
-    if (recoveryReason in recoveryReasons) {
-      recoveryReasons[recoveryReason as ExactReviewReviewRecoveryReason] += 1;
-    }
-    const startedAt = exactReviewPhaseStartedAt(item, safeNow, safeLeaseMs, safeExecutionLeaseMs);
-    const phase = phaseValues[item.state];
-    if (!phase) continue;
-    phase.count += 1;
-    const key = item.key?.trim() || null;
-    if (
-      phase.oldestAt === null ||
-      startedAt < phase.oldestAt ||
-      (startedAt === phase.oldestAt &&
-        key !== null &&
-        (phase.oldestKey === null || key < phase.oldestKey))
-    ) {
-      phase.oldestAt = startedAt;
-      phase.oldestKey = key;
-    }
-  }
-
-  return projectExactReviewHandoff({
-    itemCount: items.length,
-    phaseCensus: phaseValues,
-    recoveryReasons,
-    dispatcher,
-    now: safeNow,
-    capacity,
-    dispatchLeaseMs: safeLeaseMs,
-    shedSinceReset,
-  });
-}
 
 export function projectExactReviewHandoff({
   itemCount,
   phaseCensus,
   recoveryReasons,
   dispatcher,
+  dispatchablePending = false,
   now,
   capacity,
   dispatchLeaseMs,
@@ -167,6 +109,7 @@ export function projectExactReviewHandoff({
   phaseCensus: Record<ExactReviewPhase, ExactReviewHandoffPhaseCensus>;
   recoveryReasons: Record<ExactReviewReviewRecoveryReason, number>;
   dispatcher?: ExactReviewHealthDispatcher | undefined;
+  dispatchablePending?: boolean;
   now: number;
   capacity: number;
   dispatchLeaseMs: number;
@@ -227,15 +170,30 @@ export function projectExactReviewHandoff({
       ...common,
     };
   }
-  if (dispatcher?.state === "blocked" && phases.pending.count > 0) {
+  const dispatcherInactive = dispatcher?.state === "blocked" || dispatcher?.state === "paused";
+  // Expiry allows another attempt; it does not prove recovery. Keep a due
+  // retry visible only while canonical admission has work it could dispatch.
+  const retryExpired =
+    Number.isFinite(dispatcher?.retryAt) &&
+    Number(dispatcher?.retryAt) > 0 &&
+    exactReviewDispatcherRetryAt(dispatcher, now) === null;
+  if (dispatcherInactive && retryExpired && dispatchablePending) {
     return {
-      status: "stalled",
-      reason: "dispatcher_blocked",
-      message: "The dispatcher cannot verify workflow availability while reviews are pending.",
+      status: "degraded",
+      reason: "dispatcher_retry_due",
+      message: "The dispatcher is due to retry while eligible reviews are waiting.",
       ...common,
     };
   }
-  if (dispatcher?.state === "paused" && phases.pending.count > 0) {
+  if (dispatcher?.state === "blocked" && !retryExpired && phases.pending.count > 0) {
+    return {
+      status: "stalled",
+      reason: "dispatcher_blocked",
+      message: "The dispatcher is backing off after a failed attempt while reviews are pending.",
+      ...common,
+    };
+  }
+  if (dispatcher?.state === "paused" && !retryExpired && phases.pending.count > 0) {
     return {
       status: "degraded",
       reason: "dispatcher_paused",
@@ -318,78 +276,44 @@ export function summarizeExactReviewPublicationHealth(
   const active = nonNegativeInteger(lane.active);
   const parked = nonNegativeInteger(lane.parked);
   const oldestAge = nonNegativeInteger(lane.oldest_pending_age_seconds);
+  // Retained stale revisions are parked for observation only. They keep the
+  // age-based severity they had while counted as pending, not dead-letter severity.
+  const staleRevisions = Math.min(parked, nonNegativeInteger(lane.parked_reasons?.stale_revision));
+  const deadLetters = parked - staleRevisions;
+  const staleAge = staleRevisions ? nonNegativeInteger(lane.oldest_stale_revision_age_seconds) : 0;
 
   // Dead letters and retired state-writer history are reported independently.
   // Neither is current publication demand, so an empty lane must stay idle.
   if (pending === 0 && active === 0 && parked === 0) {
     return { status: "idle", reason: null };
   }
-  if (parked > 0 || oldestAge >= 6 * 60 * 60) {
+  if (deadLetters > 0 || oldestAge >= 6 * 60 * 60 || staleAge >= 6 * 60 * 60) {
     return {
       status: "critical",
-      reason: parked > 0 ? "dead_letter_capacity" : "oldest_pending_over_6h",
+      reason:
+        deadLetters > 0
+          ? "dead_letter_capacity"
+          : oldestAge >= 6 * 60 * 60
+            ? "oldest_pending_over_6h"
+            : "stale_revision_over_6h",
     };
   }
   if (
     oldestAge >= 60 * 60 ||
+    staleAge >= 60 * 60 ||
     (pending >= 100 && flow.last_15_minutes.net_drain_rate_per_hour <= 0)
   ) {
     return {
       status: "degraded",
-      reason: oldestAge >= 60 * 60 ? "oldest_pending_over_1h" : "not_draining",
+      reason:
+        oldestAge >= 60 * 60
+          ? "oldest_pending_over_1h"
+          : staleAge >= 60 * 60
+            ? "stale_revision_over_1h"
+            : "not_draining",
     };
   }
   return { status: "healthy", reason: null };
-}
-
-function exactReviewPhaseStartedAt(
-  item: ExactReviewHealthItem,
-  now: number,
-  dispatchLeaseMs: number,
-  executionLeaseMs: number,
-) {
-  if (item.state === "dispatching") {
-    const dispatchedAt = validTimestamp(item.dispatchedAt);
-    const leaseExpiresAt = validTimestamp(item.leaseExpiresAt);
-    const leaseStartedAt =
-      leaseExpiresAt === null ? null : timestampAtOrBefore(leaseExpiresAt - dispatchLeaseMs, now);
-    // Rolling deploys can expose rows created before dispatchedAt existed, while a rollback can
-    // leave an old dispatchedAt behind. The current lease start is the reliable compatibility
-    // marker; prefer the newest plausible transition and keep an unknown age non-alarming.
-    return newestTimestamp(dispatchedAt, leaseStartedAt) ?? now;
-  }
-  if (item.state === "leased") {
-    const claimedAt = validTimestamp(item.claimedAt);
-    const leaseExpiresAt = validTimestamp(item.leaseExpiresAt);
-    const leaseStartedAt =
-      leaseExpiresAt === null ? null : validTimestamp(leaseExpiresAt - executionLeaseMs);
-    return newestTimestamp(claimedAt, leaseStartedAt) ?? now;
-  }
-  return finiteTimestamp(item.createdAt, finiteTimestamp(item.updatedAt, now));
-}
-
-function newestTimestamp(...values: Array<number | null>) {
-  let newest: number | null = null;
-  for (const value of values) {
-    if (value === null) continue;
-    newest = newest === null ? value : Math.max(newest, value);
-  }
-  return newest;
-}
-
-function validTimestamp(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 && number <= 8_640_000_000_000_000 ? number : null;
-}
-
-function timestampAtOrBefore(value: unknown, maximum: number): number | null {
-  const timestamp = validTimestamp(value);
-  return timestamp !== null && timestamp <= maximum ? timestamp : null;
-}
-
-function finiteTimestamp(value: unknown, fallback: number) {
-  return validTimestamp(value) ?? fallback;
 }
 
 function finiteNumber(value: unknown, fallback: number) {

@@ -2,6 +2,7 @@
 // Controlled workflow execution only: every gh/curl call is intercepted locally.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { Console } from "node:console";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -29,8 +30,15 @@ export async function proveApplyDriftRefresh() {
     path.join(sourceRoot, "scripts/control-plane-curl.sh"),
     path.join(artifacts, "control-plane-curl.sh"),
   );
+  fs.copyFileSync(
+    path.join(sourceRoot, "src/repair/exact-review-queue-request.ts"),
+    path.join(artifacts, "exact-review-queue-request.mts"),
+  );
   const workflow = YAML.parse(
     fs.readFileSync(path.join(sourceRoot, ".github/workflows/sweep.yml"), "utf8"),
+  );
+  const planner = YAML.parse(
+    fs.readFileSync(path.join(sourceRoot, ".github/workflows/review-plan.yml"), "utf8"),
   );
   const step = (job: string, name: string): Step => {
     const found = workflow.jobs[job].steps.find((entry: Step) => entry.name === name);
@@ -79,7 +87,7 @@ if (tool === 'pnpm') {
 if (tool === 'curl') {
   assert.equal(args.at(-1), 'http://queue.invalid/internal/exact-review/enqueue');
   if (process.env.FAIL_INTAKE === 'true') { process.stderr.write('controlled queue HTTP 500\\n'); process.exit(22); }
-  const body = args[args.indexOf('--data')+1];
+  const body = args[args.indexOf('--data-binary')+1];
   assert.ok(args.includes('x-clawsweeper-exact-review-signature: sha256='+createHmac('sha256',process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(body).digest('hex')));
   fs.appendFileSync(process.env.ENQUEUE, body+'\\n'); process.stdout.write('{"ok":true,"queued":true}'); process.exit(0);
 }
@@ -101,7 +109,7 @@ if (process.env.LIVE_STATE === 'missing') { process.stderr.write('gh: Not Found 
 const number = Number(endpoint.split('/').at(-1));
 // Synthetic kinds: the recorded apply report does not establish issue/PR kind.
 const pr = [128515,121477].includes(number);
-process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : JSON.stringify({number,state:process.env.LIVE_STATE || 'open',locked:false,...(pr ? {pull_request:{}} : {})}));
+process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : JSON.stringify({number,html_url:'https://github.com/openclaw/openclaw/'+(pr ? 'pull/' : 'issues/')+number,state:process.env.LIVE_STATE || 'open',locked:false,...(pr ? {pull_request:{}} : {})}));
 `;
   for (const tool of ["gh", "curl", "pnpm"])
     fs.writeFileSync(path.join(bin, tool), proxy, { mode: 0o755 });
@@ -116,7 +124,8 @@ process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : J
     APPLY_TARGET_REPO: "openclaw/openclaw",
     APPLY_AUTO_SELECTED_BATCH: "true",
     DISPATCH_REPOSITORY: "openclaw/clawsweeper",
-    GITHUB_RUN_ID: "fixture",
+    // Actions run ids are numeric; the intake command checks this.
+    GITHUB_RUN_ID: "424242",
     GITHUB_RUN_ATTEMPT: "1",
     GITHUB_OUTPUT: path.join(artifacts, "live-output.txt"),
     QUEUE_URL: "http://queue.invalid",
@@ -181,7 +190,7 @@ process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : J
   }
   for (const event of events) {
     assert.equal(event.event_type, "clawsweeper_item");
-    assert.equal(route(workflow.jobs.plan.if, event.event_type), false);
+    assert.equal(route(planner.jobs.plan.if, event.event_type), false);
     assert.equal(route(workflow.jobs["legacy-event-queue-intake"].if, event.event_type), true);
     assert.equal(route(workflow.jobs["event-review-apply"].if, event.event_type), false);
     success(intake.run!, {
@@ -189,9 +198,9 @@ process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : J
       GITHUB_RUN_ID: String(event.client_payload.item_number),
     });
   }
-  assert.equal(route(workflow.jobs.plan.if, "clawsweeper_target_sweep"), true);
+  assert.equal(route(planner.jobs.plan.if, "clawsweeper_target_sweep"), true);
   assert.ok(
-    workflow.jobs.plan.steps.some((entry: Step) =>
+    planner.jobs.plan.steps.some((entry: Step) =>
       entry.uses?.endsWith("/.github/actions/setup-state"),
     ),
   );
@@ -376,6 +385,9 @@ process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : J
     workflowSha256: createHash("sha256")
       .update(fs.readFileSync(path.join(sourceRoot, ".github/workflows/sweep.yml")))
       .digest("hex"),
+    plannerWorkflowSha256: createHash("sha256")
+      .update(fs.readFileSync(path.join(sourceRoot, ".github/workflows/review-plan.yml")))
+      .digest("hex"),
     reportSha256: createHash("sha256").update(report).digest("hex"),
     recordedRows: 27,
     driftRows: 15,
@@ -398,5 +410,12 @@ process.stdout.write(args.includes('--jq') ? (pr ? 'pull_request' : 'issue') : J
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  console.log(JSON.stringify(await proveApplyDriftRefresh(), null, 2));
+  const originalConsole = globalThis.console;
+  // Keep in-process Worker diagnostics separate from the CLI's JSON result.
+  globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
+  try {
+    process.stdout.write(`${JSON.stringify(await proveApplyDriftRefresh(), null, 2)}\n`);
+  } finally {
+    globalThis.console = originalConsole;
+  }
 }

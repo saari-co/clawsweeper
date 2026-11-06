@@ -6,6 +6,7 @@ import test from "node:test";
 import { renderReviewStartStatusComment } from "../dist/clawsweeper.js";
 
 import {
+  canonicalPullRequestClusterForTest,
   implementedCloseReport,
   lowSignalCloseReport,
   reportWithSyncedReviewComment,
@@ -402,6 +403,9 @@ test("apply-decisions records PR coverage proof retry before same-author pair sk
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }),
       321,
       "duplicate_or_superseded",
@@ -705,8 +709,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/${leaseCommentId}$/.test(path) && args.includes("DELETE")) {
   console.log("");
-} else if (args[0] === "label" && args[1] === "list") {
-  console.log(JSON.stringify([]));
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/labels?per_page=100") {
+  console.log(JSON.stringify([[]]));
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
 } else {

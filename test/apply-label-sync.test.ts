@@ -6,27 +6,62 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
-  contextHasNonAutomationActivityAfterForTest,
   implementedOnMainCloseProvenanceBlock,
   isExactEventSourceRevisionChange,
-  itemSourceRevisionSha256ForTest,
   renderReviewStartStatusComment,
 } from "../dist/clawsweeper.js";
-import { createReviewCommentPublication } from "../dist/clawsweeper-review-comment-publication.js";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
+import {
+  ensureCloseAppliedComment,
+  writeCommentPayload,
+} from "../dist/clawsweeper-review-comment-publication.js";
+import { repositoryProfileFor, withTargetProfile } from "../dist/repository-profiles.js";
+import { withGitHubRun } from "../dist/clawsweeper-github-runtime.js";
+import { contextHasNonAutomationActivityAfter } from "../dist/clawsweeper-promotion-facts.js";
+import { completeActivityContextSymbol, type ItemContext } from "../dist/clawsweeper-types.js";
 
 import {
   implementedCloseReport,
   lowSignalCloseReport,
+  mockCommandBinEnv,
   prRatingReportSection,
   promotionGhMock,
   realBehaviorProofReportSection,
+  readText,
   reportFrontMatter,
   reportWithSyncedReviewComment,
   runApplyDecisionsForTest,
   tmpPrefix,
   withMockGh,
+  withReviewRecord,
   workPlanCandidateReport,
 } from "./helpers.ts";
+
+const labelReviewDecision = {
+  decision: "keep_open",
+  closeReason: "none",
+  triagePriority: "none",
+  fixedSha: null,
+  fixedAt: null,
+  closeComment: "",
+  nextStep: { kind: "none", text: "" },
+  realBehaviorProof: {
+    status: "sufficient",
+    evidenceKind: "terminal",
+    needsContributorAction: false,
+    summary:
+      "The PR includes a terminal transcript from a real OpenClaw setup showing the fixed behavior after the patch.",
+  },
+  prRating: {
+    overallTier: "A",
+    proofTier: "A",
+    patchTier: "B",
+    summary: "This PR has strong proof and normal merge-ready implementation quality.",
+    nextSteps: [],
+  },
+  overallCorrectness: "patch is correct",
+  overallConfidenceScore: 0.9,
+};
 
 function createApplyDirectories(root: string) {
   const itemsDir = join(root, "items");
@@ -81,7 +116,7 @@ fixed_pr_merged_at: unknown`;
 fixed_pr_url: https://github.com/openclaw/openclaw/pull/456
 fixed_pr_number: 456
 fixed_pr_confidence: high
-fixed_pr_source: GitHub linked-issue closing PR reference
+fixed_pr_source: "GitHub linked-issue current closing PR"
 fixed_pr_merged_at: 2026-08-18T12:00:00Z`;
   assert.equal(
     implementedOnMainCloseProvenanceBlock(verified, "pull_request", 118679, "implemented_on_main"),
@@ -94,17 +129,14 @@ fixed_pr_merged_at: 2026-08-18T12:00:00Z`;
 });
 
 test("same-item comment payloads never overwrite an earlier pending mutation", () => {
-  const root = mkdtempSync(tmpPrefix);
+  const payloads: string[] = [];
   try {
-    const publication = createReviewCommentPublication({
-      root,
-      ensureDir: (directory: string) => mkdirSync(directory, { recursive: true }),
-    } as Parameters<typeof createReviewCommentPublication>[0]);
-
     const firstBody = "ClawSweeper applied the proposed close for this PR.";
     const secondBody = "A concurrent worker published a different durable review.";
-    const firstPayload = publication.writeCommentPayload(321, firstBody);
-    const secondPayload = publication.writeCommentPayload(321, secondBody);
+    const firstPayload = writeCommentPayload(321, firstBody);
+    payloads.push(firstPayload);
+    const secondPayload = writeCommentPayload(321, secondBody);
+    payloads.push(secondPayload);
 
     assert.notEqual(firstPayload, secondPayload);
     assert.deepEqual(JSON.parse(readFileSync(firstPayload, "utf8")), { body: firstBody });
@@ -112,66 +144,72 @@ test("same-item comment payloads never overwrite an earlier pending mutation", (
     assert.equal(readFileSync(firstPayload.replace(/\.json$/, ".md"), "utf8"), firstBody);
     assert.equal(readFileSync(secondPayload.replace(/\.json$/, ".md"), "utf8"), secondBody);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    for (const payload of payloads) {
+      rmSync(payload, { force: true });
+      rmSync(payload.replace(/\.json$/, ".md"), { force: true });
+    }
   }
 });
 
 test("closeout receipts ignore spoofed markers after posting the owned receipt", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const comments: Record<string, unknown>[] = [
-      {
-        id: 1,
-        user: { login: "contributor" },
-        body: "<!-- clawsweeper-close-applied item=321 -->",
-      },
-    ];
-    let mutationCount = 0;
-    const publication = createReviewCommentPublication({
-      root,
-      targetRepo: () => "openclaw/clawsweeper",
-      ghPaged: () => comments,
-      asRecord: (value: unknown) => value as Record<string, unknown>,
-      ensureDir: (directory: string) => mkdirSync(directory, { recursive: true }),
-      sha256: () => "body-digest",
-      ghObservedMutationCommand: ({ args }) => {
-        mutationCount += 1;
-        const input = args[args.indexOf("--input") + 1];
-        const body = JSON.parse(readFileSync(input!, "utf8")).body as string;
-        comments.push({ id: 2, user: { login: "clawsweeper[bot]" }, body });
-        return JSON.stringify({ id: 2 });
-      },
-      frontMatterValue: () => undefined,
-      replaceFrontMatterValue: (markdown: string) => markdown,
-      sectionValue: () => "",
-      timestampMs: () => null,
-      sentence: (value: string) => value,
-      normalizedLabelSet: () => new Set<string>(),
-      sectionLineValue: () => undefined,
-      markdownLink: (label: string, url: string) => `[${label}](${url})`,
-      closeAppliedCommentMarker: (number: number) =>
-        `<!-- clawsweeper-close-applied item=${number} -->`,
-      commentId: (comment: Record<string, unknown> | undefined) =>
-        typeof comment?.id === "number" ? comment.id : null,
-      canPatchReviewComment: (comment: Record<string, unknown> | undefined) =>
-        (comment?.user as { login?: unknown } | undefined)?.login === "clawsweeper[bot]",
-    } as Parameters<typeof createReviewCommentPublication>[0]);
+    const statePath = join(root, "comments.json");
+    const callsPath = join(root, "calls.json");
+    writeFileSync(callsPath, "[]");
+    const script = `
+const { readFileSync, writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+const statePath = ${JSON.stringify(statePath)};
+const callsPath = ${JSON.stringify(callsPath)};
+const comments = JSON.parse(readFileSync(statePath, "utf8"));
+if (args.includes("--input")) {
+  const payload = args[args.indexOf("--input") + 1];
+  const calls = JSON.parse(readFileSync(callsPath, "utf8"));
+  calls.push(payload);
+  writeFileSync(callsPath, JSON.stringify(calls));
+  const { body } = JSON.parse(readFileSync(payload, "utf8"));
+  const comment = { id: 2, user: { login: "clawsweeper[bot]" }, body };
+  comments.push(comment);
+  writeFileSync(statePath, JSON.stringify(comments));
+  console.log(JSON.stringify(comment));
+} else {
+  console.log(JSON.stringify([comments]));
+}`;
     const options = {
       number: 321,
       closeReason: "implemented_on_main" as const,
-      markdown: "",
+      markdown: implementedCloseReport({ type: "pull_request" }),
       itemUrl: "https://github.com/openclaw/clawsweeper/pull/321",
       dryRun: false,
     };
-    comments[0]!.body = publication.renderCloseAppliedComment(options);
-
-    assert.equal(publication.ensureCloseAppliedComment(options), "posted close-applied comment");
-    assert.equal(
-      publication.ensureCloseAppliedComment(options),
-      "matching ClawSweeper close-applied comment already exists",
+    writeFileSync(statePath, "[]");
+    withTargetProfile(repositoryProfileFor("openclaw/clawsweeper"), () =>
+      withGitHubRun(() =>
+        withMockGh(root, script, () => {
+          assert.equal(ensureCloseAppliedComment(options), "posted close-applied comment");
+          const [seed] = JSON.parse(readFileSync(statePath, "utf8"));
+          writeFileSync(
+            statePath,
+            JSON.stringify([{ ...seed, id: 1, user: { login: "contributor" } }]),
+          );
+          assert.equal(ensureCloseAppliedComment(options), "posted close-applied comment");
+          assert.equal(
+            ensureCloseAppliedComment(options),
+            "matching ClawSweeper close-applied comment already exists",
+          );
+        }),
+      ),
     );
-    assert.equal(mutationCount, 1);
+    assert.equal(JSON.parse(readFileSync(callsPath, "utf8")).length, 2);
   } finally {
+    const callsPath = join(root, "calls.json");
+    if (existsSync(callsPath)) {
+      for (const payload of JSON.parse(readFileSync(callsPath, "utf8"))) {
+        rmSync(payload, { force: true });
+        rmSync(payload.replace(/\.json$/, ".md"), { force: true });
+      }
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -183,14 +221,17 @@ test("partial label-sync authentication failures preserve labels already applied
     const labelState = join(root, "labels.json");
     writeFileSync(labelState, "[]");
     const synced = reportWithSyncedReviewComment(
-      workPlanCandidateReport({
-        number: 321,
-        reviewed_at: "2026-05-01T00:00:00Z",
-        item_snapshot_hash: "reviewed-snapshot-321",
-        item_updated_at: "2026-05-01T00:00:00Z",
-        triage_priority: "P2",
-        impact_labels: JSON.stringify(["impact:message-loss"]),
-      }),
+      workPlanCandidateReport(
+        {
+          number: 321,
+          reviewed_at: "2026-05-01T00:00:00Z",
+          item_snapshot_hash: "reviewed-snapshot-321",
+          item_updated_at: "2026-05-01T00:00:00Z",
+          triage_priority: "P2",
+          impact_labels: JSON.stringify(["impact:message-loss"]),
+        },
+        { triagePriority: "P2", impactLabels: ["impact:message-loss"] },
+      ),
       321,
     );
     const itemPath = join(itemsDir, "321.md");
@@ -199,7 +240,7 @@ test("partial label-sync authentication failures preserve labels already applied
 const { readFileSync, writeFileSync } = require("fs");
 const args = process.argv.slice(2);
 const actual = args[0] === "--repo" ? args.slice(2) : args;
-const path = actual[1] || "";
+const path = actual[1] === "-i" ? actual[2] || "" : actual[1] || "";
 const stateFile = ${JSON.stringify(labelState)};
 const labels = () => JSON.parse(readFileSync(stateFile, "utf8"));
 if (actual[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
@@ -208,6 +249,8 @@ if (actual[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify({ number: 321, title: "Render work plans", html_url: "https://github.com/openclaw/clawsweeper/issues/321", created_at: "2026-05-01T00:00:00Z", updated_at: "2026-05-01T00:00:00Z", closed_at: null, state: "open", locked: false, active_lock_reason: null, author_association: "CONTRIBUTOR", user: { login: "reporter" }, labels: labels().map(name => ({ name })), pull_request: null }));
 } else if (actual[0] === "issue" && actual[1] === "view") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
+} else if (actual[0] === "api" && /\\/issues\\/321\\/timeline(?:\\?|$)/.test(path)) {
+  console.log(actual.includes("-i") ? "HTTP/2 200\\n\\n[]" : JSON.stringify([[]]));
 } else if (actual[0] === "label" && actual[1] === "create") {
   console.log("");
 } else if (actual[0] === "issue" && actual[1] === "edit" && actual.includes("P2")) {
@@ -269,23 +312,26 @@ test("a lost mutation lease preserves labels already applied", () => {
       comments: 2,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     const synced = reportWithSyncedReviewComment(
-      workPlanCandidateReport({
-        number,
-        repository: "openclaw/clawsweeper",
-        type: "issue",
-        title: issue.title,
-        reviewed_at: reviewedAt,
-        item_snapshot_hash: "reviewed-snapshot-321",
-        item_updated_at: reviewedAt,
-        item_source_revision: sourceRevision,
-        review_lease_owner: leaseOwner,
-        review_lease_comment_id: String(leaseId),
-        labels: JSON.stringify([]),
-        triage_priority: "P2",
-        impact_labels: JSON.stringify(["impact:message-loss"]),
-      }),
+      workPlanCandidateReport(
+        {
+          number,
+          repository: "openclaw/clawsweeper",
+          type: "issue",
+          title: issue.title,
+          reviewed_at: reviewedAt,
+          item_snapshot_hash: "reviewed-snapshot-321",
+          item_updated_at: reviewedAt,
+          item_source_revision: sourceRevision,
+          review_lease_owner: leaseOwner,
+          review_lease_comment_id: String(leaseId),
+          labels: JSON.stringify([]),
+          triage_priority: "P2",
+          impact_labels: JSON.stringify(["impact:message-loss"]),
+        },
+        { triagePriority: "P2", impactLabels: ["impact:message-loss"] },
+      ),
       number,
     );
     const itemPath = join(itemsDir, "321.md");
@@ -366,28 +412,22 @@ if (actual[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path) && !
 test("command-only timeline activity is ignored only through the completed review", () => {
   const storedAtMs = Date.parse("2026-07-03T21:42:48Z");
   const reviewedAtMs = Date.parse("2026-07-03T21:44:48Z");
-  const timelineEvent = (createdAt: string) => ({
-    event: "commented",
-    actor: "contributor",
-    createdAt,
-  });
-
-  assert.equal(
-    contextHasNonAutomationActivityAfterForTest({
-      timeline: [timelineEvent("2026-07-03T21:43:00Z")],
-      activityAfterMs: storedAtMs,
-      ignoreTimelineCommentsThroughMs: reviewedAtMs,
-    }),
-    false,
-  );
-  assert.equal(
-    contextHasNonAutomationActivityAfterForTest({
-      timeline: [timelineEvent("2026-07-03T21:45:00Z")],
-      activityAfterMs: storedAtMs,
-      ignoreTimelineCommentsThroughMs: reviewedAtMs,
-    }),
-    true,
-  );
+  for (const [createdAt, expected] of [
+    ["2026-07-03T21:43:00Z", false],
+    ["2026-07-03T21:45:00Z", true],
+  ] as const) {
+    const context = {
+      issue: {},
+      comments: [],
+      timeline: [{ event: "commented", actor: "contributor", createdAt }],
+    };
+    assert.equal(
+      contextHasNonAutomationActivityAfter(context, storedAtMs, {
+        ignoreTimelineCommentsThroughMs: reviewedAtMs,
+      }),
+      expected,
+    );
+  }
 });
 
 test("complete activity hydration distinguishes truncation from hidden human activity", () => {
@@ -400,16 +440,8 @@ test("complete activity hydration distinguishes truncation from hidden human act
     },
     {
       name: "timeline",
-      automation: {
-        event: "labeled",
-        actor: "fixture[bot]",
-        createdAt: "2026-07-03T21:45:00Z",
-      },
-      human: {
-        event: "labeled",
-        actor: "maintainer",
-        createdAt: "2026-07-03T21:46:00Z",
-      },
+      automation: { event: "labeled", actor: "fixture[bot]", createdAt: "2026-07-03T21:45:00Z" },
+      human: { event: "labeled", actor: "maintainer", createdAt: "2026-07-03T21:46:00Z" },
     },
     {
       name: "pullReviewComments",
@@ -417,33 +449,41 @@ test("complete activity hydration distinguishes truncation from hidden human act
       human: { author: "maintainer", createdAt: "2026-07-03T21:46:00Z" },
     },
   ] as const;
-
   for (const surface of surfaces) {
-    assert.equal(
-      contextHasNonAutomationActivityAfterForTest({
-        truncated: { [surface.name]: true },
-        completeActivityContext: { [surface.name]: [surface.automation] },
-        activityAfterMs,
-      }),
-      false,
-      `${surface.name} automation-only hydration should permit reconciliation`,
-    );
-    assert.equal(
-      contextHasNonAutomationActivityAfterForTest({
-        truncated: { [surface.name]: true },
-        completeActivityContext: { [surface.name]: [surface.automation, surface.human] },
-        activityAfterMs,
-      }),
-      true,
-      `${surface.name} hydration must preserve hidden human activity`,
-    );
+    for (const hasHuman of [false, true]) {
+      const context: ItemContext = {
+        issue: {},
+        comments: [],
+        timeline: [],
+        pullReviewComments: [],
+        counts: { comments: 0, timeline: 0, [`${surface.name}Truncated`]: true },
+        [completeActivityContextSymbol]: {
+          comments: [],
+          timeline: [],
+          pullReviewComments: [],
+          [surface.name]: hasHuman ? [surface.automation, surface.human] : [surface.automation],
+        },
+      };
+      assert.equal(
+        contextHasNonAutomationActivityAfter(context, activityAfterMs, {
+          useCompleteActivityContext: true,
+        }),
+        hasHuman,
+        `${surface.name} hydration must distinguish automation from hidden human activity`,
+      );
+    }
   }
-
   assert.equal(
-    contextHasNonAutomationActivityAfterForTest({
-      truncated: { comments: true },
+    contextHasNonAutomationActivityAfter(
+      {
+        issue: {},
+        comments: [],
+        timeline: [],
+        counts: { comments: 0, timeline: 0, commentsTruncated: true },
+      },
       activityAfterMs,
-    }),
+      { useCompleteActivityContext: true },
+    ),
     true,
     "truncation without complete hydration must remain fail closed",
   );
@@ -458,26 +498,29 @@ test("apply-decisions publishes a detected bulk-filer label from a failed exact 
     const reviewedAt = new Date().toISOString();
     writeFileSync(
       join(itemsDir, `${number}.md`),
-      `${reportFrontMatter({
-        repository: "openclaw/clawsweeper",
-        type: "issue",
-        number: String(number),
-        title: "Publish bulk-filer label",
-        url: `https://github.com/openclaw/clawsweeper/issues/${number}`,
-        decision: "keep_open",
-        close_reason: "none",
-        confidence: "high",
-        action_taken: "kept_open",
-        review_status: "failed",
-        local_checkout_access: "verified",
-        author: "contributor",
-        author_association: "CONTRIBUTOR",
-        labels: JSON.stringify([]),
-        bulk_filer_detected: "true",
-        item_snapshot_hash: "snapshot-a",
-        item_updated_at: reviewedAt,
-        reviewed_at: reviewedAt,
-      })}
+      `${withReviewRecord(
+        reportFrontMatter({
+          repository: "openclaw/clawsweeper",
+          type: "issue",
+          number: String(number),
+          title: "Publish bulk-filer label",
+          url: `https://github.com/openclaw/clawsweeper/issues/${number}`,
+          decision: "keep_open",
+          close_reason: "none",
+          confidence: "high",
+          action_taken: "kept_open",
+          review_status: "failed",
+          local_checkout_access: "verified",
+          author: "contributor",
+          author_association: "CONTRIBUTOR",
+          labels: JSON.stringify([]),
+          bulk_filer_detected: "true",
+          item_snapshot_hash: "snapshot-a",
+          item_updated_at: reviewedAt,
+          reviewed_at: reviewedAt,
+        }),
+        { decision: "keep_open", closeReason: "none", triagePriority: "none" },
+      )}
 
 ## Summary
 
@@ -580,26 +623,29 @@ test("apply-decisions clears a stale bulk-filer label for a redacted maintain ro
     const reviewedAt = new Date().toISOString();
     writeFileSync(
       join(itemsDir, `${number}.md`),
-      `${reportFrontMatter({
-        repository: "openclaw/clawsweeper",
-        type: "issue",
-        number: String(number),
-        title: "Clear stale bulk-filer label",
-        url: `https://github.com/openclaw/clawsweeper/issues/${number}`,
-        decision: "keep_open",
-        close_reason: "none",
-        confidence: "high",
-        action_taken: "kept_open",
-        review_status: "failed",
-        local_checkout_access: "verified",
-        author: "maintainer",
-        author_association: "CONTRIBUTOR",
-        labels: JSON.stringify(["clawsweeper:bulk-filed"]),
-        bulk_filer_detected: "true",
-        item_snapshot_hash: "snapshot-a",
-        item_updated_at: reviewedAt,
-        reviewed_at: reviewedAt,
-      })}
+      `${withReviewRecord(
+        reportFrontMatter({
+          repository: "openclaw/clawsweeper",
+          type: "issue",
+          number: String(number),
+          title: "Clear stale bulk-filer label",
+          url: `https://github.com/openclaw/clawsweeper/issues/${number}`,
+          decision: "keep_open",
+          close_reason: "none",
+          confidence: "high",
+          action_taken: "kept_open",
+          review_status: "failed",
+          local_checkout_access: "verified",
+          author: "maintainer",
+          author_association: "CONTRIBUTOR",
+          labels: JSON.stringify(["clawsweeper:bulk-filed"]),
+          bulk_filer_detected: "true",
+          item_snapshot_hash: "snapshot-a",
+          item_updated_at: reviewedAt,
+          reviewed_at: reviewedAt,
+        }),
+        { decision: "keep_open", closeReason: "none", triagePriority: "none" },
+      )}
 
 ## Summary
 
@@ -710,7 +756,7 @@ test("exact event source drift includes a revision change while its apply lease 
   );
 });
 
-function assertCompletedIssueLeaseAccepted(extraArgs: string[]): void {
+function assertCompletedIssueLeaseAccepted(extraArgs: string[], reusedLease = false): void {
   const root = mkdtempSync(tmpPrefix);
   try {
     const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
@@ -724,7 +770,7 @@ function assertCompletedIssueLeaseAccepted(extraArgs: string[]): void {
       number,
       title: `Incident issue ${number}`,
       body: "The reviewed issue source remains unchanged.",
-      html_url: `https://github.com/openclaw/openclaw/issues/${number}`,
+      html_url: `https://github.com/openclaw/clawsweeper/issues/${number}`,
       created_at: "2026-04-01T00:00:00Z",
       updated_at: leaseUpdatedAt,
       closed_at: null,
@@ -737,7 +783,7 @@ function assertCompletedIssueLeaseAccepted(extraArgs: string[]): void {
       comments: 2,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     const closeReport = implementedCloseReport({
       repository: "openclaw/clawsweeper",
       number,
@@ -761,18 +807,27 @@ function assertCompletedIssueLeaseAccepted(extraArgs: string[]): void {
       leaseExpiresAt,
       leaseOwner,
     });
+    const durableComment = reusedLease
+      ? reportWithSyncedReviewComment(
+          closeReport
+            .replace(`review_lease_owner: ${leaseOwner}`, "review_lease_owner: previous-owner")
+            .replace(`reviewed_at: ${reviewedAt}`, "reviewed_at: 2026-04-30T00:00:00Z"),
+          number,
+          "implemented_on_main",
+        ).comment
+      : synced.comment;
     const comments = [
       {
         id: 9000 + number,
-        html_url: `https://github.com/openclaw/openclaw/issues/${number}#issuecomment-${9000 + number}`,
+        html_url: `https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-${9000 + number}`,
         created_at: reviewedAt,
         updated_at: reviewedAt,
         user: { login: "clawsweeper[bot]" },
-        body: synced.comment,
+        body: durableComment,
       },
       {
         id: leaseCommentId,
-        html_url: `https://github.com/openclaw/openclaw/issues/${number}#issuecomment-${leaseCommentId}`,
+        html_url: `https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-${leaseCommentId}`,
         created_at: leaseUpdatedAt,
         updated_at: leaseUpdatedAt,
         user: { login: "clawsweeper[bot]" },
@@ -847,6 +902,14 @@ test("exact issue apply accepts its report-owned lease update after stable sourc
   assertCompletedIssueLeaseAccepted([]);
 });
 
+test("exact publication accepts a later issue review that reuses a command lease id", () => {
+  assertCompletedIssueLeaseAccepted(["--exact-event-publication"], true);
+});
+
+test("issue apply accepts a later owner of the same command lease id", () => {
+  assertCompletedIssueLeaseAccepted([], true);
+});
+
 test("exact publication rechecks after batched labels and again before close", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
@@ -877,21 +940,31 @@ test("exact publication rechecks after batched labels and again before close", (
       comments: 3,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
-    const closeReport = implementedCloseReport({
-      repository: "openclaw/openclaw",
-      number,
-      type: "issue",
-      title: issue.title,
-      reviewed_at: reviewedAt,
-      item_updated_at: reviewedAt,
-      item_source_revision: sourceRevision,
-      review_lease_owner: leaseOwner,
-      review_lease_comment_id: String(leaseCommentId),
-      labels: JSON.stringify(["clawsweeper-recovery-stuck"]),
-      triage_priority: "P2",
-      impact_labels: JSON.stringify(["impact:message-loss"]),
-    });
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
+    const closeReport = withReviewRecord(
+      implementedCloseReport({
+        repository: "openclaw/openclaw",
+        number,
+        type: "issue",
+        title: issue.title,
+        reviewed_at: reviewedAt,
+        item_updated_at: reviewedAt,
+        item_source_revision: sourceRevision,
+        review_lease_owner: leaseOwner,
+        review_lease_comment_id: String(leaseCommentId),
+        labels: JSON.stringify(["clawsweeper-recovery-stuck"]),
+        triage_priority: "P2",
+        impact_labels: JSON.stringify(["impact:message-loss"]),
+      }),
+      {
+        decision: "close",
+        closeReason: "implemented_on_main",
+        triagePriority: "P2",
+        impactLabels: ["impact:message-loss"],
+        fixedSha: "1234567890abcdef1234567890abcdef12345678",
+        fixedAt: "2026-05-01T02:00:00Z",
+      },
+    );
     const synced = reportWithSyncedReviewComment(closeReport, number, "implemented_on_main");
     writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
     const leaseComment = renderReviewStartStatusComment({
@@ -991,11 +1064,11 @@ if (args[0] === "api" && new RegExp("/issues/comments/\\\\d+$").test(path) && ar
   console.log(JSON.stringify({ items: [] }));
 } else if (args[0] === "issue" && args[1] === "view") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
-} else if (args[0] === "label" && args[1] === "list") {
-  console.log(JSON.stringify([
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/labels?per_page=100") {
+  console.log(JSON.stringify([[
     { name: "P2", color: "FBCA04", description: "Important but bounded work with a practical workaround or moderate scope." },
     { name: "impact:message-loss", color: "D93F0B", description: "This issue is about lost, duplicated, misrouted, or suppressed channel messages." }
-  ]));
+  ]]));
 } else if (args[0] === "label" && args[1] === "create") {
   console.log("");
 } else if (args[0] === "issue" && args[1] === "edit") {
@@ -1141,7 +1214,7 @@ test("exact metadata-only publication flushes recoverable labels and drops faile
       comments: 2,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     const sourceReport = workPlanCandidateReport({
       repository: "openclaw/openclaw",
       number,
@@ -1221,10 +1294,10 @@ if (args[0] === "api" && new RegExp("/issues/${number}/comments(?:\\\\?|$)").tes
   console.log("");
 } else if (args[0] === "issue" && args[1] === "view") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [] }));
-} else if (args[0] === "label" && args[1] === "list") {
-  console.log(JSON.stringify([
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/labels?per_page=100") {
+  console.log(JSON.stringify([[
     { name: "P2", color: "FBCA04", description: "Important but bounded work with a practical workaround or moderate scope." }
-  ]));
+  ]]));
 } else if (args[0] === "label" && args[1] === "create") {
   console.log("");
 } else if (args[0] === "issue" && args[1] === "edit") {
@@ -1347,7 +1420,7 @@ if (args[0] === "api" && new RegExp("/issues/${number}/comments(?:\\\\?|$)").tes
 
 for (const scenario of [
   { name: "verified newer", lease: "9200", owner: "new-review-owner", verified: true },
-  { name: "equal lease", lease: "9100", owner: "new-review-owner", verified: false },
+  { name: "equal lease", lease: "9100", owner: "new-review-owner", verified: true },
   { name: "unknown owner", lease: "9200", owner: "unknown", verified: false },
   { name: "unsafe lease", lease: "9007199254740992", owner: "new-review-owner", verified: false },
 ]) {
@@ -1377,7 +1450,7 @@ for (const scenario of [
         comments: 1,
         pull_request: null,
       };
-      const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+      const sourceRevision = itemSourceRevisionSha256(issue, []);
 
       const oldReport = workPlanCandidateReport({
         number,
@@ -1559,8 +1632,8 @@ test("issue apply rejects a stable live source revision that differs from the re
       pull_request: null,
     };
     const reviewedIssue = { ...liveIssue, body: "Body at review time.", updated_at: reviewedAt };
-    const reviewedRevision = itemSourceRevisionSha256ForTest(reviewedIssue, []);
-    const liveRevision = itemSourceRevisionSha256ForTest(liveIssue, []);
+    const reviewedRevision = itemSourceRevisionSha256(reviewedIssue, []);
+    const liveRevision = itemSourceRevisionSha256(liveIssue, []);
     writeFileSync(
       join(itemsDir, `${number}.md`),
       workPlanCandidateReport({
@@ -1656,7 +1729,7 @@ test("issue apply preserves an owned active review lease for the live source rev
       comments: 2,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     const report = workPlanCandidateReport({
       number,
       title: issue.title,
@@ -1873,28 +1946,44 @@ for (const sourceAction of ["legacy_dispatch", "command_proof_result"]) {
       const itemPath = join(itemsDir, "74478.md");
       writeFileSync(
         itemPath,
-        `${reportFrontMatter({
-          repository: "openclaw/clawsweeper",
-          type: "pull_request",
-          number: "74478",
-          title: "Record PR label churn",
-          url: "https://github.com/openclaw/clawsweeper/pull/74478",
-          decision: "keep_open",
-          close_reason: "none",
-          confidence: "high",
-          action_taken: "kept_open",
-          review_status: "complete",
-          review_source_action: sourceAction,
-          local_checkout_access: "verified",
-          author: "contributor",
-          author_association: "CONTRIBUTOR",
-          labels: JSON.stringify([]),
-          item_category: "feature",
-          requires_new_feature: "true",
-          item_snapshot_hash: "snapshot-a",
-          item_updated_at: "2026-05-19T20:00:00Z",
-          pull_head_sha: "abc123def456",
-        })}
+        `${withReviewRecord(
+          reportFrontMatter({
+            repository: "openclaw/clawsweeper",
+            type: "pull_request",
+            number: "74478",
+            title: "Record PR label churn",
+            url: "https://github.com/openclaw/clawsweeper/pull/74478",
+            decision: "keep_open",
+            close_reason: "none",
+            confidence: "high",
+            action_taken: "kept_open",
+            review_status: "complete",
+            review_source_action: sourceAction,
+            local_checkout_access: "verified",
+            author: "contributor",
+            author_association: "CONTRIBUTOR",
+            labels: JSON.stringify([]),
+            item_category: "feature",
+            requires_new_feature: "true",
+            item_snapshot_hash: "snapshot-a",
+            item_updated_at: "2026-05-19T20:00:00Z",
+            pull_head_sha: "abc123def456",
+          }),
+          {
+            ...labelReviewDecision,
+            itemCategory: "feature",
+            requiresNewFeature: true,
+            realBehaviorProof: {
+              ...labelReviewDecision.realBehaviorProof,
+              evidenceKind: "screenshot",
+            },
+            featureShowcase: {
+              status: "showcase",
+              reason:
+                "This unlocks a notably useful maintainer workflow that did not exist before.",
+            },
+          },
+        )}
 
 ## Summary
 
@@ -2054,27 +2143,41 @@ test("apply-decisions clears stale PR review labels when live head changed", () 
       "proof: sufficient",
       "good first issue",
     ];
-    const sourceReport = `${reportFrontMatter({
-      repository: "openclaw/openclaw",
-      type: "pull_request",
-      number: "74481",
-      title: "Stale review label cleanup",
-      url: "https://github.com/openclaw/openclaw/pull/74481",
-      decision: "keep_open",
-      close_reason: "none",
-      confidence: "high",
-      action_taken: "kept_open",
-      review_status: "complete",
-      local_checkout_access: "verified",
-      author: "contributor",
-      author_association: "CONTRIBUTOR",
-      labels: JSON.stringify(staleLabels),
-      item_snapshot_hash: "snapshot-a",
-      item_updated_at: "2026-05-19T20:00:00Z",
-      reviewed_at: "2026-05-19T20:00:00Z",
-      pull_head_sha: "old-head",
-      merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
-    })}
+    const sourceReport = `${withReviewRecord(
+      reportFrontMatter({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number: "74481",
+        title: "Stale review label cleanup",
+        url: "https://github.com/openclaw/openclaw/pull/74481",
+        decision: "keep_open",
+        close_reason: "none",
+        confidence: "high",
+        action_taken: "kept_open",
+        review_status: "complete",
+        local_checkout_access: "verified",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify(staleLabels),
+        item_snapshot_hash: "snapshot-a",
+        item_updated_at: "2026-05-19T20:00:00Z",
+        reviewed_at: "2026-05-19T20:00:00Z",
+        pull_head_sha: "old-head",
+        merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
+      }),
+      {
+        ...labelReviewDecision,
+        prRating: {
+          ...labelReviewDecision.prRating,
+          overallTier: "F",
+          proofTier: "F",
+          patchTier: "F",
+        },
+        mergeRiskLabels: ["merge-risk: 🚨 session-state"],
+        overallCorrectness: "patch is incorrect",
+        overallConfidenceScore: 0.87,
+      },
+    )}
 
 ## Summary
 
@@ -2243,27 +2346,34 @@ test("apply-decisions skips stale label cleanup when the durable review comment 
     ];
     writeFileSync(
       itemPath,
-      `${reportFrontMatter({
-        repository: "openclaw/openclaw",
-        type: "pull_request",
-        number: "74483",
-        title: "Stale report with newer durable comment",
-        url: "https://github.com/openclaw/openclaw/pull/74483",
-        decision: "keep_open",
-        close_reason: "none",
-        confidence: "high",
-        action_taken: "kept_open",
-        review_status: "complete",
-        local_checkout_access: "verified",
-        author: "contributor",
-        author_association: "CONTRIBUTOR",
-        labels: JSON.stringify(staleLabels),
-        item_snapshot_hash: "snapshot-a",
-        item_updated_at: "2026-05-19T20:00:00Z",
-        reviewed_at: "2026-05-19T20:00:00.000Z",
-        pull_head_sha: "old-head",
-        merge_risk_labels: JSON.stringify([mergeRiskLabel]),
-      })}
+      `${withReviewRecord(
+        reportFrontMatter({
+          repository: "openclaw/openclaw",
+          type: "pull_request",
+          number: "74483",
+          title: "Stale report with newer durable comment",
+          url: "https://github.com/openclaw/openclaw/pull/74483",
+          decision: "keep_open",
+          close_reason: "none",
+          confidence: "high",
+          action_taken: "kept_open",
+          review_status: "complete",
+          local_checkout_access: "verified",
+          author: "contributor",
+          author_association: "CONTRIBUTOR",
+          labels: JSON.stringify(staleLabels),
+          item_snapshot_hash: "snapshot-a",
+          item_updated_at: "2026-05-19T20:00:00Z",
+          reviewed_at: "2026-05-19T20:00:00.000Z",
+          pull_head_sha: "old-head",
+          merge_risk_labels: JSON.stringify([mergeRiskLabel]),
+        }),
+        {
+          ...labelReviewDecision,
+          prRating: { ...labelReviewDecision.prRating, patchTier: "A" },
+          mergeRiskLabels: [mergeRiskLabel],
+        },
+      )}
 
 ## Summary
 
@@ -2427,7 +2537,7 @@ for (const scenario of [
           ? "I relabeled this myself; keep my labels."
           : "@clawsweeper re-review";
       const emptyActivityDigest = createHash("sha256").update("[]").digest("hex");
-      const sourceRevision = itemSourceRevisionSha256ForTest(
+      const sourceRevision = itemSourceRevisionSha256(
         {
           title: "Fresh head label restore after re-review",
           labels: ["status: 📣 needs proof", "rating: 🦪 silver shellfish"],
@@ -2447,33 +2557,36 @@ for (const scenario of [
           },
         ],
       );
-      const sourceReport = `${reportFrontMatter({
-        repository: "openclaw/openclaw",
-        type: "pull_request",
-        number: "74482",
-        title: "Fresh head label restore after re-review",
-        url: "https://github.com/openclaw/openclaw/pull/74482",
-        decision: "keep_open",
-        close_reason: "none",
-        confidence: "high",
-        action_taken: "kept_open",
-        review_status: "complete",
-        local_checkout_access: "verified",
-        author: "contributor",
-        author_association: "CONTRIBUTOR",
-        labels: JSON.stringify([]),
-        item_snapshot_hash: "snapshot-a",
-        item_updated_at: "2026-07-03T21:42:48Z",
-        reviewed_at: "2026-07-03T21:44:48.750Z",
-        item_source_revision: scenario === "changed receipt" ? "stale-source" : sourceRevision,
-        review_timeline_revision:
-          scenario === "changed timeline receipt" ? "0".repeat(64) : emptyActivityDigest,
-        review_activity_cursor: `v1:0:${emptyActivityDigest}`,
-        pull_head_sha: scenario === "changed head" ? "a".repeat(40) : headSha,
-        review_lease_owner: leaseOwner,
-        review_lease_comment_id: String(leaseCommentId),
-        merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
-      })}
+      const sourceReport = `${withReviewRecord(
+        reportFrontMatter({
+          repository: "openclaw/openclaw",
+          type: "pull_request",
+          number: "74482",
+          title: "Fresh head label restore after re-review",
+          url: "https://github.com/openclaw/openclaw/pull/74482",
+          decision: "keep_open",
+          close_reason: "none",
+          confidence: "high",
+          action_taken: "kept_open",
+          review_status: "complete",
+          local_checkout_access: "verified",
+          author: "contributor",
+          author_association: "CONTRIBUTOR",
+          labels: JSON.stringify([]),
+          item_snapshot_hash: "snapshot-a",
+          item_updated_at: "2026-07-03T21:42:48Z",
+          reviewed_at: "2026-07-03T21:44:48.750Z",
+          item_source_revision: scenario === "changed receipt" ? "stale-source" : sourceRevision,
+          review_timeline_revision:
+            scenario === "changed timeline receipt" ? "0".repeat(64) : emptyActivityDigest,
+          review_activity_cursor: `v1:0:${emptyActivityDigest}`,
+          pull_head_sha: scenario === "changed head" ? "a".repeat(40) : headSha,
+          review_lease_owner: leaseOwner,
+          review_lease_comment_id: String(leaseCommentId),
+          merge_risk_labels: JSON.stringify(["merge-risk: 🚨 session-state"]),
+        }),
+        { ...labelReviewDecision, mergeRiskLabels: ["merge-risk: 🚨 session-state"] },
+      )}
 
 ## Summary
 
@@ -2613,8 +2726,8 @@ if (args[0] === "api" && /\\/issues\\/74482$/.test(path)) {
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
-} else if (args[0] === "label" && args[1] === "list") {
-  console.log("[]");
+} else if (args[0] === "api" && path === "repos/openclaw/openclaw/labels?per_page=100") {
+  console.log("[[]]");
 } else if (args[0] === "label" && args[1] === "create") {
   console.log(JSON.stringify({ name: args[2] }));
 } else {
@@ -2688,26 +2801,29 @@ test("apply-decisions skips fresh-head PR label sync when humans act after the r
     const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
     const itemPath = join(itemsDir, "74483.md");
-    const sourceReport = `${reportFrontMatter({
-      repository: "openclaw/openclaw",
-      type: "pull_request",
-      number: "74483",
-      title: "Fresh head with human activity",
-      url: "https://github.com/openclaw/openclaw/pull/74483",
-      decision: "keep_open",
-      close_reason: "none",
-      confidence: "high",
-      action_taken: "kept_open",
-      review_status: "complete",
-      local_checkout_access: "verified",
-      author: "contributor",
-      author_association: "CONTRIBUTOR",
-      labels: JSON.stringify([]),
-      item_snapshot_hash: "snapshot-a",
-      item_updated_at: "2026-07-03T21:42:48Z",
-      reviewed_at: "2026-07-03T21:42:48Z",
-      pull_head_sha: "bc60b889",
-    })}
+    const sourceReport = `${withReviewRecord(
+      reportFrontMatter({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number: "74483",
+        title: "Fresh head with human activity",
+        url: "https://github.com/openclaw/openclaw/pull/74483",
+        decision: "keep_open",
+        close_reason: "none",
+        confidence: "high",
+        action_taken: "kept_open",
+        review_status: "complete",
+        local_checkout_access: "verified",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify([]),
+        item_snapshot_hash: "snapshot-a",
+        item_updated_at: "2026-07-03T21:42:48Z",
+        reviewed_at: "2026-07-03T21:42:48Z",
+        pull_head_sha: "bc60b889",
+      }),
+      labelReviewDecision,
+    )}
 
 ## Summary
 
@@ -2861,26 +2977,41 @@ test("apply-decisions withholds fresh-head PR label sync from close proposals", 
     const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
     const itemPath = join(itemsDir, "74484.md");
-    const sourceReport = `${reportFrontMatter({
-      repository: "openclaw/openclaw",
-      type: "pull_request",
-      number: "74484",
-      title: "Fresh head close proposal",
-      url: "https://github.com/openclaw/openclaw/pull/74484",
-      decision: "close",
-      close_reason: "low_signal_unmergeable_pr",
-      confidence: "high",
-      action_taken: "proposed_close",
-      review_status: "complete",
-      local_checkout_access: "verified",
-      author: "contributor",
-      author_association: "CONTRIBUTOR",
-      labels: JSON.stringify([]),
-      item_snapshot_hash: "snapshot-a",
-      item_updated_at: "2026-07-03T21:42:48Z",
-      reviewed_at: "2026-07-03T21:42:48Z",
-      pull_head_sha: "bc60b889",
-    })}
+    const sourceReport = `${withReviewRecord(
+      reportFrontMatter({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number: "74484",
+        title: "Fresh head close proposal",
+        url: "https://github.com/openclaw/openclaw/pull/74484",
+        decision: "close",
+        close_reason: "low_signal_unmergeable_pr",
+        confidence: "high",
+        action_taken: "proposed_close",
+        review_status: "complete",
+        local_checkout_access: "verified",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify([]),
+        item_snapshot_hash: "snapshot-a",
+        item_updated_at: "2026-07-03T21:42:48Z",
+        reviewed_at: "2026-07-03T21:42:48Z",
+        pull_head_sha: "bc60b889",
+      }),
+      {
+        ...labelReviewDecision,
+        decision: "close",
+        closeReason: "low_signal_unmergeable_pr",
+        prRating: {
+          ...labelReviewDecision.prRating,
+          overallTier: "F",
+          proofTier: "F",
+          patchTier: "F",
+        },
+        overallCorrectness: "patch is incorrect",
+        closeComment: "Closing this PR because the branch is not a useful landing base.",
+      },
+    )}
 
 ## Summary
 
@@ -3027,42 +3158,61 @@ if (args[0] === "api" && /\\/issues\\/74484$/.test(path)) {
   }
 });
 
-test("apply-decisions routes parsed security owner acceptance to maintainer review", () => {
+test("apply-decisions keeps a listed security owner acceptance out of ready and author wait", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const labelLogPath = join(root, "label-sync.log");
     const itemPath = join(itemsDir, "74480.md");
 
-    const sourceReport = `${reportFrontMatter({
-      repository: "openclaw/openclaw",
-      type: "pull_request",
-      number: "74480",
-      title: "Route owner security acceptance",
-      url: "https://github.com/openclaw/openclaw/pull/74480",
-      decision: "keep_open",
-      close_reason: "none",
-      confidence: "high",
-      action_taken: "kept_open",
-      review_status: "complete",
-      local_checkout_access: "verified",
-      author: "contributor",
-      author_association: "CONTRIBUTOR",
-      labels: JSON.stringify(["status: ⏳ waiting on author"]),
-      item_snapshot_hash: "reviewed-snapshot",
-      item_created_at: "2026-02-01T00:00:00Z",
-      item_updated_at: "2026-05-01T00:00:00Z",
-      pull_head_sha: "head-sha",
-      merge_risk_options: JSON.stringify([
-        {
-          title: "Accept the reviewed security tradeoff",
-          body: "A maintainer may accept this bounded security tradeoff before merge.",
-          category: "accept_risk",
-          recommended: true,
-          automergeInstruction: "",
+    const sourceReport = `${withReviewRecord(
+      reportFrontMatter({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number: "74480",
+        title: "Route owner security acceptance",
+        url: "https://github.com/openclaw/openclaw/pull/74480",
+        decision: "keep_open",
+        close_reason: "none",
+        confidence: "high",
+        action_taken: "kept_open",
+        review_status: "complete",
+        local_checkout_access: "verified",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify(["status: ⏳ waiting on author"]),
+        item_snapshot_hash: "reviewed-snapshot",
+        item_created_at: "2026-02-01T00:00:00Z",
+        item_updated_at: "2026-05-01T00:00:00Z",
+        pull_head_sha: "head-sha",
+        merge_risk_options: JSON.stringify([
+          {
+            title: "Accept the reviewed security tradeoff",
+            body: "A maintainer may accept this bounded security tradeoff before merge.",
+            category: "accept_risk",
+            recommended: true,
+          },
+        ]),
+      }),
+      {
+        ...labelReviewDecision,
+        prRating: { ...labelReviewDecision.prRating, overallTier: "B" },
+        securityReview: {
+          status: "needs_attention",
+          summary: "A maintainer must explicitly accept the bounded security tradeoff.",
+          concerns: [],
         },
-      ]),
-    })}
+        mergeRiskOptions: [
+          {
+            title: "Accept the reviewed security tradeoff",
+            body: "A maintainer may accept this bounded security tradeoff before merge.",
+            category: "accept_risk",
+            recommended: true,
+          },
+        ],
+        overallConfidenceScore: 0.95,
+      },
+    )}
 
 ## Summary
 
@@ -3113,12 +3263,13 @@ Full review comments:
       },
     );
 
+    // The acceptance is still a Before-merge item, so no status label claims readiness.
     const updatedReport = readFileSync(itemPath, "utf8");
-    assert.match(updatedReport, /status: 👀 ready for maintainer look/);
+    assert.doesNotMatch(updatedReport, /status: 👀 ready for maintainer look/);
     assert.doesNotMatch(updatedReport, /status: ⏳ waiting on author/);
     const labelCalls = readFileSync(labelLogPath, "utf8");
     assert.match(labelCalls, /--remove-label status: ⏳ waiting on author/);
-    assert.match(labelCalls, /--add-label status: 👀 ready for maintainer look/);
+    assert.doesNotMatch(labelCalls, /--add-label status:/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3132,26 +3283,35 @@ test("apply-decisions clears a recovery escalation only after publishing a compl
     const itemPath = join(itemsDir, "74479.md");
     writeFileSync(
       itemPath,
-      `${reportFrontMatter({
-        repository: "openclaw/clawsweeper",
-        type: "pull_request",
-        number: "74479",
-        title: "Refresh label explanation",
-        url: "https://github.com/openclaw/clawsweeper/pull/74479",
-        decision: "keep_open",
-        close_reason: "none",
-        confidence: "high",
-        action_taken: "kept_open",
-        review_status: "complete",
-        local_checkout_access: "verified",
-        author: "contributor",
-        author_association: "CONTRIBUTOR",
-        labels: JSON.stringify(["clawsweeper-recovery-stuck"]),
-        item_snapshot_hash: "snapshot-a",
-        item_updated_at: "2026-05-19T20:00:00Z",
-        pull_head_sha: "abc123def456",
-        review_comment_synced_at: "2026-05-19T23:59:00Z",
-      })}
+      `${withReviewRecord(
+        reportFrontMatter({
+          repository: "openclaw/clawsweeper",
+          type: "pull_request",
+          number: "74479",
+          title: "Refresh label explanation",
+          url: "https://github.com/openclaw/clawsweeper/pull/74479",
+          decision: "keep_open",
+          close_reason: "none",
+          confidence: "high",
+          action_taken: "kept_open",
+          review_status: "complete",
+          local_checkout_access: "verified",
+          author: "contributor",
+          author_association: "CONTRIBUTOR",
+          labels: JSON.stringify(["clawsweeper-recovery-stuck"]),
+          item_snapshot_hash: "snapshot-a",
+          item_updated_at: "2026-05-19T20:00:00Z",
+          pull_head_sha: "abc123def456",
+          review_comment_synced_at: "2026-05-19T23:59:00Z",
+        }),
+        {
+          ...labelReviewDecision,
+          realBehaviorProof: {
+            ...labelReviewDecision.realBehaviorProof,
+            evidenceKind: "screenshot",
+          },
+        },
+      )}
 
 ## Summary
 
@@ -3777,15 +3937,13 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
       calls.some((args) => args[0] === "label" && args[1] === "create"),
       false,
     );
-    assert.equal(
-      calls.some(
-        (args) =>
-          args[0] === "api" &&
-          (args[1] ?? "").endsWith("/issues/321/timeline?per_page=100") &&
-          args.includes("--paginate"),
-      ),
-      true,
+    const timelineCalls = calls.filter(
+      (args) => args[0] === "api" && args.some((arg) => arg.includes("/issues/321/timeline?")),
     );
+    assert.deepEqual(timelineCalls, [
+      ["api", "-i", "repos/openclaw/clawsweeper/issues/321/timeline?per_page=100&page=1"],
+      ["api", "-i", "repos/openclaw/clawsweeper/issues/321/timeline?per_page=100&page=2"],
+    ]);
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
@@ -3797,6 +3955,24 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function withMockReceiptGh(root: string, script: string, run: () => void): void {
+  const previous = {
+    GH_TOKEN: process.env.GH_TOKEN,
+    CURL_BIN: process.env.CURL_BIN,
+    CURL_BIN_ARGS: process.env.CURL_BIN_ARGS,
+  };
+  process.env.GH_TOKEN = "fixture-only";
+  Object.assign(process.env, mockCommandBinEnv("curl", join(root, "bin", "gh.js")));
+  try {
+    withMockGh(root, script, run);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 
 for (const scenario of [
   "normal",
@@ -3820,6 +3996,7 @@ for (const scenario of [
   "paired_locked_closeout_cleanup",
   "paired_provenance_revoked_before_close",
   "paired_provenance_retargeted_before_close",
+  "paired_corrupt_review_record",
   "paired_human_activity_during_lease",
 ] as const) {
   test(`apply-decisions verifies provenance after a closeout note and before closing PR proposals (${scenario})`, () => {
@@ -3842,6 +4019,7 @@ for (const scenario of [
       scenario === "paired_provenance_revoked_before_close";
     const pairedProvenanceRetargetedBeforeClose =
       scenario === "paired_provenance_retargeted_before_close";
+    const pairedCorruptReviewRecord = scenario === "paired_corrupt_review_record";
     const pairedHumanActivityDuringLease = scenario === "paired_human_activity_during_lease";
     const lockedCloseoutComment = scenario === "locked_closeout_comment";
     const betweenFreshnessAndCloseoutHumanActivity =
@@ -3855,7 +4033,7 @@ for (const scenario of [
       const postedBodiesPath = join(root, "posted-bodies.jsonl");
       const prCommentPath = join(root, "pr-review-comment");
       const linkedIssueCommentPath = join(root, "linked-issue-review-comment");
-      const reviewedSourceRevision = itemSourceRevisionSha256ForTest(
+      const reviewedSourceRevision = itemSourceRevisionSha256(
         {
           title: "Render work plans",
           labels: ["maintainer"],
@@ -3879,7 +4057,7 @@ for (const scenario of [
           : `https://github.com/openclaw/clawsweeper/pull/${mismatchedCanonical ? "901" : "900"}`,
         fixed_pr_number: mismatchedCanonical ? "901" : "900",
         fixed_pr_confidence: "high",
-        fixed_pr_source: "GitHub verified implementation landing",
+        fixed_pr_source: "GitHub reviewed implementation landing",
         fixed_pr_merged_at: "2026-05-01T02:00:00Z",
         fixed_sha: "1234567890abcdef1234567890abcdef12345678",
         fixed_at: "2026-05-01T02:00:00Z",
@@ -3893,19 +4071,25 @@ for (const scenario of [
         fixed_pr_url: "https://github.com/openclaw/clawsweeper/pull/900",
         fixed_pr_number: "900",
         fixed_pr_confidence: "high",
-        fixed_pr_source: "GitHub verified implementation landing",
+        fixed_pr_source: "GitHub reviewed implementation landing",
         fixed_pr_merged_at: missingCanonicalMerge ? "unknown" : "2026-05-01T02:00:00Z",
       }).replaceAll("openclaw/openclaw", "openclaw/clawsweeper");
       const linkedIssueSynced = reportWithSyncedReviewComment(
         pairedKeepOpen
-          ? linkedIssueReport.replace(/^decision: close$/m, "decision: keep_open")
+          ? withReviewRecord(linkedIssueReport, { decision: "keep_open", closeReason: "none" })
           : linkedIssueReport,
         456,
         "implemented_on_main",
       );
       writeFileSync(join(itemsDir, "321.md"), synced.report, "utf8");
       if (!multipleLinkedIssues) {
-        writeFileSync(join(itemsDir, "456.md"), linkedIssueSynced.report, "utf8");
+        writeFileSync(
+          join(itemsDir, "456.md"),
+          pairedCorruptReviewRecord
+            ? linkedIssueSynced.report.replace(/^---\n/, "---\nreview_record: {broken\n")
+            : linkedIssueSynced.report,
+          "utf8",
+        );
         writeFileSync(
           linkedIssueCommentPath,
           pairedDurableReviewMismatch
@@ -3956,6 +4140,20 @@ const pairedLockedCloseoutCleanup = ${pairedLockedCloseoutCleanup};
 const pairedProvenanceRevokedBeforeClose = ${pairedProvenanceRevokedBeforeClose};
 const pairedProvenanceRetargetedBeforeClose = ${pairedProvenanceRetargetedBeforeClose};
 const pairedHumanActivityDuringLease = ${pairedHumanActivityDuringLease};
+const linkedIssueReviewComment = () => ({
+  id: 9456,
+  html_url: "https://github.com/openclaw/clawsweeper/issues/456#issuecomment-9456",
+  created_at: "2026-05-01T01:00:00Z",
+  updated_at: pairedFreshOwnedReviewComment ? freshOwnedReviewUpdatedAt : "2026-05-01T01:00:00Z",
+  user: { login: "clawsweeper[bot]" },
+  body: readFileSync(linkedIssueCommentPath, "utf8")
+});
+if (rawArgs.includes("--url")) {
+  const url = new URL(rawArgs[rawArgs.indexOf("--url") + 1]);
+  if (url.pathname !== "/repos/openclaw/clawsweeper/issues/comments/9456") throw new Error("unexpected receipt route");
+  console.log("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n" + JSON.stringify(linkedIssueReviewComment()));
+  process.exit(0);
+}
 if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$)/.test(args[2] || "")) {
   const timeline = existsSync(betweenFreshnessAndCloseoutHumanActivityPath)
     ? [{
@@ -4033,14 +4231,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     if (pairedBotActivityDuringCloseout) writeFileSync(pairedIssueBotActivityPath, new Date(Date.now() + 60_000).toISOString());
     console.log(JSON.stringify({ id: 9456, html_url: "https://github.com/openclaw/clawsweeper/issues/456#issuecomment-9456" }));
   } else {
-    const comments = [{
-      id: 9456,
-      html_url: "https://github.com/openclaw/clawsweeper/issues/456#issuecomment-9456",
-      created_at: "2026-05-01T01:00:00Z",
-      updated_at: pairedFreshOwnedReviewComment ? freshOwnedReviewUpdatedAt : "2026-05-01T01:00:00Z",
-      user: { login: "clawsweeper[bot]" },
-      body: readFileSync(linkedIssueCommentPath, "utf8")
-    }];
+    const comments = [linkedIssueReviewComment()];
     if (pairedFreshOwnedReviewComment) {
       comments.push({
         id: 9455,
@@ -4276,7 +4467,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
   process.exit(1);
 }
 `;
-      withMockGh(root, ghMock, () => {
+      withMockReceiptGh(root, ghMock, () => {
         runApplyDecisionsForTest({
           itemsDir,
           closedDir,
@@ -4336,6 +4527,34 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
       const graphqlIndices = calls
         .map((args, index) => (args[0] === "api" && args[1] === "graphql" ? index : -1))
         .filter((index) => index >= 0);
+      if (pairedCorruptReviewRecord) {
+        const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{
+          number: number;
+          action: string;
+          reason: string;
+        }>;
+        assert.equal(pairedIssueCloseIndex, -1, JSON.stringify(report));
+        assert.equal(closeIndex, -1);
+        assert.equal(existsSync(join(closedDir, "456.md")), false);
+        assert.equal(existsSync(join(closedDir, "321.md")), false);
+        assert.equal(
+          report.some(
+            (entry) =>
+              entry.number === 321 &&
+              entry.action === "kept_open" &&
+              entry.reason ===
+                "implemented-on-main paired closeout requires an exact current durable review comment for the linked issue report",
+          ),
+          true,
+          JSON.stringify(report),
+        );
+        assert.equal(
+          report.some((entry) => entry.number === 456),
+          false,
+          JSON.stringify(report),
+        );
+        return;
+      }
       if (lockedCloseoutComment) {
         assert.equal(closeIndex, -1);
         assert.equal(existsSync(join(closedDir, "321.md")), false);
@@ -4633,7 +4852,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
   console.log(JSON.stringify([[
     {
       id: 9322,
-      html_url: "https://github.com/openclaw/clawsweeper/pull/322#issuecomment-9322",
+      html_url: "https://github.com/openclaw/openclaw/pull/322#issuecomment-9322",
       created_at: "2026-05-01T01:00:00Z",
       updated_at: "2026-05-01T01:00:00Z",
       author_association: "NONE",
@@ -4642,7 +4861,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
     },
     {
       id: 9323,
-      html_url: "https://github.com/openclaw/clawsweeper/pull/322#issuecomment-9323",
+      html_url: "https://github.com/openclaw/openclaw/pull/322#issuecomment-9323",
       created_at: "2026-05-01T01:30:00Z",
       updated_at: "2026-05-01T01:30:00Z",
       author_association: "MEMBER",
@@ -4656,7 +4875,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
   console.log(JSON.stringify({
     number: 322,
     title: "Add provider clamp",
-    html_url: "https://github.com/openclaw/clawsweeper/pull/322",
+    html_url: "https://github.com/openclaw/openclaw/pull/322",
     created_at: "2026-05-01T00:00:00Z",
     updated_at: "2026-05-01T00:00:00Z",
     closed_at: null,
@@ -4668,20 +4887,20 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
     labels: [],
     assignees: [],
     comments: 2,
-    pull_request: { url: "https://api.github.com/repos/openclaw/clawsweeper/pulls/322" }
+    pull_request: { url: "https://api.github.com/repos/openclaw/openclaw/pulls/322" }
   }));
 } else if (args[0] === "api" && /\\/pulls\\/322$/.test(path)) {
   console.log(JSON.stringify({
     number: 322,
-    html_url: "https://github.com/openclaw/clawsweeper/pull/322",
+    html_url: "https://github.com/openclaw/openclaw/pull/322",
     state: "open",
     changed_files: 4,
     commits: 1,
     review_comments: 0,
     requested_reviewers: [],
     requested_teams: [],
-    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/clawsweeper" } },
-    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
+    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
 } else if (args[0] === "api" && /\\/pulls\\/322\\/reviews(?:\\?|$)/.test(path)) {
@@ -4735,4 +4954,20 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/322\\/timeline(?:\\?|$
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("a blocked exact close discards staged labels before it writes the report", () => {
+  // Staged labels must not reach GitHub when the close is blocked and only the report changes.
+  const source = readText("src/clawsweeper-apply-decision-workflow.ts");
+  const start = source.indexOf("if (closeBlockedForCommentSync) {");
+  const blocked = source.slice(start, source.indexOf("clawSweeperLabelsChanged &&", start));
+  assert.match(blocked, /discardIssueLabelBatch\(\);[^]*writeReportMarkdown\(path, markdown\)/);
+});
+
+test("labels_synced_at is recorded only after a confirmed label mutation", () => {
+  // An unconfirmed label write must not claim that the labels are in sync.
+  assert.match(
+    readText("src/clawsweeper-apply-decision-workflow.ts"),
+    /if \(confirmed\) rememberPublishedLabelSync\(\);/,
+  );
 });

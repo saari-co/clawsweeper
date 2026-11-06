@@ -1,0 +1,166 @@
+name: Dashboard site
+
+# Static operator dashboard (dashboard-site/), rebuilt every 15 minutes and published to
+# Cloudflare Pages. The clawsweeper.openclaw.ai Worker serves its pages from there; webhooks,
+# the queue and /api/* stay on the Worker and are never redeployed by this workflow.
+# Review totals, quality and closes come from the corpus aggregate, which the separate Dashboard
+# corpus workflow (dashboard-corpus.yml) refreshes incrementally every hour. This workflow never
+# reads canonical records: it restores the newest saved aggregate, so a slow or failed corpus
+# refresh can never block or time out a publish.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: >-
+          Fill sweep counts and sampled run durations for this many past days (up to 30), about
+          20 requests per day with this repository's token. 0 keeps the normal incremental refresh.
+        type: number
+        default: 0
+  # Branches have no cached corpus (caches flow from main only), so only main publishes.
+  push:
+    branches: [main]
+    paths:
+      - "dashboard-site/**"
+      - ".github/workflows/dashboard-site.yml"
+  # Pull requests only build the site from a committed fixture snapshot; no secrets, no publish.
+  pull_request:
+    paths:
+      - "dashboard-site/**"
+      - ".github/workflows/dashboard-site.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: dashboard-site-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-check:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          working-directory: dashboard-site
+
+      - name: Build the site from the fixture snapshot
+        working-directory: dashboard-site
+        run: |
+          set -euo pipefail
+          mkdir -p src/data
+          cp fixtures/dashboard.json src/data/dashboard.json
+          pnpm run build
+          for page in index.html agent/index.html operations/index.html queue/index.html throughput/index.html quality/index.html coverage/index.html repos/index.html 404.html; do
+            test -s "dist/$page" || { echo "::error::missing dist/$page"; exit 1; }
+          done
+
+  publish:
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+      CLOUDFLARE_ACCOUNT_ID: 91b59577e757131d68d55a471fe32aca
+      PAGES_PROJECT: clawsweeper-dashboard
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          working-directory: dashboard-site
+
+      # State between runs: Actions history (per-hour buckets), repository visibility and the
+      # last corpus aggregate. Cache keys are immutable, so the key includes the attempt: a
+      # rerun must save its own state, not lose it to the failed attempt's key.
+      - name: Restore dashboard state
+        id: state
+        uses: actions/cache/restore@v6
+        with:
+          path: .dashboard-state
+          key: dashboard-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dashboard-state-
+
+      # The newest aggregate saved by the Dashboard corpus workflow replaces the state's copy; the
+      # copy is kept when the aggregate cache is missing (evicted, or before the first refresh).
+      - name: Restore corpus aggregate
+        uses: actions/cache/restore@v6
+        with:
+          path: .dashboard-corpus
+          key: dashboard-corpus-aggregate-publish-${{ github.run_id }}
+          restore-keys: dashboard-corpus-aggregate-
+
+      - name: Use the newest corpus
+        run: |
+          if [ -f .dashboard-corpus/corpus.json ]; then
+            mkdir -p .dashboard-state
+            cp .dashboard-corpus/corpus.json .dashboard-state/corpus.json
+          fi
+
+      # Until the first corpus refresh there is nothing to show: skip quietly, do not fail.
+      - name: Check corpus
+        id: corpus
+        run: |
+          if [ -f .dashboard-state/corpus.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No corpus yet; run the Dashboard corpus workflow once with mode=full at a quiet hour."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only a missing history needs the app's higher rate limit, for the 2-day bootstrap.
+      - name: Create bootstrap token
+        id: bootstrap
+        if: ${{ steps.corpus.outputs.ready == 'true' && steps.state.outputs.cache-matched-key == '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: openclaw
+          repositories: clawsweeper
+          permission-actions: read
+
+      - name: Build dashboard data
+        if: ${{ steps.corpus.outputs.ready == 'true' }}
+        working-directory: dashboard-site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP_GITHUB_TOKEN: ${{ steps.bootstrap.outputs.token }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          BACKFILL_DAYS: ${{ inputs.backfill_days || 0 }}
+        run: node scripts/build-data.ts --state ../.dashboard-state --backfill-days "$BACKFILL_DAYS"
+
+      - name: Save dashboard state
+        if: ${{ always() && hashFiles('.dashboard-state/actions.json') != '' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .dashboard-state
+          key: dashboard-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build site
+        if: ${{ steps.corpus.outputs.ready == 'true' }}
+        working-directory: dashboard-site
+        run: pnpm run build
+
+      - name: Publish to Cloudflare Pages
+        if: ${{ steps.corpus.outputs.ready == 'true' }}
+        working-directory: dashboard-site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_PAGES_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! npx --yes wrangler@4.131.1 pages project list | grep -qw "$PAGES_PROJECT"; then
+            npx --yes wrangler@4.131.1 pages project create "$PAGES_PROJECT" --production-branch main
+          fi
+          npx --yes wrangler@4.131.1 pages deploy dist --project-name "$PAGES_PROJECT" --branch "$GITHUB_REF_NAME" --commit-dirty=true

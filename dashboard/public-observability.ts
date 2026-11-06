@@ -1,3 +1,5 @@
+import { validatedLiveCoverage } from "./public-live-coverage.ts";
+import { PUBLICATION_TELEMETRY_REASONS } from "./exact-review-publication-reasons.ts";
 import { publicTimestamp as timestamp } from "./public-timestamp.ts";
 import {
   GITHUB_EGRESS_CLAIM_GENERATION_BUCKETS,
@@ -16,7 +18,6 @@ import {
 
 const MAX_PUBLIC_COUNT = 10_000_000;
 const MAX_GITHUB_COUNT = 10_000_000_000;
-const MAX_DURATION_MS = 90 * 24 * 60 * 60 * 1000;
 const MAX_GITHUB_ROLLUP_ROWS = 2_000;
 const MAX_GITHUB_RATE_LIMIT_ROWS = 256;
 const MAX_GITHUB_THROTTLE_ROWS = 7 * 24 * GITHUB_EGRESS_POOL_CLASSES.length * 2;
@@ -74,21 +75,6 @@ const APPLY_FAILURE_COUNT_FIELDS = [
   "safe_close_blocked",
   "safe_close_failure",
 ] as const;
-
-const AUTOMERGE_OUTCOMES = [
-  "merged",
-  "repair_failed",
-  "maintainer_stopped",
-  "repair_cap_exhausted",
-  "pr_closed",
-  "automerge_disabled",
-] as const;
-const AUTOMERGE_BUCKET_COUNTS = { "6h": 12, "24h": 12, "7d": 14 } as const;
-const AUTOMERGE_RANGE_MS = {
-  "6h": 6 * 60 * 60 * 1000,
-  "24h": 24 * 60 * 60 * 1000,
-  "7d": 7 * 24 * 60 * 60 * 1000,
-} as const;
 
 const GITHUB_FIRST_REPEAT = ["first", "repeat", "unknown"] as const;
 const GITHUB_RESET_AUTHORITIES = ["retry_after", "rate_limit_reset", "absent", "invalid"] as const;
@@ -289,6 +275,15 @@ const REVIEW_COVERAGE_TOTAL_FIELDS = [
 ] as const;
 
 export function publicReviewCoverageProjection(value: unknown) {
+  return reviewCoverageProjection(value, false);
+}
+
+// Private candidates are provenance, not continued public visibility authority.
+export function privateReviewCoverageProjection(value: unknown) {
+  return reviewCoverageProjection(value, true);
+}
+
+function reviewCoverageProjection(value: unknown, identifyingBuildRead: boolean) {
   const source = objectValue(value);
   const totalsSource = objectValue(source?.totals);
   if (!source || source.ok !== true || !totalsSource) return null;
@@ -305,6 +300,15 @@ export function publicReviewCoverageProjection(value: unknown) {
   ) {
     return null;
   }
+  if (source.cohort === "live-open-identities-v1") {
+    const rich = validatedLiveCoverage(source, generatedAt, inventoryGeneratedAt, windowDays);
+    if (!rich) return null;
+    if (identifyingBuildRead) return { ...rich, scope: "authenticated-coverage-candidates" };
+    // Anonymous telemetry never returns identities, regardless of persisted
+    // visibility/age or identifying query parameters. No GitHub request fanout.
+    const { fleets: _privateFleets, ...aggregate } = rich;
+    return { ...aggregate, scope: "aggregate-only", count_scope: "fleet-inventory-aggregate" };
+  }
   const totals: Record<string, number | null> = {};
   for (const field of REVIEW_COVERAGE_TOTAL_FIELDS) {
     const parsed = count(totalsSource[field]);
@@ -316,13 +320,26 @@ export function publicReviewCoverageProjection(value: unknown) {
   const reviewable = totals.reviewable_records ?? 0;
   const reviewed = totals.reviewed_recent ?? 0;
   const expectedCoverage = reviewable ? Math.round((reviewed / reviewable) * 1000) / 10 : null;
-  if (reviewed > reviewable || coveragePercent !== expectedCoverage) return null;
+  if (
+    source.coverage_status !== undefined &&
+    !member(["complete", "unknown"], source.coverage_status)
+  )
+    return null;
+  const coverageStatus = source.coverage_status === "complete" ? "complete" : "unknown";
+  if (
+    reviewed > reviewable ||
+    (coverageStatus === "complete"
+      ? coveragePercent !== expectedCoverage || source.inventory_status !== "current"
+      : coveragePercent !== null)
+  )
+    return null;
   return {
     ok: true,
     generated_at: generatedAt,
     window_days: windowDays,
     inventory_generated_at: inventoryGeneratedAt,
     inventory_status: source.inventory_status,
+    coverage_status: coverageStatus,
     totals: { ...totals, coverage_percent: coveragePercent },
   };
 }
@@ -408,205 +425,6 @@ export function publicApplyObservabilityProjection(value: unknown) {
     retry_amplification: expectedRetryAmplification,
     lease,
     failures,
-  };
-}
-
-function automergeSummary(value: unknown) {
-  const source = objectValue(value);
-  if (!source) return null;
-  const terminalSessions = count(source.terminal_sessions);
-  const mergedSessions = count(source.merged_sessions);
-  const activeSessions = count(source.active_sessions);
-  const successRate = nullableNumber(source.merge_success_rate_percent, 0, 100);
-  const latencyP50 = nullableCount(source.command_to_merge_p50_ms, MAX_DURATION_MS);
-  const latencyP90 = nullableCount(source.command_to_merge_p90_ms, MAX_DURATION_MS);
-  const baseSyncP50 = nullableCount(source.base_sync_p50);
-  const baseSyncP90 = nullableCount(source.base_sync_p90);
-  const multiRebaseRate = nullableNumber(source.multi_rebase_rate_percent, 0, 100);
-  if (
-    terminalSessions === null ||
-    mergedSessions === null ||
-    activeSessions === null ||
-    successRate === undefined ||
-    latencyP50 === undefined ||
-    latencyP90 === undefined ||
-    baseSyncP50 === undefined ||
-    baseSyncP90 === undefined ||
-    multiRebaseRate === undefined ||
-    mergedSessions > terminalSessions
-  ) {
-    return null;
-  }
-  const expectedSuccessRate = terminalSessions
-    ? Math.round((mergedSessions / terminalSessions) * 1000) / 10
-    : null;
-  const latencyPairValid =
-    (latencyP50 === null) === (latencyP90 === null) &&
-    (latencyP50 === null || latencyP50 <= Number(latencyP90)) &&
-    (mergedSessions > 0 || latencyP50 === null);
-  const baseSyncPairValid = terminalSessions
-    ? baseSyncP50 !== null && baseSyncP90 !== null && baseSyncP50 <= baseSyncP90
-    : baseSyncP50 === null && baseSyncP90 === null;
-  if (successRate !== expectedSuccessRate || !latencyPairValid || !baseSyncPairValid) return null;
-  return {
-    terminal_sessions: terminalSessions,
-    merged_sessions: mergedSessions,
-    merge_success_rate_percent: successRate,
-    command_to_merge_p50_ms: latencyP50,
-    command_to_merge_p90_ms: latencyP90,
-    base_sync_p50: baseSyncP50,
-    base_sync_p90: baseSyncP90,
-    multi_rebase_rate_percent: multiRebaseRate,
-    active_sessions: activeSessions,
-  };
-}
-
-function automergeBuckets(value: unknown, range: (typeof REVIEW_RANGES)[number]) {
-  if (!Array.isArray(value) || value.length !== AUTOMERGE_BUCKET_COUNTS[range]) return null;
-  const result = [];
-  let priorEnd: string | null = null;
-  for (const entry of value) {
-    const source = objectValue(entry);
-    if (!source) return null;
-    const start = timestamp(source.start);
-    const end = timestamp(source.end);
-    const terminalCount = count(source.terminal_count);
-    const mergedCount = count(source.merged_count);
-    const successRate = nullableNumber(source.success_rate_percent, 0, 100);
-    const latencyP50 = nullableCount(source.command_to_merge_p50_ms, MAX_DURATION_MS);
-    const latencyP90 = nullableCount(source.command_to_merge_p90_ms, MAX_DURATION_MS);
-    if (latencyP50 === undefined || latencyP90 === undefined) return null;
-    const latencyPairValid =
-      (latencyP50 === null) === (latencyP90 === null) &&
-      (latencyP50 === null || latencyP50 <= Number(latencyP90)) &&
-      (mergedCount === 0 ? latencyP50 === null : true);
-    if (
-      !start ||
-      !end ||
-      Date.parse(start) >= Date.parse(end) ||
-      (priorEnd !== null && start !== priorEnd) ||
-      terminalCount === null ||
-      mergedCount === null ||
-      mergedCount > terminalCount ||
-      successRate === undefined ||
-      !latencyPairValid ||
-      typeof source.low_sample !== "boolean" ||
-      successRate !==
-        (terminalCount ? Math.round((mergedCount / terminalCount) * 1000) / 10 : null) ||
-      source.low_sample !== (terminalCount > 0 && terminalCount < 5)
-    ) {
-      return null;
-    }
-    result.push({
-      start,
-      end,
-      terminal_count: terminalCount,
-      merged_count: mergedCount,
-      success_rate_percent: successRate,
-      command_to_merge_p50_ms: latencyP50,
-      command_to_merge_p90_ms: latencyP90,
-      low_sample: source.low_sample,
-    });
-    priorEnd = end;
-  }
-  return result;
-}
-
-function automergeOutcomes(value: unknown): Record<string, number> | null {
-  const source = objectValue(value);
-  if (!source || Object.keys(source).length > 32) return null;
-  const result = Object.fromEntries(AUTOMERGE_OUTCOMES.map((outcome) => [outcome, 0])) as Record<
-    string,
-    number
-  >;
-  let unknown = 0;
-  for (const [outcome, value] of Object.entries(source)) {
-    const parsed = count(value);
-    if (parsed === null) return null;
-    if (member(AUTOMERGE_OUTCOMES, outcome)) result[outcome] = parsed;
-    else unknown += parsed;
-    if (unknown > MAX_PUBLIC_COUNT) return null;
-  }
-  return { ...result, unknown };
-}
-
-export function publicAutomergeMetricsProjection(value: unknown) {
-  const source = objectValue(value);
-  const filters = objectValue(source?.filters);
-  if (!source || !member(REVIEW_RANGES, source.range)) return null;
-  // A public aggregate must not become a repository, policy, or session oracle.
-  if (filters && (filters.repo !== null || filters.policy_version !== null)) return null;
-  const generatedAt = timestamp(source.generated_at);
-  const rangeStart = timestamp(source.range_start);
-  const telemetrySince = nullableTimestamp(source.telemetry_since);
-  const coveragePercent = nullableNumber(source.coverage_percent, 0, 100);
-  const summary = automergeSummary(source.summary);
-  const buckets = automergeBuckets(source.buckets, source.range);
-  const outcomes = automergeOutcomes(source.terminal_outcomes);
-  const efficiency = countObject(source.repair_efficiency, [
-    "zero_base_sync",
-    "one_base_sync",
-    "multiple_base_sync",
-  ]);
-  const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
-  const rangeStartMs = rangeStart ? Date.parse(rangeStart) : Number.NaN;
-  const expectedCoveragePercent =
-    telemetrySince === null
-      ? 0
-      : Math.max(
-          0,
-          Math.min(
-            100,
-            Math.round(
-              ((generatedAtMs - Math.max(rangeStartMs, Date.parse(String(telemetrySince)))) /
-                AUTOMERGE_RANGE_MS[source.range]) *
-                100,
-            ),
-          ),
-        );
-  if (
-    !generatedAt ||
-    !rangeStart ||
-    telemetrySince === undefined ||
-    coveragePercent === undefined ||
-    !summary ||
-    !buckets ||
-    !outcomes ||
-    !efficiency ||
-    Date.parse(generatedAt) - Date.parse(rangeStart) !== AUTOMERGE_RANGE_MS[source.range] ||
-    coveragePercent !== expectedCoveragePercent ||
-    buckets[0]?.start !== rangeStart ||
-    buckets.at(-1)?.end !== generatedAt
-  ) {
-    return null;
-  }
-  const outcomeTotal = Object.values(outcomes).reduce((total, item) => total + item, 0);
-  const bucketTerminalTotal = buckets.reduce((total, bucket) => total + bucket.terminal_count, 0);
-  const bucketMergedTotal = buckets.reduce((total, bucket) => total + bucket.merged_count, 0);
-  const efficiencyTotal = Object.values(efficiency).reduce((total, item) => total + (item ?? 0), 0);
-  const expectedMultiRebaseRate = summary.terminal_sessions
-    ? Math.round(((efficiency.multiple_base_sync ?? 0) / summary.terminal_sessions) * 1000) / 10
-    : null;
-  if (
-    outcomeTotal !== summary.terminal_sessions ||
-    outcomes.merged !== summary.merged_sessions ||
-    bucketTerminalTotal !== summary.terminal_sessions ||
-    bucketMergedTotal !== summary.merged_sessions ||
-    efficiencyTotal !== summary.terminal_sessions ||
-    summary.multi_rebase_rate_percent !== expectedMultiRebaseRate
-  ) {
-    return null;
-  }
-  return {
-    generated_at: generatedAt,
-    range: source.range,
-    range_start: rangeStart,
-    telemetry_since: telemetrySince,
-    coverage_percent: expectedCoveragePercent,
-    summary: { ...summary, multi_rebase_rate_percent: expectedMultiRebaseRate },
-    buckets,
-    terminal_outcomes: outcomes,
-    repair_efficiency: efficiency,
   };
 }
 
@@ -1119,7 +937,11 @@ export function publicGithubEgressObservabilityProjection(value: unknown) {
   };
 }
 
-function publicationSource(value: unknown, outcomes: readonly string[]) {
+function publicationSource(
+  value: unknown,
+  outcomes: readonly string[],
+  reasonCodes?: Record<string, readonly string[]>,
+) {
   const source = objectValue(value);
   const countsSource = objectValue(source?.counts);
   if (!source || !countsSource || typeof source.complete !== "boolean") return null;
@@ -1160,7 +982,39 @@ function publicationSource(value: unknown, outcomes: readonly string[]) {
   ) {
     return null;
   }
-  return { complete: source.complete, rows, latest_observed_at: latestObservedAt, counts, buckets };
+  let reasonCounts: Record<string, Record<string, number | null>> | null = null;
+  // Older snapshots still carry valid outcome totals. Their missing breakdown
+  // is unavailable, not zero and not a reason to discard the whole snapshot.
+  if (reasonCodes && source.reason_counts != null) {
+    const reasons = objectValue(source.reason_counts);
+    if (!source.complete || !reasons) return null;
+    reasonCounts = {};
+    for (const outcome of outcomes) {
+      const outcomeReasons = reasonCodes[outcome];
+      if (!outcomeReasons) return null;
+      const projected = nullableCountObject(
+        reasons[outcome],
+        [...outcomeReasons, "unrecorded"],
+        10_000,
+      );
+      if (
+        !projected ||
+        Object.values(projected).some((value) => value === null) ||
+        Object.values(projected).reduce<number>((total, value) => total + Number(value), 0) !==
+          counts[outcome]
+      )
+        return null;
+      reasonCounts[outcome] = projected;
+    }
+  }
+  return {
+    complete: source.complete,
+    rows,
+    latest_observed_at: latestObservedAt,
+    counts,
+    buckets,
+    ...(reasonCodes ? { reason_counts: reasonCounts } : {}),
+  };
 }
 
 export function publicRecentDurablePublicationEventsProjection(value: unknown) {
@@ -1175,7 +1029,11 @@ export function publicRecentDurablePublicationEventsProjection(value: unknown) {
   const startAt = timestamp(window.start_at);
   const endAt = timestamp(window.end_at);
   const direct = publicationSource(source.direct, DIRECT_PUBLICATION_OUTCOMES);
-  const batch = publicationSource(source.batch, BATCH_PUBLICATION_OUTCOMES);
+  const batch = publicationSource(
+    source.batch,
+    BATCH_PUBLICATION_OUTCOMES,
+    PUBLICATION_TELEMETRY_REASONS,
+  );
   if (
     source.version !== 1 ||
     !capturedAt ||

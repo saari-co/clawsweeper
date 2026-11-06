@@ -7,9 +7,9 @@ import {
   fetchProcessGateChecks,
   parseProcessGates,
   qualifyOwnCurrentCheck,
+  reportProcessGates,
   validateDecisionProcessGates,
 } from "../dist/review-process-gates.js";
-import { reportProcessGates } from "../dist/clawsweeper-report-parser.js";
 import { parseExactTupleConfig } from "../dist/saari-exact-tuple.js";
 import { closeDecision } from "./helpers.ts";
 

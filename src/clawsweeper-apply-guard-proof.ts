@@ -10,45 +10,50 @@ import {
   WAITING_ON_AUTHOR_LABEL,
 } from "./clawsweeper-policy.js";
 import type { Item } from "./clawsweeper-types.js";
-import type { ApplyGuardDependencies } from "./clawsweeper-apply-guard-dependencies.js";
-import type { createApplyGuardActivity } from "./clawsweeper-apply-guard-activity.js";
-import type { createApplyGuardPolicy } from "./clawsweeper-apply-guard-policy.js";
+import {
+  prAutoCloseExemptLabel,
+  type ApplyGuardActivity,
+  type GuardReads,
+} from "./clawsweeper-apply-guard-activity.js";
+import { normalizeLabelName } from "./clawsweeper-item-policy.js";
+import { asRecord } from "./value-coerce.js";
+import { isOlderThanDays } from "./iso-time.js";
+
+export function stalledUnprovenPrAgeSkipReason(
+  item: Pick<Item, "createdAt">,
+  now = Date.now(),
+): string | null {
+  if (!isOlderThanDays(item.createdAt, STALLED_UNPROVEN_PR_MIN_AGE_DAYS, now)) {
+    return `stalled_unproven_pr requires PR older than ${STALLED_UNPROVEN_PR_MIN_AGE_DAYS} days`;
+  }
+  return null;
+}
+
+export function abandonedPrAgeSkipReason(
+  item: Pick<Item, "createdAt">,
+  now = Date.now(),
+): string | null {
+  if (!isOlderThanDays(item.createdAt, ABANDONED_PR_MIN_AGE_DAYS, now)) {
+    return `abandoned_pr requires PR older than ${ABANDONED_PR_MIN_AGE_DAYS} days`;
+  }
+  return null;
+}
+
+const STALLED_PROOF_REQUEST_LABELS = new Set([
+  "triage: needs-real-behavior-proof",
+  "status: 📣 needs proof",
+]);
 
 export function createApplyGuardProof(
-  dependencies: ApplyGuardDependencies &
-    ReturnType<typeof createApplyGuardActivity> &
-    ReturnType<typeof createApplyGuardPolicy>,
+  { ghPaged, targetRepo }: GuardReads,
+  { pullRequestHumanEngagementBlockReason, pullRequestLiveActivity }: ApplyGuardActivity,
 ) {
-  const {
-    asRecord,
-    ghPaged,
-    isOlderThanDays,
-    normalizeLabelName,
-    targetRepo,
-    pullRequestHumanEngagementBlockReason,
-    pullRequestLiveActivity,
-    prAutoCloseExemptLabel,
-  } = dependencies;
-
-  function stalledUnprovenPrAgeSkipReason(
-    item: Pick<Item, "createdAt">,
-    now = Date.now(),
-  ): string | null {
-    if (!isOlderThanDays(item.createdAt, STALLED_UNPROVEN_PR_MIN_AGE_DAYS, now)) {
-      return `stalled_unproven_pr requires PR older than ${STALLED_UNPROVEN_PR_MIN_AGE_DAYS} days`;
-    }
-    return null;
-  }
-  const STALLED_PROOF_REQUEST_LABELS = new Set([
-    "triage: needs-real-behavior-proof",
-    "status: 📣 needs proof",
-  ]);
   function stalledUnprovenProofRequestBlockReason(number: number, now = Date.now()): string | null {
-    let earliestRequestAtMs: number | null = null;
+    let latestRequestAtMs: number | null = null;
     const observe = (value: unknown): void => {
       const ms = Date.parse(typeof value === "string" ? value : "");
-      if (Number.isFinite(ms) && (earliestRequestAtMs === null || ms < earliestRequestAtMs)) {
-        earliestRequestAtMs = ms;
+      if (Number.isFinite(ms) && (latestRequestAtMs === null || ms > latestRequestAtMs)) {
+        latestRequestAtMs = ms;
       }
     };
     for (const event of ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/timeline`)) {
@@ -64,21 +69,13 @@ export function createApplyGuardProof(
       const body = typeof record.body === "string" ? record.body : "";
       if (!body.includes(PROOF_NUDGE_MARKER_PREFIX)) continue;
       observe(record.created_at);
+      observe(record.updated_at);
     }
-    if (earliestRequestAtMs === null) {
+    if (latestRequestAtMs === null) {
       return "no visible dated proof request (needs-proof label event or proof nudge) on the live PR";
     }
-    if (now - earliestRequestAtMs <= STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS * DAY_MS) {
+    if (now - latestRequestAtMs <= STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS * DAY_MS) {
       return `stalled_unproven_pr requires the proof request to be visible for ${STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS} days`;
-    }
-    return null;
-  }
-  function abandonedPrAgeSkipReason(
-    item: Pick<Item, "createdAt">,
-    now = Date.now(),
-  ): string | null {
-    if (!isOlderThanDays(item.createdAt, ABANDONED_PR_MIN_AGE_DAYS, now)) {
-      return `abandoned_pr requires PR older than ${ABANDONED_PR_MIN_AGE_DAYS} days`;
     }
     return null;
   }
@@ -109,7 +106,11 @@ export function createApplyGuardProof(
     ) {
       return `stalled_unproven_pr requires ${STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS} days without source activity on the current head`;
     }
-    return pullRequestHumanEngagementBlockReason(number);
+    return pullRequestHumanEngagementBlockReason(
+      number,
+      undefined,
+      STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS,
+    );
   }
   function stalledUnprovenPrApplyBlockReasonSafe(
     number: number,
@@ -146,7 +147,7 @@ export function createApplyGuardProof(
     if (!stalledState) {
       return "live PR is not draft, waiting-on-author, failing checks, or merge-conflicted; abandonment is not confirmed";
     }
-    return pullRequestHumanEngagementBlockReason(number);
+    return pullRequestHumanEngagementBlockReason(number, undefined, ABANDONED_PR_MIN_INACTIVE_DAYS);
   }
   function abandonedPrApplyBlockReasonSafe(
     number: number,
@@ -162,10 +163,7 @@ export function createApplyGuardProof(
   }
 
   return {
-    stalledUnprovenPrAgeSkipReason,
-    STALLED_PROOF_REQUEST_LABELS,
     stalledUnprovenProofRequestBlockReason,
-    abandonedPrAgeSkipReason,
     stalledUnprovenPrApplyBlockReason,
     stalledUnprovenPrApplyBlockReasonSafe,
     abandonedPrApplyBlockReason,

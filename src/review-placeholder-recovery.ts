@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-import { createHash, createHmac } from "node:crypto";
+import { createHmac } from "node:crypto";
+import { sha256 } from "./content-hash.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { clearInPlaceReviewStartStatus } from "./review-comment-markers.js";
+import { CLAWSWEEPER_BOT_LOGINS } from "./clawsweeper-bot-identity.js";
 import {
   fetchDurableCursor,
   putDurableCursor,
@@ -31,7 +34,6 @@ const SEARCH_PAGE_SIZE = 100;
 const SEARCH_RESULT_LIMIT = 1_000;
 const COMMENT_PAGE_SIZE = 100;
 const COMMENT_MAX_PAGES = 5;
-const CLAWSWEEPER_BOT_LOGINS = new Set(["clawsweeper[bot]", "openclaw-clawsweeper[bot]"]);
 
 export type ReviewPlaceholderComment = {
   body?: unknown;
@@ -67,10 +69,7 @@ export function reviewPlaceholderCursorMode(
   repository: string,
   state: ReviewPlaceholderState,
 ): ReviewPlaceholderCursorMode {
-  const repositoryKey = createHash("sha256")
-    .update(repository.toLowerCase())
-    .digest("hex")
-    .slice(0, 16);
+  const repositoryKey = sha256(repository.toLowerCase()).slice(0, 16);
   return `review-placeholder-${repositoryKey}-${state}`;
 }
 
@@ -398,13 +397,21 @@ export async function runReviewPlaceholderRecovery(
     ) {
       return "skipped";
     }
+    const cleared = clearInPlaceReviewStartStatus(current.body, number);
+    const inPlace = cleared !== current.body;
+    // A malformed combined lease is not permission to delete a durable review.
+    if (!inPlace && current.body.includes(`<!-- clawsweeper-review item=${number} -->`)) {
+      return "skipped";
+    }
     const response = await fetchImpl(`${apiUrl}/repos/${repo}/issues/comments/${commentId}`, {
-      method: "DELETE",
+      method: inPlace ? "PATCH" : "DELETE",
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${targetWriteToken}`,
         "x-github-api-version": "2022-11-28",
+        ...(inPlace ? { "content-type": "application/json" } : {}),
       },
+      ...(inPlace ? { body: JSON.stringify({ body: cleared }) } : {}),
     });
     if (!response.ok) {
       // Observed live (openclaw/openclaw#99252): the installation token gets
@@ -413,7 +420,7 @@ export async function runReviewPlaceholderRecovery(
       // skips, not errors to retry every sweep.
       if (response.status === 403 && item.locked === true) return "skipped";
       throw new Error(
-        `DELETE /repos/${repo}/issues/comments/${commentId} returned ${response.status}`,
+        `${inPlace ? "PATCH" : "DELETE"} /repos/${repo}/issues/comments/${commentId} returned ${response.status}`,
       );
     }
     return "deleted";

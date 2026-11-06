@@ -1,14 +1,49 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import MarkdownIt from "markdown-it";
 import { parse } from "yaml";
+import { exactReviewSourceRevisionMaterial } from "../dashboard/exact-review-source-revision.ts";
+import { classifyItemWebhook } from "../dist/repair/comment-webhook.js";
+import {
+  TARGET_DISPATCH_ENDPOINT,
+  TARGET_DISPATCH_WORKFLOW_PATH,
+} from "../dashboard/target-dispatch-ingress.ts";
 
-const liveWorkflow = readFileSync(".github/workflows/clawsweeper-dispatch.yml", "utf8").replace(
-  /\r\n/g,
-  "\n",
-);
+type WorkflowStep = {
+  id?: string;
+  name?: string;
+  if?: string;
+  run?: string;
+  env?: Record<string, string>;
+  with?: Record<string, string>;
+  "continue-on-error"?: boolean;
+};
+
+type Workflow = {
+  concurrency?: { group?: string; "cancel-in-progress"?: string };
+  jobs?: Record<
+    string,
+    {
+      if?: string;
+      needs?: string;
+      permissions?: Record<string, string>;
+      steps?: WorkflowStep[];
+      uses?: string;
+      with?: Record<string, string>;
+    }
+  >;
+};
+
+const liveWorkflow = parse(
+  readFileSync(".github/workflows/clawsweeper-dispatch.yml", "utf8"),
+) as Workflow;
 const documentation = readFileSync("docs/target-dispatcher.md", "utf8").replace(/\r\n/g, "\n");
 const dispatcherTemplates = new MarkdownIt()
   .parse(documentation, {})
@@ -21,50 +56,10 @@ const dispatcherTemplates = new MarkdownIt()
   );
 
 assert.equal(dispatcherTemplates.length, 1, "expected one canonical target dispatcher template");
-const documentedWorkflow = dispatcherTemplates[0]!.content;
-const hostedAdmissionRevision = "174a2c9c903323eb9387d030748ed2b41824a7be";
+const documentedWorkflow = parse(dispatcherTemplates[0]!.content) as Workflow;
 
-type WorkflowStep = {
-  id?: string;
-  name?: string;
-  if?: string;
-  run?: string;
-  env?: Record<string, string>;
-  with?: Record<string, string>;
-  "continue-on-error"?: boolean;
-};
-
-function dispatchSteps(source: string): WorkflowStep[] {
-  const workflow = parse(source) as {
-    jobs?: { dispatch?: { steps?: WorkflowStep[] } };
-  };
+function dispatchSteps(workflow: Workflow): WorkflowStep[] {
   return workflow.jobs?.dispatch?.steps ?? [];
-}
-
-function workflowJobs(source: string) {
-  return (
-    parse(source) as {
-      jobs?: Record<
-        string,
-        {
-          if?: string;
-          needs?: string;
-          permissions?: Record<string, string>;
-          steps?: WorkflowStep[];
-          uses?: string;
-          with?: Record<string, string>;
-        }
-      >;
-    }
-  ).jobs;
-}
-
-function workflowConcurrency(source: string) {
-  return (
-    parse(source) as {
-      concurrency?: { group?: string; "cancel-in-progress"?: string };
-    }
-  ).concurrency;
 }
 
 function namedStep(steps: WorkflowStep[], name: string): WorkflowStep {
@@ -73,19 +68,15 @@ function namedStep(steps: WorkflowStep[], name: string): WorkflowStep {
   return step;
 }
 
-function normalizeWhitespace(value: string | undefined): string {
-  return (value ?? "").replace(/\s+/g, " ").trim();
-}
-
 test("documented target dispatcher template matches the live workflow", () => {
-  assert.equal(documentedWorkflow, liveWorkflow);
+  assert.deepEqual(documentedWorkflow, liveWorkflow);
 });
 
 test("copied dispatchers isolate comment and ignored bot-label concurrency", () => {
   const expectedGroup =
     "clawsweeper-dispatch-${{ github.repository }}-${{ github.event_name }}-${{ github.event.comment.id || github.event.issue.number || github.event.pull_request.number || github.run_id }}-${{ endsWith(github.actor, '[bot]') && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.actor || 'dispatchable' }}";
   for (const source of [liveWorkflow, documentedWorkflow]) {
-    const concurrency = workflowConcurrency(source);
+    const concurrency = source.concurrency;
     assert.equal(concurrency?.group, expectedGroup);
     assert.equal(
       concurrency?.["cancel-in-progress"],
@@ -94,52 +85,18 @@ test("copied dispatchers isolate comment and ignored bot-label concurrency", () 
   }
 });
 
-test("copied dispatchers admit the target before any token or acknowledgement", () => {
+test("copied dispatchers are keyless and leave admission and acknowledgements to the Worker", () => {
   for (const source of [liveWorkflow, documentedWorkflow]) {
-    const jobs = workflowJobs(source);
-    assert.equal(
-      jobs?.["hosted-target-admission"]?.uses,
-      `openclaw/clawsweeper/.github/workflows/hosted-target-admission.yml@${hostedAdmissionRevision}`,
-    );
-    assert.deepEqual(jobs?.["hosted-target-admission"]?.with, {
-      target_repo: "${{ github.repository }}",
-    });
-    const rejected = jobs?.["reject-hosted-target"];
-    assert.equal(
-      rejected?.if,
-      "${{ always() && needs.hosted-target-admission.outputs.outcome != 'public' }}",
-    );
-    assert.equal(rejected?.needs, "hosted-target-admission");
-    assert.deepEqual(rejected?.permissions, {});
-    assert.match(rejected?.steps?.[0]?.run ?? "", /run the review locally/);
-    assert.match(rejected?.steps?.[0]?.run ?? "", /Retry the workflow later/);
+    assert.deepEqual(Object.keys(source.jobs ?? {}), ["dispatch"]);
     assert.doesNotMatch(
-      rejected?.steps?.[0]?.run ?? "",
-      /gh api|GITHUB_TOKEN|github\.token|create-github-app-token|CLAWSWEEPER_APP/,
+      JSON.stringify(source),
+      /secrets\.|create-github-app-token|repository_dispatch|GH_TOKEN/,
     );
-    assert.equal(jobs?.dispatch?.needs, "hosted-target-admission");
-    assert.match(
-      jobs?.dispatch?.if ?? "",
-      /needs\.hosted-target-admission\.outputs\.outcome == 'public'/,
-    );
-  }
-});
-
-test("copied dispatchers keep command delivery independent of target acknowledgement tokens", () => {
-  for (const source of [liveWorkflow, documentedWorkflow]) {
-    const steps = dispatchSteps(source);
-    const token = namedStep(steps, "Create target comment token");
-    const command = namedStep(steps, "Acknowledge and dispatch ClawSweeper comment");
-
-    assert.equal(token["continue-on-error"], true);
-    assert.doesNotMatch(normalizeWhitespace(command.if), /target_token|TARGET_TOKEN/);
-    assert.equal(command.env?.TARGET_TOKEN, "${{ steps.target_token.outputs.token }}");
-    assert.equal(command.env?.DISPATCH_TOKEN, "${{ steps.token.outputs.token }}");
-    assert.match(command.run ?? "", /if \[ -n "\$TARGET_TOKEN" \]; then/);
-    assert.match(
-      command.run ?? "",
-      /GH_TOKEN="\$DISPATCH_TOKEN" gh api repos\/openclaw\/clawsweeper\/dispatches/,
-    );
+    assert.equal(source.jobs?.dispatch?.needs, undefined);
+    const command = namedStep(dispatchSteps(source), "Dispatch ClawSweeper comment");
+    assert.match(command.if ?? "", /comment_filter.outputs.is_command == 'true'/);
+    assert.equal(command.env?.COMMENT_BODY, undefined);
+    assert.equal(command.env?.AUTHOR_ASSOCIATION, undefined);
   }
 });
 
@@ -185,110 +142,329 @@ test("copied dispatcher prefilters every canonical maintainer command form", () 
   }
 });
 
-test("target dispatcher acknowledges non-draft PR receipts before review dispatch", () => {
-  for (const source of [liveWorkflow, documentedWorkflow]) {
-    const steps = dispatchSteps(source);
-    const tokenIndex = steps.findIndex(
-      (step) => step.name === "Create target PR acknowledgement token",
-    );
-    const acknowledgementIndex = steps.findIndex(
-      (step) => step.name === "Acknowledge received pull request",
-    );
-    const dispatchIndex = steps.findIndex(
-      (step) => step.name === "Dispatch exact ClawSweeper review",
-    );
-    assert.ok(tokenIndex >= 0 && tokenIndex < acknowledgementIndex);
-    assert.ok(acknowledgementIndex < dispatchIndex);
-
-    const token = namedStep(steps, "Create target PR acknowledgement token");
-    const acknowledgement = namedStep(steps, "Acknowledge received pull request");
-    const expectedGate =
-      "${{ github.event_name == 'pull_request_target' && env.HAS_CLAWSWEEPER_APP_PRIVATE_KEY == 'true' }}";
-
-    assert.equal(normalizeWhitespace(token.if), expectedGate);
-    assert.equal(normalizeWhitespace(acknowledgement.if), expectedGate);
-    assert.equal(token["continue-on-error"], true);
-    assert.equal(acknowledgement["continue-on-error"], true);
-    assert.equal(acknowledgement.id, "pr_acknowledgement");
-    assert.deepEqual(
-      Object.keys(token.with ?? {}).filter((key) => key.startsWith("permission-")),
-      ["permission-issues"],
-    );
-    assert.equal(token.with?.["permission-issues"], "write");
-    assert.equal(acknowledgement.env?.ACK_TOKEN, "${{ steps.pr_ack_token.outputs.token }}");
-
-    const run = acknowledgement.run ?? "";
-    assert.match(run, /issues\/\$ITEM_NUMBER\/comments\?per_page=100/);
-    assert.match(run, /page <= 10/);
-    assert.doesNotMatch(run, /--paginate/);
-    assert.match(run, /\| jq -s 'add'/);
-    assert.match(run, /leaving existing comments untouched/);
-    assert.match(run, /--arg marker_prefix "clawsweeper-pr-ack:"/);
-    assert.match(run, /--arg marker_suffix " item=\$ITEM_NUMBER -->"/);
-    assert.match(run, /\["clawsweeper", "clawsweeper\[bot\]", "openclaw-clawsweeper\[bot\]"\]/);
-    assert.match(run, /clawsweeper-review-progress:start/);
-    assert.match(run, /sort_by\(\.created_at, \.id\) \| first/);
-    assert.match(run, /echo "status_comment_id=\$status_comment_id" >> "\$GITHUB_OUTPUT"/);
-    assert.match(run, /\$SOURCE_ACTION" != "ready_for_review"/);
-    assert.match(run, /"<!-- clawsweeper-pr-ack:\$SOURCE_ACTION item=\$ITEM_NUMBER -->"/);
-    assert.match(
-      run,
-      /"Pull request received\. I will update this pull request when review starts\."/,
-    );
-    assert.match(run, /issues\/\$ITEM_NUMBER\/comments"\s*\\\s*--method POST/);
-    const dispatch = namedStep(steps, "Dispatch exact ClawSweeper review");
-    assert.equal(
-      dispatch.env?.REVIEW_ACKNOWLEDGEMENT_COMMENT_ID,
-      "${{ steps.pr_acknowledgement.outputs.status_comment_id }}",
-    );
-    assert.match(
-      dispatch.run ?? "",
-      /queueClaim\.review_acknowledgement_comment_id = reviewAcknowledgementCommentId/,
-    );
+test("an old maintainer reminder comment cannot route itself as a command", () => {
+  const prefilter = namedStep(dispatchSteps(liveWorkflow), "Pre-filter ClawSweeper comment").run!;
+  const root = mkdtempSync(path.join(tmpdir(), "target-dispatch-reminder-"));
+  const output = path.join(root, "output");
+  // Reminders posted before maintainer first reviews became automatic mention the command.
+  const body = [
+    "<!-- clawsweeper-maintainer-opt-in:opened item=42 -->",
+    "ClawSweeper reviews are opt-in for maintainers. If a review is required, finish the work and validation first, then comment `@clawsweeper review`.",
+  ].join("\n");
+  try {
+    writeFileSync(output, "");
+    const filtered = spawnSync("bash", ["-e", "-c", prefilter], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH, COMMENT_BODY: body, GITHUB_OUTPUT: output },
+    });
+    assert.equal(filtered.status, 0, filtered.stderr);
+    assert.equal(readFileSync(output, "utf8"), "is_command=false\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("target dispatcher carries immutable issue and pull-request source identity", () => {
+test("dispatcher uses OIDC only and fails transient intake errors while warning on rejection", async () => {
+  // The Worker only trusts tokens minted by the documented dispatcher file.
+  assert.equal(TARGET_DISPATCH_WORKFLOW_PATH, ".github/workflows/clawsweeper-dispatch.yml");
+  assert.match(documentation, /canonical dispatcher filename/);
   for (const source of [liveWorkflow, documentedWorkflow]) {
-    const run = namedStep(dispatchSteps(source), "Dispatch exact ClawSweeper review").run ?? "";
-    assert.match(run, /source_identity_json=/);
-    assert.match(run, /version: 2/);
-    assert.match(run, /const result = \{ queue_claim: queueClaim \}/);
-    assert.match(run, /queueClaim\.source_content_revision/);
-    assert.match(run, /queueClaim\.source_updated_at/);
-    assert.match(run, /queueClaim\.source_head_sha/);
-    assert.match(run, /queueClaim\.source_base_sha/);
-    assert.match(run, /queueClaim\.source_is_draft/);
-    assert.match(run, /result\.ingress_route = "target_dispatcher"/);
-    assert.match(run, /result\.ingress_fingerprint/);
-    assert.doesNotMatch(run, /process\.exit\(0\)/);
-    assert.match(run, /\+ \$source_identity/);
-    assert.equal(
-      [
-        "target_repo",
-        "target_branch",
-        "item_number",
-        "item_kind",
-        "source_event",
-        "source_action",
-        "supersedes_in_progress",
-        "queue_claim",
-        "ingress_route",
-        "ingress_fingerprint",
-      ].length,
-      10,
+    assert.deepEqual(source.jobs?.dispatch?.permissions, {
+      contents: "read",
+      "id-token": "write",
+    });
+    const step = namedStep(dispatchSteps(source), "Dispatch exact ClawSweeper review");
+    assert.equal(step.env?.TARGET_DISPATCH_URL, TARGET_DISPATCH_ENDPOINT);
+  }
+  const run = namedStep(dispatchSteps(liveWorkflow), "Dispatch exact ClawSweeper review").run!;
+  const root = mkdtempSync(path.join(tmpdir(), "target-dispatch-"));
+  const eventPath = path.join(root, "event.json");
+  writeFileSync(
+    eventPath,
+    JSON.stringify({
+      action: "opened",
+      pull_request: {
+        number: 42,
+        title: "Fix parser",
+        body: "Body",
+        locked: false,
+        draft: false,
+        labels: [
+          { name: "bug" },
+          { name: "clawsweeper:autofix" },
+          { name: "clawsweeper:automerge" },
+        ],
+        updated_at: "2026-10-01T03:10:50Z",
+        head: { sha: "a".repeat(40) },
+        base: { sha: "b".repeat(40) },
+      },
+    }),
+  );
+  writeFileSync(
+    path.join(root, "gh"),
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_STUB_LOG"\ncat >> "$GH_STUB_LOG"\nprintf "\\n" >> "$GH_STUB_LOG"\n',
+  );
+  chmodSync(path.join(root, "gh"), 0o755);
+  let tokenStatus = 200;
+  let directStatus = 202;
+  let requests: Array<{ path: string; query: string; authorization: string; body: string }> = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      const url = new URL(request.url ?? "/", "http://fixture");
+      requests.push({
+        path: url.pathname,
+        query: url.search,
+        authorization: String(request.headers.authorization ?? ""),
+        body,
+      });
+      const status = url.pathname === "/token" ? tokenStatus : directStatus;
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify(
+          url.pathname === "/token"
+            ? { value: "synthetic-oidc-token" }
+            : { ok: status < 300, queued: status < 300, item_key: "openclaw/example#42" },
+        ),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const directUrl = `${origin}/github/target-dispatch`;
+  let executions = 0;
+  const execute = (options: { oidc: boolean; directUrl?: string; comment?: boolean }) => {
+    const log = path.join(root, `gh-${(executions += 1)}.log`);
+    writeFileSync(log, "");
+    return new Promise<{ status: number | null; stdout: string; gh: string }>((resolve, reject) => {
+      const child = spawn(
+        "bash",
+        [
+          "-e",
+          "-c",
+          options.comment
+            ? namedStep(dispatchSteps(liveWorkflow), "Dispatch ClawSweeper comment").run!
+            : run,
+        ],
+        {
+          env: {
+            PATH: `${root}:${process.env.PATH}`,
+            GH_STUB_LOG: log,
+            GH_TOKEN: "app-installation-token",
+            GITHUB_EVENT_PATH: eventPath,
+            RUNNER_TEMP: root,
+            TARGET_REPO: "openclaw/example",
+            TARGET_BRANCH: "main",
+            ITEM_NUMBER: "42",
+            ITEM_KIND: "pull_request",
+            SOURCE_EVENT: "pull_request_target",
+            SOURCE_ACTION: options.comment ? "created" : "opened",
+            COMMENT_ID: "9001",
+            SUPERSEDES_IN_PROGRESS: "false",
+            TARGET_DISPATCH_URL: options.directUrl ?? directUrl,
+            ...(options.oidc
+              ? {
+                  ACTIONS_ID_TOKEN_REQUEST_URL: `${origin}/token?api-version=2.0`,
+                  ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token",
+                }
+              : {}),
+          },
+        },
+      );
+      let stdout = "";
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.resume();
+      child.on("error", reject);
+      child.on("close", (status) => resolve({ status, stdout, gh: readFileSync(log, "utf8") }));
+    });
+  };
+  try {
+    const direct = await execute({ oidc: true });
+    assert.equal(direct.status, 0);
+    assert.equal(direct.gh, "", "a direct admission must not create a repository_dispatch");
+    assert.match(direct.stdout, /Queued ClawSweeper intake directly: \{"ok":true/);
+    assert.deepEqual(
+      requests.map((request) => request.path),
+      ["/token", "/github/target-dispatch"],
     );
+    const tokenQuery = new URLSearchParams(requests[0]!.query);
+    assert.equal(requests[0]!.authorization, "bearer request-token");
+    assert.equal(tokenQuery.get("api-version"), "2.0");
+    // One URL is both the OIDC audience and the POST target.
+    assert.equal(tokenQuery.get("audience"), directUrl);
+    assert.equal(requests[1]!.authorization, "Bearer synthetic-oidc-token");
+    const clientPayload = JSON.parse(requests[1]!.body);
+    assert.deepEqual(Object.keys(clientPayload).sort(), [
+      "ingress_fingerprint",
+      "ingress_route",
+      "item_kind",
+      "item_number",
+      "queue_claim",
+      "source_action",
+      "source_event",
+      "supersedes_in_progress",
+      "target_branch",
+      "target_repo",
+    ]);
+    assert.equal(clientPayload.ingress_route, "target_dispatcher");
+    assert.match(clientPayload.ingress_fingerprint, /^[0-9a-f]{64}$/);
+    const contentRevision = createHash("sha256")
+      .update(
+        JSON.stringify({
+          version: 2,
+          title: "Fix parser",
+          body: "Body",
+          locked: false,
+          close_guard_labels: ["bug", "clawsweeper:autofix", "clawsweeper:automerge"],
+        }),
+      )
+      .digest("hex");
+    assert.deepEqual(clientPayload.queue_claim, {
+      source_updated_at: "2026-10-01T03:10:50Z",
+      source_content_revision: contentRevision,
+      source_head_sha: "a".repeat(40),
+      source_base_sha: "b".repeat(40),
+      source_is_draft: false,
+    });
+    const pullRequest = JSON.parse(readFileSync(eventPath, "utf8")).pull_request;
+    const webhook = classifyItemWebhook({
+      event: "pull_request",
+      payload: {
+        action: "opened",
+        repository: { full_name: "openclaw/openclaw", default_branch: "main" },
+        installation: { id: 1 },
+        pull_request: pullRequest,
+      },
+    });
+    assert.equal(webhook.accepted, true);
+    assert.equal(webhook.sourceContentRevision, clientPayload.queue_claim.source_content_revision);
+    const workerRevision = createHash("sha256")
+      .update(JSON.stringify(exactReviewSourceRevisionMaterial(pullRequest)))
+      .digest("hex");
+    assert.equal(workerRevision, clientPayload.queue_claim.source_content_revision);
+
+    requests = [];
+    const command = await execute({ oidc: true, comment: true });
+    assert.equal(command.status, 0);
+    assert.equal(command.gh, "");
+    assert.deepEqual(JSON.parse(requests[1]!.body), {
+      target_repo: "openclaw/example",
+      item_number: 42,
+      comment_id: 9001,
+      source_event: "issue_comment",
+      source_action: "created",
+    });
+
+    const declined = /::warning::.*declined this event/;
+    const unavailable = /::error::.*intake unavailable/;
+    const noToken = /::error::.*OIDC token unavailable/;
+    // Definitive rejection is covered by the App webhook. Transient errors must
+    // fail the run and stay re-runnable, including OIDC verifier unavailability.
+    const failures = [
+      {
+        name: "worker rejection",
+        oidc: true,
+        token: 200,
+        direct: 401,
+        posts: 2,
+        exit: 0,
+        log: declined,
+      },
+      {
+        name: "worker timeout",
+        oidc: true,
+        token: 200,
+        direct: 408,
+        posts: 2,
+        exit: 1,
+        log: unavailable,
+      },
+      {
+        name: "worker throttling",
+        oidc: true,
+        token: 200,
+        direct: 429,
+        posts: 2,
+        exit: 1,
+        log: unavailable,
+      },
+      {
+        name: "worker outage",
+        oidc: true,
+        token: 200,
+        direct: 503,
+        posts: 2,
+        exit: 1,
+        log: unavailable,
+      },
+      // curl --fail treats a 3xx as success; only a 2xx counts as delivered.
+      {
+        name: "worker redirect",
+        oidc: true,
+        token: 200,
+        direct: 307,
+        posts: 2,
+        exit: 1,
+        log: unavailable,
+      },
+      {
+        name: "token endpoint failure",
+        oidc: true,
+        token: 500,
+        direct: 202,
+        posts: 1,
+        exit: 1,
+        log: noToken,
+      },
+      {
+        name: "no id-token permission",
+        oidc: false,
+        token: 200,
+        direct: 202,
+        posts: 0,
+        exit: 1,
+        log: noToken,
+      },
+      {
+        name: "unreachable worker",
+        oidc: true,
+        token: 200,
+        direct: 202,
+        posts: 1,
+        exit: 1,
+        log: unavailable,
+        directUrl: "http://127.0.0.1:9/github/target-dispatch",
+      },
+    ];
+    for (const scenario of failures) {
+      tokenStatus = scenario.token;
+      directStatus = scenario.direct;
+      for (const comment of [false, true]) {
+        requests = [];
+        const result = await execute({
+          oidc: scenario.oidc,
+          comment,
+          ...(scenario.directUrl ? { directUrl: scenario.directUrl } : {}),
+        });
+        assert.equal(result.status, scenario.exit, scenario.name);
+        assert.equal(requests.length, scenario.posts, scenario.name);
+        assert.equal(result.gh, "", scenario.name);
+        assert.match(result.stdout, scenario.log, scenario.name);
+      }
+    }
+  } finally {
+    server.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("automatic acknowledgement lookup bounds real shell pagination and fails closed", () => {
-  const sweep = readFileSync(".github/workflows/sweep.yml", "utf8");
-  const jobs = workflowJobs(sweep);
+  const jobs = (parse(readFileSync(".github/workflows/sweep.yml", "utf8")) as Workflow).jobs;
   const scheduled = Object.values(jobs ?? {})
     .flatMap((job) => job.steps ?? [])
     .find((step) => step.name === "Resolve automatic review status comment");
   assert.ok(scheduled?.run);
-  const dispatcher = namedStep(dispatchSteps(liveWorkflow), "Acknowledge received pull request");
   const cases = [
     {
       name: "old receipt after five pages",
@@ -324,7 +500,7 @@ test("automatic acknowledgement lookup bounds real shell pagination and fails cl
       success: false,
     },
   ];
-  for (const run of [dispatcher.run!, scheduled.run]) {
+  for (const run of [scheduled.run]) {
     const helper = /^list_ack_comments\(\) \{[\s\S]*?^\}/m.exec(run)?.[0];
     assert.ok(helper, "expected the actual bounded workflow helper");
     for (const scenario of cases) {

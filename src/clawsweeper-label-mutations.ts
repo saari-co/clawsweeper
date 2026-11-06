@@ -1,4 +1,5 @@
-import { IDEA_ARCHIVE_LABEL } from "./idea-archive-revival.js";
+import { INTAKE_LABELS } from "./intake-triage-contract.js";
+import { IDEA_ARCHIVE_LABEL } from "./clawsweeper-policy.js";
 import { ratingLabelForTier } from "./clawsweeper-rating.js";
 import {
   ACCEPTED_LARGE_LABEL_DEFINITION,
@@ -19,31 +20,51 @@ import {
   PROOF_SUFFICIENT_LABEL,
   PROOF_SUFFICIENT_LABEL_COLOR,
   PROOF_SUFFICIENT_LABEL_DESCRIPTION,
-  TELEGRAM_VISIBLE_PROOF_LABEL,
-  TELEGRAM_VISIBLE_PROOF_LABEL_COLOR,
-  TELEGRAM_VISIBLE_PROOF_LABEL_DESCRIPTION,
+  type MergeRiskLabelName,
 } from "./clawsweeper-policy.js";
 import { compareCodeUnits } from "./stable-json.js";
 import type {
   ImpactLabelName,
   MaturityLabelName,
-  MergeRiskLabelName,
   PrRatingTier,
   PrStatusLabelKind,
 } from "./clawsweeper-types.js";
-import type { LabelSynchronizationDependencies } from "./clawsweeper-label-dependencies.js";
-import type { createLabelSelectionPolicy } from "./clawsweeper-label-selection.js";
+import { normalizeLabelName } from "./clawsweeper-item-policy.js";
+import { prStatusLabelForKind } from "./clawsweeper-label-policy.js";
+import type { PriorityLabelSpec } from "./clawsweeper-label-selection.js";
 
-export function createLabelMutationOperations(
-  dependencies: LabelSynchronizationDependencies & ReturnType<typeof createLabelSelectionPolicy>,
-) {
-  const { ghJson, ghObservedMutationCommand, normalizeLabelName, prStatusLabelForKind } =
-    dependencies;
+export function labelAlreadyExistsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already exists/i.test(message);
+}
 
-  type PriorityLabelSpec = NonNullable<
-    ReturnType<ReturnType<typeof createLabelSelectionPolicy>["priorityLabelForTriage"]>
-  >;
+export function missingLabelError(error: unknown, label: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(`'${label}' not found`) || message.includes(`"${label}" not found`);
+}
 
+export function labelCapacityError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /labels can have a maximum of 100 labels/i.test(message);
+}
+
+// The gh shell that label writes go through.
+export interface LabelGh {
+  readLabelCatalogPages: () => unknown;
+  ghObservedMutationCommand: (options: {
+    identity: string;
+    args: string[];
+    attempts?: number | undefined;
+    onMutation?: (() => void) | undefined;
+    knownNoMutation?: ((error: unknown) => boolean) | undefined;
+  }) => string;
+}
+
+// One instance owns the pending label batch and the label catalog cache.
+export function createLabelMutationOperations({
+  readLabelCatalogPages,
+  ghObservedMutationCommand,
+}: LabelGh) {
   type LabelDefinition = {
     name: string;
     color: string;
@@ -157,17 +178,13 @@ export function createLabelMutationOperations(
 
   function repositoryLabelCatalog(): Map<string, { color: string; description: string }> {
     if (repositoryLabelCatalogCache) return repositoryLabelCatalogCache;
-    const raw = ghJson<unknown>([
-      "label",
-      "list",
-      "--limit",
-      "1000",
-      "--json",
-      "name,color,description",
-    ]);
-    if (!Array.isArray(raw)) throw new Error("GitHub label catalog was not an array");
+    // Native `gh label list --json` emits no JSON for an empty repository.
+    // REST pages retain that valid empty catalog without accepting malformed reads.
+    const pages = readLabelCatalogPages();
+    if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page)))
+      throw new Error("GitHub label catalog pages were not arrays");
     const catalog = new Map<string, { color: string; description: string }>();
-    for (const value of raw) {
+    for (const value of pages.flat()) {
       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const label = value as Record<string, unknown>;
       if (typeof label.name !== "string" || typeof label.color !== "string") continue;
@@ -401,13 +418,6 @@ export function createLabelMutationOperations(
       knownNoMutation: (error) => missingLabelError(error, label) || labelCapacityError(error),
     });
   }
-  function labelAlreadyExistsError(error: unknown): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return /already exists/i.test(message);
-  }
-  function isGitHubLabelAlreadyExistsErrorForTest(message: string): boolean {
-    return labelAlreadyExistsError(new Error(message));
-  }
   function ensurePriorityLabel(label: PriorityLabelSpec, onMutation?: () => void): void {
     ensureLabelDefinition(label, onMutation);
   }
@@ -460,16 +470,6 @@ export function createLabelMutationOperations(
     const definition = prStatusLabelForKind(kind);
     ensureLabelDefinition(definition, onMutation);
   }
-  function ensureTelegramVisibleProofLabel(onMutation?: () => void): void {
-    ensureLabelDefinition(
-      {
-        name: TELEGRAM_VISIBLE_PROOF_LABEL,
-        color: TELEGRAM_VISIBLE_PROOF_LABEL_COLOR,
-        description: TELEGRAM_VISIBLE_PROOF_LABEL_DESCRIPTION,
-      },
-      onMutation,
-    );
-  }
   function ensureIdeaArchiveLabel(onMutation?: () => void): void {
     ensureLabelDefinition(
       {
@@ -479,14 +479,6 @@ export function createLabelMutationOperations(
       },
       onMutation,
     );
-  }
-  function missingLabelError(error: unknown, label: string): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return message.includes(`'${label}' not found`) || message.includes(`"${label}" not found`);
-  }
-  function labelCapacityError(error: unknown): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return /labels can have a maximum of 100 labels/i.test(message);
   }
   function tryAddOptionalLabel(options: {
     number: number;
@@ -517,12 +509,6 @@ export function createLabelMutationOperations(
       );
       return false;
     }
-  }
-  function isMissingGitHubLabelErrorForTest(message: string, label: string): boolean {
-    return missingLabelError(new Error(message), label);
-  }
-  function isGitHubLabelCapacityErrorForTest(message: string): boolean {
-    return labelCapacityError(new Error(message));
   }
   function ensureRealBehaviorProofSufficientLabel(onMutation?: () => void): boolean {
     try {
@@ -557,14 +543,58 @@ export function createLabelMutationOperations(
     }
   }
 
+  function syncIntakeLabels(options: {
+    number: number;
+    labels: readonly string[];
+    wanted: readonly string[];
+    dryRun: boolean;
+    onMutation?: (() => void) | undefined;
+  }): { labels: string[]; changed: boolean } {
+    const family = new Set<string>(INTAKE_LABELS);
+    if (options.wanted.some((label) => !family.has(label))) throw new Error("Invalid intake label");
+    const wanted = new Set(options.wanted);
+    let labels = [...options.labels];
+    let changed = false;
+    for (const label of options.labels) {
+      if (!family.has(label.toLowerCase()) || wanted.has(label.toLowerCase())) continue;
+      if (!options.dryRun) removeIssueLabel(options.number, label, options.onMutation);
+      labels = labels.filter((value) => value !== label);
+      changed = true;
+    }
+    for (const label of wanted) {
+      if (labels.some((value) => value.toLowerCase() === label) || labels.length >= 100) continue;
+      if (!options.dryRun) {
+        ensureLabelDefinition(
+          {
+            name: label,
+            color: "c5def5",
+            description: "Preliminary submission classification; full source review pending.",
+          },
+          options.onMutation,
+        );
+        if (
+          !tryAddOptionalLabel({
+            number: options.number,
+            label,
+            currentLabels: labels,
+            onMutation: options.onMutation,
+          })
+        )
+          continue;
+      }
+      labels.push(label);
+      changed = true;
+    }
+    return { labels, changed };
+  }
+
   return {
+    syncIntakeLabels,
     beginIssueLabelMutationBatch,
     discardIssueLabelMutationBatch,
     flushIssueLabelMutationBatch,
     removeIssueLabel,
     addIssueLabel,
-    labelAlreadyExistsError,
-    isGitHubLabelAlreadyExistsErrorForTest,
     ensurePriorityLabel,
     ensureImpactLabel,
     ensureBulkFilerLabel,
@@ -574,14 +604,11 @@ export function createLabelMutationOperations(
     ensurePrRatingLabel,
     ensureFeatureShowcaseLabel,
     ensurePrStatusLabel,
-    ensureTelegramVisibleProofLabel,
     ensureIdeaArchiveLabel,
-    missingLabelError,
-    labelCapacityError,
     tryAddOptionalLabel,
-    isMissingGitHubLabelErrorForTest,
-    isGitHubLabelCapacityErrorForTest,
     ensureRealBehaviorProofSufficientLabel,
     ensureRealBehaviorProofMediaLabel,
   };
 }
+
+export type LabelMutations = ReturnType<typeof createLabelMutationOperations>;

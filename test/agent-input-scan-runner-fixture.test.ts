@@ -57,7 +57,7 @@ function fixture() {
           level: "info-0",
           logger: "trufflehog",
           msg: "finished scanning",
-          trufflehog_version: "3.97.4",
+          trufflehog_version: "3.99.4",
           chunks: 1,
           bytes: 1,
           verified_secrets: rows.filter((r) => (r as typeof finding).Verified).length,

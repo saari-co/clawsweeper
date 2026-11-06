@@ -1,5 +1,6 @@
 import type { CreateApplyDecisionWorkflowDependencies } from "./clawsweeper-apply-dependencies.js";
 import type {
+  ApplyCloseGuardBlock,
   AuthorPrBudgetApplyGate,
   CloseReason,
   Item,
@@ -8,16 +9,17 @@ import type {
   PrCloseCoverageProofGateResult,
 } from "./clawsweeper-types.js";
 import type { PrCloseCoverageProofRuntime } from "./pr-close-coverage-proof.js";
+import { reportReviewDecision } from "./report-review-decision.js";
+import { requiresPrCloseCoverageProof } from "./clawsweeper-policy.js";
 
 type ApplyCandidateGuardDependencies = Pick<
   CreateApplyDecisionWorkflowDependencies,
   | "authorPrBudgetApplyGateSafe"
   | "authorPrBudgetMaxClosesPerRun"
   | "coverageProofRetryExhaustedRuntimeBudget"
-  | "frontMatterValue"
-  | "obsoleteFixPrApplyBlockReasonSafe"
+  | "obsoleteFixPrApplyBlockSafe"
   | "prCloseCoverageProofGateResult"
-  | "staleVersionBugApplyBlockReasonSafe"
+  | "staleVersionBugApplyBlockSafe"
   | "timeoutWithinRuntimeBudget"
 >;
 
@@ -42,10 +44,9 @@ export function createApplyCandidateGuards(
     authorPrBudgetApplyGateSafe,
     authorPrBudgetMaxClosesPerRun,
     coverageProofRetryExhaustedRuntimeBudget,
-    frontMatterValue,
-    obsoleteFixPrApplyBlockReasonSafe,
+    obsoleteFixPrApplyBlockSafe,
     prCloseCoverageProofGateResult,
-    staleVersionBugApplyBlockReasonSafe,
+    staleVersionBugApplyBlockSafe,
     timeoutWithinRuntimeBudget,
   } = dependencies;
   const {
@@ -61,8 +62,8 @@ export function createApplyCandidateGuards(
     startedAtMs,
   } = options;
   let cachedAuthorPrBudgetApplyGate: AuthorPrBudgetApplyGate | undefined;
-  let cachedStaleVersionBugBlockReason: string | null | undefined;
-  let cachedObsoleteFixPrBlockReason: string | null | undefined;
+  let cachedStaleVersionBugBlock: ApplyCloseGuardBlock | null | undefined;
+  let cachedObsoleteFixPrBlock: ApplyCloseGuardBlock | null | undefined;
   const coverageProofState: {
     cachedPrCloseCoverageProofGateResult: PrCloseCoverageProofGateResult | undefined;
     prCloseCoverageProofGateChecked: boolean;
@@ -73,17 +74,17 @@ export function createApplyCandidateGuards(
     prCloseCoverageProofStartedAtMs: null,
   };
 
-  const candidateStaleVersionBugBlockReason = (): string | null => {
-    if (cachedStaleVersionBugBlockReason === undefined) {
-      cachedStaleVersionBugBlockReason = staleVersionBugApplyBlockReasonSafe(number, item);
+  const candidateStaleVersionBugBlock = (): ApplyCloseGuardBlock | null => {
+    if (cachedStaleVersionBugBlock === undefined) {
+      cachedStaleVersionBugBlock = staleVersionBugApplyBlockSafe(number, item);
     }
-    return cachedStaleVersionBugBlockReason;
+    return cachedStaleVersionBugBlock;
   };
-  const candidateObsoleteFixPrBlockReason = (): string | null => {
-    if (cachedObsoleteFixPrBlockReason === undefined) {
-      cachedObsoleteFixPrBlockReason = obsoleteFixPrApplyBlockReasonSafe(number, item);
+  const candidateObsoleteFixPrBlock = (): ApplyCloseGuardBlock | null => {
+    if (cachedObsoleteFixPrBlock === undefined) {
+      cachedObsoleteFixPrBlock = obsoleteFixPrApplyBlockSafe(number, item);
     }
-    return cachedObsoleteFixPrBlockReason;
+    return cachedObsoleteFixPrBlock;
   };
   const currentAuthorPrBudgetApplyGate = (refresh = false): AuthorPrBudgetApplyGate => {
     if (refresh) cachedAuthorPrBudgetApplyGate = undefined;
@@ -131,8 +132,8 @@ export function createApplyCandidateGuards(
     coverageProofState.prCloseCoverageProofGateChecked = true;
     const { closeReason, markdown } = currentDecisionState();
     if (
-      frontMatterValue(markdown, "decision") !== "close" ||
-      closeReason !== "duplicate_or_superseded"
+      reportReviewDecision(markdown).decision !== "close" ||
+      !requiresPrCloseCoverageProof(closeReason)
     ) {
       coverageProofState.cachedPrCloseCoverageProofGateResult = null;
       return null;
@@ -190,9 +191,9 @@ export function createApplyCandidateGuards(
   return {
     coverageProofState,
     currentAuthorPrBudgetApplyGate,
-    candidateObsoleteFixPrBlockReason,
+    candidateObsoleteFixPrBlock,
     currentPrCloseCoverageProofGateBlock,
-    candidateStaleVersionBugBlockReason,
+    candidateStaleVersionBugBlock,
     resetCoverageProof: () => {
       coverageProofState.cachedPrCloseCoverageProofGateResult = undefined;
     },

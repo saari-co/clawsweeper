@@ -18,8 +18,6 @@ branch, not a promise that every method will remain supported.
 | ---------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------- |
 | `/api/health`                            | `ANY`  | Service liveness and deployed source marker from the Worker environment.                             |
 | `/api/exact-review-queue`                | `GET`  | Closed queue aggregates plus a bounded allowlisted public repository/item reference sample.          |
-| `/api/durable-lifecycle-bay`             | `GET`  | Lifecycle inventory, six closed lane counts, and a bounded verified-public item-card sample.         |
-| `/api/live-activity-bay`                 | `GET`  | Five closed live-activity kind counts; fails closed for an incomplete census.                        |
 | `/api/recent-durable-publication-events` | `GET`  | Closed outcome counts in a normalized `6h`, `24h`, or `7d` window.                                   |
 | `/api/exact-review-queue/item`           | `GET`  | Stable aggregate-only unavailable response; does not perform a per-item lookup.                      |
 | `/api/exact-review-queue/reviews`        | `GET`  | Stable empty aggregate-only envelope; ignores identifying query parameters.                          |
@@ -28,7 +26,6 @@ branch, not a promise that every method will remain supported.
 | `/api/review-coverage`                   | `GET`  | Fleet-wide coverage counts; repository rows are retained only in the private store.                  |
 | `/api/apply-observability`               | `GET`  | Global closed apply-lane counts and failure categories without repository or run links.              |
 | `/api/health-history`                    | `GET`  | Historical health from `healthHistoryJson`.                                                          |
-| `/api/automerge-metrics`                 | `GET`  | Global automerge counts, rates, buckets, and outcomes without filters or session rows.               |
 | `/api/reviews`                           | `GET`  | Privacy-filtered review projection limited to verified-public repositories and proof links.          |
 | `/api/status`                            | `ANY`  | Closed status plus bounded allowlisted public references, reprojected on every cache/store boundary. |
 | `/api/triage`                            | `ANY`  | Closed issue-triage view descriptors, bounded counts, and completeness only.                         |
@@ -51,8 +48,24 @@ writer credential.
 
 For egress field interpretation, use
 [GitHub publication egress telemetry](github-egress-telemetry.md). For other
-fields, use [Live dashboard](live-dashboard.md). For the rendered lane model,
-use [OpenClaw Bay](openclaw-bay-demo.md).
+fields, use [Live dashboard](live-dashboard.md).
+
+The publication endpoint's `batch.reason_counts` groups the same retained events
+by outcome (`superseded`, `retryable`, `permanent`) and validated reason code.
+Each outcome includes `unrecorded` for historical or synthesized events without
+a recorded reason. Its reason counts sum to that outcome's count. A null
+breakdown means the breakdown is unavailable; existing outcome totals remain
+valid. These are publication outcome events, not unique reviews or unresolved
+targets. Free-text errors and fingerprints are never public reason labels.
+
+The optional queue `warning_evidence` field adds bounded, allowlisted public
+record evidence for `scanner_refused`, `review_retry_exhausted`, and
+`stale_revision`, plus observed repeated-claim counts/history. It has no new
+route or identifying query parameter. Source candidates are capped at 20 per
+class; public samples at 10, recent claim observations at five per target.
+Every fresh/cache/status projection rechecks repository eligibility and closed
+fields. Missing or malformed evidence is null without changing valid aggregate
+counts. See [agent metrics](agent-performance-metrics.md) for meanings and limits.
 
 Public observer routes are projections, not private-store serializers. Internal
 Durable Object state may retain item keys, repository selectors, workflow/job
@@ -80,12 +93,16 @@ separately authenticated operator surface, which does not currently exist.
 GraphQL enrichment failures, missing enrichment auth, and enrichment truncation
 therefore do not make valid counts incomplete. Label/Search source failures and
 Search budget exhaustion still contribute to `error_count` and keep `complete`
-false. OpenClaw Bay does not consume this route and needs no corresponding change.
+false.
 
 `/api/exact-review-queue` retains closed recovery-reason counts for
 `claim_timeout`, `execution_timeout`, `workflow_cancelled`, and
-`workflow_failed`, but omits per-member, per-target, ownership, fingerprint,
-detail, raw timing, and internal-key records. Bay activity is producer-composed
+`workflow_failed`, review shed counts by `backpressure`, `scheduled_rate`, and
+`unattributed`, and the scheduled admission budget: global and per-lane
+`token_balance` (signed), `burst`, lane `target_rate_per_hour`, and the
+throttle pause timestamps (see [Automation limits](limits.md)). It omits the
+throttle source label, and it omits per-member, per-target, ownership, fingerprint,
+detail, raw timing, and internal-key records. Activity is producer-composed
 from a complete census so queue/live overlap is counted once; incomplete or
 legacy shapes cannot claim a complete activity aggregate. Its optional bounded
 reference sample contains canonical `repository`, positive `item_number`,
@@ -96,7 +113,7 @@ bounded ordered list of fixed step kinds and closed states. A reference may
 carry a separate timing descriptor containing only `kind=queue` with the
 validated queue creation time or `kind=run` with the validated public action
 start time. These clocks are elapsed queue/run context, not inferred visual
-lane-entry times. The same sample feeds Bay and Overview cards, search,
+lane-entry times. The same sample feeds Overview cards, search,
 overflow lists, and detail blades. Queue references may additionally carry
 `review_failure: { stage, reason }`: closed, allowlisted categories from the
 observed failure of that review identity. This is not raw diagnostic text or a
@@ -108,10 +125,7 @@ classification, independently of their current visual stage; absent evidence
 remains an unspecified live workflow. Queue and terminal references do not
 carry this live-only identity. Titles,
 raw step names, source URLs, queries, opaque keys, failure payloads, credentials,
-tokens, and non-allowlisted repositories are not projected. The lifecycle
-route applies the same allowlist to its bounded 24-card sample and retains only
-the item reference, closed lane/state, current-revision boolean, and canonical
-timestamp.
+tokens, and non-allowlisted repositories are not projected.
 
 The queue response also includes `review_failure_health`, a closed one-hour
 aggregate of failed review attempts. It reports retryable and terminal counts,
@@ -120,6 +134,18 @@ first/last timestamps. It never publishes repository, item, run, revision,
 fingerprint, path, detector, or scanner-output detail. The signed operator-only
 `/internal/exact-review/review-failures/list` route retains those bounded
 identities for incident investigation without storing raw failure text.
+
+The optional `review_runaway_health` object is a closed trailing-24-hour alert:
+`status` (`healthy`, `degraded`, or `unknown`), `reason`, `window_hours`,
+`threshold_reviews_per_day`, `runaway_items`, and `sample_item_keys`. New snapshots
+also carry `counting_basis: "claimed_review_runs"`; older snapshots may omit it.
+Claims include cache hits, semantic no-ops, and failures before model execution,
+so this alert does not count model calls. Any other counting basis projects as
+`null`. Samples are
+at most five canonical `owner/repo#number` keys for repositories in
+`PUBLIC_BAY_REPOS`; private-repository runaways are counted but not named, and
+run, revision, and per-item review counts are not projected. A missing or
+malformed object projects as `null`.
 
 The GitHub-egress response exposes only revision-independent closed dimensions
 and sanitized retention watermarks. `query_complete` describes retained

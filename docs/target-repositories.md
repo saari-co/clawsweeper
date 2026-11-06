@@ -28,9 +28,17 @@ entries into `config/target-repositories.json`.
 The JSON file uses the bundled `schema_version` and may contain only
 `repositories` and `generic_fallbacks`. Entries are appended after strict
 validation; an overlay cannot replace a bundled repository or owner fallback.
-The overlay affects repository profile lookup and repair toolchain selection.
+The overlay affects repository profile lookup.
 It does not alter the bundled target inventory, hosted admission registry,
 dashboard targets, scheduled fanout, or apply membership.
+
+These paths govern hosted admission. Offline committed-range review
+(`local-review` and `review --local-range`) also accepts unlisted/private targets
+without changing this configuration or hosted inventory. It selects the local
+identity from `--target-repo`, the existing environment selectors, or the
+checkout's GitHub origin. Known targets keep their full profile guidance;
+unlisted targets use the checkout's own instructions. Every local profile has
+empty close rules. See [local branch review](commit-sweeper.md).
 
 `openclaw/openclaw` remains a built-in profile because it has broader
 auto-close policy. Every other configured profile declares its own issue and PR
@@ -40,14 +48,29 @@ configured profiles allow `implemented_on_main` for issues and PRs, and some
 profiles additionally allow age-gated `mostly_implemented_on_main` for PRs.
 
 Review guidance belongs to the selected profile's `promptNote` in
-`src/repository-profiles.ts` or `config/target-repositories.json`. The production
-prompt assembler selects it with `repositoryProfileFor(item.repo)`, using the
+`src/repository-profiles.ts` or `config/target-repositories.json`; a built-in
+profile can add `kindPromptNotes` for guidance that applies only to issues or
+only to PRs. The production prompt assembler selects them with
+`repositoryProfileFor(item.repo)`, using the
 normalized exact owner/repository, not the organization, display name, PR body,
-linked repository, or author association. The built-in `openclaw/openclaw`
-profile alone supplies its release-owned `CHANGELOG.md` review restriction.
+linked repository, or author association, and renders them as the prompt's
+`Repository Policy` section. The same profile's `apply_close_rules` for the item
+kind select which entries of `prompts/review-close-reasons.md` the prompt shows.
+The built-in `openclaw/openclaw` profile alone supplies its release-owned
+`CHANGELOG.md` review restriction, Telegram proof routing, and maturity-label
+guidance.
 `openclaw/clawsweeper`, ClawHub, and generic targets follow their own release-note
 policies; being a non-core target does not grant contributors or workers
 permission to edit release-owned files.
+
+All profiles share the hidden-payload security guard in
+`src/repair/security-signals.ts`. It checks the raw item body and discussion
+before prompt compaction, inspecting rendered HTML comments for remote shell
+substitution, download-to-shell pipelines, or encoded environment dumps. Visible
+fenced and inline code examples are excluded. A signal becomes a typed security
+review requiring human moderation, P1 (or an existing P0), and `impact:security`;
+it blocks every automatic close reason. Apply also checks current source before
+closing, including paired closes and older proposals without a recorded signal.
 
 OpenClaw’s generated locale PRs are publisher-owned. Automatic apply and repair
 close paths leave PRs open when live GitHub metadata identifies
@@ -73,11 +96,21 @@ preserves the repository's platform-design, IAM, audit, persistence, deployment,
 and integration-proof boundaries, while its baseline repair validation follows
 the target repository's workspace, lint, formatting, OpenAPI, and typecheck
 gates. Issue and pull-request close rules remain empty; enabling the target
-dispatcher does not grant automatic close authority.
+dispatcher does not grant automatic close authority. The profile keeps review
+and read-only comment commands available but rejects issue implementation,
+autofix, automerge, CI/review repair, rebase, and trusted repair/merge automation
+before the router can create a repair job. The repair worker independently
+rechecks the same profile before planning or execution effects, so a job queued
+before the policy changed and a replayed execute job cannot mutate the target.
 
 Repair validation defaults to 480,000 ms per command. Set `validation_timeout_ms`
 in an exact repository entry (or `core_target_overrides`) to override it:
-`openclaw/openclaw` uses 1,500,000 ms (25 minutes) for its cold changed gate.
+`openclaw/openclaw` uses 3,000,000 ms (50 minutes) for its cold changed gate.
+When a change selects every core test graph, that gate typechecks 27 graphs one
+at a time from a cold cache and then runs three Knip dead-export scans. On the
+16-vCPU execution runner (2026-10-03 to 10-09), finished runs took 19 to 24
+minutes before the Knip scans, and slower runners were on pace for up to 36
+minutes. The Knip scans add about 7 to 8 minutes.
 Other repositories retain eight minutes. The repair workflow's optional
 `target_validation_timeout_ms` input takes precedence over the ClawSweeper
 repository variable `CLAWSWEEPER_FIX_TARGET_VALIDATION_TIMEOUT_MS`, then this
@@ -88,16 +121,22 @@ Each top-level validation command receives a fresh budget. OpenClaw's
 stages share that budget. The overall executor budget is the larger of 70 minutes
 and 10 minutes of setup + the configured edit-worker budget + twice the validation
 budget + 10 minutes for review/reporting, capped at 110 minutes. With the default
-30-minute worker budget, OpenClaw receives 100 minutes. An explicit
+30-minute worker budget, OpenClaw receives the 110-minute ceiling. An explicit
 `CLAWSWEEPER_FIX_STEP_TIMEOUT_MS` overrides that derivation within the existing
 15-minute floor and new 110-minute ceiling. Actions resolves the same budget and
-adds two minutes for executor shutdown; the job retains its 120-minute ceiling.
+adds two minutes for executor shutdown. The job allows 130 minutes, so a step at
+that ceiling still leaves time for setup (at most 2.2 minutes measured) and for
+publication and post-flight, whose check wait is capped at 10 minutes.
 Checkout identity proof
 reserves a small part of its budget. The lower-level
 `CLAWSWEEPER_TARGET_VALIDATION_TIMEOUT_MS` can further shorten that budget.
 The repair executor requests OpenClaw's `--timed` summary and records core
 typecheck, core-test typecheck, and core lint durations in Actions logs, including
 successful validation. Other command output is not echoed by this timing logger.
+Outside strict validation, a failed changed gate gets one retry
+(`CLAWSWEEPER_VALIDATION_RETRIES`) inside the same command budget, and only when
+the remaining budget can fit the failed attempt again. Otherwise the executor
+reports that failure, which the issue or repair worker can still fix.
 
 Edit, validation-fix, and review-fix workers run focused checks and return the
 patch for one full executor acceptance pass. Worker claims and shell transcripts
@@ -122,7 +161,7 @@ Dashboard targets are configured separately with `TARGET_REPOS` in
 does not enable any of those surfaces.
 
 `PUBLIC_BAY_REPOS` is a separate public-output allowlist for the minimal
-repository/item reference cards shown by OpenClaw Bay and Overview. Add a
+repository/item reference cards shown by Overview. Add a
 repository only after confirming that it is public and intended to be visible
 on the unauthenticated dashboard. The Worker treats an absent or malformed
 allowlist as empty. Membership does not authorize titles, URLs, queries,
@@ -138,8 +177,7 @@ without a TypeScript change. It is intentionally narrow:
 - denied repositories are rejected
 - scheduled fanout is public-only unless a private state publication path exists
 - auto-close policy comes from that owner fallback
-- `live_test`, when present, is retained for compatibility with historical
-  live-proof records and tooling; automatic review-time live proof is retired
+- `live_test` configuration and its post-review executor are retired
 - generic `openclaw/*` issues can auto-close only for
   `implemented_on_main`; PRs can auto-close for `implemented_on_main` or
   age-gated `mostly_implemented_on_main`
@@ -154,12 +192,12 @@ workflow and GitHub App installation.
 1. Install the ClawSweeper GitHub App on the target repository.
 2. Add or merge the target dispatcher from
    [`docs/target-dispatcher.md`](target-dispatcher.md).
-3. Ensure the target repo can read the org or repo
-   `CLAWSWEEPER_APP_PRIVATE_KEY` secret.
+3. Verify the App receives Issues, Pull requests, and Issue comments webhooks.
+   The target workflow uses OIDC and needs no ClawSweeper secret.
 4. Open, edit, or comment on a target issue/PR and confirm a dispatcher run
    appears in the target repo.
-5. Confirm the receiver run appears in
-   `https://github.com/openclaw/clawsweeper/actions`.
+5. Confirm direct Worker intake succeeds and the queued review appears in
+   `https://github.com/openclaw/clawsweeper/actions`; no relay run is expected.
 6. Confirm the target item gets one durable ClawSweeper review comment.
 
 Add a `config/target-repositories.json` entry when a repository needs explicit
@@ -186,6 +224,6 @@ Batch rollout should use target fanout:
   close policy
 
 If a target dispatch reaches ClawSweeper but receiver token creation fails, the
-App is usually not installed on that target repo. If the target workflow skips
-before dispatch, the target repo usually cannot access
-`CLAWSWEEPER_APP_PRIVATE_KEY`.
+App is usually not installed on that target repo. If the target workflow warns before intake, check its OIDC permission,
+canonical workflow filename, and default-branch ref. The independent App webhook
+route remains enabled; see [failure semantics](target-dispatcher.md#failure-semantics-and-legacy-receivers).

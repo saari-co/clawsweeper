@@ -1,10 +1,11 @@
+import { reviewBodyWithoutPreflight } from "./review-preflight-body.js";
 import { readPrAdmissionInput } from "./clawsweeper-pr-admission-input.js";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { boolArg, itemNumbersArg, numberArg, stringArg } from "./clawsweeper-args.js";
 import { DEFAULT_CODEX_MODEL, DEFAULT_REVIEW_CODEX_TIMEOUT_MS } from "./clawsweeper-policy.js";
 import type { GitInfo } from "./clawsweeper-types.js";
-import { UserFacingCommandError } from "./command.js";
+import { rejectRetiredCodexProfileArgs, UserFacingCommandError } from "./command.js";
 import {
   isolateGitHubConfigDir,
   localReviewAdditionalPrompt,
@@ -12,7 +13,6 @@ import {
 } from "./commit-sweeper.js";
 import type { Args } from "./clawsweeper-args.js";
 import type { CreateReviewCommandWorkflowDependencies } from "./clawsweeper-review-command-dependencies.js";
-import { parsePrCommentActivityRevisionMap } from "./pr-hydration-snapshot.js";
 import {
   EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_BYTES,
   EXACT_REVIEW_FAILURE_DIAGNOSTICS_MAX_FILES,
@@ -20,7 +20,7 @@ import {
 } from "./clawsweeper-review-failure-diagnostics.js";
 import { ReviewSourcePreparationError } from "./review-source-preparation.js";
 import { exactTupleIdentityFromReviewArgs } from "./saari-exact-tuple.js";
-import { validationRecoveryRequired } from "./repair/validation-recovery.js";
+import { validationRecoveryRequired } from "./validation-recovery.js";
 import {
   createTransientReviewOutput,
   createReviewOutputBudget,
@@ -42,10 +42,26 @@ export function isExplicitReviewDispatch(args: Args, hasExplicitItemSelection: b
   return !plannedAutomaticReview && hasExplicitItemSelection;
 }
 
-export function prepareReviewCommand(
-  args: Args,
-  dependencies: CreateReviewCommandWorkflowDependencies,
-) {
+export type PrepareReviewDependencies = Pick<
+  CreateReviewCommandWorkflowDependencies,
+  | "buildLocalRangeReview"
+  | "DEFAULT_PLAN_BATCH_SIZE"
+  | "defaultItemsDir"
+  | "defaultLocalRangeArtifactDir"
+  | "defaultLocalRangeHistoryPath"
+  | "defaultReviewArtifactDir"
+  | "ensureDir"
+  | "localExactReviewItem"
+  | "repoFromArgs"
+  | "reviewCodexForcedLoginMethod"
+  | "reviewPolicyHash"
+  | "suppliedReviewStartLeaseFromArgs"
+  | "targetRepo"
+  | "codexReviewFailureRetryable"
+> &
+  Partial<Pick<CreateReviewCommandWorkflowDependencies, "gitInfo" | "resolveReviewCheckout">>;
+
+export function prepareReviewCommand(args: Args, dependencies: PrepareReviewDependencies) {
   const {
     buildLocalRangeReview,
     DEFAULT_PLAN_BATCH_SIZE,
@@ -64,9 +80,25 @@ export function prepareReviewCommand(
     targetRepo,
   } = dependencies;
 
+  function requireHostedCheckout() {
+    if (!resolveReviewCheckout)
+      throw new UserFacingCommandError(
+        "Hosted checkout preparation is unavailable in local-range review.",
+      );
+    return resolveReviewCheckout;
+  }
+
   const profile = repoFromArgs(args);
   const localRange = boolArg(args.local_range);
   const localOnly = boolArg(args.local_only) || localRange;
+  if (
+    boolArg(args.preflight) &&
+    (!localRange || stringArg(args.result_format, "text") !== "json")
+  ) {
+    throw new UserFacingCommandError(
+      "--preflight requires --local-range and --result-format json.",
+    );
+  }
   const outputSelection = reviewOutputSelection(args, {
     destinationFlag: "artifact_dir",
     hostedEvidenceRequired: !localOnly,
@@ -97,9 +129,6 @@ export function prepareReviewCommand(
     const itemNumbers = hasItemNumbersInput
       ? itemNumbersArg(args.item_numbers, undefined)
       : undefined;
-    const prCommentActivityRevisions = parsePrCommentActivityRevisionMap(
-      stringArg(args.pr_comment_activity_revisions, ""),
-    );
     if (localRange && (itemNumber !== undefined || itemNumbers !== undefined)) {
       throw new UserFacingCommandError(
         "--item-number / --item-numbers cannot be combined with --local-range (local-range reviews " +
@@ -134,17 +163,24 @@ export function prepareReviewCommand(
     const metadataOnly = prAdmissionInput?.admission.admitted === false;
     const checkout = metadataOnly
       ? { openclawDir: checkoutArtifactDir, gitTargetBranch: undefined }
-      : resolveReviewCheckout({
-          args,
-          artifactDir: checkoutArtifactDir,
-          humanLocalReview,
-          itemNumber,
-          itemNumbers,
-          localRange,
-          localOnly,
-          profile,
-          verbose,
-        });
+      : localRange
+        ? {
+            openclawDir: resolve(
+              stringArg(args.target_dir, stringArg(args.openclaw_dir, process.cwd())),
+            ),
+            gitTargetBranch: undefined,
+          }
+        : requireHostedCheckout()({
+            args,
+            artifactDir: checkoutArtifactDir,
+            humanLocalReview,
+            itemNumber,
+            itemNumbers,
+            localRange,
+            localOnly,
+            profile,
+            verbose,
+          });
     const openclawDir = checkout.openclawDir;
     const artifactDir =
       transientOutput?.path ??
@@ -163,11 +199,10 @@ export function prepareReviewCommand(
     const batchSize = numberArg(args.batch_size, DEFAULT_PLAN_BATCH_SIZE);
     const maxPages = numberArg(args.max_pages, 250);
     const model = stringArg(args.codex_model, DEFAULT_CODEX_MODEL);
-    if (args.codex_reasoning_effort !== undefined || args.codex_service_tier !== undefined) {
-      throw new UserFacingCommandError(
-        "--codex-reasoning-effort and --codex-service-tier are retired for item reviews; author association selects the fixed profile.",
-      );
-    }
+    rejectRetiredCodexProfileArgs(
+      args,
+      "item reviews; author association selects the fixed profile",
+    );
     const sandboxMode = stringArg(args.codex_sandbox, "read-only");
     const timeoutMs = numberArg(args.codex_timeout_ms, DEFAULT_REVIEW_CODEX_TIMEOUT_MS);
     const expectedSourceRevision = stringArg(args.expected_source_revision, "").trim();
@@ -190,8 +225,8 @@ export function prepareReviewCommand(
     const allowClosed = boolArg(args.allow_closed);
     const bodyFile = stringArg(args.body_file, "");
     if (bodyFile) {
-      const providedBody = readFileSync(bodyFile, "utf8");
-      additionalPrompt = `${additionalPrompt}\n\n## AUTHORITATIVE PR BODY (review THIS exact body)\nTreat the text below as the pull request's current body/description and review it as such — assess its real-behavior proof, telegram-visible-proof, and mantis recommendation against it. Do NOT fetch, prefer, or assume any other version of the body from the GitHub API. The diff, code, and comments are still the live PR.\n\n----- BEGIN PROVIDED PR BODY -----\n${providedBody}\n----- END PROVIDED PR BODY -----`;
+      const providedBody = reviewBodyWithoutPreflight(readFileSync(bodyFile, "utf8"));
+      additionalPrompt = `${additionalPrompt}\n\n## AUTHORITATIVE PR BODY (review THIS exact body)\nTreat the text below as the pull request's current body/description and review it as such — assess its real-behavior proof against it. Do NOT fetch, prefer, or assume any other version of the body from the GitHub API. The diff, code, and comments are still the live PR.\n\n----- BEGIN PROVIDED PR BODY -----\n${providedBody}\n----- END PROVIDED PR BODY -----`;
     }
     const localRangeData = localRange
       ? buildLocalRangeReview(openclawDir, targetRepo(), stringArg(args.base, ""))
@@ -268,11 +303,16 @@ export function prepareReviewCommand(
         `${targetRepo()}#${exactItemNumber}`.toLowerCase()
         ? ({ repo: targetRepo(), itemKind, itemNumber: exactItemNumber } as const)
         : null;
-    const loadReviewGitInfo = (): GitInfo =>
-      gitInfo(openclawDir, {
+    const loadReviewGitInfo = (): GitInfo => {
+      if (!gitInfo)
+        throw new UserFacingCommandError(
+          "Hosted Git metadata is unavailable in local-range review.",
+        );
+      return gitInfo(openclawDir, {
         ...(checkout.gitTargetBranch ? { targetBranch: checkout.gitTargetBranch } : {}),
         ...(exactReviewIdentity ? { classifyFetchFailure: true } : {}),
       });
+    };
     let git: GitInfo;
     try {
       git = metadataOnly
@@ -341,7 +381,6 @@ export function prepareReviewCommand(
       localOnly,
       itemNumber,
       itemNumbers,
-      prCommentActivityRevisions,
       humanLocalReview,
       openclawDir,
       artifactDir,

@@ -30,10 +30,24 @@ budget:
 | `CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED`      | `false` | Enables live per-author budget closes.               |
 | `CLAWSWEEPER_AUTHOR_PR_BUDGET`                    |      15 | Allowed open PRs per external author and repository. |
 | `CLAWSWEEPER_AUTHOR_PR_BUDGET_MAX_CLOSES_PER_RUN` |       5 | Gradual trim cap per author in one apply run.        |
-| `CLAWSWEEPER_BULK_FILER_THRESHOLD`                |      10 | Recent authored-issue count that marks bulk filing.  |
-| `CLAWSWEEPER_BULK_FILER_WINDOW_DAYS`              |       7 | Lookback window for authored issue filing rate.      |
+| `CLAWSWEEPER_BULK_FILER_THRESHOLD`                |      10 | Recent authored issues after profile exclusions.    |
+| `CLAWSWEEPER_BULK_FILER_WINDOW_DAYS`              |       7 | Lookback window ending at the issue's creation.      |
 | `CLAWSWEEPER_STALE_VERSION_BUG_CLOSE_ENABLED`     | `false` | Enables stale-version bug closes after 120 days.     |
 | `CLAWSWEEPER_OBSOLETE_FIX_PR_CLOSE_ENABLED`       | `false` | Enables obsolete small-fix PR closes after 90 days.  |
+
+The bulk-filer count leaves out issues closed as completed in every repository.
+Only `openclaw/openclaw` also excludes issues currently rated
+`issue-rating: 🦀 challenger crab` or `issue-rating: 🦞 diamond lobster`.
+This opt-in is owned by `src/repository-profiles.ts`; ClawHub and all other
+repository profiles retain completed-only counting while rating stability is
+assessed separately. There is no cross-repository author exemption or shared count.
+Unrated and lower-rated issues still count, including not-planned and duplicate
+issues without either excluded rating. Priority labels do not affect the count.
+This is a per-report exclusion, not an author exemption: a burst of ten unproven
+reports still reaches the threshold. Counts use current ratings and close reasons
+within the fixed filing-time window; a rating crossing the exclusion boundary can
+change the count on a later review. Existing labels are reconciled on that issue's
+next review, not immediately across all of the author's reports.
 
 See [`author-pr-budget-close-policy.md`](author-pr-budget-close-policy.md) for
 the rating, proof, inactivity, engagement, and fail-closed gates.
@@ -85,12 +99,9 @@ It does not alter worker budgets, exact-review admission, or target selection.
 
 ## Derived Limits
 
-Review and existing repair limits are intentionally percentages of
-`workers.max`; imported cluster repair has its own lane knob. With
+Review limits are percentages of `workers.max`, with small fixed floors. With
 `workers.max = 128`, normal and hot intake have configured ceilings of 89 and 44.
-The interactive and expansion reserves leave 104 background slots when
-quiet. Existing repair lanes dispatch 51 live workers by default; imported
-cluster repair dispatches two.
+The interactive and expansion reserves leave 104 background slots when quiet.
 
 | Name                                                | Current | Meaning                                                                               |
 | --------------------------------------------------- | ------: | ------------------------------------------------------------------------------------- |
@@ -102,24 +113,13 @@ cluster repair dispatches two.
 | `review_shards.hot_intake_default`                  |      44 | Quiet-system broad hot-intake review shard ceiling.                                   |
 | `review_shards.exact_item_default`                  |       1 | Exact-item hot-intake shard count.                                                    |
 | `review_shards.hard_cap`                            |     128 | Maximum accepted review shard count.                                                  |
-| `repair_live_runs.default`                          |      51 | Default live repair workflow run cap for manual dispatch/requeue/self-heal.           |
-| `repair_live_runs.hard_cap`                         |     128 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
-| `repair_live_runs.automerge_default`                |      51 | Live repair run cap for automerge comment-router dispatches.                          |
-| `repair_live_runs.issue_implementation_default`     |      51 | Live repair run cap for issue-to-PR implementation intake.                            |
-| `repair_live_runs.cluster_default`                  |       2 | Live repair run cap for imported gitcrawl cluster dispatches.                         |
-| `issue_implementation.dispatches_per_sweep_default` |       5 | Maximum implementation intake jobs queued from one review publish run.                |
 
 Formula summary:
 
 - normal review: 70% of `workers.max`
 - normal active floor: 30% of `workers.max`
 - hot intake: 35% of `workers.max`
-- repair, automerge repair, and issue implementation: 40% of `workers.max`
-- imported cluster repair: `lanes.repair.cluster_max_live_runs`, clamped to
-  `workers.max`
-- issue implementation dispatches per sweep: 4% of `workers.max`
 - review hard caps: `workers.max`
-- repair hard cap: `workers.max`
 
 ## Dynamic Scheduling
 
@@ -132,8 +132,7 @@ rate, backlog, and claim limits own their concurrency.
 The scheduler does this for background lanes:
 
 1. start with `workers.max`
-2. subtract active priority work, currently repair workers plus exact-item sweep
-   runs
+2. subtract active priority work, currently exact-item sweep runs
 3. subtract active background work already known to the workflow, meaning
    other active normal/hot sweep runs
 4. reserve `workers.reserve_for_interactive`
@@ -207,7 +206,31 @@ the cap does not cancel owners or remove pending work. Organic/manual requests
 remain eligible when the scheduled cap is full. The same bound governs admission,
 admissible statistics and next-wake calculation, so held backlog does not cause
 one-second polling. Public `scheduled_feed.max_concurrent` and `active` expose
-only these counts; OpenClaw Bay remains observer-only and needs no new controls.
+these counts; OpenClaw Bay remains observer-only and needs no new controls.
+
+The public `scheduled_feed` also reports the admission budget itself:
+- `burst` and `token_balance` for the global bucket. The balance is negative while organic debt is outstanding, down to `-burst`.
+- `lanes.hot_intake` and `lanes.normal_backfill`, each with `target_rate_per_hour`, `burst` and `token_balance`.
+- `throttle_observed_at` and `throttle_recovery_at` after a review completion has reported a GitHub throttle. Scheduled admission is paused until the recovery time.
+
+`lanes.review.shed_reasons_since_reset` splits review sheds into `backpressure`, `scheduled_rate` and `unattributed`. Together these show whether scheduled backfill is held back by organic debt, by lane rates, by a throttle pause, or by queue backpressure. They are aggregate numbers with no item, repository or credential detail.
+
+Ordinary automatic PR reviews first observe the live head, title, body, and
+draft state, then wait for `EXACT_REVIEW_INITIAL_PR_QUIET_MS` (ten minutes).
+Meaningful changes restart that quiet window, including changes discovered
+without a webhook. Comments and label-only activity do not extend it. There is
+no maximum-wait shortcut: a continuously changing PR waits until it settles.
+Draft-state changes restart the window; existing draft and oversized-PR gates remain in force.
+Explicit review requests bypass this initial hold.
+
+Once a PR has a completed canonical review, ordinary webhooks and scheduled
+hot/normal passes cannot review it again. Request `@clawsweeper re-review` after
+finishing changes. The additive `exact_review_pull_request_answers` table records
+that fact across restarts, report replacement, archive moves, and queue cleanup;
+existing verified canonical reports with retained completion provenance seed it
+on first use. Reports whose old receipts were already pruned remain eligible
+for one fresh answer. Unverified attempts and stale-source requeues do not
+consume the first answer. Issues keep their existing cadence.
 
 Fresh webhook work waits for `EXACT_REVIEW_DISPATCH_DEBOUNCE_MS` (90 seconds by
 default) so rapid edits and pushes coalesce before dispatch. Repeated pending
@@ -235,20 +258,135 @@ ordinary-review one-minute heartbeat plus request/termination time. Oversized
 generation retains its post-generation finalization check rather than an active
 stop loop. Finalization and publication fences remain unchanged. The [startup proof](proof/exact-review-start/README.md)
 records the isolated workflow/process boundary and its limits.
-Explicit command work and publication work bypass the delay.
+Explicit command work and publication work bypass the delay. The PR quiet
+window above takes precedence for ordinary automatic PRs.
+
+Items under active churn wait longer. When an item has already completed
+`EXACT_REVIEW_ACTIVE_ITEM_REVIEW_THRESHOLD` (2 by default) successful review
+generations within the trailing `EXACT_REVIEW_ACTIVE_ITEM_WINDOW_MS` (one hour
+by default), its next organic source revision (a review-triggering issue or pull
+request webhook action such as `synchronize` or `edited`) waits
+`EXACT_REVIEW_ACTIVE_ITEM_DEBOUNCE_MS` (ten minutes by default) from the latest
+pending revision. Further revisions still coalesce into that one pending entry,
+capped at `EXACT_REVIEW_ACTIVE_ITEM_DEBOUNCE_MAX_MS` (15 minutes by default) from
+the first pending enqueue, so a continuously pushed pull request is still
+reviewed. The active delay only ever lengthens the ordinary debounce. A
+superseding event still revokes an in-flight lease immediately; only the next
+dispatch waits. Explicit commands, publication, scheduled intake, repair
+follow-ups, and recovery work keep their existing timing, as do items below the threshold. PR `opened` / `ready_for_review` intake
+can observe live state immediately, but ordinary PR dispatch still waits for
+the initial quiet window above. The queue keeps the completion history in an
+additive `exact_review_queue_review_completions` table keyed by item and
+workflow run, pruned to the window; a store without history behaves as before.
+The next-wake calculation reads the delayed `nextAttemptAt`, so a held item does
+not cause extra polling.
+
 When pending depth reaches
 `EXACT_REVIEW_PENDING_SOFT_LIMIT` (600 by default), new recovery and scheduled
 feed work is shed; this threshold counts review work only, so publication
 backlog cannot consume review admission capacity. Existing items, webhook
-events, commands, and publications remain admitted. The queue reports shed
+events, commands, and publications remain admitted, and so does recovery or
+source-drift work that still carries a command's context, which also passes
+a GitHub throttle window. The queue reports shed
 counts under `lanes.review.shed_reasons_since_reset` and the rolling flow by
 `backpressure` versus `scheduled_rate`; pre-migration totals remain
-`unattributed`. All newly queued review work debits a durable 60-review/hour
-budget with a 6-item burst. Organic work is always admitted and consumes the
-budget first; scheduled work fills the remainder and is split 35% hot intake and
-65% normal backfill so hot churn cannot starve oldest-first coverage. Re-offering an item
+`unattributed`. Executed reviews debit a durable 220-review/hour
+scheduled budget with a 24-item burst. The budget meters started review
+generations, not admissions or claims: a claim records that its claim generation
+owes one token, and the workflow's startup ownership check, immediately before
+Codex generation, sends `generation_start: true` on the lease heartbeat to pay
+it. Organic work therefore consumes the budget first, once per run that actually
+reaches generation. Organic admission itself is free and always admitted. Work
+that never starts generation is never charged: items superseded or coalesced
+before claim, dedupes, items completed at the dispatch-time live check without a
+run, runs that claim and then exit at live-item admission or lose the lease
+during setup, publication work, and acknowledgement-only finalizers. A retried
+generation-start heartbeat for the same claim generation is the same execution;
+a rerun attempt, retry, or requeue that claims and starts again is another
+execution. A scheduled admission debits its token when admitted, because
+admission is where scheduled work is gated, and marks the item prepaid so its
+first started generation is not charged again; later starts of that item are
+charged like organic ones.
+Organic debt carries on the global bucket down to minus the burst, so scheduled
+work is admitted only after that bounded debt is repaid. Further organic debits
+at the floor are forgotten, so this is not a total-work or spend cap. Scheduled work fills
+the remainder through two lane buckets on top of that global bucket:
+`EXACT_REVIEW_HOT_INTAKE_RATE_PER_HOUR` caps hot intake (production sets 30),
+and normal backfill receives the total minus hot, so frequent hot offers cannot
+take the remainder that oldest-first backfill needs. The burst splits 35% hot
+and 65% normal (8 and 16 in production). Re-offering an item
 that is already pending, dispatching, or leased is a semantic dedupe: it does not
 advance the queue revision, revoke a lease, or count as new work.
+
+A source-drift loop breaker bounds automatic re-review. The queue counts
+consecutive `source_drift_requeue` review generations per item in an additive
+`exact_review_queue_source_drift_loops` table, because each completed generation
+deletes the queue item. Once an item has used
+`EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_LIMIT` (production: 3) such generations, the
+next source-drift requeue is not admitted: the item is parked with reason
+`source_drift_loop`, and later automatic requeues are deduped against it with
+`dedupe_scope: source_drift_loop`. The publisher still receives a successful
+dedupe, so the parked item is the only new state. The direct and batch
+publishers both send that requeue as `publisher-source-drift:<producer run
+id>:<attempt>`, so one review generation is requeued at most once. A direct-publication
+completion that owes a lifecycle requeue (`direct_lifecycle_requeue`) creates the
+same automatic generation without `/enqueue`, so it counts and parks the same
+way: below the limit its successor revision is pending; at the limit the
+successor revision is parked with reason `source_drift_loop`, while the
+completed revision keeps its `requeue` lifecycle fact. An organic webhook item action
+(`opened`, `reopened`, `edited`, `synchronize`, `ready_for_review`,
+`converted_to_draft`, `unlocked`, `unlabeled`), an explicit command, a manual
+review, or an operator `recover-fresh` both resets the counter and admits the
+item normally. A scheduled offer whose `sourceUpdatedAt` is later than the park
+releases it for one review generation but does not reset the counter:
+ClawSweeper's own post-review writes, such as lease-comment cleanup and label
+syncs, move `updated_at` and feed hot intake. If that review ends in another
+source-drift requeue, the item re-parks immediately. Older scheduled offers
+dedupe with reason `source_drift_loop`. A source-drift
+requeue that still carries command context continues that command's status
+lifecycle, so it is neither counted nor parked. The parked item spends no review
+capacity, appears under `parked_reasons.source_drift_loop`, is operator-listable
+through the parked-review routes, and still receives the five-minute terminal
+check that removes closed or advanced targets. Set the limit to `0` to disable
+the breaker. A counter idle for seven days expires: the admission lookup treats
+it as absent before the limit check, and parking never refreshes an expired row.
+
+Deterministic no-op holds stop the other observed self-feeding shape without a
+counter. When a review run completes successfully on the guarded locked-conversation
+path, the oversized PR path, or the maintainer-request guard, sweep.yml sends
+`review_hold` (`locked_conversation`, `oversized_pull_request`, or
+`maintainer_request_required`) with the lease completion.
+Without command context, without input that arrived during the lease, and (for
+oversized PRs) with a pinned head, the queue keeps the row parked under that
+reason instead of deleting it. Scheduled offers then dedupe with that
+`dedupe_reason`, automatic recoveries dedupe with `dedupe_scope: review_hold`,
+and neither claims a run, so neither debits the scheduled budget nor counts
+toward `review_runaway_health`. Organic events, commands, manual reviews, the
+parked terminal check, and parked-review fresh recovery release it exactly as
+for `source_drift_loop`. The Worker must recognize a hold reason before a
+workflow sends it; deploy the Worker first when adding a reason. Older workflows
+that omit the field keep the previous behavior.
+
+The queue also applies the maintainer-request hold before dispatch, so the
+common case starts no runner. The live item check that runs before every
+dispatch evaluates the same rule for automatic work (no command, manual request
+or publication). GitHub shows a private org member to the App as `CONTRIBUTOR`,
+so for a `CONTRIBUTOR` author the queue and the webhook gate read the author's
+repository permission (admin or maintain counts as a maintainer, as in the
+runner admission check), cached per author for one hour. A held item parks under
+`maintainer_request_required` exactly as after a skipped run. A failed
+permission read dispatches as before, and the runner check still applies.
+
+The same queue keeps a trailing 24-hour history of claimed review runs per item
+(`exact_review_queue_review_generations`, keyed by item, run ID, and attempt;
+publication and finalizer-only claims are excluded). An item with more than
+`EXACT_REVIEW_RUNAWAY_REVIEWS_PER_DAY` (production: 24) claimed reviews in that
+window is a runaway. `review_runaway_health` reports `degraded` with reason
+`review_runaway`, the runaway count, and up to five verified-public sample keys;
+the dashboard health summary raises it amber. This alert observes; it never
+changes admission. Its `counting_basis: "claimed_review_runs"` includes cache
+hits, semantic no-ops, and failures before model execution; it is not a model-call
+counter.
 
 Exact-review result publication has a separate adaptive Actions lane. Source
 fallback minimum, base, and maximum are 4, 24, and 48; production overrides
@@ -379,7 +517,7 @@ Examples with the current config:
   slots available after reserving 16 for interactive work and 8 for matrix
   expansion. When the queue capacity probe is unavailable, a single-target
   scheduled plan falls back to offering up to 50 candidates to the durable
-  60-review/hour admission target with a 6-item burst instead of starting
+  220-review/hour admission target with a 24-item burst instead of starting
   matrix shards.
 - Four active repair workers and 96 active background workers: normal review gets
   four because `128 - 16 interactive reserve - 8 expansion reserve - 4 priority - 96 background = 4`.
@@ -429,18 +567,9 @@ These limits are owned by `dashboard/exact-review-queue.ts`, implemented in
   default is 10 (clamped 1-1000). The former hardcoded 50 pinned the lane at
   its minimum under hourly rate-limit bursts because the counter resets on
   every failure.
-- `CLAWSWEEPER_MAINTAINER_LOGINS` (comma-separated) supplements the maintainer
-  author-association check in the idea-archive revival watcher — needed where
-  GitHub reports an org owner as `CONTRIBUTOR` on app-operated repositories. A
-  qualifying maintainer or allowlisted author sponsors revival by commenting
-  `@clawsweeper revive` (or `@clawsweeper sponsor`) on the closed issue.
-- `CLAWSWEEPER_IDEA_REVIVAL_REACTIONS` overrides the positive-reaction threshold
-  for reopening an issue parked with `clawsweeper:idea-archive`; the default is 5.
-- `CLAWSWEEPER_IDEA_ARCHIVE_SCAN_PAGES` overrides the bounded created-order scan
-  page count; the default is 5 and the maximum is 10. The watcher first checks
-  the two most recently updated pages for sponsorship commands, then alternates
-  newest/oldest created-order scans. Reaction-only revival can lag in very large
-  archives; raise this override to scan deeper per run.
+- `CLAWSWEEPER_IDEA_REVIVAL_REACTIONS` retains the positive-reaction threshold
+  that prevents closing an old feature request with community traction; the
+  default is 5. It no longer configures an automatic reopening watcher.
 - `REVIEW_PLACEHOLDER_MAX_CHECKS` overrides the number of search candidates
   examined per open and closed state class by each 15-minute
   orphaned-placeholder recovery pass; the default is 20 and the maximum is 1000. Independent durable cursors rotate both state classes so non-actionable
@@ -458,13 +587,36 @@ These limits are owned by `dashboard/exact-review-queue.ts`, implemented in
   for fresh non-command exact-review events.
 - `EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS` overrides the 180,000 ms maximum
   coalescing window measured from the item's first enqueue.
+- `EXACT_REVIEW_ACTIVE_ITEM_REVIEW_THRESHOLD` overrides the two completed review
+  generations (clamped to 1-100) that mark an item as under active churn.
+- `EXACT_REVIEW_ACTIVE_ITEM_WINDOW_MS` overrides the 3,600,000 ms trailing window
+  for counting those completions (at most 24 hours); `0` disables the
+  active-item debounce.
+- `EXACT_REVIEW_ACTIVE_ITEM_DEBOUNCE_MS` overrides the 600,000 ms delay from the
+  latest organic revision of an active item (at most one hour).
+- `EXACT_REVIEW_ACTIVE_ITEM_DEBOUNCE_MAX_MS` overrides the 900,000 ms cap for that
+  delay, measured from the first pending enqueue (at most one hour).
 - `EXACT_REVIEW_PENDING_SOFT_LIMIT` overrides the pending-depth threshold for
   shedding new recovery and scheduled exact-review work; production sets it to 600.
-- `EXACT_REVIEW_TARGET_RATE_PER_HOUR` sets the fleet-wide review
-  admission target; the default is 60, organic reviews consume it first, and
-  the scheduled remainder is split 35/65 between hot intake and normal backfill.
-- `EXACT_REVIEW_TARGET_BURST` bounds the scheduled admission burst; the
-  default is six and uses the same lane split.
+- `EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_LIMIT` sets how many consecutive automatic
+  source-drift review generations an item may use before it parks as
+  `source_drift_loop`; the default and production value is 3, `0` disables the
+  breaker, and the maximum is 100.
+- `EXACT_REVIEW_RUNAWAY_REVIEWS_PER_DAY` sets the claimed-review count per item in
+  a trailing 24 hours above which queue health reports `review_runaway`; the
+  default and production value is 24.
+- `EXACT_REVIEW_TARGET_RATE_PER_HOUR` sets the fleet-wide scheduled admission
+  refill target; the source fallback is 60 and production sets 220. Claimed
+  organic review executions consume it first and may carry debt down to minus
+  the burst; scheduled work fills only the remainder. Unconditional organic work
+  may exceed the target.
+- `EXACT_REVIEW_TARGET_BURST` bounds the admission burst and the organic debt
+  floor; the source fallback is six and production sets 24, split 35/65 between
+  the hot-intake and normal-backfill lane buckets.
+- `EXACT_REVIEW_HOT_INTAKE_RATE_PER_HOUR` caps the hot-intake lane rate
+  (clamped to at least one and below the total); normal backfill receives the
+  total minus hot. When unset or invalid, hot intake keeps 35% of the total.
+  Production sets 30.
 - `EXACT_REVIEW_SCHEDULED_MAX_CONCURRENT` caps active scheduled review owners;
   the source fallback is eight and production sets 32, clamped to the global review capacity.
 - Scheduled planners subtract active and pending review work from the 80-slot
@@ -474,34 +626,5 @@ These limits are owned by `dashboard/exact-review-queue.ts`, implemented in
 - `EXACT_REVIEW_HEARTBEAT_GRACE_MS` overrides the 1,200,000 ms exact-review worker heartbeat
   grace. It is clamped to at least 420,000 ms so a configured grace can never dip
   near the one-minute worker heartbeat interval during scheduler or network stalls.
-- `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=1` enables the scheduled
-  `repair-cluster-intake.yml` imported-cluster intake. Direct repair import and
-  dispatch commands are not blocked by this variable; they keep the existing
-  repair execution gates. The selector model compares live evidence for a batch
-  of unprocessed clusters and chooses one cluster or rejects the batch. Candidate
-  quality is not decided by word lists, scores, or semantic thresholds.
-- `CLAWSWEEPER_CLUSTER_REPAIR_CANDIDATE_BATCH` controls how many unprocessed
-  clusters the scheduled selector model compares. The default is `8`; the model
-  still selects at most one cluster. The upstream gitcrawl-store refreshes every
-  15 minutes. Intake durably publishes the selected job, store identity, the
-  model's per-cluster decisions and rationale, and stable dispatch key before
-  dispatch. Decisions persist in a versioned sidecar so the
-  strict v2 dispatch ledger remains backward-compatible with in-flight readers.
-  Rejected cluster IDs are therefore not offered again on the next store
-  snapshot. A cluster with one live candidate may be offered when its other
-  members provide useful context; the model remains the usefulness judge. The
-  intake owner recovers pending dispatch before accepting new work without
-  duplicating completed worker execution.
-- `CLAWSWEEPER_MAX_LIVE_WORKERS` overrides the `job_intent`-derived repair
-  dispatch cap.
-- `CLAWSWEEPER_AUTOMERGE_MAX_LIVE_WORKERS` overrides
-  `repair_live_runs.automerge_default`.
-- `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS` overrides
-  `repair_live_runs.issue_implementation_default`.
-- `CLAWSWEEPER_AUTO_IMPLEMENT_MAX_DISPATCH_PER_SWEEP` overrides
-  `issue_implementation.dispatches_per_sweep_default`.
-- Each enabled automatic issue intake lane scans durable open reports and
-  dispatches at most `issue_implementation.dispatches_per_sweep_default`
-  candidates per target sweep.
-- Broad `sweep.yml` dispatches use queue-advertised candidate capacity, bounded
+- Broad `review-plan.yml` dispatches use queue-advertised candidate capacity, bounded
   by `review_shards.hard_cap`; there is no per-run shard override.
