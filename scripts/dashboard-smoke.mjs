@@ -6,9 +6,12 @@ import { realpathSync } from "node:fs";
 const cliUrl = process.argv.find((arg, index) => index > 1 && arg !== "--");
 const baseUrl = cliUrl || process.env.CLAWSWEEPER_STATUS_URL || "http://127.0.0.1:8787";
 const expectedDeploySha = String(process.env.CLAWSWEEPER_EXPECTED_DEPLOY_SHA || "").trim();
+// The queue Durable Object can keep serving the previous version for minutes
+// after a deploy (4 min 45 s observed on 2026-10-14), so wait up to 10 minutes.
+const DEFAULT_DEPLOY_READY_TIMEOUT_MS = 600_000;
 const deploymentReadyTimeoutMs = positiveInteger(
   process.env.CLAWSWEEPER_DEPLOY_READY_TIMEOUT_MS,
-  180_000,
+  DEFAULT_DEPLOY_READY_TIMEOUT_MS,
 );
 const deploymentReadyIntervalMs = positiveInteger(
   process.env.CLAWSWEEPER_DEPLOY_READY_INTERVAL_MS,
@@ -30,7 +33,13 @@ async function main() {
     : await fetchJson(`${baseUrl}/api/health`);
   if (health.ok !== true) throw new Error("health endpoint did not return ok");
   const reviewAdmission = expectedDeploySha
-    ? await verifyReviewAdmission(webhookSecret)
+    ? await verifyReviewAdmission({
+        secret: webhookSecret,
+        baseUrl,
+        expectedSha: expectedDeploySha,
+        timeoutMs: deploymentReadyTimeoutMs,
+        intervalMs: deploymentReadyIntervalMs,
+      })
     : { state: "skipped", reason: "no_expected_deployment" };
 
   const statusStartedAt = Date.now();
@@ -68,67 +77,11 @@ async function main() {
     );
   }
 
+  // The overview is the static dashboard-site build, served from Cloudflare Pages by this Worker.
   const html = await fetchText(`${baseUrl}/`);
-  if (!html.includes("ClawSweeper Live")) throw new Error("dashboard HTML title missing");
-  if (!html.includes("System Overview")) throw new Error("dashboard system overview missing");
-  if (!html.includes('id="worker-dialog"')) throw new Error("dashboard worker drill-down missing");
-  if (!html.includes('href="/bay"')) {
-    throw new Error("public Bay route is missing from the overview navigation");
-  }
-
-  const bayResponse = await fetch(`${baseUrl}/bay`);
-  if (!bayResponse.ok) throw new Error(`${baseUrl}/bay returned ${bayResponse.status}`);
-  if (bayResponse.headers.get("cache-control") !== "no-store") {
-    throw new Error("Bay HTML is not marked no-store");
-  }
-  if (bayResponse.headers.get("x-robots-tag") !== null) {
-    throw new Error("public Bay route has an unexpected robots response policy");
-  }
-  const bayCsp = bayResponse.headers.get("content-security-policy") || "";
-  if (
-    !bayCsp.includes("connect-src 'self' https://*.openclaw.ai") ||
-    !bayCsp.includes("frame-ancestors https://team.openclaw.ai;") ||
-    bayResponse.headers.get("x-frame-options") !== null
-  ) {
-    throw new Error("Bay is missing its expected content security policy");
-  }
-  const bayHtml = await bayResponse.text();
-  if (!bayHtml.includes("OpenClaw Bay · ClawSweeper")) {
-    throw new Error("Bay HTML title missing");
-  }
-  if (bayHtml.includes('<meta name="robots"')) {
-    throw new Error("public Bay route has unexpected robots page metadata");
-  }
-  if (!bayHtml.includes('fetch("/api/status"')) {
-    throw new Error("Bay does not use the shared status endpoint");
-  }
-  if (containsDirectGitHubApiUrl(bayHtml)) {
-    throw new Error("Bay contains a direct browser-to-GitHub request");
-  }
-
-  const legacyBay = await fetch(`${baseUrl}/bay-demo?repo=openclaw%2Fopenclaw&q=proof`, {
-    redirect: "manual",
-  });
-  if (!isCanonicalLegacyBayRedirect(legacyBay, baseUrl)) {
-    throw new Error("legacy Bay route did not strip its query in a permanent redirect");
-  }
-
-  const bayAssets = {};
-  for (const asset of [
-    "bay-background.webp",
-    "bay-background-portrait.webp",
-    "crustaceans-atlas.webp",
-    "master-sweeper.webp",
-  ]) {
-    const response = await fetch(`${baseUrl}/bay-assets/${asset}`);
-    if (!response.ok) throw new Error(`${baseUrl}/bay-assets/${asset} returned ${response.status}`);
-    if (response.headers.get("content-type") !== "image/webp") {
-      throw new Error(`${asset} did not return image/webp`);
-    }
-    const bytes = (await response.arrayBuffer()).byteLength;
-    if (bytes < 1_000) throw new Error(`${asset} is unexpectedly small`);
-    bayAssets[asset] = bytes;
-  }
+  if (!html.includes("<title>Overview · ClawSweeper</title>"))
+    throw new Error("dashboard overview title missing");
+  if (!html.includes('href="/queue/"')) throw new Error("dashboard queue page link missing");
 
   console.log(
     JSON.stringify(
@@ -146,13 +99,6 @@ async function main() {
         cache_state: cacheState,
         status_fetch_ms: statusFetchMs,
         diagnostic_errors: status.diagnostics?.errors || [],
-        bay: {
-          route: "/bay",
-          public: true,
-          indexable: true,
-          direct_github_requests: 0,
-          assets: bayAssets,
-        },
       },
       null,
       2,
@@ -160,46 +106,74 @@ async function main() {
   );
 }
 
-async function verifyReviewAdmission(secret) {
+export async function verifyReviewAdmission({
+  secret,
+  baseUrl,
+  expectedSha,
+  timeoutMs = DEFAULT_DEPLOY_READY_TIMEOUT_MS,
+  intervalMs = 5_000,
+  fetchImpl = fetch,
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  now = Date.now,
+}) {
   // Verify the producer contract before a Worker-first rollout can enable new producers.
   // Redirects must never forward the signed request to another endpoint.
   const body = "{}";
-  let response;
-  try {
-    response = await fetch(`${baseUrl}/internal/exact-review/admission-capabilities`, {
-      method: "POST",
-      redirect: "error",
-      signal: AbortSignal.timeout(20_000),
-      headers: {
-        "content-type": "application/json",
-        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
-      },
-      body,
-    });
-  } catch (error) {
-    throw new Error("review admission capability request failed", { cause: error });
+  const deadline = now() + timeoutMs;
+  const timeoutMessage = `review queue deployment ${expectedSha} was not ready within ${timeoutMs}ms`;
+  while (true) {
+    if (now() >= deadline) throw new Error(timeoutMessage);
+    let response;
+    try {
+      response = await fetchImpl(`${baseUrl}/internal/exact-review/admission-capabilities`, {
+        method: "POST",
+        redirect: "error",
+        signal: AbortSignal.timeout(Math.min(20_000, Math.max(1, deadline - now()))),
+        headers: {
+          "content-type": "application/json",
+          "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+        },
+        body,
+      });
+    } catch (error) {
+      throw new Error(
+        now() >= deadline ? timeoutMessage : "review admission capability request failed",
+        { cause: error },
+      );
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`review admission capabilities returned HTTP ${response.status}`);
+    }
+    const capability = await response.json().catch(() => null);
+    const feed = capability?.scheduled_feed;
+    const manual = capability?.manual_publication;
+    if (
+      !Number.isSafeInteger(feed?.target_rate_per_hour) ||
+      feed.target_rate_per_hour <= 0 ||
+      feed.enqueue_replay !== "scheduled_disposition_v1" ||
+      manual?.policy !== "record_comment_only" ||
+      typeof manual.enabled !== "boolean"
+    ) {
+      throw new Error("review admission capability contract is invalid");
+    }
+    // A healthy outer Worker can still call the previous Durable Object version.
+    // Its own deployment identity must match before new producer contracts go live.
+    if (capability.deployment_sha !== expectedSha) {
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) {
+        throw new Error(timeoutMessage);
+      }
+      await sleep(Math.min(intervalMs, remainingMs));
+      continue;
+    }
+    return {
+      state: "verified",
+      deployment_sha: capability.deployment_sha,
+      target_rate_per_hour: feed.target_rate_per_hour,
+      manual_publication_enabled: manual.enabled,
+    };
   }
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
-    throw new Error(`review admission capabilities returned HTTP ${response.status}`);
-  }
-  const capability = await response.json().catch(() => null);
-  const feed = capability?.scheduled_feed;
-  const manual = capability?.manual_publication;
-  if (
-    !Number.isSafeInteger(feed?.target_rate_per_hour) ||
-    feed.target_rate_per_hour <= 0 ||
-    feed.enqueue_replay !== "scheduled_disposition_v1" ||
-    manual?.policy !== "record_comment_only" ||
-    typeof manual.enabled !== "boolean"
-  ) {
-    throw new Error("review admission capability contract is invalid");
-  }
-  return {
-    state: "verified",
-    target_rate_per_hour: feed.target_rate_per_hour,
-    manual_publication_enabled: manual.enabled,
-  };
 }
 
 function validateStatus(status) {
@@ -209,35 +183,16 @@ function validateStatus(status) {
   }
   if (!Array.isArray(status.workers)) throw new Error("status response is missing worker details");
   if (!Array.isArray(status.pipeline)) throw new Error("status response is missing pipeline rows");
-  if (!status.bay || status.bay.tide_threshold !== 20) {
-    throw new Error("status response is missing the bounded Bay tide contract");
-  }
-  if (!Array.isArray(status.bay.terminal_buffer) || !Array.isArray(status.bay.recently_washed)) {
-    throw new Error("status response is missing Bay terminal outcome arrays");
-  }
-  if (
-    status.bay.timings?.sample_kind !== "completed_review_journeys" ||
-    status.bay.timings?.source !== "durable_exact_review_lifecycles" ||
-    status.bay.timings?.completion_source !== "verified_final_review_receipts"
-  ) {
-    throw new Error("status response is missing the durable Bay timing provenance");
-  }
 }
 
 function statusDiagnostic(status, cacheState, statusFetchMs) {
   const complete = status?.public_projection_complete;
   const freshness = status?.freshness?.state;
-  const tide = status?.bay?.tide_threshold;
-  // Match the bounded Bay metric and diagnostic counts; never copy response text.
-  const boundedTide = Number.isSafeInteger(tide) && tide >= 0 && tide <= 100;
   const errorCount = status?.diagnostics?.error_count;
   return {
     projection: complete === true ? "complete" : complete === false ? "unavailable" : "invalid",
     freshness: ["fresh", "stale", "unavailable"].includes(freshness) ? freshness : "invalid",
     cache_state: ["fresh", "stale", "miss"].includes(cacheState) ? cacheState : "unknown",
-    tide:
-      tide === 20 ? "valid" : tide === undefined ? "missing" : boundedTide ? "mismatch" : "invalid",
-    tide_threshold: boundedTide ? tide : null,
     diagnostic_error_count:
       Number.isSafeInteger(errorCount) && errorCount >= 0 && errorCount <= 20 ? errorCount : null,
     status_fetch_ms:
@@ -248,7 +203,7 @@ function statusDiagnostic(status, cacheState, statusFetchMs) {
 export async function waitForDashboardDeployment({
   baseUrl,
   expectedSha,
-  timeoutMs = 180_000,
+  timeoutMs = DEFAULT_DEPLOY_READY_TIMEOUT_MS,
   intervalMs = 5_000,
   fetchImpl = fetch,
   sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
@@ -304,14 +259,6 @@ async function fetchText(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url} returned ${response.status}`);
   return response.text();
-}
-
-export function containsDirectGitHubApiUrl(html) {
-  return /(?:^|[^a-z0-9.-])api\.github\.com\.?(?=$|[^a-z0-9.-])/iu.test(html);
-}
-
-export function isCanonicalLegacyBayRedirect(response, baseUrl) {
-  return response.status === 308 && response.headers.get("location") === `${baseUrl}/bay`;
 }
 
 function positiveInteger(value, fallback) {

@@ -21,6 +21,167 @@ import {
 
 const publicHostedTargetProbe = async () => "public" as const;
 
+test("maintainer item events stay out of the queue and share one opt-in reminder", async (t) => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const comments = new Map<string, Array<{ id: number; body: string; user: { login: string } }>>();
+  const queued: unknown[] = [];
+  const pending: Promise<unknown>[] = [];
+  let posts = 0;
+  const permissionReads: string[] = [];
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens")
+      return jsonResponse({ token: "fixture-token" });
+    const permission = url.pathname.match(
+      /^\/repos\/openclaw\/fs-safe\/collaborators\/([^/]+)\/permission$/,
+    );
+    if (permission) {
+      permissionReads.push(permission[1]!);
+      return jsonResponse({ permission: permission[1] === "private-member" ? "admin" : "read" });
+    }
+    assert.match(url.pathname, /^\/repos\/openclaw\/fs-safe\/issues\/\d+\/comments$/);
+    const existing = comments.get(url.pathname) ?? [];
+    if (init?.method === "POST") {
+      posts += 1;
+      const comment = {
+        id: posts,
+        body: JSON.parse(String(init.body)).body,
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.set(url.pathname, [...existing, comment]);
+      return jsonResponse(comment);
+    }
+    assert.equal(
+      url.searchParams.has("since"),
+      false,
+      "reminders must search the complete history",
+    );
+    return jsonResponse(existing);
+  });
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+    hostedPublicTargetProbe: publicHostedTargetProbe,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace({
+      async fetch(request: Request) {
+        if (new URL(request.url).pathname === "/enqueue") queued.push(await request.json());
+        return jsonResponse({ ok: true, queued: true });
+      },
+    }),
+  };
+  const send = (
+    event: string,
+    action: string,
+    item: Record<string, unknown>,
+    sender = "contributor",
+  ) =>
+    worker.fetch(
+      signedGithubWebhookRequest({
+        event,
+        secret: "test-secret",
+        payload: {
+          action,
+          repository: {
+            full_name: "openclaw/fs-safe",
+            default_branch: "main",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          installation: { id: 123 },
+          sender: { login: sender },
+          [event === "issues" ? "issue" : "pull_request"]: item,
+        },
+      }),
+      env,
+      { waitUntil: (promise: Promise<unknown>) => pending.push(promise) },
+    );
+  const issue = {
+    number: 42,
+    state: "open",
+    locked: false,
+    author_association: "MEMBER",
+    labels: [],
+  };
+  for (const response of await Promise.all([
+    send("issues", "opened", issue),
+    send("issues", "opened", issue),
+  ])) {
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      accepted: false,
+      reason: "maintainer review requires an explicit request",
+    });
+  }
+  await send("issues", "edited", issue);
+  const pull = { ...issue, number: 43, draft: true, head: { sha: "a".repeat(40) } };
+  await send("pull_request", "opened", pull);
+  assert.equal(posts, 1, "draft PRs do not get a reminder");
+  await send("pull_request", "ready_for_review", { ...pull, draft: false });
+  await send("pull_request", "synchronize", { ...pull, draft: false });
+  await send("pull_request", "ready_for_review", { ...pull, draft: false });
+  await Promise.all(pending);
+  assert.equal(posts, 2);
+  assert.deepEqual(queued, []);
+  for (const [url, entries] of comments) {
+    assert.equal(entries.length, 1, url);
+    assert.match(entries[0]!.body, /If a review is required, finish the work and validation first/);
+    assert.match(entries[0]!.body, /`@clawsweeper review`/);
+    assert.match(entries[0]!.body, /agents should not request reviews automatically/);
+    assert.doesNotMatch(entries[0]!.body, /clawsweeper-pr-ack:|review in progress/);
+  }
+  // The item's author determines eligibility, even when a maintainer triggers it.
+  await send(
+    "issues",
+    "opened",
+    { ...issue, number: 44, author_association: "CONTRIBUTOR" },
+    "maintainer",
+  );
+  assert.equal(queued.length, 1);
+  assert.equal(posts, 2);
+  // GitHub shows a private org member to the App as CONTRIBUTOR; repository
+  // permission decides, and one read serves the author's later events.
+  const privateMemberPull = {
+    ...pull,
+    number: 45,
+    draft: false,
+    author_association: "CONTRIBUTOR",
+    user: { login: "private-member" },
+  };
+  for (const action of ["synchronize", "edited"]) {
+    assert.deepEqual(await (await send("pull_request", action, privateMemberPull)).json(), {
+      ok: true,
+      accepted: false,
+      reason: "maintainer review requires an explicit request",
+    });
+  }
+  await send("issues", "opened", {
+    ...issue,
+    number: 46,
+    author_association: "CONTRIBUTOR",
+    user: { login: "outside-author" },
+  });
+  // A maintainer item created from the cutover is queued like any other, with no
+  // permission read and no opt-in reminder.
+  await send("issues", "opened", {
+    ...issue,
+    number: 47,
+    author_association: "MEMBER",
+    created_at: "2026-10-16T00:00:00Z",
+  });
+  await Promise.all(pending);
+  assert.deepEqual(permissionReads, ["private-member", "outside-author"]);
+  assert.equal(queued.length, 3);
+  assert.equal(posts, 2);
+});
+
 function sqlRowCount(storage: MemoryDurableStorage, table: string) {
   return Number(Array.from(storage.sql.exec(`SELECT COUNT(*) AS count FROM ${table}`))[0]?.count);
 }
@@ -439,6 +600,7 @@ test("hosted pull request reservation rechecks visibility before durable authori
       const storage = new MemoryDurableStorage();
       let visibilityProbes = 0;
       let sourceAuthorityCalls = 0;
+      let maintenanceWake: number | null = null;
       let targetCredentialCalls = 0;
       const hostedPublicTargetProbe = async () => {
         visibilityProbes += 1;
@@ -483,11 +645,15 @@ test("hosted pull request reservation rechecks visibility before durable authori
           CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
           hostedPublicTargetProbe,
           EXACT_REVIEW_QUEUE: new MemoryDurableNamespace({
-            fetch: (request: Request) => {
+            fetch: async (request: Request) => {
               if (new URL(request.url).pathname === "/source-authority") {
                 sourceAuthorityCalls += 1;
               }
-              return queue.fetch(request);
+              const result = await queue.fetch(request);
+              if (new URL(request.url).pathname === "/github-read-model/ingest") {
+                maintenanceWake = await storage.getAlarm();
+              }
+              return result;
             },
           }),
         },
@@ -510,7 +676,17 @@ test("hosted pull request reservation rechecks visibility before durable authori
         false,
       );
       assert.equal(storage.rawHas("exact-review-source-authority-sequence:v1"), false);
-      assert.equal(await storage.getAlarm(), null);
+      // Public read-model ingress already owns a future maintenance wake.
+      // Rejected authority must leave that wake and all canonical state alone.
+      assert.ok(maintenanceWake !== null && maintenanceWake > Date.now());
+      assert.deepEqual(
+        Array.from(
+          storage.sql.exec("SELECT payload_retire_at FROM github_webhook_read_model_items_v1"),
+          (row) => Number(row.payload_retire_at),
+        ),
+        [maintenanceWake],
+      );
+      assert.equal(await storage.getAlarm(), maintenanceWake);
       assert.equal(sqlRowCount(storage, "exact_review_queue_deliveries"), 0);
       assert.equal(sqlRowCount(storage, "exact_review_queue_items"), 0);
     }
@@ -625,10 +801,9 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
       response: {
         ok: true,
         accepted: false,
-        reason: "recorded Bay journey completion",
+        reason: "recorded lifecycle acknowledgement",
       },
       lifecycle: "completed",
-      bayPersisted: true,
       finalizerRetained: false,
     },
     {
@@ -643,7 +818,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
         reason: "recorded lifecycle acknowledgement",
       },
       lifecycle: "completed",
-      bayPersisted: false,
       finalizerRetained: false,
     },
     {
@@ -657,10 +831,9 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
       response: {
         ok: true,
         accepted: false,
-        reason: "recorded Bay journey completion",
+        reason: "recorded lifecycle acknowledgement",
       },
       lifecycle: "completed",
-      bayPersisted: true,
       finalizerRetained: false,
     },
     {
@@ -675,7 +848,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
         reason: "private target unsupported",
       },
       lifecycle: "acknowledgement_pending",
-      bayPersisted: false,
       finalizerRetained: false,
     },
     {
@@ -689,7 +861,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
         retryable: true,
       },
       lifecycle: "acknowledgement_pending",
-      bayPersisted: false,
       finalizerRetained: true,
     },
   ] as const;
@@ -815,7 +986,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
     const resultingLifecycle = lifecycleState(
       lifecycle.read(identity.canonicalTargetKey, identity.fenceKey, 1)!,
     );
-    const bayPersisted = (await statusStore.get("openclaw-bay:journey-state:v1")) !== null;
     const finalizerKey = `terminal-finalization:${identity.fenceKey}:${identity.revision}`;
     const queueState = storage.sql.readNormalizedQueue() as {
       items: Record<string, unknown>;
@@ -832,7 +1002,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
         visibility_probes: visibilityProbes,
         acknowledgement_requests: acknowledgementRequests,
         acknowledgement_persisted: resultingLifecycle === "completed",
-        bay_persisted: bayPersisted,
         finalizer_retained: finalizerRetained,
         lifecycle_state: resultingLifecycle,
       }),
@@ -842,7 +1011,6 @@ test("matching bot lifecycle receipts persist only after hosted admission", asyn
     assert.equal(visibilityProbes, 2, entry.name);
     assert.equal(acknowledgementRequests, 1, entry.name);
     assert.equal(resultingLifecycle, entry.lifecycle, entry.name);
-    assert.equal(bayPersisted, entry.bayPersisted, entry.name);
     assert.equal(finalizerRetained, entry.finalizerRetained, entry.name);
   }
 });
@@ -3614,16 +3782,18 @@ test("dashboard shares in-flight GitHub App installation token across parallel r
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  let tokenRequests = 0;
+  const tokenScopes = new Set<string>();
   let badBearer = "";
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     const authorization = String(new Headers(init?.headers).get("authorization") || "");
-    if (url.pathname === "/repos/openclaw/openclaw/installation") {
+    if (url.pathname.endsWith("/installation")) {
       return jsonResponse({ id: 12345 });
     }
     if (url.pathname === "/app/installations/12345/access_tokens") {
-      tokenRequests += 1;
+      const scope = JSON.stringify(JSON.parse(String(init?.body)));
+      assert.equal(tokenScopes.has(scope), false, "parallel reads share only identical scopes");
+      tokenScopes.add(scope);
       await new Promise((resolve) => setTimeout(resolve, 5));
       return jsonResponse({
         token: "installation-token",
@@ -3654,25 +3824,10 @@ test("dashboard shares in-flight GitHub App installation token across parallel r
       },
     );
     assert.equal(response.status, 200);
-    assert.equal(tokenRequests, 1);
+    assert.equal(tokenScopes.size, 3);
     assert.equal(badBearer, "");
   } finally {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
   }
-});
-
-test("dashboard html preserves client compactText regex escapes", async () => {
-  const response = await worker.fetch(new Request("https://example.test/"));
-  const body = await response.text();
-  const match = body.match(/function compactText\(value\) \{[\s\S]*?\n\}/);
-  assert.ok(match, "compactText function should render in dashboard html");
-  const compactText = new Function(`${match[0]}; return compactText;`)() as (
-    value: unknown,
-  ) => string;
-
-  assert.equal(
-    compactText("1234567890abcdef1234567890abcdef\n\t repeated   spaces"),
-    "1234567890 repeated spaces",
-  );
 });

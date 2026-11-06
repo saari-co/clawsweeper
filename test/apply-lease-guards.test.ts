@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { executeApplyClose } from "../dist/clawsweeper-apply-close-execution.js";
 import { createApplyLeaseGuards } from "../dist/clawsweeper-apply-lease-guards.js";
 import { renderReviewStartStatusComment } from "../dist/clawsweeper.js";
+import { reviewReportFrontMatter, withReviewRecord } from "./helpers.ts";
 
 const headSha = "a".repeat(40);
 const leaseOwner = "exact-pr-42";
@@ -27,8 +29,6 @@ const leaseComment = {
 
 function leaseGuards(calls: string[], activityBlock: string | null = null) {
   return createApplyLeaseGuards({
-    asRecord: (value: unknown) =>
-      value && typeof value === "object" && !Array.isArray(value) ? value : {},
     canonicalBoundStaleReviewReason: () => {
       calls.push("canonical");
       return null;
@@ -39,7 +39,6 @@ function leaseGuards(calls: string[], activityBlock: string | null = null) {
       return activityBlock;
     },
     dryRun: false,
-    frontMatterValue: () => undefined,
     getActiveApplyMutationLease: () => ({ itemNumber: 42, lease }),
     ghJson: () => {
       calls.push("pull");
@@ -59,7 +58,6 @@ function leaseGuards(calls: string[], activityBlock: string | null = null) {
     postReviewStartStatusComment: () => ({ status: "posted", lease }),
     reportReviewRevision: headSha,
     requiresApplyMutationLease: true,
-    reviewLeaseRevisionFromReport: () => headSha,
     setActiveApplyMutationLease: () => undefined,
     shouldPreserveReviewStartLease: () => false,
     targetRepo: () => "openclaw/openclaw",
@@ -102,4 +100,104 @@ test("lease acquisition keeps its own review-activity barrier", () => {
     null,
   );
   assert.deepEqual(calls, ["activity", "pull", "comments", "pull", "canonical"]);
+});
+
+// Unknown dependencies fail the test, so the close path uses only the listed fakes.
+function strict<T extends object>(label: string, values: T): T {
+  return new Proxy(values, {
+    get(target, key) {
+      if (key in target) return Reflect.get(target, key);
+      return () => {
+        throw new Error(`unexpected ${label}: ${String(key)}`);
+      };
+    },
+  });
+}
+
+test("apply does not close an item after it loses its lease or is locked during close execution", () => {
+  for (const [name, lostAfterChecks, expectedClosed, locked] of [
+    ["lease held", Infinity, [42], false],
+    ["lease lost after the first check", 1, [], false],
+    // Issues get no closeout comment, so the close guard's live read is the only lock check.
+    ["issue locked after review", Infinity, [], true],
+  ] as const) {
+    const closed: number[] = [];
+    const leaseSkips: string[] = [];
+    const skips: string[] = [];
+    let leaseChecks = 0;
+    let markdown = withReviewRecord(
+      reviewReportFrontMatter({
+        number: 42,
+        type: "issue",
+        item_updated_at: "2026-05-01T00:00:00Z",
+      }),
+      { decision: "close", closeReason: "stale_insufficient_info", closeComment: "Closing." },
+    );
+    executeApplyClose(
+      strict("dependency", {
+        closeReasonEnabled: () => true,
+        ghJson: () => ({ body: "Please help with this issue.", locked }),
+        fetchIssueReviewComments: () => [],
+        implementedOnMainPullRequestProvenanceApplyBlock: () => null,
+        validateCloseDecision: () => ({ ok: true }),
+        closeReasonApplyAgeSkipReason: () => null,
+        issueRecentHumanCommentBlockSafe: () => null,
+        normalizeLabelName: (label: string) => label,
+        resetGuardReadCache: () => undefined,
+        withGuardReadOptions: (_options: unknown, run: () => unknown) => run(),
+        closeItem: ({ number }: { number: number }) => closed.push(number),
+        ensureRuntimeDelayFits: () => undefined,
+        sleepMs: () => undefined,
+      }) as never,
+      strict("option", {
+        applyCloseReasons: null,
+        applyKind: "all",
+        closeReason: "stale_insufficient_info",
+        closeLimitReached: false,
+        requiredMaintainerDecision: null,
+        item: {
+          kind: "issue",
+          number: 42,
+          labels: [],
+          repo: "openclaw/openclaw",
+          authorAssociation: "NONE",
+        },
+        number: 42,
+        repo: "openclaw/openclaw",
+        dryRun: false,
+        isRetryableSkippedClose: false,
+        getMarkdown: () => markdown,
+        setMarkdown: (value: string) => (markdown = value),
+        itemsDir: "items",
+        closedDir: "closed",
+        minAgeMs: 0,
+        minAgeDescription: "0 minutes",
+        staleMinAgeDays: 60,
+        closeDelayMs: 0,
+        reviewComment: "Closing.",
+        emitEventApplyProof: false,
+        postProofCoveringPrFreshnessBlock: () => null,
+        postProofFreshnessBlock: () => null,
+        currentSameAuthorPairBlockReason: () => null,
+        currentObsoleteFixPrBlock: () => null,
+        currentStaleVersionBugBlock: () => null,
+        currentAuthorPrBudgetApplyGate: () => ({ block: null }),
+        setCloseMutationPolicyGuard: () => undefined,
+        currentApplyMutationLeaseBlockReason: () =>
+          ++leaseChecks > lostAfterChecks ? "apply mutation lease is not held" : null,
+        recordReviewLeaseSkip: (reason: string) => (leaseSkips.push(reason), false),
+        markApplySkipped: (action: string) => skips.push(action),
+        archiveClosed: () => undefined,
+        onClosed: () => false,
+        logProgress: () => undefined,
+      }) as never,
+    );
+    assert.deepEqual(closed, expectedClosed, name);
+    assert.deepEqual(
+      leaseSkips,
+      expectedClosed.length || locked ? [] : ["apply mutation lease is not held"],
+      name,
+    );
+    assert.deepEqual(skips, locked ? ["skipped_locked_conversation"] : [], name);
+  }
 });

@@ -1,3 +1,6 @@
+import { BULK_FILED_LABEL } from "./repair/exact-review-guard-labels.js";
+import { parseIsoMs } from "./iso-time.js";
+
 export type SchedulerItemKind = "issue" | "pull_request";
 
 export interface SchedulerItem {
@@ -55,7 +58,6 @@ const DAILY_REVIEW_DAYS = 1;
 const WEEKLY_REVIEW_DAYS = 7;
 export const WEEKLY_COVERAGE_REVIEW_DAYS = 6;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const BULK_FILED_LABEL = "clawsweeper:bulk-filed";
 
 function isBulkFiled(item: SchedulerItem): boolean {
   return item.labels?.some((label) => label.toLowerCase() === BULK_FILED_LABEL) ?? false;
@@ -63,12 +65,6 @@ function isBulkFiled(item: SchedulerItem): boolean {
 
 function bulkFiledComparison(left: SchedulerDueCandidate, right: SchedulerDueCandidate): number {
   return Number(isBulkFiled(left.item)) - Number(isBulkFiled(right.item));
-}
-
-function timestampMs(value: string | undefined): number | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function schedulerItemKey(repo: string, number: number): string {
@@ -161,12 +157,38 @@ export function shouldReviewItem(
   );
 }
 
+/**
+ * The item is due only because GitHub reports activity after the last review:
+ * without that activity its normal cadence would not have come round yet.
+ */
+export function dueOnlyForActivitySinceReview(
+  item: SchedulerItem,
+  review: SchedulerExistingReview | null,
+  now = Date.now(),
+  reviewPolicy?: string,
+): boolean {
+  if (!review || !hasActivitySinceReview(item, review)) return false;
+  if (!shouldReviewItem(item, review, now, reviewPolicy)) return false;
+  const reviewedAt = reviewedAtMs(review);
+  if (reviewedAt === null) return false;
+  const quiet = { ...item, updatedAt: new Date(reviewedAt - 1000).toISOString() };
+  return !shouldReviewItem(quiet, { ...review, itemUpdatedAt: undefined }, now, reviewPolicy);
+}
+
 export const REVIEW_CACHE_MAX_AGE_DAYS = 14;
+// Issue reviews read the target branch, so every target commit changes the exact
+// content digest even when the issue itself is untouched. Busy target branches move
+// several times a day, and each move would buy a full review of every hourly activity
+// item. Target-only drift therefore reuses the prior verdict for the same daily window
+// in which an untouched recent issue is reviewed.
+export const ISSUE_TARGET_DRIFT_REUSE_MS = DAILY_REVIEW_DAYS * DAY_MS;
 
 export function reviewContentCacheHit(options: {
   review: SchedulerExistingReview | null;
   reviewPolicy: string | undefined;
   contentDigest: string;
+  // Current issue content digested against the target SHA of the prior full review.
+  targetDriftContentDigest?: string | null | undefined;
   now?: number;
   explicitDispatch: boolean;
   maintainerRequest: boolean;
@@ -177,11 +199,17 @@ export function reviewContentCacheHit(options: {
   if (review.decision !== "keep_open") return false;
   if (review.lastFullReviewDecision !== "keep_open") return false;
   if (hasReviewPolicyMismatch(review, options.reviewPolicy)) return false;
-  if (!review.contentDigest || review.contentDigest !== options.contentDigest) return false;
-  const lastFullReviewAt = timestampMs(review.lastFullReviewAt);
+  if (!review.contentDigest) return false;
+  const lastFullReviewAt = parseIsoMs(review.lastFullReviewAt);
   if (lastFullReviewAt === null) return false;
   const now = options.now ?? Date.now();
-  return now - lastFullReviewAt < REVIEW_CACHE_MAX_AGE_DAYS * DAY_MS;
+  if (review.contentDigest === options.contentDigest) {
+    return now - lastFullReviewAt < REVIEW_CACHE_MAX_AGE_DAYS * DAY_MS;
+  }
+  return (
+    review.contentDigest === options.targetDriftContentDigest &&
+    now - lastFullReviewAt < ISSUE_TARGET_DRIFT_REUSE_MS
+  );
 }
 
 export function reviewPriority(

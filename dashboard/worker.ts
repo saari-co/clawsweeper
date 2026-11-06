@@ -1,4 +1,10 @@
+import { CENSUS, CENSUS_PATHS, censusSignatureInput } from "../src/review-coverage-census.ts";
+import { publicWarningEvidence } from "./exact-review-warning-evidence.ts";
 import { publicTimestamp } from "./public-timestamp.ts";
+import { writeReviewUsage } from "./review-usage.ts";
+import { isReviewUsageRecord } from "../src/review-usage-contract.ts";
+import { requiresMaintainerReviewRequest } from "../src/maintainer-review-policy.ts";
+import { requiresVerifiedMaintainerReviewRequest } from "./maintainer-author.ts";
 import {
   publicBayActivityKind,
   normalizePublicBayActivityKind,
@@ -10,6 +16,10 @@ import {
 } from "../src/review-failure-explanation.ts";
 import { MAX_TRIAGE_ITEMS_PER_VIEW, publicTriageProjection } from "./public-triage.ts";
 import { githubEtagCacheShard } from "./github-etag-cache.ts";
+import {
+  CLAWSWEEPER_APP_BOT_LOGINS,
+  CLAWSWEEPER_BOT_LOGINS,
+} from "../src/clawsweeper-bot-identity.ts";
 export { GithubEtagCache } from "./github-etag-cache.ts";
 import {
   commandTextForClawSweeperFastAck,
@@ -18,10 +28,14 @@ import {
   reReviewContextFromClawSweeperComment,
 } from "../src/repair/comment-command-text.ts";
 import {
-  authenticateReviewProofProducerToken,
-  reviewProofProducerMatches,
-} from "./review-proof-producer-auth.ts";
+  authenticateTargetDispatchToken,
+  TARGET_DISPATCH_MAX_BODY_BYTES,
+  targetDispatchQueueIntake,
+  targetDispatchCommentIntake,
+  type TargetDispatchIdentity,
+} from "./target-dispatch-ingress.ts";
 import { legacyCommandCommentId } from "../src/repair/command-ack-convergence.ts";
+import { commandAckMarker } from "../src/repair/markers.ts";
 import { directReReviewIntake } from "../src/repair/direct-re-review-admission.ts";
 import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
 import { sha256Hex } from "./exact-review-direct-publication.ts";
@@ -35,16 +49,13 @@ import {
   githubEtagCacheKey,
   githubEtagCacheRequestBody,
 } from "../src/github-etag-cache-contract.ts";
-import { inlineProofParticipation, publicInlineProofCohorts } from "./inline-proof-telemetry.ts";
-import { bayHtml } from "./bay-page.ts";
 import {
-  dashboardHtml,
   issueTriagePageConfig,
   prProofTriagePageConfig,
   triageHtml,
   type DashboardEnv,
 } from "./dashboard-pages.ts";
-import { liveActivityBaySnapshot } from "./live-activity.ts";
+import { dashboardSiteResponse, isDashboardSitePath } from "./dashboard-site.ts";
 import {
   privateUnifiedReviewStatus,
   unifiedReviewHtml,
@@ -53,17 +64,19 @@ import {
 import { summarizeDashboardHealth } from "./dashboard-health.ts";
 import {
   createGithubAppTokenFor,
+  githubAppTokenRequest,
   githubApiUrl,
   githubAppCredentials,
+  GitHubRequestError,
+  githubResponseRateLimited,
+  githubAppInstallationId as typedGithubAppInstallationId,
+  githubAppJson,
   githubAppInstallationIdAsPlainError as githubAppInstallationId,
-  githubAppJsonAsPlainError as githubAppJson,
   signGithubAppJwt,
 } from "./github-api.ts";
 import {
   HEALTH_HISTORY_RETENTION_DAYS,
   HEALTH_HISTORY_SAMPLE_MS,
-  OPERATIONAL_QUEUE_DEGRADED_MS,
-  OPERATIONAL_QUEUE_ZOMBIE_MS,
   exactReviewHistorySample,
   mergeHealthHistorySample,
   normalizeHealthHistorySample,
@@ -102,19 +115,6 @@ import {
   newExactReviewQueueTraceId,
 } from "./exact-review-queue-observability.ts";
 import {
-  AUTOMERGE_METRICS_EVENT_TYPE,
-  AUTOMERGE_METRICS_EVENT_KEY_PREFIX,
-  AUTOMERGE_METRICS_EVENT_ID_KEY_PREFIX,
-  AUTOMERGE_METRICS_EVENT_LIMIT,
-  AUTOMERGE_METRICS_SESSION_CONTEXT_MS,
-  AUTOMERGE_METRICS_STORE_KEY,
-  AUTOMERGE_METRICS_TTL_SECONDS,
-  automergeMetricRange,
-  automergeMetricRangeStart,
-  normalizeAutomergeMetricEvent,
-  summarizeAutomergeMetrics,
-} from "./automerge-metrics.ts";
-import {
   APPLY_OBSERVABILITY_IN_PROGRESS_MAX_SILENCE_MS,
   APPLY_OBSERVABILITY_RANGES,
   APPLY_OBSERVABILITY_RETENTION_MS,
@@ -124,10 +124,10 @@ import {
 } from "./apply-observability.ts";
 import {
   publicApplyObservabilityProjection,
-  publicAutomergeMetricsProjection,
   publicGithubEgressObservabilityProjection,
   publicRecentDurablePublicationEventsProjection,
   publicReviewCoverageProjection,
+  privateReviewCoverageProjection,
   publicReviewObservabilityProjection,
 } from "./public-observability.ts";
 import {
@@ -145,7 +145,6 @@ import {
   type SnapshotUploadOperation,
 } from "./record-snapshot-uploads.ts";
 import {
-  GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS,
   githubWebhookReadModelDeliveryFromWebhook,
   type GithubWebhookReadModelDelivery,
 } from "./github-webhook-read-model.ts";
@@ -163,9 +162,11 @@ export {
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const QUEUED_RUN_STATUSES = new Set(["queued", "waiting", "requested", "pending"]);
-const OPERATIONAL_QUEUED_RUN_STATUSES = new Set(["queued", "requested", "pending"]);
 type DashboardContext = { waitUntil?: (promise: Promise<unknown>) => void };
-type GithubJsonReader = (path: string) => ReturnType<typeof githubJson>;
+type GithubJsonReader = (
+  path: string,
+  options?: { fresh: boolean },
+) => ReturnType<typeof githubJson>;
 type StoredValue = {
   value: string;
   expires_at?: number;
@@ -378,24 +379,15 @@ declare global {
   }
 }
 const ACTIVE_RUN_STATUS_FILTERS = ["in_progress", "queued", "waiting", "requested", "pending"];
+const ACTIVE_RUN_PAGE_LIMIT = 3;
+const GITHUB_ETAG_CACHE_TIMEOUT_MS = 1_000;
 const TERMINAL_BAD_CONCLUSIONS = new Set(["failure", "timed_out", "action_required"]);
 const EVENT_LIMIT = 200;
 const EVENT_STORE_TTL_SECONDS = 7 * 24 * 60 * 60;
-const BAY_TERMINAL_STATE_KEY = "openclaw-bay:terminal-state:v1";
-const BAY_JOURNEY_STATE_KEY = "openclaw-bay:journey-state:v1";
-const BAY_TIDE_THRESHOLD = 20;
-const BAY_SEEN_EVENT_LIMIT = 256;
-const BAY_WASH_VISIBLE_MS = 60_000;
-const BAY_TIMING_WINDOW_MS = 60 * 60 * 1000;
-const BAY_INITIAL_TERMINAL_LOOKBACK_MS = BAY_TIMING_WINDOW_MS;
 const BAY_TIMING_MAX_SAMPLE_MS = 24 * 60 * 60 * 1000;
-const BAY_JOURNEY_LIMIT = 100;
-const BAY_JOURNEY_TTL_SECONDS = 24 * 60 * 60;
-const AVERAGE_LIMIT = 4;
 const RECENT_CLOSED_LIMIT = 8;
 const CLOSED_STATS_HOURS = 24;
 const CLOSED_STATS_PAGE_LIMIT = 10;
-const DEFAULT_CLAWSWEEPER_BOT_LOGINS = ["clawsweeper[bot]", "openclaw-clawsweeper[bot]"];
 const GITHUB_TIMEOUT_MS = 4500;
 const DEFAULT_STALE_QUEUED_WORKFLOW_MS = 6 * 60 * 60 * 1000;
 const HEALTH_HISTORY_TTL_SECONDS = (HEALTH_HISTORY_RETENTION_DAYS + 1) * 24 * 60 * 60;
@@ -406,7 +398,6 @@ const APPLY_OBSERVABILITY_LEGACY_LIMIT = 5_000;
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
 const CLAWSWEEPER_STATE_REPO = "openclaw/clawsweeper-state";
 const CLAWSWEEPER_STATE_REF = "state";
-const CLUSTER_REPAIR_INTAKE_WORKFLOW = "repair-cluster-intake.yml";
 const CLAWSWEEPER_ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const CLAWSWEEPER_ISSUE_ITEM_ACTIONS = new Set([
   "opened",
@@ -468,25 +459,72 @@ class FastAckLookupLimitError extends Error {
   }
 }
 const inFlightFastAcks = new Map();
-let githubReadModelDashboardFallbackReported = false;
 const CLAWSWEEPER_WEBHOOK_DENY_REPOS = new Set(["openclaw/clawsweeper-state", "openclaw/.github"]);
 const OPTIONAL_SECTION_TIMEOUT_MS = 6000;
-// Ten exact reads are two five-way waves: below the 20-second status refresh
-// cadence even at the 4.5-second GitHub timeout, while healing up to 30 rows/minute.
-const STALE_WORKFLOW_HEALTH_RECHECK_BATCH_SIZE = 10;
+// Record the failing owner before projection; upstream messages can contain
+// private routes and must never enter the public status cache.
+const PUBLIC_STATUS_TELEMETRY_ERRORS = new Set([
+  "completed_workflow_runs_unavailable",
+  "active_runs_unavailable",
+  "active_jobs_unavailable",
+  "worker_health_unavailable",
+  "pipeline_unavailable",
+  "apply_health_unavailable",
+  "recent_closed_unavailable",
+  "events_unavailable",
+]);
+const PUBLIC_STATUS_TELEMETRY_CAUSES = new Set([
+  "timeout",
+  "network",
+  "rate_limited",
+  "invalid_json",
+]);
+
+function publicStatusTelemetryError(value: unknown): string {
+  if (typeof value !== "string" || value.length > 96) return "telemetry_unavailable";
+  const [section, cause, extra] = value.split(":");
+  return PUBLIC_STATUS_TELEMETRY_ERRORS.has(section) &&
+    extra === undefined &&
+    (cause === undefined ||
+      PUBLIC_STATUS_TELEMETRY_CAUSES.has(cause) ||
+      /^http_[45]\d{2}$/.test(cause) ||
+      (section === "active_runs_unavailable" && cause === "census_incomplete"))
+    ? value
+    : "telemetry_unavailable";
+}
+
+function statusTelemetryError(section: string, error: unknown): string {
+  // Cached errors are already closed codes. Never recover a cause from an
+  // upstream message: paths, credentials and response text must stay private.
+  if (typeof error === "string" && error.split(":", 1)[0] === section) {
+    if (publicStatusTelemetryError(error) === error) return error;
+  }
+  const cause =
+    error instanceof GitHubRequestError
+      ? error.timedOut
+        ? "timeout"
+        : error.rateLimited
+          ? "rate_limited"
+          : error.status !== undefined
+            ? `http_${error.status}`
+            : "network"
+      : error instanceof DOMException && error.name === "TimeoutError"
+        ? "timeout"
+        : error instanceof SyntaxError
+          ? "invalid_json"
+          : null;
+  const code = cause ? `${section}:${cause}` : section;
+  return publicStatusTelemetryError(code) === code ? code : section;
+}
 const STALE_CACHE_TTL_SECONDS = 900;
 const CI_STATUS_TTL_SECONDS = 7200;
 const WORKER_JOB_CACHE_TTL_SECONDS = 60;
 const WORKER_JOB_IDLE_CACHE_TTL_SECONDS = 10;
 const WORKER_JOB_PAGE_LIMIT = 3;
 const DEFAULT_WORKER_JOB_FETCH_CONCURRENCY = 12;
-// The tide needs 20 distinct terminal items. Sampling exactly 20 runs leaves no
-// room for support/fallback jobs, repeated targets, or still-active items and can
-// strand the tide indefinitely just below its threshold.
-const RECENT_WORKER_HEALTH_RUN_LIMIT = BAY_TIDE_THRESHOLD * 2;
+const RECENT_WORKER_HEALTH_RUN_LIMIT = 40;
 const WORKER_HEALTH_CACHE_TTL_SECONDS = 120;
-// Forty terminal runs still complete in the same two default waves as the
-// former 20-run sample, so the larger tide sample does not outgrow the bounded
+// Forty terminal runs fit in two default fetch waves within the bounded
 // worker-health section budget on ordinary uncached reads.
 const MAX_WORKER_HEALTH_FETCH_CONCURRENCY = 20;
 const DEFAULT_WORKER_HEALTH_FETCH_CONCURRENCY = MAX_WORKER_HEALTH_FETCH_CONCURRENCY;
@@ -529,11 +567,6 @@ export function workerHealthSectionTimeoutMs(
 }
 const WORKER_TARGET_CACHE_TTL_SECONDS = 900;
 const WORKER_TARGET_BATCH_SIZE = 50;
-const AUTOMERGE_CACHE_TTL_SECONDS = 300;
-const AUTOMERGE_REPAIR_WORKFLOW = "repair-cluster-worker.yml";
-const AUTOMERGE_RELIABILITY_RUN_LIMIT = 100;
-const AUTOMERGE_STALLED_AFTER_MS = 90 * 60 * 1000;
-const AUTOMERGE_FAILURE_DISPLAY_LIMIT = 5;
 const RECENT_CLOSED_CACHE_TTL_SECONDS = 300;
 const DEFAULT_WORKER_DETAIL_RUN_LIMIT = 32;
 const SUPPORT_WORKFLOW_NAMES = new Set([
@@ -557,8 +590,6 @@ const PR_PROOF_LABEL_NAMES = [
   "triage: mock-only-proof",
   "proof: sufficient",
   "proof: override",
-  "mantis: telegram-visible-proof",
-  "proof: telegram-e2e",
 ];
 const TRIAGE_VIEWS = [
   {
@@ -649,13 +680,6 @@ const PR_PROOF_VIEWS = [
     itemLimit: 100,
   },
   {
-    id: "telegram-proof",
-    title: "Telegram proof",
-    description: "PRs that need Telegram Test Server proof with the repository E2E skill.",
-    anyLabels: ["mantis: telegram-visible-proof", "proof: telegram-e2e"],
-    itemLimit: 100,
-  },
-  {
     id: "sufficient-with-need-label",
     title: "Sufficient + needs label",
     description:
@@ -665,8 +689,15 @@ const PR_PROOF_VIEWS = [
   },
 ];
 
-let githubAppTokenCache = null;
+// Only settled tokens are shared across requests. Workers cancels a request's
+// I/O when that request ends, so an in-flight mint shared with a later request
+// can never settle and stalls every caller until its deadline. In-flight mints
+// are deduplicated only within one status collection, which owns their I/O.
+const githubAppTokenCache = new Map<string, { token: string; expiresAtMs: number }>();
 let statusRefresh: { key: string; promise: ReturnType<typeof refreshStatusCaches> } | null = null;
+// The body can fail after headers resolve. Retain its actual request signal
+// without keeping completed responses alive or confusing collection cancellation.
+const githubResponseSignals = new WeakMap<Response, AbortSignal | undefined>();
 export const STATUS_REFRESH_TIMEOUT_MS = 18_000;
 type StatusCollectionPhase = "cache" | "refresh" | "github" | "github_auth" | "queue" | "store";
 
@@ -680,6 +711,7 @@ class StatusCollection {
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly cancelled: Promise<never>;
   private readonly pending = new Map<StatusCollectionPhase, number>();
+  readonly githubAppTokenMints = new Map<string, Promise<string>>();
 
   constructor(deadline = Date.now() + STATUS_REFRESH_TIMEOUT_MS) {
     this.deadline = deadline;
@@ -762,6 +794,16 @@ export class StatusStore {
     this.storage = state.storage;
     this.state = state;
     this.env = env;
+    const removeRetiredBayState = () =>
+      Promise.all([
+        this.storage.delete("openclaw-bay:terminal-state:v1"),
+        this.storage.delete("openclaw-bay:journey-state:v1"),
+      ]);
+    if (typeof state.blockConcurrencyWhile === "function") {
+      state.blockConcurrencyWhile(removeRetiredBayState);
+    } else {
+      void removeRetiredBayState();
+    }
   }
 
   async fetch(request: Request) {
@@ -795,46 +837,6 @@ export class StatusStore {
       });
     }
 
-    if (request.method === "GET" && key === AUTOMERGE_METRICS_STORE_KEY) {
-      const now = Date.now();
-      const range = automergeMetricRange(url.searchParams.get("range"));
-      const rangeStart = automergeMetricRangeStart(range, now);
-      const contextStart = rangeStart - AUTOMERGE_METRICS_SESSION_CONTEXT_MS;
-      const upperBound = `${AUTOMERGE_METRICS_EVENT_KEY_PREFIX}${new Date(now).toISOString()}:\uffff`;
-      const entries = (await this.storage.list({
-        prefix: AUTOMERGE_METRICS_EVENT_KEY_PREFIX,
-        start: `${AUTOMERGE_METRICS_EVENT_KEY_PREFIX}${new Date(contextStart).toISOString()}`,
-        end: upperBound,
-        limit: AUTOMERGE_METRICS_EVENT_LIMIT,
-        reverse: false,
-      })) as Map<string, StoredValue>;
-      const events = [];
-      for (const [entryKey, stored] of entries) {
-        if (!entryKey.startsWith(AUTOMERGE_METRICS_EVENT_KEY_PREFIX)) continue;
-        if (stored.expires_at && stored.expires_at <= Date.now()) continue;
-        try {
-          const event = normalizeAutomergeMetricEvent(JSON.parse(stored.value));
-          if (event) events.push(event);
-        } catch {
-          // A malformed isolated event must not hide the rest of the metric history.
-        }
-      }
-      return json(
-        summarizeAutomergeMetrics(
-          { version: 1, telemetry_since: events[0]?.occurred_at ?? null, events },
-          {
-            range,
-            repo: url.searchParams.get("repo"),
-            policyVersion: url.searchParams.get("policy_version"),
-            sessionId: url.searchParams.get("session_id"),
-            activeOnly: url.searchParams.get("active_only") === "true",
-            sessionLimit: Number(url.searchParams.get("session_limit")),
-            now: new Date(now).toISOString(),
-          },
-        ),
-      );
-    }
-
     if (request.method === "GET" && key === "apply-observability") {
       return json(await this.summarizeApplyObservability(url));
     }
@@ -853,71 +855,31 @@ export class StatusStore {
     if (request.method === "PUT") {
       const stored = (await request.json()) as StoredValue;
       if (typeof stored?.value !== "string") return new Response("invalid value", { status: 400 });
+      if (key.startsWith("snapshot:bay-scope:v2:")) {
+        const now = Date.now();
+        const incomingAt = statusPublicationTime(stored.value, now);
+        if (incomingAt === null) return new Response("invalid snapshot", { status: 400 });
+        // Collection completion releases its isolate before publication finishes.
+        // Fence delayed arrivals at the shared SQLite owner, without holding network work.
+        const accepted = this.storage.transactionSync(() => {
+          const current = this.storage.kv.get(key) as StoredValue | undefined;
+          const currentAt =
+            current && (!current.expires_at || current.expires_at > now)
+              ? statusPublicationTime(current.value, now)
+              : null;
+          if (currentAt !== null && incomingAt <= currentAt) return false;
+          this.storage.kv.put(key, stored);
+          return true;
+        });
+        if (accepted && stored.expires_at) await this.scheduleCleanup(stored.expires_at);
+        return new Response(null, {
+          status: 204,
+          headers: { "X-ClawSweeper-Snapshot": accepted ? "accepted" : "retained" },
+        });
+      }
       await this.storage.put(key, stored);
       if (stored.expires_at) await this.scheduleCleanup(stored.expires_at);
       return new Response(null, { status: 204 });
-    }
-
-    if (request.method === "POST" && key === BAY_TERMINAL_STATE_KEY) {
-      const body = await request.json();
-      const current = (await this.storage.get(key)) as StoredValue | undefined;
-      const currentValue =
-        current?.value && (!current.expires_at || current.expires_at > Date.now())
-          ? JSON.parse(current.value)
-          : null;
-      const generatedAt = String(body?.generated_at || new Date().toISOString());
-      const next = mergeBayTerminalState(
-        currentValue,
-        body?.attempts,
-        body?.closed_items,
-        generatedAt,
-        body?.active_item_keys,
-        body?.completed_reviews,
-        body?.completed_reviews_authoritative,
-        body?.active_item_keys_authoritative,
-      );
-      if (
-        currentValue &&
-        bayTerminalStateSignature(currentValue) === bayTerminalStateSignature(next)
-      ) {
-        return json(currentValue);
-      }
-      const expiresAt = Date.now() + numberFrom(body?.ttl_seconds, EVENT_STORE_TTL_SECONDS) * 1000;
-      await this.storage.put(key, {
-        value: JSON.stringify(next),
-        expires_at: expiresAt,
-      });
-      await this.scheduleCleanup(expiresAt);
-      return json(next);
-    }
-
-    if (request.method === "POST" && key === BAY_JOURNEY_STATE_KEY) {
-      const body = await request.json();
-      const current = (await this.storage.get(key)) as StoredValue | undefined;
-      const currentValue =
-        current?.value && (!current.expires_at || current.expires_at > Date.now())
-          ? JSON.parse(current.value)
-          : null;
-      const generatedAt = String(body?.generated_at || new Date().toISOString());
-      const next = mergeBayJourneyState(
-        currentValue,
-        body?.triggers,
-        body?.completions,
-        generatedAt,
-      );
-      if (
-        currentValue &&
-        bayJourneyStateSignature(currentValue) === bayJourneyStateSignature(next)
-      ) {
-        return json(currentValue);
-      }
-      const expiresAt = Date.now() + numberFrom(body?.ttl_seconds, BAY_JOURNEY_TTL_SECONDS) * 1000;
-      await this.storage.put(key, {
-        value: JSON.stringify(next),
-        expires_at: expiresAt,
-      });
-      await this.scheduleCleanup(expiresAt);
-      return json(next);
     }
 
     if (request.method === "POST" && key === "events") {
@@ -936,28 +898,6 @@ export class StatusStore {
       await this.storage.put("events", {
         value: JSON.stringify(events),
         expires_at: expiresAt,
-      });
-      await this.scheduleCleanup(expiresAt);
-      return json({ ok: true });
-    }
-
-    if (request.method === "POST" && key === AUTOMERGE_METRICS_STORE_KEY) {
-      const body = await request.json();
-      const event = normalizeAutomergeMetricEvent(body?.event);
-      if (!event) return new Response("invalid automerge metric event", { status: 400 });
-      const expiresAt = Date.parse(event.occurred_at) + AUTOMERGE_METRICS_TTL_SECONDS * 1000;
-      if (expiresAt <= Date.now()) return json({ ok: true, expired: true });
-      const idKey = `${AUTOMERGE_METRICS_EVENT_ID_KEY_PREFIX}${encodeURIComponent(event.event_id)}`;
-      const existing = (await this.storage.get(idKey)) as StoredValue | undefined;
-      if (existing && (!existing.expires_at || existing.expires_at > Date.now())) {
-        return json({ ok: true, duplicate: true });
-      }
-      const eventKey = `${AUTOMERGE_METRICS_EVENT_KEY_PREFIX}${event.occurred_at}:${encodeURIComponent(event.event_id)}`;
-      // Durable Object multi-key put is atomic, so a retry cannot observe an ID
-      // receipt without its time-ordered event (or vice versa).
-      await this.storage.put({
-        [eventKey]: { value: JSON.stringify(event), expires_at: expiresAt },
-        [idKey]: { value: eventKey, expires_at: expiresAt },
       });
       await this.scheduleCleanup(expiresAt);
       return json({ ok: true });
@@ -1144,6 +1084,21 @@ export default {
     ) {
       return json({ error: "not_found" }, 404);
     }
+    if ((CENSUS_PATHS as readonly string[]).includes(url.pathname)) {
+      const response =
+        request.method !== "POST" || url.search
+          ? json({ error: "invalid_coverage_checkpoint_request" }, 400)
+          : await authenticatedCoverageCheckpoint(request, env);
+      const headers = new Headers(response.headers);
+      for (const key of [
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+      ])
+        headers.delete(key);
+      headers.set("cache-control", "private, no-store");
+      return new Response(response.body, { status: response.status, headers });
+    }
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
     if (url.pathname === "/api/health") {
       return json({
@@ -1158,24 +1113,8 @@ export default {
       return json({ ok: true, service: "clawsweeper-github-webhook" });
     if (url.pathname === "/github/webhook" && request.method === "POST")
       return githubWebhook(request, env, ctx);
-    if (url.pathname === "/internal/exact-review/proof" && request.method === "POST")
-      return reviewProofRequest(request, env);
-    if (url.pathname === "/internal/exact-review/proof/producer" && request.method === "POST")
-      return reviewProofProducerRequest(request, env);
-    if (
-      /^\/internal\/command-proof\/(claim|pending|get|update)$/.test(url.pathname) &&
-      request.method === "POST"
-    ) {
-      const declared = Number(request.headers.get("content-length") || "0");
-      if (declared > 128 * 1024) return json({ error: "proof_request_too_large" }, 413);
-      const body = await boundedCommandProofBody(request);
-      if (body === null) return json({ error: "proof_request_too_large_or_invalid" }, 413);
-      return authenticatedExactReviewQueueRequest(
-        new Request(request, { method: "POST", body }),
-        env,
-        url.pathname.slice("/internal".length),
-      );
-    }
+    if (url.pathname === "/github/target-dispatch" && request.method === "POST")
+      return githubTargetDispatch(request, env, ctx);
     if (url.pathname === "/internal/exact-review/command-intake" && request.method === "POST")
       return authenticatedHostedTargetQueueRequest(request, env, "/command-intake");
     if (
@@ -1189,6 +1128,8 @@ export default {
       return authenticatedHostedTargetQueueRequest(request, env, "/branch-authority");
     if (url.pathname === "/internal/exact-review/source-authority" && request.method === "POST")
       return authenticatedHostedTargetQueueRequest(request, env, "/source-authority");
+    if (url.pathname === "/internal/review-coverage/build" && request.method === "POST")
+      return authenticatedReviewCoverageBuildRead(request, env);
     if (url.pathname === "/internal/review-coverage/inventory" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
     const operationalCursorPath =
@@ -1214,6 +1155,18 @@ export default {
         url.pathname.slice("/internal/state".length),
         canonicalRecordPath[1] === "items",
       );
+    if (
+      url.pathname === "/internal/exact-review/canonical-bodies/maintenance" &&
+      request.method === "POST"
+    )
+      return authenticatedExactReviewQueueRequest(request, env, "/canonical-bodies/maintenance");
+    if (
+      url.pathname === "/internal/exact-review/read-model/compression" &&
+      request.method === "POST"
+    )
+      return authenticatedExactReviewQueueRequest(request, env, "/read-model/compression");
+    if (url.pathname === "/internal/exact-review/storage-stats" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/storage/stats");
     if (url.pathname === "/internal/state/records/slugs" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/slugs");
     if (url.pathname === "/internal/state/records/list" && request.method === "POST")
@@ -1298,21 +1251,6 @@ export default {
       request.method === "POST"
     )
       return authenticatedExactReviewOperatorRequest(request, env, "/lifecycle-audit/inventory");
-    if (
-      url.pathname === "/internal/exact-review/telemetry-reconciliation" &&
-      request.method === "POST"
-    ) {
-      const scope = new URLSearchParams();
-      for (const repository of verifiedPublicBayRepositories(env)) {
-        scope.append("public_repo", repository);
-      }
-      const query = scope.size ? `?${scope.toString()}` : "";
-      return authenticatedExactReviewOperatorRequest(
-        request,
-        env,
-        `/telemetry-reconciliation${query}`,
-      );
-    }
     if (url.pathname === "/internal/exact-review/dead-letters/replay" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/dead-letters/replay");
     if (
@@ -1432,9 +1370,11 @@ export default {
       url.pathname === "/internal/exact-review/lifecycle/command-ack/observed" &&
       request.method === "POST"
     )
-      return authenticatedLifecycleCommandAcknowledgement(request, env, ctx);
+      return authenticatedExactReviewQueueRequest(request, env, "/lifecycle/command-ack/observed");
     if (url.pathname === "/internal/exact-review/review-run-telemetry" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-run-telemetry");
+    if (url.pathname === "/internal/exact-review/review-usage" && request.method === "POST")
+      return authenticatedReviewUsage(request, env);
     if (
       url.pathname === "/internal/exact-review/publication-batches/claim" &&
       request.method === "POST"
@@ -1466,12 +1406,6 @@ export default {
       return authenticatedExactReviewReconcile(request, env);
     if (url.pathname === "/api/exact-review-queue" && request.method === "GET")
       return publicExactReviewQueueJson(env);
-    if (url.pathname === "/api/durable-lifecycle-bay" && request.method === "GET")
-      return durableLifecycleBayJson(request, env, ctx);
-    if (url.pathname === "/api/live-activity-bay" && request.method === "GET")
-      return json({
-        live_activity_bay: await liveActivityBaySnapshotForRequest(request, env, ctx),
-      });
     if (url.pathname === "/api/recent-durable-publication-events" && request.method === "GET")
       return publicRecentDurablePublicationEventsJson(env, url.searchParams);
     if (url.pathname === "/api/exact-review-queue/item" && request.method === "GET")
@@ -1494,8 +1428,6 @@ export default {
       return applyObservabilityJson(request, env);
     if (url.pathname === "/api/health-history" && request.method === "GET")
       return healthHistoryJson(request, env);
-    if (url.pathname === "/api/automerge-metrics" && request.method === "GET")
-      return automergeMetricsJson(request, env);
     if (url.pathname === "/api/reviews" && request.method === "GET")
       return unifiedReviewStatus(request, env);
     if (url.pathname === "/api/private/reviews" && request.method === "GET")
@@ -1504,17 +1436,20 @@ export default {
     if (url.pathname === "/api/triage") return triageJson(request, env, ctx);
     if (url.pathname === "/api/pr-proof-triage") return prProofTriageJson(request, env, ctx);
     if (url.pathname === "/reviews") return html(unifiedReviewHtml("public"));
-    if (url.pathname === "/" || url.pathname === "/index.html")
+    if (
+      (url.pathname === "/" || url.pathname === "/index.html") &&
+      (env.DASHBOARD_HOME === "private-reviews" || env.DASHBOARD_HOME === "reviews")
+    )
       return html(
         env.DASHBOARD_HOME === "private-reviews"
           ? unifiedReviewHtml("private")
-          : env.DASHBOARD_HOME === "reviews"
-            ? unifiedReviewHtml("public")
-            : dashboardHtml(env),
+          : unifiedReviewHtml("public"),
       );
-    if (url.pathname === "/bay") return demoHtml(bayHtml());
-    if (url.pathname === "/bay-demo")
-      return Response.redirect(new URL("/bay", url.origin).toString(), 308);
+    if (
+      (request.method === "GET" || request.method === "HEAD") &&
+      isDashboardSitePath(url.pathname)
+    )
+      return dashboardSiteResponse(request, env);
     if (url.pathname === "/triage" || url.pathname === "/triage.html")
       return html(triageHtml(issueTriagePageConfig()));
     if (url.pathname === "/pr-proof-triage" || url.pathname === "/pr-proof-triage.html")
@@ -1535,19 +1470,38 @@ async function statusJson(request, env, ctx) {
   try {
     const cache = caches.default;
     const publicBayScope = publicBayRepositoryScope(verifiedPublicBayRepositories(env));
-    const cached = await statusOperation(env, "cache", () =>
-      cache.match(statusCacheRequest(request, "fresh", publicBayScope)),
-    );
-    if (cached) {
-      return await statusOperation(env, "cache", () => cachedStatusResponse(cached, "fresh", env));
-    }
-    const stale = await statusOperation(env, "cache", () =>
-      cache.match(statusCacheRequest(request, "stale", publicBayScope)),
-    );
-    if (stale) {
-      staleResponse = await statusOperation(env, "cache", () =>
-        cachedStatusResponse(stale, "stale", env),
+    if (isDurableStatusStore(env.STATUS_STORE)) {
+      const ttl = numberFrom(env.CACHE_TTL_SECONDS, 60);
+      const staleTtl = numberFrom(env.STALE_CACHE_TTL_SECONDS, STALE_CACHE_TTL_SECONDS);
+      const stored = await readCachedSnapshot(env, Math.max(ttl, staleTtl), publicBayScope);
+      if (stored) {
+        const state =
+          Date.now() - Date.parse(stored.generated_at) <= ttl * 1000 ? "fresh" : "stale";
+        const response = statusSnapshotResponse(
+          publicStatusProjection(stored, verifiedPublicBayRepositories(env)),
+          state,
+          env,
+        );
+        if (state === "fresh") return response;
+        staleResponse = response;
+      }
+    } else {
+      const cached = await statusOperation(env, "cache", () =>
+        cache.match(statusCacheRequest(request, "fresh", publicBayScope)),
       );
+      if (cached) {
+        return await statusOperation(env, "cache", () =>
+          cachedStatusResponse(cached, "fresh", env),
+        );
+      }
+      const stale = await statusOperation(env, "cache", () =>
+        cache.match(statusCacheRequest(request, "stale", publicBayScope)),
+      );
+      if (stale) {
+        staleResponse = await statusOperation(env, "cache", () =>
+          cachedStatusResponse(stale, "stale", env),
+        );
+      }
     }
     if (staleResponse && ctx?.waitUntil) {
       refreshStatus(request, env, ctx, collection.deadline).catch(() => undefined);
@@ -1946,6 +1900,7 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "claim_stalled",
   "dispatcher_blocked",
   "dispatcher_paused",
+  "dispatcher_retry_due",
   "claim_delayed",
   "handoff_current",
   "handoff_unknown",
@@ -1973,6 +1928,8 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "review_failure_telemetry_unavailable",
   "review_status_delivery_failed",
   "review_retries_exhausted",
+  "review_runaway",
+  "review_runaway_telemetry_unavailable",
   "workflow_execution_stalled",
   "workflow_execution_degraded",
   "worker_failures_unresolved",
@@ -1993,7 +1950,6 @@ const PUBLIC_STATUS_TEXT_FIELDS = new Set([
   "stage",
   "state",
   "status",
-  "metrics_state",
   "terminal_outcome",
   "work_kind",
   "reasons",
@@ -2013,14 +1969,11 @@ const PUBLIC_STATUS_TIME_FIELDS = new Set([
   "oldest_leased_at",
   "next_attempt_at",
   "next_wake_at",
-  "last_tide_at",
-  "timing_coverage_started_at",
   "window_ended_at",
   "received_at",
   "since",
   "started_at",
   "updated_at",
-  "washed_at",
   "first_seen_at",
   "last_seen_at",
 ]);
@@ -2098,8 +2051,6 @@ const PUBLIC_STATUS_COUNT_FIELDS = new Set([
   "successful_attempts",
   "skipped",
   "skipped_changed_since_review",
-  "tide_generation",
-  "tide_threshold",
   "target_repository_count",
   "total",
   "unresolved_failures",
@@ -2139,7 +2090,6 @@ const PUBLIC_STATUS_COUNT_FIELDS = new Set([
   "scheduled_interval_minutes",
   "target_rate_per_hour",
   "max_concurrent",
-  "terminal_count",
   "total_count",
   "total_duration_ms",
   "ttl_seconds",
@@ -2178,6 +2128,10 @@ const PUBLIC_STATUS_COUNT_FIELDS = new Set([
   "dispatch_rejected",
   "review_retry_exhausted",
   "direct_publication",
+  "source_drift_loop",
+  "locked_conversation",
+  "oversized_pull_request",
+  "maintainer_request_required",
   "claim_timeout",
   "execution_timeout",
   "workflow_cancelled",
@@ -2218,17 +2172,9 @@ const PUBLIC_STATUS_CONTAINER_FIELDS = new Set([
   "steps",
   "timeline",
   "ci",
-  "timings",
   "history",
   "points",
   "overall",
-  "including_legacy_batch",
-  "inline_proof",
-  "requested",
-  "not_requested",
-  "unknown",
-  "terminal_buffer",
-  "recently_washed",
   "cluster_repair",
   "markers",
   "latest_runs",
@@ -2302,7 +2248,6 @@ const PUBLIC_STATUS_BOOLEAN_FIELDS = new Set([
   "public_projection_complete",
   "recovered",
   "telemetry_complete",
-  "timing_coverage_complete",
   "workflow_run_census_complete",
   "durable_server_observed",
   "legacy_batch_path",
@@ -2350,7 +2295,6 @@ const PUBLIC_BAY_ACTIVITY_REFERENCE_LIMIT = 124;
 const PUBLIC_BAY_ITEM_NUMBER_LIMIT = 1_000_000_000;
 const PUBLIC_BAY_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const PUBLIC_BAY_REFERENCE_SOURCES = new Set(["queue", "live"]);
-const PUBLIC_BAY_OUTCOMES = new Set(["success", "failure", "cancelled"]);
 const PUBLIC_BAY_ACTION_CONCLUSIONS = new Set([
   "success",
   "failure",
@@ -2696,61 +2640,6 @@ function publicBayReferences(
     references.push(reference);
   }
   return references;
-}
-
-function publicBayTerminalOutcome(value, allowedRepositories: ReadonlySet<string>) {
-  const source = objectValue(value);
-  const outcome = typeof source.outcome === "string" ? source.outcome : "";
-  if (!PUBLIC_BAY_OUTCOMES.has(outcome)) return null;
-  const explicitRepository = typeof source.repository === "string" ? source.repository.trim() : "";
-  const explicitNumber = source.item_number ?? source.number;
-  const journeyDuration = source.journey_duration_ms;
-  const legacyBatchPath = source.legacy_batch_path;
-  const itemKey = typeof source.item_key === "string" ? source.item_key.trim() : "";
-  const keyMatch = itemKey.match(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)$/);
-  const repository = explicitRepository || keyMatch?.[1] || "";
-  const itemNumber = explicitNumber ?? (keyMatch ? Number(keyMatch[2]) : Number.NaN);
-  const explicitMatchesKey =
-    !keyMatch ||
-    (repository.toLowerCase() === keyMatch[1].toLowerCase() && itemNumber === Number(keyMatch[2]));
-  if (
-    explicitMatchesKey &&
-    PUBLIC_BAY_REPOSITORY_PATTERN.test(repository) &&
-    typeof itemNumber === "number" &&
-    Number.isSafeInteger(itemNumber) &&
-    itemNumber > 0 &&
-    itemNumber <= PUBLIC_BAY_ITEM_NUMBER_LIMIT &&
-    (legacyBatchPath === undefined || typeof legacyBatchPath === "boolean")
-  ) {
-    const canonicalRepository = repository.toLowerCase();
-    if (allowedRepositories.has(canonicalRepository)) {
-      if (
-        !Number.isSafeInteger(journeyDuration) ||
-        journeyDuration < 0 ||
-        journeyDuration > 24 * 60 * 60 * 1000
-      ) {
-        return { outcome };
-      }
-      const action = publicBayActionFromWorker(
-        { ...source, status: "completed", run_url: source.run_url ?? source.job_url },
-        allowedRepositories,
-      );
-      return {
-        repository: canonicalRepository,
-        item_number: itemNumber,
-        outcome,
-        journey_duration_ms: journeyDuration,
-        legacy_batch_path: legacyBatchPath === true,
-        ...(action ? { action } : {}),
-      };
-    }
-  }
-  return { outcome };
-}
-
-function publicBayTerminalOutcomes(value, limit, allowedRepositories: ReadonlySet<string>) {
-  if (!Array.isArray(value) || value.length > limit) return [];
-  return value.map((entry) => publicBayTerminalOutcome(entry, allowedRepositories)).filter(Boolean);
 }
 
 function publicBayActivity(value, allowedRepositories: ReadonlySet<string>) {
@@ -3292,7 +3181,6 @@ function unavailablePublicStatusProjection() {
       budget_used_percent: 0,
     },
     workers: [],
-    automatic_work: [],
     pipeline: [],
     bay: {},
     recent: {},
@@ -3335,11 +3223,7 @@ export function publicStatusProjection(
     typeof snapshot.fleet !== "object" ||
     Array.isArray(snapshot.fleet) ||
     !Array.isArray(snapshot.workers) ||
-    !Array.isArray(snapshot.automatic_work) ||
     !Array.isArray(snapshot.pipeline) ||
-    !snapshot.bay ||
-    typeof snapshot.bay !== "object" ||
-    Array.isArray(snapshot.bay) ||
     !snapshot.diagnostics ||
     typeof snapshot.diagnostics !== "object" ||
     Array.isArray(snapshot.diagnostics) ||
@@ -3353,35 +3237,7 @@ export function publicStatusProjection(
     const stage = publicWorkerBayStage(worker);
     return { ...objectValue(worker), ...(stage ? { stage } : {}) };
   });
-  const rawSourceBay = objectValue(source.bay);
-  const rawTimings = objectValue(rawSourceBay.timings);
-  const rawAllTimings = objectValue(rawTimings.including_legacy_batch);
-  const withInlineProof = (timing) => ({
-    ...timing,
-    ...(timing.inline_proof === undefined
-      ? {}
-      : {
-          inline_proof: publicInlineProofCohorts(
-            timing.inline_proof,
-            objectValue(timing.overall).samples,
-          ),
-        }),
-  });
-  const sourceBay = {
-    ...rawSourceBay,
-    ...(rawSourceBay.timings === undefined
-      ? {}
-      : {
-          timings: {
-            ...withInlineProof(rawTimings),
-            ...(rawTimings.including_legacy_batch === undefined
-              ? {}
-              : {
-                  including_legacy_batch: withInlineProof(rawAllTimings),
-                }),
-          },
-        }),
-  };
+  const sourceBay = objectValue(source.bay);
   const derivedActiveTargets = publicBayActiveTargets(
     sourceWorkers || [],
     sourceBay.active_census_complete === true,
@@ -3408,17 +3264,11 @@ export function publicStatusProjection(
   const projectionSource = {
     ...source,
     public_projection_complete: true,
-    ...(source.bay ? { bay: sourceBay } : {}),
     ...(projectedWorkers ? { workers: projectedWorkers } : {}),
-    ...(sourceWorkers || Object.prototype.hasOwnProperty.call(sourceBay, "active_stages")
-      ? {
-          bay: {
-            ...sourceBay,
-            active_census_complete: effectiveActiveCensusComplete,
-            active_stages: activeStages,
-          },
-        }
-      : {}),
+    bay: {
+      active_census_complete: effectiveActiveCensusComplete,
+      active_stages: activeStages,
+    },
     ...(hasExactReviewQueueObject
       ? {
           exact_review_queue: publicExactReviewQueueProjection(
@@ -3444,26 +3294,12 @@ export function publicStatusProjection(
   const errorCount = Math.max(declaredErrorCount, Math.min(sourceErrors.length, 20));
   document.diagnostics = {
     ...diagnostics,
-    // Keep a bounded incomplete-telemetry signal without retaining upstream text.
-    errors: Array.from({ length: Math.min(errorCount, 20) }, () => "telemetry_unavailable"),
+    // Only producer-owned codes survive repeated projection and durable caching.
+    errors: Array.from({ length: errorCount }, (_, index) =>
+      publicStatusTelemetryError(sourceErrors[index]),
+    ),
     error_count: errorCount,
   };
-  const documentBay = objectValue(document.bay);
-  if (Array.isArray(sourceBay.terminal_buffer)) {
-    documentBay.terminal_buffer = publicBayTerminalOutcomes(
-      sourceBay.terminal_buffer,
-      100,
-      allowedRepositories,
-    );
-  }
-  if (Array.isArray(sourceBay.recently_washed)) {
-    documentBay.recently_washed = publicBayTerminalOutcomes(
-      sourceBay.recently_washed,
-      100,
-      allowedRepositories,
-    );
-  }
-  document.bay = documentBay;
   if (hasExactReviewQueueObject) {
     // The dedicated queue projector owns its closed fields. A second generic
     // allowlist can drop reason counts and make a cached valid queue malformed.
@@ -3613,7 +3449,6 @@ function refreshStatus(request, env, ctx?: DashboardContext, deadline?: number) 
   const key = [
     new URL(request.url).origin,
     env.CLAWSWEEPER_REPO || "openclaw/clawsweeper",
-    dashboardWorkflowSource(env),
     env.TARGET_REPOS || "openclaw/openclaw",
     env.PUBLIC_BAY_REPOS || "",
     env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO,
@@ -3668,27 +3503,31 @@ async function refreshStatusCaches(request, env, ctx?: DashboardContext) {
   // Final publication is best-effort and only uses a terminal, usable body.
   // Request cancellation must not leave process-global state blocking later writes.
   if (!looksEmpty) {
-    const writes = [
-      caches.default.put(
-        statusCacheRequest(request, "fresh", publicBayScope),
-        new Response(body, {
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "cache-control": `public, max-age=${ttl}`,
-          },
-        }),
-      ),
-      caches.default.put(
-        statusCacheRequest(request, "stale", publicBayScope),
-        new Response(body, {
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "cache-control": `public, max-age=${staleTtl}`,
-          },
-        }),
-      ),
-    ];
-    if (env.STATUS_STORE) {
+    // Edge caches cannot conditionally replace a body. A durable binding owns
+    // both publication and reads, so an old edge PUT cannot bypass its fence.
+    const writes = isDurableStatusStore(env.STATUS_STORE)
+      ? [writeCachedStatusSnapshot(env.STATUS_STORE, body, publicBayScope)]
+      : [
+          caches.default.put(
+            statusCacheRequest(request, "fresh", publicBayScope),
+            new Response(body, {
+              headers: {
+                "content-type": "application/json; charset=utf-8",
+                "cache-control": `public, max-age=${ttl}`,
+              },
+            }),
+          ),
+          caches.default.put(
+            statusCacheRequest(request, "stale", publicBayScope),
+            new Response(body, {
+              headers: {
+                "content-type": "application/json; charset=utf-8",
+                "cache-control": `public, max-age=${staleTtl}`,
+              },
+            }),
+          ),
+        ];
+    if (env.STATUS_STORE && !isDurableStatusStore(env.STATUS_STORE)) {
       writes.push(writeCachedStatusSnapshot(env.STATUS_STORE, body, publicBayScope));
     }
     const persistence = Promise.allSettled(writes);
@@ -3699,7 +3538,7 @@ async function refreshStatusCaches(request, env, ctx?: DashboardContext) {
 
 function statusCacheRequest(request, bucket, publicBayScope) {
   const scope = publicBayScope ? encodeURIComponent(publicBayScope) : "_";
-  return new Request(new URL(`/api/status-cache/v7/${scope}/${bucket}`, request.url).toString(), {
+  return new Request(new URL(`/api/status-cache/v8/${scope}/${bucket}`, request.url).toString(), {
     method: "GET",
   });
 }
@@ -3867,51 +3706,15 @@ async function ingestEvent(request, env) {
   if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) return json({ error: "unauthorized" }, 401);
   const body = await request.json().catch(() => null);
   if (!body || typeof body !== "object") return json({ error: "invalid_json" }, 400);
-  let metricEvent = null;
-  if (body.event_type === AUTOMERGE_METRICS_EVENT_TYPE) {
-    metricEvent = normalizeAutomergeMetricEvent(body);
-    if (!metricEvent) return json({ error: "invalid_automerge_metric_event" }, 400);
-    if (!isDurableStatusStore(env.STATUS_STORE)) {
-      return json({ error: "automerge_metrics_store_unavailable" }, 503);
-    }
-  }
   const event = normalizeEvent(body);
   const writes = [
     prependStoredEvent(env, event),
     writeStoredJson(env, "latest-event", event, EVENT_STORE_TTL_SECONDS),
   ];
-  if (metricEvent) writes.push(storeAutomergeMetricEvent(env, metricEvent));
   const ci = normalizeCiStatus(body);
   if (ci) writes.push(writeCiStatus(env, ci));
   await Promise.all(writes);
   return json({ ok: true, event });
-}
-
-async function automergeMetricsJson(request, env) {
-  const url = new URL(request.url);
-  if (!isDurableStatusStore(env.STATUS_STORE)) {
-    return json({ error: "automerge_metrics_store_unavailable" }, 503);
-  }
-  const storeUrl = new URL(statusStoreRequest(AUTOMERGE_METRICS_STORE_KEY).url);
-  storeUrl.searchParams.set("range", publicReviewRange(url.searchParams));
-  try {
-    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(new Request(storeUrl));
-    if (!response.ok) return json({ error: "automerge_metrics_unavailable" }, 503);
-    const projection = publicAutomergeMetricsProjection(await response.json().catch(() => null));
-    return projection ? json(projection) : json({ error: "automerge_metrics_unavailable" }, 503);
-  } catch {
-    return json({ error: "automerge_metrics_unavailable" }, 503);
-  }
-}
-
-async function storeAutomergeMetricEvent(env, event) {
-  const store = env.STATUS_STORE;
-  if (!isDurableStatusStore(store)) throw new Error("automerge metrics require durable storage");
-  const response = await durableStatusStoreStub(store).fetch(
-    statusStoreRequest(AUTOMERGE_METRICS_STORE_KEY, "POST"),
-    { method: "POST", body: JSON.stringify({ event }) },
-  );
-  if (!response.ok) throw new Error(`automerge metric write failed: ${response.status}`);
 }
 
 async function githubWebhook(request, env, ctx) {
@@ -3970,20 +3773,12 @@ async function githubWebhook(request, env, ctx) {
     return hostedTargetProbeResponse(admission);
   }
 
-  const completion = bayJourneyCompletionFromGithubWebhook({
+  const acknowledgement = lifecycleCommandAcknowledgementFromGithubWebhook({
     event,
     payload,
     env,
     hostedTargetEligible: true,
   });
-  const acknowledgement =
-    completion ??
-    lifecycleCommandAcknowledgementFromGithubWebhook({
-      event,
-      payload,
-      env,
-      hostedTargetEligible: true,
-    });
   if (acknowledgement) {
     const acknowledgementResult = await recordLifecycleCommandAcknowledgement(env, acknowledgement);
     if ("admission" in acknowledgementResult) {
@@ -3997,13 +3792,7 @@ async function githubWebhook(request, env, ctx) {
         202,
       );
     }
-    return recordedLifecycleAcknowledgementResponse({
-      env,
-      ctx,
-      completion,
-      acknowledgement,
-      acknowledgementResult,
-    });
+    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
   }
 
   let readModelMaterialized = false;
@@ -4043,6 +3832,35 @@ async function githubWebhook(request, env, ctx) {
   }
 
   if ("type" in decision && decision.type === "item") {
+    const source = objectValue(payload.pull_request || payload.issue);
+    if (
+      await requiresVerifiedMaintainerReviewRequest(decision.targetRepo, source, async (author) =>
+        githubTokenJson({
+          env,
+          token: stringEnv(env.GITHUB_TOKEN) || (await authorPermissionToken(env, decision)),
+          path: `/repos/${decision.targetRepo}/collaborators/${author}/permission`,
+          body: undefined,
+          errorLabel: "author repository permission",
+        }),
+      )
+    ) {
+      if (
+        ["opened", "ready_for_review"].includes(decision.sourceAction) &&
+        source.draft !== true &&
+        source.locked !== true &&
+        source.state !== "closed"
+      ) {
+        await acknowledgePullRequestReceipt({ env, ctx, decision, maintainerOptIn: true }).catch(
+          () => {
+            console.warn("ClawSweeper maintainer opt-in reminder unavailable");
+          },
+        );
+      }
+      return json(
+        { ok: true, accepted: false, reason: "maintainer review requires an explicit request" },
+        202,
+      );
+    }
     const deliveryId = deliveryHeaders.deliveryId || "";
     let itemDecision: ExactReviewDecision & { installationId: number } = decision;
     itemDecision = await withItemContentRevision({
@@ -4156,13 +3974,17 @@ async function githubWebhook(request, env, ctx) {
     return json({ ok: true, ...queued }, 202);
   }
 
-  const trigger = bayJourneyTriggerFromGithubWebhook({
-    decision,
-    payload,
-    deliveryId: deliveryHeaders.deliveryId,
-  });
+  return handleGithubCommentCommand(env, ctx, decision, payload, deliveryHeaders.deliveryId);
+}
 
-  const commentDecision = decision;
+// Shared by signed App webhooks and OIDC intake after its live GitHub hydration.
+async function handleGithubCommentCommand(
+  env,
+  ctx,
+  commentDecision: GithubWebhookIssueCommentClassification,
+  payload: GithubWebhookPayload,
+  sourceDeliveryId?: string | null,
+) {
   if (
     commentDecision.itemState === "open" &&
     typeof commentDecision.commentBody === "string" &&
@@ -4179,7 +4001,6 @@ async function githubWebhook(request, env, ctx) {
       sourceCommentUpdatedAt: commentDecision.commentUpdatedAt,
       commandBodyDigest: await sha256Text(commentDecision.commentBody),
       commandOrigin: "hosted_webhook",
-      ...(trigger?.source_delivery_id ? { bayJourneyDeliveryId: trigger.source_delivery_id } : {}),
       additionalPrompt: directReReviewAdditionalPrompt({
         body: commentDecision.commentBody,
         maintainerAuthorized: commentDecision.maintainerAuthorized,
@@ -4198,25 +4019,8 @@ async function githubWebhook(request, env, ctx) {
         body: JSON.stringify(intake),
       }),
     );
-    const intakeResult = objectValue(
-      await intakeResponse
-        .clone()
-        .json()
-        .catch(() => null),
-    );
-    const bayJourneyDeliveryId = nullableString(intakeResult.bay_journey_delivery_id);
-    if (trigger && intakeResult.accepted === true && bayJourneyDeliveryId) {
-      await recordBayJourneyTelemetry(
-        env,
-        ctx,
-        [{ ...trigger, source_delivery_id: bayJourneyDeliveryId }],
-        [],
-      );
-    }
     return intakeResponse;
   }
-
-  if (trigger) await recordBayJourneyTelemetry(env, ctx, [trigger], []);
 
   const credentials = githubAppCredentials(env);
   if (!credentials) return json({ error: "github_app_not_configured" }, 503);
@@ -4242,13 +4046,18 @@ async function githubWebhook(request, env, ctx) {
       pull_requests: "write",
     },
   });
-  const statusCommentId = await createFastAckCommentOnce({
-    env,
-    token: targetToken,
-    repo: commentDecision.targetRepo,
-    itemNumber: commentDecision.itemNumber,
-    sourceCommentId: commentDecision.commentId,
-  });
+  const statusCommentId = commentDecision.maintainerAuthorized
+    ? await createFastAckCommentOnce({
+        env,
+        token: targetToken,
+        repo: commentDecision.targetRepo,
+        itemNumber: commentDecision.itemNumber,
+        sourceCommentId: commentDecision.commentId,
+      }).catch(() => {
+        console.warn("ClawSweeper queued command acknowledgement unavailable");
+        return null;
+      })
+    : null;
   await addIssueCommentReaction({
     env,
     token: targetToken,
@@ -4261,7 +4070,17 @@ async function githubWebhook(request, env, ctx) {
     token: dispatchToken,
     decision: commentDecision,
     statusCommentId,
-    sourceDeliveryId: trigger?.source_delivery_id,
+    sourceDeliveryId:
+      isClawSweeperReReviewCommandText(
+        commandTextForClawSweeperFastAck(String(commentDecision.commentBody || "")),
+      ) &&
+      exactWebhookTimestamp(
+        String(payload.action || "") === "edited"
+          ? payload.comment?.updated_at || payload.comment?.created_at
+          : payload.comment?.created_at || payload.comment?.updated_at,
+      )
+        ? (sourceDeliveryId ?? undefined)
+        : undefined,
   });
   settleFastAckComments({
     env,
@@ -4314,45 +4133,6 @@ async function workerHostedTargetVisibilityAdmission(
   }
 }
 
-async function recordedLifecycleAcknowledgementResponse({
-  env,
-  ctx,
-  completion,
-  acknowledgement,
-  acknowledgementResult,
-}) {
-  if (!completion) {
-    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
-  }
-  await recordBayJourneyTelemetry(
-    env,
-    ctx,
-    [],
-    [
-      acknowledgementResult.bayJourneyDeliveryId || acknowledgementResult.sourceDeliveryId
-        ? {
-            ...acknowledgement,
-            source_delivery_id:
-              acknowledgementResult.bayJourneyDeliveryId ?? acknowledgementResult.sourceDeliveryId,
-          }
-        : acknowledgement,
-    ],
-  );
-  return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
-}
-
-async function recordBayJourneyTelemetry(env, ctx, triggers, completions) {
-  if (!env.STATUS_STORE) return;
-  const write = updateBayJourneyState(env, triggers, completions, new Date().toISOString()).catch(
-    () => undefined,
-  );
-  if (ctx?.waitUntil) {
-    ctx.waitUntil(write);
-    return;
-  }
-  await write;
-}
-
 async function materializeGithubWebhookReadModel(
   env: DashboardEnv,
   delivery: GithubWebhookReadModelDelivery,
@@ -4369,295 +4149,6 @@ async function materializeGithubWebhookReadModel(
   if (!response.ok) {
     throw new Error(`github read-model ingest returned ${response.status}`);
   }
-}
-
-async function githubWebhookReadModelQueuePost(
-  env: DashboardEnv,
-  operation: "workflows" | "repair",
-  body: Record<string, unknown>,
-): Promise<Record<string, unknown> | null> {
-  const response = await exactReviewQueueRequest(
-    env,
-    `/github-read-model/${operation}`,
-    new Request(`https://clawsweeper-exact-review-queue/github-read-model/${operation}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
-  if (!response.ok) return null;
-  return objectValue(await response.json().catch(() => null));
-}
-
-function dashboardWorkflowSource(env: DashboardEnv): "poll" | "webhook" {
-  // The shared signing secret also serves unrelated queue and ingress routes.
-  // Its presence does not mean this dashboard consumes workflow webhooks.
-  return stringEnv(env.CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE) === "poll" ? "poll" : "webhook";
-}
-
-function githubWebhookReadModelWorkflowObject(
-  repository: string,
-  kind: "workflow_run" | "workflow_job",
-  value: unknown,
-): Record<string, unknown> | null {
-  const source = objectValue(value);
-  const id = Number(source.id);
-  const sourceUpdatedAt = exactWebhookTimestamp(
-    source.updated_at || source.completed_at || source.started_at || source.created_at,
-  );
-  if (!Number.isSafeInteger(id) || id <= 0 || !sourceUpdatedAt) return null;
-  const runId = kind === "workflow_run" ? id : Number(source.run_id);
-  return {
-    kind,
-    repository: repository.toLowerCase(),
-    id,
-    runId: Number.isSafeInteger(runId) && runId > 0 ? runId : null,
-    sourceUpdatedAt,
-    snapshot: source,
-  };
-}
-
-function reportGithubReadModelDashboardFallback(snapshot: Record<string, unknown> | null): void {
-  if (githubReadModelDashboardFallbackReported) return;
-  githubReadModelDashboardFallbackReported = true;
-  const classState = objectValue(snapshot?.class_state);
-  const sourceReason = String(classState.reason || "");
-  const reason = ["observed", "never_observed"].includes(sourceReason)
-    ? sourceReason
-    : snapshot
-      ? "snapshot_stale_or_gap"
-      : "unavailable";
-  console.warn(
-    JSON.stringify({
-      event: "github_read_model_degraded",
-      consumer: "dashboard_workflow_health",
-      event_class: "workflow_runs",
-      reason,
-      probe_window_elapsed: classState.probe_window_elapsed === true,
-      fallback: "live_poll",
-    }),
-  );
-}
-
-async function revalidateStaleWorkflowHealthRuns({
-  env,
-  repo,
-  runs,
-  observations,
-  checkedAt,
-  github,
-}: {
-  env: DashboardEnv;
-  repo: string;
-  runs: unknown[];
-  observations: unknown[];
-  checkedAt: string;
-  github: GithubJsonReader;
-}): Promise<{ runs: unknown[]; errors: string[] }> {
-  const checkedAtMs = Date.parse(checkedAt);
-  const now = Number.isFinite(checkedAtMs) ? checkedAtMs : Date.now();
-  const confirmedAtByRun = new Map(
-    observations.flatMap((value) => {
-      const observation = objectValue(value);
-      const runId = Number(observation.run_id);
-      const confirmedAt = Date.parse(String(observation.confirmed_at || ""));
-      return Number.isSafeInteger(runId) && runId > 0 && Number.isFinite(confirmedAt)
-        ? ([[runId, confirmedAt]] as const)
-        : [];
-    }),
-  );
-  const candidates = runs
-    .filter((value) => {
-      const run = objectValue(value);
-      if (!OPERATIONAL_QUEUED_RUN_STATUSES.has(String(run.status || ""))) return false;
-      const createdAt = Date.parse(String(run.created_at || ""));
-      if (!Number.isFinite(createdAt) || now - createdAt < OPERATIONAL_QUEUE_DEGRADED_MS) {
-        return false;
-      }
-      if (now - createdAt > OPERATIONAL_QUEUE_ZOMBIE_MS) return false;
-      const confirmedAt = confirmedAtByRun.get(Number(run.id));
-      return (
-        confirmedAt === undefined || now - confirmedAt > GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS
-      );
-    })
-    .sort((left, right) => {
-      const leftRun = objectValue(left);
-      const rightRun = objectValue(right);
-      return (
-        Date.parse(String(leftRun.created_at || "")) -
-          Date.parse(String(rightRun.created_at || "")) || Number(leftRun.id) - Number(rightRun.id)
-      );
-    });
-  if (candidates.length === 0) return { runs, errors: [] };
-  const recheckBatch = candidates.slice(0, STALE_WORKFLOW_HEALTH_RECHECK_BATCH_SIZE);
-  const omittedCandidates = new Set(candidates.slice(STALE_WORKFLOW_HEALTH_RECHECK_BATCH_SIZE));
-  console.warn(
-    JSON.stringify({
-      event: "github_read_model_workflow_run_revalidation_batch",
-      consumer: "dashboard_workflow_health",
-      candidate_count: candidates.length,
-      batch_limit: STALE_WORKFLOW_HEALTH_RECHECK_BATCH_SIZE,
-      batch_size: recheckBatch.length,
-      omitted_count: omittedCandidates.size,
-    }),
-  );
-
-  const outcomes = await mapWithConcurrency(
-    recheckBatch,
-    5,
-    async (value) => {
-      const snapshotRun = objectValue(value);
-      const runId = Number(snapshotRun.id);
-      if (!Number.isSafeInteger(runId) || runId <= 0) {
-        return { runId, error: "snapshot run has no valid id" };
-      }
-      const verificationStartedAt = new Date().toISOString();
-      try {
-        const liveRun = objectValue(await github(`/repos/${repo}/actions/runs/${runId}`));
-        if (Number(liveRun.id) !== runId) {
-          return { runId, error: "live workflow response id mismatch" };
-        }
-        if (isActiveWorkflowRun(liveRun)) {
-          const object = githubWebhookReadModelWorkflowObject(repo, "workflow_run", liveRun);
-          if (object) {
-            await githubWebhookReadModelQueuePost(env, "repair", {
-              repository: repo,
-              repair_kind: "workflows",
-              objects: [object],
-            }).catch(() => null);
-          }
-          return { runId, liveRun };
-        }
-        const repair = await githubWebhookReadModelQueuePost(env, "repair", {
-          repository: repo,
-          repair_kind: "workflows",
-          workflow_run_verification_started_at: verificationStartedAt,
-          evict_workflow_run_ids: [runId],
-          objects: [],
-        }).catch(() => null);
-        const verdict = String(liveRun.status || "completed");
-        reportGithubReadModelWorkflowRunEvicted({
-          snapshotRun,
-          verdict,
-          evicted: Number(repair?.evicted_workflow_runs || 0) > 0,
-        });
-        return { runId, evicted: true };
-      } catch (error) {
-        if (/GitHub 404 for /.test(String(error instanceof Error ? error.message : error))) {
-          const repair = await githubWebhookReadModelQueuePost(env, "repair", {
-            repository: repo,
-            repair_kind: "workflows",
-            workflow_run_verification_started_at: verificationStartedAt,
-            evict_workflow_run_ids: [runId],
-            objects: [],
-          }).catch(() => null);
-          reportGithubReadModelWorkflowRunEvicted({
-            snapshotRun,
-            verdict: "absent",
-            evicted: Number(repair?.evicted_workflow_runs || 0) > 0,
-          });
-          return { runId, evicted: true };
-        }
-        return { runId, error: error instanceof Error ? error.message : String(error) };
-      }
-    },
-    statusRequestSignal(env),
-  );
-  const byRunId = new Map(outcomes.map((outcome) => [outcome.runId, outcome]));
-  return {
-    runs: runs.flatMap((value) => {
-      if (omittedCandidates.has(value)) return [];
-      const outcome = byRunId.get(Number(objectValue(value).id));
-      if (!outcome) return [value];
-      if (outcome.error || outcome.evicted) return [];
-      return outcome.liveRun ? [outcome.liveRun] : [];
-    }),
-    errors: [
-      ...(omittedCandidates.size > 0
-        ? [
-            `workflow run reverify omitted ${omittedCandidates.size} stale candidates after batch ${recheckBatch.length}`,
-          ]
-        : []),
-      ...outcomes.flatMap((outcome) =>
-        outcome.error ? [`workflow run ${outcome.runId} reverify: ${outcome.error}`] : [],
-      ),
-    ],
-  };
-}
-
-function reportGithubReadModelWorkflowRunEvicted({ snapshotRun, verdict, evicted }) {
-  const snapshotStatus = String(snapshotRun.status || "");
-  const publicSnapshotStatus = ["queued", "in_progress", "pending", "waiting"].includes(
-    snapshotStatus,
-  )
-    ? snapshotStatus
-    : "unknown";
-  const publicVerdict = [
-    "queued",
-    "in_progress",
-    "pending",
-    "waiting",
-    "completed",
-    "absent",
-  ].includes(String(verdict || ""))
-    ? String(verdict)
-    : "unknown";
-  console.warn(
-    JSON.stringify({
-      event: "github_read_model_workflow_run_evicted",
-      consumer: "dashboard_workflow_health",
-      snapshot_status: publicSnapshotStatus,
-      verdict: publicVerdict,
-      read_model_evicted: evicted,
-    }),
-  );
-}
-
-function bayJourneyTriggerFromGithubWebhook({
-  decision,
-  payload,
-  deliveryId,
-}: {
-  readonly decision: GithubWebhookClassification;
-  readonly payload: GithubIssueCommentWebhookPayload;
-  readonly deliveryId: string | null;
-}) {
-  if (!decision?.accepted || decision?.type !== "issue_comment") return null;
-  const comment = objectValue(payload?.comment);
-  const commandText = commandTextForClawSweeperFastAck(String(comment.body || ""));
-  if (!isClawSweeperReReviewCommandText(commandText)) return null;
-  const triggerAt = exactWebhookTimestamp(
-    String(payload?.action || "") === "edited"
-      ? comment.updated_at || comment.created_at
-      : comment.created_at || comment.updated_at,
-  );
-  const sourceDeliveryId = nullableString(deliveryId);
-  if (!triggerAt || !sourceDeliveryId) return null;
-  return {
-    repository: decision.targetRepo,
-    number: decision.itemNumber,
-    source_comment_id: decision.commentId,
-    source_delivery_id: sourceDeliveryId,
-    triggered_at: triggerAt,
-  };
-}
-
-function bayJourneyCompletionFromGithubWebhook({
-  event,
-  payload,
-  env,
-  hostedTargetEligible = false,
-}) {
-  const completion = lifecycleCommandAcknowledgementFromGithubWebhook({
-    event,
-    payload,
-    env,
-    hostedTargetEligible,
-  });
-  return completion?.status_marker &&
-    /<!--\s*clawsweeper-command-status:\d+:(review|re_review):/i.test(completion.status_marker)
-    ? completion
-    : null;
 }
 
 function lifecycleCommandAcknowledgementFromGithubWebhook({
@@ -4970,6 +4461,25 @@ function classifyGithubItemWebhook({
   return { accepted: false, reason: "unsupported event" };
 }
 
+async function authorPermissionToken(
+  env: DashboardEnv,
+  decision: ExactReviewDecision & { installationId: number },
+): Promise<string> {
+  const credentials = githubAppCredentials(env);
+  if (!credentials || !Number.isInteger(decision.installationId) || decision.installationId <= 0) {
+    throw new Error("GitHub App credentials are required to read author permission");
+  }
+  const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
+  return createGithubAppTokenFor({
+    env,
+    appJwt,
+    installationId: decision.installationId,
+    label: decision.targetRepo,
+    repositories: [repoName(decision.targetRepo)],
+    permissions: { metadata: "read" },
+  });
+}
+
 async function bindLivePullRequestHeadAuthority({
   env,
   decision,
@@ -5016,7 +4526,7 @@ async function bindLivePullRequestHeadAuthority({
   const liveHeadSha = String(objectValue(objectValue(pull).head).sha || "")
     .trim()
     .toLowerCase();
-  return liveHeadSha === sourceHeadSha
+  return !requiresMaintainerReviewRequest(objectValue(pull)) && liveHeadSha === sourceHeadSha
     ? { ...decision, sourceHeadVerified: true, sourceAuthoritySeq: Number(sourceAuthoritySeq) }
     : null;
 }
@@ -5079,9 +4589,7 @@ function targetDefaultBranch(repo) {
 
 function isClawsweeperGithubWebhookSender(sender) {
   const login = normalizedLogin(sender.login);
-  return (
-    login === "clawsweeper" || login === "clawsweeper[bot]" || login === "openclaw-clawsweeper[bot]"
-  );
+  return CLAWSWEEPER_BOT_LOGINS.has(login);
 }
 
 function isAuthorReadOnlyGithubWebhookCommand({ comment, issue, commandText }) {
@@ -5110,7 +4618,7 @@ function exactReviewQueueStub(env): DurableObjectStub | null {
 
 async function recordLifecycleCommandAcknowledgement(env, completion) {
   const queue = exactReviewQueueStub(env);
-  if (!queue) return { accepted: true, sourceDeliveryId: null, bayJourneyDeliveryId: null };
+  if (!queue) return { accepted: true };
   const observedAt = Date.parse(String(completion.completed_at || ""));
   const targetRepo = String(completion.canonical_repository ?? completion.repository);
   const { response } = await exactReviewQueueFetch(
@@ -5127,7 +4635,6 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
         status_marker: completion.status_marker,
         command_comment_id: completion.source_comment_id,
         completion_comment_id: completion.completion_comment_id,
-        include_delivery_identity: true,
         ...(completion.require_exact_status_comment ? { require_exact_status_comment: true } : {}),
         observed_at: Number.isFinite(observedAt) ? observedAt : Date.now(),
       }),
@@ -5139,8 +4646,6 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
   const result = objectValue(await response.json());
   return {
     accepted: result.accepted !== false,
-    sourceDeliveryId: nullableString(result.source_delivery_id),
-    bayJourneyDeliveryId: nullableString(result.bay_journey_delivery_id),
   };
 }
 
@@ -5267,9 +4772,9 @@ async function exactReviewQueueFetch(
   path: string,
   request?: Request,
   service: "exact_review_queue" | "github_etag_cache" = "exact_review_queue",
+  traceId = newExactReviewQueueTraceId(),
 ) {
   const body = request ? await request.text() : undefined;
-  const traceId = newExactReviewQueueTraceId();
   const endpoint = exactReviewQueueEndpointTemplate(path);
   const preparedHostedTarget = request?.headers.get(HOSTED_TARGET_ELIGIBILITY_HEADER);
   const authenticatedBodyFingerprint = request?.headers.get(
@@ -5317,34 +4822,49 @@ async function exactReviewQueueFetch(
       return { response, malformedServerResponse: true };
     }
   } catch (error) {
-    const failure = objectValue(error);
-    const remote = failure.remote === true;
-    const retryable = failure.retryable === true;
-    const overloaded = failure.overloaded === true;
     console.error(`${service}_request_failed`, {
       trace_id: traceId,
       endpoint,
       phase: "request",
       transport: "throw",
       upstream_status: null,
-      remote,
-      retryable,
-      overloaded,
-      failure_category: overloaded
-        ? "platform_overloaded"
-        : retryable
-          ? "platform_retryable"
-          : remote
-            ? "remote_exception"
-            : "request_exception",
+      ...queuePlatformFailure(error),
     });
     throw error;
   }
 }
 
+function queuePlatformFailure(error: unknown) {
+  const failure = objectValue(error);
+  const remote = failure.remote === true;
+  const retryable = failure.retryable === true;
+  const overloaded = failure.overloaded === true;
+  return {
+    remote,
+    retryable,
+    overloaded,
+    failure_category: overloaded
+      ? "platform_overloaded"
+      : retryable
+        ? "platform_retryable"
+        : remote
+          ? "remote_exception"
+          : "request_exception",
+  };
+}
+
 async function exactReviewQueueRequest(env, path, request?: Request) {
+  const maintenance =
+    path === "/canonical-bodies/maintenance" || path === "/read-model/compression";
+  const traceId = newExactReviewQueueTraceId();
+  const respond = (response: Response) => {
+    if (!maintenance) return response;
+    const headers = new Headers(response.headers);
+    headers.set(EXACT_REVIEW_QUEUE_TRACE_HEADER, traceId);
+    return new Response(response.body, { status: response.status, headers });
+  };
   const queue = exactReviewQueueStub(env);
-  if (!queue) return json({ error: "exact_review_queue_not_configured" }, 503);
+  if (!queue) return respond(json({ error: "exact_review_queue_not_configured" }, 503));
   try {
     const { response, malformedServerResponse } = await statusOperation(env, "queue", (signal) =>
       exactReviewQueueFetch(
@@ -5353,166 +4873,36 @@ async function exactReviewQueueRequest(env, path, request?: Request) {
         signal
           ? new Request(request || `https://clawsweeper-exact-review-queue${path}`, { signal })
           : request,
+        "exact_review_queue",
+        traceId,
       ),
     );
-    return malformedServerResponse
-      ? json({ error: "exact_review_queue_unavailable" }, response.status)
-      : response;
-  } catch {
-    return json({ error: "exact_review_queue_unavailable" }, 500);
+    return respond(
+      malformedServerResponse
+        ? json(
+            {
+              error: "exact_review_queue_unavailable",
+              ...(maintenance ? { failure_category: "malformed_server_response" } : {}),
+            },
+            response.status,
+          )
+        : response,
+    );
+  } catch (error) {
+    // Only the authenticated maintenance owner receives closed platform metadata.
+    // Remote/retryable are observations, not instructions to retry a mutation.
+    return respond(
+      json(
+        {
+          error: "exact_review_queue_unavailable",
+          ...(maintenance
+            ? { failure_category: queuePlatformFailure(error).failure_category }
+            : {}),
+        },
+        500,
+      ),
+    );
   }
-}
-
-async function reviewProofQueue(env, path: string, body: unknown) {
-  return exactReviewQueueRequest(
-    env,
-    path,
-    new Request("https://queue" + path, { method: "POST", body: JSON.stringify(body) }),
-  );
-}
-
-async function reviewProofRequest(request: Request, env) {
-  const text = await boundedCommandProofBody(request);
-  if (text === null) return json({ error: "invalid_review_proof_request" }, 413);
-  const body = parseJsonObject(text);
-  if (!body || !["request", "poll", "capabilities"].includes(body.operation))
-    return json({ error: "invalid_review_proof_request" }, 400);
-  const admission = await reviewProofQueue(env, "/review-proof", body);
-  if (!admission.ok) return admission;
-  const admitted = (await admission.json()) as any;
-  if (body.operation === "capabilities") return json(admitted);
-  const update = async (patch) => {
-    const response = await reviewProofQueue(env, "/review-proof/update", {
-      ...patch,
-      lease: body.lease,
-      requestId: admitted.record.requestId,
-    });
-    return response.json();
-  };
-  try {
-    const credentials = githubAppCredentials(env);
-    if (!credentials) throw new Error("github_app_not_configured");
-    const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
-    // Never broaden the general read-only dashboard token or return this token to the reviewer.
-    const token = await createGithubAppTokenFor({
-      env,
-      appJwt,
-      installationId: await githubAppInstallationId(appJwt, "openclaw/openclaw", env),
-      label: "review-proof",
-      repositories: ["openclaw"],
-      permissions: { actions: "write", contents: "read", pull_requests: "read" },
-    });
-    const { executeReviewProof } = await import("./review-proof-execution.ts");
-    const result = await executeReviewProof({
-      record: admitted.record,
-      target: admitted.target,
-      dispatch: admitted.dispatch === true,
-      github: (path, value) =>
-        githubTokenJson({
-          env,
-          token,
-          path: "/" + path,
-          method: value === undefined ? "GET" : "POST",
-          body: value,
-          errorLabel: "Proof GitHub",
-          apiVersion: "2026-03-10",
-        }),
-      artifact: (id) => reviewProofArtifact(env, token, id),
-      update,
-    });
-    return json({
-      ...result,
-      requestId: admitted.record.requestId,
-      planSha256: admitted.record.planSha256,
-      expiresAt: admitted.record.expiresAt,
-    });
-  } catch {
-    await update({ state: "inconclusive", reason: "proof_execution_unavailable" });
-    return json({ state: "inconclusive", reason: "proof_execution_unavailable" });
-  }
-}
-
-async function reviewProofProducerRequest(request: Request, env) {
-  const text = await boundedCommandProofBody(request);
-  const body = text === null ? null : parseJsonObject(text);
-  if (
-    !body ||
-    !/^[0-9a-f]{64}$/.test(body.requestId || "") ||
-    !/^[1-9][0-9]{0,19}$/.test(body.runId || "") ||
-    body.runAttempt !== 1
-  )
-    return json({ error: "invalid_producer_request" }, 400);
-  const identity = await authenticateReviewProofProducerToken(bearerToken(request));
-  if (!identity || identity.runId !== body.runId || identity.runAttempt !== body.runAttempt)
-    return json({ error: "producer_not_authorized" }, 403);
-  const response = await reviewProofQueue(env, "/review-proof/producer-record", body);
-  if (!response.ok) return json({ error: "proof_not_active" }, 409);
-  const { record } = (await response.json()) as any;
-  if (
-    body.planSha256 !== record.planSha256 ||
-    !reviewProofProducerMatches(identity, {
-      ...record.producer,
-      runId: body.runId,
-      runAttempt: body.runAttempt,
-    })
-  )
-    return json({ error: "producer_not_authorized" }, 403);
-  // OIDC pins the workflow/run; this final durable check also fences owner loss during verification.
-  const redeemed = await reviewProofQueue(env, "/review-proof/redeem", body);
-  if (!redeemed.ok) return json({ error: "proof_not_active" }, 409);
-  return json({ ok: true, expiresAt: record.expiresAt });
-}
-
-async function reviewProofArtifact(env, token: string, id: string): Promise<Uint8Array> {
-  if (!/^[1-9][0-9]{0,19}$/.test(id)) throw new Error("invalid_artifact_id");
-  let response = await fetch(
-    githubApiUrl(env, `/repos/openclaw/openclaw/actions/artifacts/${id}/zip`),
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "clawsweeper-review-proof",
-      },
-      redirect: "manual",
-      signal: AbortSignal.timeout(20_000),
-    },
-  );
-  if (response.status === 302) {
-    const target = new URL(response.headers.get("location") || "");
-    await response.body?.cancel();
-    if (
-      target.protocol !== "https:" ||
-      target.username ||
-      target.password ||
-      ![".blob.core.windows.net", ".actions.githubusercontent.com"].some((suffix) =>
-        target.hostname.endsWith(suffix),
-      )
-    )
-      throw new Error("invalid_artifact_redirect");
-    response = await fetch(target, { redirect: "error", signal: AbortSignal.timeout(30_000) });
-  }
-  if (!response.ok) throw new Error("artifact_unavailable");
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("artifact_unavailable");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    total += chunk.value.length;
-    if (total > 16 * 1024 * 1024) {
-      await reader.cancel();
-      throw new Error("artifact_too_large");
-    }
-    chunks.push(chunk.value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return bytes;
 }
 
 const PUBLIC_QUEUE_COUNT_LIMIT = 1_000_000;
@@ -5534,8 +4924,17 @@ const PUBLIC_QUEUE_PARKED_REASONS = [
   "source_incompatible",
   "scanner_refused",
   "direct_publication",
+  "stale_revision",
+  "source_drift_loop",
+  "locked_conversation",
+  "oversized_pull_request",
+  "maintainer_request_required",
   "unknown",
 ] as const;
+const PUBLIC_QUEUE_SHED_REASONS = ["backpressure", "scheduled_rate", "unattributed"] as const;
+const PUBLIC_RUNAWAY_SAMPLE_LIMIT = 5;
+const PUBLIC_RUNAWAY_SOURCE_SAMPLE_LIMIT = 20;
+const PUBLIC_RUNAWAY_ITEM_KEY_PATTERN = /^([a-z0-9_.-]+\/[a-z0-9_.-]+)#([1-9]\d{0,9})$/;
 const PUBLIC_QUEUE_RECOVERY_REASONS = [
   "claim_timeout",
   "execution_timeout",
@@ -5552,6 +4951,89 @@ function publicQueueCount(value, maximum = PUBLIC_QUEUE_COUNT_LIMIT) {
 function publicQueueTimestamp(value) {
   if (value === null || value === undefined) return null;
   return publicTimestamp(value);
+}
+
+function publicPublicationHandoff(value) {
+  const source = objectValue(value);
+  const observedAt = publicQueueTimestamp(source.observed_at);
+  const samples = publicQueueCount(source.sample_count);
+  const retained = publicQueueCount(source.retained_batches);
+  const states = [
+    "idle",
+    "dispatching",
+    "awaiting_claim",
+    "claimed",
+    "dispatch_failed",
+    "reservation_expired",
+  ];
+  const ids = ["under_1m", "1m_to_5m", "5m_to_10m", "over_10m"];
+  if (
+    !observedAt ||
+    samples === null ||
+    retained === null ||
+    samples > retained ||
+    !states.includes(source.dispatch_state) ||
+    !Array.isArray(source.delay_buckets) ||
+    source.delay_buckets.length !== ids.length
+  )
+    return null;
+  const buckets = source.delay_buckets.map((entry, index) => {
+    const bucket = objectValue(entry);
+    return bucket.id === ids[index] && publicQueueCount(bucket.count) !== null
+      ? { id: ids[index], count: publicQueueCount(bucket.count)! }
+      : null;
+  });
+  if (
+    buckets.some((bucket) => bucket === null) ||
+    buckets.reduce((sum, bucket) => sum + (bucket?.count ?? 0), 0) !== samples
+  )
+    return null;
+  const first = publicQueueTimestamp(source.first_claim_at);
+  const last = publicQueueTimestamp(source.last_claim_at);
+  const wait =
+    source.dispatch_wait_seconds === null ? null : publicQueueCount(source.dispatch_wait_seconds);
+  if (
+    (samples > 0 && (!first || !last || first > last || last > observedAt)) ||
+    (samples === 0 && (first !== null || last !== null)) ||
+    (source.dispatch_state === "awaiting_claim" ? wait === null : wait !== null)
+  )
+    return null;
+  return {
+    observed_at: observedAt,
+    sample_count: samples,
+    retained_batches: retained,
+    first_claim_at: first,
+    last_claim_at: last,
+    dispatch_state: source.dispatch_state,
+    dispatch_wait_seconds: wait,
+    delay_buckets: buckets,
+  };
+}
+
+// Scheduled admission balances carry organic debt down to -burst, so they may be negative.
+function publicSignedQueueCount(value, maximum = PUBLIC_SCHEDULED_FEED_RATE_LIMIT) {
+  return Number.isSafeInteger(value) && Math.abs(Number(value)) <= maximum ? Number(value) : null;
+}
+
+function publicScheduledFeedLane(value) {
+  const source = objectValue(value);
+  const targetRate = publicQueueCount(
+    source.target_rate_per_hour,
+    PUBLIC_SCHEDULED_FEED_RATE_LIMIT,
+  );
+  const burst = publicQueueCount(source.burst, PUBLIC_SCHEDULED_FEED_RATE_LIMIT);
+  const tokenBalance = publicSignedQueueCount(source.token_balance);
+  if (targetRate === null || burst === null || tokenBalance === null) return null;
+  return { target_rate_per_hour: targetRate, burst, token_balance: tokenBalance };
+}
+
+function publicScheduledFeedLanes(value) {
+  const source = objectValue(value);
+  const hotIntake = publicScheduledFeedLane(source.hot_intake);
+  const normalBackfill = publicScheduledFeedLane(source.normal_backfill);
+  return hotIntake && normalBackfill
+    ? { hot_intake: hotIntake, normal_backfill: normalBackfill }
+    : null;
 }
 
 function publicQueueCounts(value, keys: readonly string[], maximum = PUBLIC_QUEUE_COUNT_LIMIT) {
@@ -5646,6 +5128,14 @@ function publicExactReviewQueueLane(value) {
   );
   result.backoff_reasons = backoffReasons.counts;
   result.parked_reasons = parkedReasons.counts;
+  // Only the review lane attributes sheds; the publication lane never sheds.
+  if (Object.prototype.hasOwnProperty.call(source, "shed_reasons_since_reset")) {
+    result.shed_reasons_since_reset = publicQueueCounts(
+      source.shed_reasons_since_reset,
+      PUBLIC_QUEUE_SHED_REASONS,
+      PUBLIC_QUEUE_TOTAL_LIMIT,
+    );
+  }
   return { value: result, reasonsComplete: backoffReasons.complete && parkedReasons.complete };
 }
 
@@ -5738,6 +5228,64 @@ function publicExactReviewFailureHealth(value) {
   };
 }
 
+// Optional and fail-closed to null: older snapshots without the field keep a
+// complete queue projection. Samples are re-validated on every projection and
+// keep only verified-public repository item keys.
+function publicExactReviewRunawayHealth(value, allowedRepositories: ReadonlySet<string>) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = objectValue(value);
+  const countingBasis = source.counting_basis;
+  const status = String(source.status || "");
+  const reason = source.reason ?? null;
+  const windowHours = publicQueueCount(source.window_hours, 24 * 7);
+  const threshold = publicQueueCount(source.threshold_reviews_per_day, 10_000);
+  const runawayItems = publicQueueCount(source.runaway_items);
+  const keys = source.sample_item_keys;
+  const expectedReason =
+    status === "degraded"
+      ? "review_runaway"
+      : status === "unknown"
+        ? "telemetry_unavailable"
+        : status === "healthy"
+          ? null
+          : undefined;
+  if (
+    (countingBasis !== undefined && countingBasis !== "claimed_review_runs") ||
+    expectedReason === undefined ||
+    reason !== expectedReason ||
+    windowHours === null ||
+    windowHours < 1 ||
+    threshold === null ||
+    threshold < 1 ||
+    runawayItems === null ||
+    (status === "degraded") !== runawayItems > 0 ||
+    !Array.isArray(keys) ||
+    keys.length > PUBLIC_RUNAWAY_SOURCE_SAMPLE_LIMIT
+  ) {
+    return null;
+  }
+  const sample: string[] = [];
+  for (const entry of keys) {
+    const match =
+      typeof entry === "string" ? PUBLIC_RUNAWAY_ITEM_KEY_PATTERN.exec(entry.trim()) : null;
+    if (!match) return null;
+    const itemNumber = Number(match[2]);
+    if (!allowedRepositories.has(match[1]) || itemNumber > PUBLIC_BAY_ITEM_NUMBER_LIMIT) continue;
+    const itemKey = `${match[1]}#${itemNumber}`;
+    if (!sample.includes(itemKey)) sample.push(itemKey);
+    if (sample.length >= PUBLIC_RUNAWAY_SAMPLE_LIMIT) break;
+  }
+  return {
+    ...(countingBasis === undefined ? {} : { counting_basis: countingBasis }),
+    status,
+    reason,
+    window_hours: windowHours,
+    threshold_reviews_per_day: threshold,
+    runaway_items: runawayItems,
+    sample_item_keys: sample,
+  };
+}
+
 function publicExactReviewHandoff(value) {
   const source = objectValue(value);
   const status = String(source.status || "");
@@ -5750,6 +5298,7 @@ function publicExactReviewHandoff(value) {
       "claim_stalled",
       "dispatcher_blocked",
       "dispatcher_paused",
+      "dispatcher_retry_due",
       "claim_delayed",
       "handoff_current",
     ].includes(reason)
@@ -5832,6 +5381,11 @@ export function publicExactReviewQueueProjection(
     scheduledFeed.enqueue_replay === "scheduled_disposition_v1" ? "scheduled_disposition_v1" : null;
   const scheduledMaxConcurrent = publicQueueCount(scheduledFeed.max_concurrent);
   const scheduledActive = publicQueueCount(scheduledFeed.active);
+  const scheduledBurst = publicQueueCount(scheduledFeed.burst, PUBLIC_SCHEDULED_FEED_RATE_LIMIT);
+  const scheduledTokenBalance = publicSignedQueueCount(scheduledFeed.token_balance);
+  const scheduledThrottleObservedAt = publicQueueTimestamp(scheduledFeed.throttle_observed_at);
+  const scheduledThrottleRecoveryAt = publicQueueTimestamp(scheduledFeed.throttle_recovery_at);
+  const scheduledLanes = publicScheduledFeedLanes(scheduledFeed.lanes);
   const requiredCounts = [
     source.pending,
     source.ready_pending,
@@ -5931,6 +5485,12 @@ export function publicExactReviewQueueProjection(
     handoff_health: projectedHandoff,
     pressure: projectedPressure,
     review_failure_health: projectedReviewFailureHealth.value,
+    review_runaway_health: publicExactReviewRunawayHealth(
+      source.review_runaway_health,
+      allowedRepositories,
+    ),
+    warning_evidence: publicWarningEvidence(source.warning_evidence, allowedRepositories),
+    publication_handoff: publicPublicationHandoff(source.publication_handoff),
     manual_publication:
       objectValue(source.manual_publication).policy === "record_comment_only"
         ? {
@@ -5945,6 +5505,15 @@ export function publicExactReviewQueueProjection(
             enqueue_replay: scheduledEnqueueReplay,
             ...(scheduledMaxConcurrent !== null ? { max_concurrent: scheduledMaxConcurrent } : {}),
             ...(scheduledActive !== null ? { active: scheduledActive } : {}),
+            ...(scheduledBurst !== null ? { burst: scheduledBurst } : {}),
+            ...(scheduledTokenBalance !== null ? { token_balance: scheduledTokenBalance } : {}),
+            ...(scheduledThrottleObservedAt && scheduledThrottleRecoveryAt
+              ? {
+                  throttle_observed_at: scheduledThrottleObservedAt,
+                  throttle_recovery_at: scheduledThrottleRecoveryAt,
+                }
+              : {}),
+            ...(scheduledLanes ? { lanes: scheduledLanes } : {}),
           }
         : null,
     lanes: {
@@ -5966,427 +5535,6 @@ async function publicExactReviewQueueJson(env) {
   } catch {
     return json({ error: "exact_review_queue_unavailable" }, 503);
   }
-}
-
-const DURABLE_LIFECYCLE_BAY_CACHE_SECONDS = 30;
-type DurableLifecycleBayRefresh = {
-  promise: Promise<Record<string, unknown>>;
-  state: { preserveStaleSuccess: boolean };
-};
-const durableLifecycleBayRefreshes = new Map<string, DurableLifecycleBayRefresh>();
-
-function durableLifecycleBayCacheKey(request: Request, env, bucket: "fresh" | "stale") {
-  const scope = publicBayRepositoryScope(verifiedPublicBayRepositories(env));
-  return new Request(
-    new URL(
-      `/api/durable-lifecycle-bay-cache/v1/${encodeURIComponent(scope) || "_"}/${bucket}`,
-      request.url,
-    ),
-  );
-}
-
-async function cachedDurableLifecycleBay(request: Request) {
-  try {
-    const cached = await caches.default.match(request);
-    if (cached?.ok) {
-      const body = await cached.json();
-      const snapshot = objectValue(body.durable_lifecycle_bay);
-      const generatedAt = publicQueueTimestamp(snapshot.generated_at);
-      const age = Date.now() - Date.parse(generatedAt || "");
-      // Only sanitized public responses enter this versioned cache. Both buckets
-      // remain bounded by the source snapshot's existing maximum age.
-      if (
-        generatedAt &&
-        objectValue(snapshot.freshness).maximum_age_ms === 60_000 &&
-        age >= -60_000 &&
-        age <= 60_000
-      )
-        return body;
-    }
-  } catch {
-    // Cache availability must not prevent a fresh lifecycle read.
-  }
-  return null;
-}
-
-async function durableLifecycleBayJson(request: Request, env, ctx?: DashboardContext) {
-  const freshKey = durableLifecycleBayCacheKey(request, env, "fresh");
-  const cached = await cachedDurableLifecycleBay(freshKey);
-  if (cached) return json(cached);
-  const staleKey = durableLifecycleBayCacheKey(request, env, "stale");
-  const stale = await cachedDurableLifecycleBay(staleKey);
-  if (stale && ctx?.waitUntil) {
-    const preserveStaleSuccess =
-      objectValue(objectValue(stale.durable_lifecycle_bay).collection).state === "complete";
-    ctx.waitUntil(
-      refreshDurableLifecycleBay(env, freshKey, staleKey, preserveStaleSuccess).catch(
-        () => undefined,
-      ),
-    );
-    return json(stale);
-  }
-  return json(await refreshDurableLifecycleBay(env, freshKey, staleKey));
-}
-
-function refreshDurableLifecycleBay(
-  env,
-  freshKey: Request,
-  staleKey: Request,
-  preserveStaleSuccess = false,
-) {
-  const key = freshKey.url;
-  const pending = durableLifecycleBayRefreshes.get(key);
-  if (pending) {
-    if (preserveStaleSuccess) pending.state.preserveStaleSuccess = true;
-    return pending.promise;
-  }
-  const state = { preserveStaleSuccess };
-  const promise = refreshDurableLifecycleBayCaches(env, freshKey, staleKey, state);
-  const refresh = { promise, state };
-  durableLifecycleBayRefreshes.set(key, refresh);
-  promise
-    .finally(() => {
-      if (durableLifecycleBayRefreshes.get(key) === refresh)
-        durableLifecycleBayRefreshes.delete(key);
-    })
-    .catch(() => undefined);
-  return promise;
-}
-
-async function refreshDurableLifecycleBayCaches(
-  env,
-  freshKey: Request,
-  staleKey: Request,
-  state: { preserveStaleSuccess: boolean },
-) {
-  const snapshot = await durableLifecycleBaySnapshot(env);
-  const body = { durable_lifecycle_bay: snapshot };
-  if (state.preserveStaleSuccess && objectValue(snapshot.collection).state !== "complete") {
-    return body;
-  }
-  const remainingSeconds = Math.floor(
-    (Date.parse(snapshot.generated_at) + 60_000 - Date.now()) / 1000,
-  );
-  if (remainingSeconds > 0) {
-    await Promise.allSettled(
-      [freshKey, staleKey].map(async (key) => {
-        const ttl =
-          key === freshKey
-            ? Math.min(DURABLE_LIFECYCLE_BAY_CACHE_SECONDS, remainingSeconds)
-            : remainingSeconds;
-        const cached = json(body);
-        cached.headers.set("cache-control", `public, max-age=${ttl}`);
-        await caches.default.put(key, cached);
-      }),
-    );
-  }
-  return body;
-}
-
-export async function durableLifecycleBaySnapshot(env, now = Date.now()) {
-  let response: Response;
-  let body: Record<string, unknown>;
-  const allowedRepositories = verifiedPublicBayRepositories(env);
-  const lifecycleQuery = new URLSearchParams();
-  for (const repository of [...allowedRepositories].sort()) {
-    lifecycleQuery.append("public_repo", repository);
-  }
-  if (allowedRepositories.size === 0) lifecycleQuery.append("public_repo", "");
-  try {
-    response = await exactReviewQueueRequest(env, `/lifecycle-bay?${lifecycleQuery.toString()}`);
-    body = objectValue(await response.json().catch(() => null));
-  } catch {
-    return unknownDurableLifecycleBay("unavailable", now);
-  }
-  const snapshot = objectValue(body.durable_lifecycle_bay) as Record<string, unknown>;
-  const checkedAt = Date.now();
-  if (!response.ok) return unknownDurableLifecycleBay("unavailable", now);
-  if (!validDurableLifecycleBaySnapshot(snapshot, checkedAt)) {
-    return unknownDurableLifecycleBay("malformed", checkedAt);
-  }
-  const collection = objectValue(snapshot.collection);
-  if (collection.state === "unknown") {
-    return unknownDurableLifecycleBay(String(collection.reason || "malformed"), checkedAt);
-  }
-  const generatedAt = publicQueueTimestamp(snapshot.generated_at);
-  if (!generatedAt || checkedAt - Date.parse(generatedAt) > 60_000) {
-    return unknownDurableLifecycleBay("stale", checkedAt);
-  }
-  return publicDurableLifecycleBaySnapshot(snapshot, allowedRepositories);
-}
-
-export async function liveActivityBaySnapshotForRequest(
-  request: Request,
-  env,
-  ctx,
-  now = Date.now(),
-) {
-  try {
-    const statusRequest = new Request(new URL("/api/status", request.url).toString());
-    const response = await statusJson(statusRequest, env, ctx);
-    return liveActivityBaySnapshot(await response.json(), now);
-  } catch {
-    return liveActivityBaySnapshot(null, now);
-  }
-}
-
-function unknownDurableLifecycleBay(reason, now = Date.now()) {
-  return {
-    version: 1,
-    source: "exact-review-lifecycle-projection-v1",
-    generated_at: new Date(now).toISOString(),
-    freshness: { maximum_age_ms: 60_000 },
-    collection: { state: "unknown", reason },
-    inventory: null,
-    lanes: null,
-    sample: null,
-  };
-}
-
-function validDurableLifecycleBaySnapshot(value, now = Date.now()) {
-  const snapshot = objectValue(value);
-  const generatedAt = publicQueueTimestamp(snapshot.generated_at);
-  if (
-    snapshot.version !== 1 ||
-    snapshot.source !== "exact-review-lifecycle-projection-v1" ||
-    !generatedAt ||
-    Date.parse(generatedAt) > now + 60_000 ||
-    !objectValue(snapshot.freshness) ||
-    Number(snapshot.freshness.maximum_age_ms) !== 60_000
-  ) {
-    return false;
-  }
-  const collection = objectValue(snapshot.collection);
-  if (collection.state === "unknown") {
-    return (
-      ["unavailable", "malformed", "mixed", "stale", "over_cap"].includes(
-        String(collection.reason),
-      ) &&
-      snapshot.inventory === null &&
-      snapshot.lanes === null &&
-      snapshot.sample === null
-    );
-  }
-  if (collection.state !== "complete") return false;
-  const inventory = objectValue(snapshot.inventory);
-  const lanes = objectValue(snapshot.lanes);
-  const sample = objectValue(snapshot.sample);
-  const inventoryKeys = ["lifecycle_records", "target_revisions", "unique_targets"];
-  const laneKeys = [
-    "pending",
-    "acknowledgement_pending",
-    "completed",
-    "superseded",
-    "requeued",
-    "terminal_attention",
-  ];
-  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER);
-  const targetRevisions = publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER);
-  const uniqueTargets = publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER);
-  if (
-    !inventoryKeys.every(
-      (key) => publicQueueCount(inventory[key], Number.MAX_SAFE_INTEGER) !== null,
-    ) ||
-    lifecycleRecords === null ||
-    targetRevisions === null ||
-    uniqueTargets === null ||
-    uniqueTargets > targetRevisions ||
-    targetRevisions > lifecycleRecords ||
-    !laneKeys.every((key) => publicQueueCount(lanes[key], Number.MAX_SAFE_INTEGER) !== null) ||
-    laneKeys.reduce((sum, key) => sum + Number(lanes[key]), 0) !== lifecycleRecords ||
-    Number(sample.limit) !== 24 ||
-    !Number.isSafeInteger(sample.returned) ||
-    !Number.isSafeInteger(sample.omitted) ||
-    !Array.isArray(sample.cards) ||
-    sample.returned !== sample.cards.length ||
-    sample.cards.length > 24 ||
-    sample.omitted !== Math.max(0, lifecycleRecords - sample.cards.length)
-  ) {
-    return false;
-  }
-  return sample.cards.every(validDurableLifecycleBayCard);
-}
-
-function publicDurableLifecycleBaySnapshot(
-  value,
-  allowedRepositories: ReadonlySet<string> = new Set(),
-) {
-  const snapshot = objectValue(value);
-  const inventory = objectValue(snapshot.inventory);
-  const lanes = objectValue(snapshot.lanes);
-  const lifecycleRecords =
-    publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER) ?? 0;
-  const cards = Array.isArray(objectValue(snapshot.sample).cards)
-    ? objectValue(snapshot.sample).cards.flatMap((value) => {
-        const card = objectValue(value);
-        const target = objectValue(card.target);
-        const repository = String(target.repository || "")
-          .trim()
-          .toLowerCase();
-        const itemNumber = publicQueueCount(target.number, PUBLIC_BAY_ITEM_NUMBER_LIMIT);
-        const lane = String(card.lane || "");
-        const state = String(card.state || "");
-        const updatedAt = publicQueueTimestamp(card.updated_at);
-        if (
-          !allowedRepositories.has(repository) ||
-          itemNumber === null ||
-          itemNumber <= 0 ||
-          ![
-            "pending",
-            "acknowledgement_pending",
-            "completed",
-            "superseded",
-            "requeued",
-            "terminal_attention",
-          ].includes(lane) ||
-          ![
-            "pending",
-            "completed",
-            "acknowledgement_pending",
-            "acknowledgement_skipped",
-            "superseded",
-            "requeue",
-            "dead_letter",
-            "target_closed",
-            "target_missing",
-            "policy_noop",
-            "guarded_open",
-            "failed",
-          ].includes(state) ||
-          typeof card.current_revision !== "boolean" ||
-          !updatedAt
-        ) {
-          return [];
-        }
-        return [
-          {
-            repository,
-            item_number: itemNumber,
-            lane,
-            state,
-            current_revision: card.current_revision,
-            inline_proof: inlineProofParticipation(objectValue(card.facts).inline_proof),
-            updated_at: updatedAt,
-          },
-        ];
-      })
-    : [];
-  return {
-    version: 1,
-    source: "exact-review-lifecycle-projection-v1",
-    generated_at: publicQueueTimestamp(snapshot.generated_at),
-    freshness: { maximum_age_ms: 60_000 },
-    collection: { state: "complete" },
-    inventory: {
-      lifecycle_records: lifecycleRecords,
-      target_revisions: publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER) ?? 0,
-      unique_targets: publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER) ?? 0,
-    },
-    lanes: publicQueueCounts(
-      lanes,
-      [
-        "pending",
-        "acknowledgement_pending",
-        "completed",
-        "superseded",
-        "requeued",
-        "terminal_attention",
-      ],
-      Number.MAX_SAFE_INTEGER,
-    ),
-    sample: {
-      limit: 24,
-      returned: cards.length,
-      omitted: Math.max(0, lifecycleRecords - cards.length),
-      cards,
-    },
-  };
-}
-
-function validDurableLifecycleBayCard(value) {
-  const card = objectValue(value);
-  const target = objectValue(card.target);
-  const facts = objectValue(card.facts);
-  return (
-    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(target.repository || "")) &&
-    Number.isSafeInteger(target.number) &&
-    Number(target.number) > 0 &&
-    target.url === `https://github.com/${target.repository}/issues/${target.number}` &&
-    Number.isSafeInteger(card.revision) &&
-    Number(card.revision) > 0 &&
-    [
-      "pending",
-      "completed",
-      "acknowledgement_pending",
-      "acknowledgement_skipped",
-      "superseded",
-      "requeue",
-      "dead_letter",
-      "target_closed",
-      "target_missing",
-      "policy_noop",
-      "guarded_open",
-      "failed",
-    ].includes(String(card.state)) &&
-    [
-      "pending",
-      "acknowledgement_pending",
-      "completed",
-      "superseded",
-      "requeued",
-      "terminal_attention",
-    ].includes(String(card.lane)) &&
-    (card.terminal_label === null ||
-      [
-        "review_completed_routed",
-        "superseded",
-        "requeue",
-        "acknowledgement_skipped",
-        "dead_letter",
-        "target_closed",
-        "target_missing",
-        "policy_noop",
-        "guarded_open",
-        "failure",
-      ].includes(String(card.terminal_label))) &&
-    Array.isArray(card.terminal_history) &&
-    card.terminal_history.every((entry) =>
-      [
-        "review_completed_routed",
-        "superseded",
-        "requeue",
-        "dead_letter",
-        "target_closed",
-        "target_missing",
-        "policy_noop",
-        "guarded_open",
-        "failure",
-      ].includes(String(entry)),
-    ) &&
-    typeof card.current_revision === "boolean" &&
-    facts.admission === "recorded" &&
-    Number.isSafeInteger(facts.claim_count) &&
-    Number(facts.claim_count) >= 0 &&
-    [null, "completed", "failed", "cancelled"].includes(facts.review_result) &&
-    typeof facts.github_effect_recorded === "boolean" &&
-    Array.isArray(facts.canonical_receipts) &&
-    facts.canonical_receipts.every((entry) =>
-      ["accepted", "deduped", "superseded"].includes(entry),
-    ) &&
-    [null, "durable", "not_required"].includes(facts.router_receipt) &&
-    [
-      "not_required",
-      "pending",
-      "observed",
-      "skipped_locked",
-      "skipped_missing_comment",
-      "unavailable",
-    ].includes(facts.acknowledgement) &&
-    publicQueueTimestamp(card.updated_at) !== null &&
-    Number.isSafeInteger(card.age_ms) &&
-    Number(card.age_ms) >= 0 &&
-    card.provenance === "exact-review-lifecycle-projection-v1"
-  );
 }
 
 async function publicRecentDurablePublicationEventsJson(env, params: URLSearchParams) {
@@ -6438,6 +5586,69 @@ async function publicReviewObservabilityJson(env, params: URLSearchParams) {
     publicReviewObservabilityProjection,
     "review_observability_unavailable",
   );
+}
+
+async function authenticatedCoverageCheckpoint(request: Request, env) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!signature) return json({ error: "invalid_signature" }, 401);
+  const body = await boundedTargetDispatchBody(request, CENSUS.wireBytes);
+  if (body === null) return json({ error: "coverage_checkpoint_too_large" }, 413);
+  const path = new URL(request.url).pathname;
+  if (
+    !(await verifyGithubWebhookSignature({
+      bodyText: censusSignatureInput(path, body),
+      signature,
+      secret,
+    }))
+  )
+    return json({ error: "invalid_signature" }, 401);
+  return exactReviewQueueRequest(
+    env,
+    path.replace("/internal", ""),
+    new Request("https://internal.invalid" + path.replace("/internal", ""), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    }),
+  );
+}
+
+async function authenticatedReviewCoverageBuildRead(request: Request, env) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!signature) return json({ error: "invalid_signature" }, 401);
+  const body = await boundedTargetDispatchBody(request, 128);
+  if (body === null) return json({ error: "coverage_build_request_too_large" }, 413);
+  if (
+    !(await verifyGithubWebhookSignature({
+      secret,
+      signature,
+      bodyText: "coverage-build-read-v1\nPOST\n/internal/review-coverage/build\n" + body,
+    }))
+  )
+    return json({ error: "invalid_signature" }, 401);
+  // Closed purpose on a fixed method/path; a signature over another request
+  // never authorizes a mutation, arbitrary queue route or identifying query.
+  if (body !== '{"purpose":"dashboard-site-coverage-v1"}' || new URL(request.url).search)
+    return json({ error: "invalid_coverage_build_read" }, 400);
+  try {
+    const response = await exactReviewQueueRequest(env, "/review-coverage");
+    const projection = response.ok
+      ? privateReviewCoverageProjection(await response.json().catch(() => null))
+      : null;
+    if (!projection) return json({ error: "review_coverage_unavailable" }, 503);
+    return new Response(JSON.stringify(projection), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "private, no-store",
+      },
+    });
+  } catch {
+    return json({ error: "review_coverage_unavailable" }, 503);
+  }
 }
 
 async function publicReviewCoverageJson(env) {
@@ -6508,173 +5719,10 @@ export async function exactReviewQueueStatusSnapshot(
   return body;
 }
 
-async function exactReviewBayLifecycleMetricsSnapshot(env) {
-  if (!exactReviewQueueStub(env)) return null;
-  const allowedRepositories = verifiedPublicBayRepositories(env);
-  const query = new URLSearchParams();
-  for (const repository of [...allowedRepositories].sort()) query.append("public_repo", repository);
-  if (allowedRepositories.size === 0) query.append("public_repo", "");
-  const response = await exactReviewQueueRequest(env, `/bay-lifecycle-metrics?${query.toString()}`);
-  const body = objectValue(await response.json().catch(() => null));
-  if (!response.ok) return null;
-  const source = objectValue(body.bay_lifecycle_metrics);
-  const collection = objectValue(source.collection);
-  if (source.version !== 2 || collection.state !== "complete") return null;
-  const coverage = objectValue(source.coverage);
-  const timings = objectValue(source.timings);
-  const terminal = objectValue(source.terminal);
-  const startedAt = publicQueueTimestamp(coverage.started_at);
-  const timingComplete = coverage.timing_complete;
-  const sampleKind = String(timings.sample_kind || "");
-  const windowMinutes = publicQueueCount(timings.window_minutes, 24 * 60);
-  const sampleLimit = publicQueueCount(timings.sample_limit, 100_000);
-  const overall = objectValue(timings.overall);
-  const history = bayLifecycleTimingHistory(timings.history);
-  const includingLegacyBatch = objectValue(timings.including_legacy_batch);
-  const includingLegacyBatchOverall = objectValue(includingLegacyBatch.overall);
-  const includingLegacyBatchHistory = bayLifecycleTimingHistory(includingLegacyBatch.history);
-  const samples = publicQueueCount(overall.samples, 100_000);
-  const average =
-    overall.average_ms === null ? null : publicQueueCount(overall.average_ms, 24 * 60 * 60 * 1000);
-  const median =
-    overall.median_ms === null ? null : publicQueueCount(overall.median_ms, 24 * 60 * 60 * 1000);
-  const invalidTimingAggregate =
-    samples === null ||
-    (samples === 0 ? average !== null || median !== null : average === null || median === null);
-  const allSamples = publicQueueCount(includingLegacyBatchOverall.samples, 100_000);
-  const allAverage =
-    includingLegacyBatchOverall.average_ms === null
-      ? null
-      : publicQueueCount(includingLegacyBatchOverall.average_ms, 24 * 60 * 60 * 1000);
-  const allMedian =
-    includingLegacyBatchOverall.median_ms === null
-      ? null
-      : publicQueueCount(includingLegacyBatchOverall.median_ms, 24 * 60 * 60 * 1000);
-  const invalidAllTimingAggregate =
-    allSamples === null ||
-    (allSamples === 0
-      ? allAverage !== null || allMedian !== null
-      : allAverage === null || allMedian === null) ||
-    (samples !== null && allSamples < samples);
-  const terminalCount = publicQueueCount(terminal.terminal_count, 20);
-  const tideThreshold = publicQueueCount(terminal.tide_threshold, 100);
-  const tideGeneration = publicQueueCount(terminal.tide_generation, 1_000_000);
-  const lastTideAt =
-    terminal.last_tide_at === null ? null : publicQueueTimestamp(terminal.last_tide_at);
-  const terminalBuffer = bayLifecycleTerminalRows(terminal.terminal_buffer);
-  const recentlyWashed = bayLifecycleTerminalRows(terminal.recently_washed);
-  if (
-    !startedAt ||
-    typeof timingComplete !== "boolean" ||
-    sampleKind !== "completed_final_review_journeys" ||
-    windowMinutes !== 60 ||
-    sampleLimit === null ||
-    invalidTimingAggregate ||
-    invalidAllTimingAggregate ||
-    !history ||
-    !includingLegacyBatchHistory ||
-    terminalCount === null ||
-    tideThreshold !== 20 ||
-    tideGeneration === null ||
-    (terminal.last_tide_at !== null && !lastTideAt) ||
-    !terminalBuffer ||
-    !recentlyWashed ||
-    terminalBuffer.length !== terminalCount
-  ) {
-    return null;
-  }
-  return {
-    timing_coverage_started_at: startedAt,
-    timing_coverage_complete: timingComplete,
-    metrics_state: timingComplete ? "complete" : "warming",
-    timings: {
-      window_ended_at: publicQueueTimestamp(timings.window_ended_at),
-      window_minutes: windowMinutes,
-      // `sample_kind` is a v1 public enum. Preserve its established spelling for
-      // strict clients, and expose end-to-end final-review provenance additively.
-      sample_kind: "completed_review_journeys",
-      source: "durable_exact_review_lifecycles",
-      completion_source: "verified_final_review_receipts",
-      sample_limit: sampleLimit,
-      overall: { average_ms: average, median_ms: median, samples },
-      inline_proof: publicInlineProofCohorts(timings.inline_proof, samples),
-      history,
-      including_legacy_batch: {
-        overall: { average_ms: allAverage, median_ms: allMedian, samples: allSamples },
-        inline_proof: publicInlineProofCohorts(includingLegacyBatch.inline_proof, allSamples),
-        history: includingLegacyBatchHistory,
-      },
-    },
-    terminal_count: terminalCount,
-    tide_threshold: tideThreshold,
-    tide_generation: tideGeneration,
-    last_tide_at: lastTideAt,
-    terminal_buffer: terminalBuffer,
-    recently_washed: recentlyWashed,
-  };
-}
-
-function bayLifecycleTerminalRows(value) {
-  if (!Array.isArray(value) || value.length > 20) return null;
-  const rows = [];
-  for (const entry of value) {
-    const row = objectValue(entry);
-    const itemKey = String(row.item_key || "").toLowerCase();
-    const outcome = String(row.outcome || "");
-    const completedAt = publicQueueTimestamp(row.completed_at);
-    const journeyDuration = publicQueueCount(row.journey_duration_ms, 24 * 60 * 60 * 1000);
-    const legacyBatchPath = row.legacy_batch_path;
-    if (
-      !/^[a-z0-9_.-]+\/[a-z0-9_.-]+#[1-9]\d*$/.test(itemKey) ||
-      !["success", "failure", "cancelled"].includes(outcome) ||
-      !completedAt ||
-      journeyDuration === null ||
-      typeof legacyBatchPath !== "boolean"
-    ) {
-      return null;
-    }
-    rows.push({
-      item_key: itemKey,
-      outcome,
-      completed_at: completedAt,
-      journey_duration_ms: journeyDuration,
-      legacy_batch_path: legacyBatchPath,
-    });
-  }
-  return rows;
-}
-
-function bayLifecycleTimingHistory(value) {
-  const source = objectValue(value);
-  const points = source && Array.isArray(source.points) ? source.points : null;
-  if (!source || source.bucket_minutes !== 5 || !points || points.length > 12) return null;
-  const result = [];
-  let previousEndedAt = 0;
-  for (const point of points) {
-    const row = objectValue(point);
-    const endedAt = row && publicQueueTimestamp(row.ended_at);
-    const average = row && publicQueueCount(row.average_ms, 24 * 60 * 60 * 1000);
-    const median = row && publicQueueCount(row.median_ms, 24 * 60 * 60 * 1000);
-    const samples = row && publicQueueCount(row.samples, 100_000);
-    const endedAtMs = endedAt ? Date.parse(endedAt) : Number.NaN;
-    if (
-      !endedAt ||
-      !Number.isFinite(endedAtMs) ||
-      endedAtMs <= previousEndedAt ||
-      average === null ||
-      median === null ||
-      samples === null ||
-      samples < 1
-    ) {
-      return null;
-    }
-    previousEndedAt = endedAtMs;
-    result.push({ ended_at: endedAt, average_ms: average, median_ms: median, samples });
-  }
-  return { bucket_minutes: 5, points: result };
-}
-
-async function boundedCommandProofBody(request: Request): Promise<string | null> {
+async function boundedTargetDispatchBody(
+  request: Request,
+  maxBytes: number,
+): Promise<string | null> {
   if (!request.body) return "";
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -6684,7 +5732,7 @@ async function boundedCommandProofBody(request: Request): Promise<string | null>
       const result = await reader.read();
       if (result.done) break;
       size += result.value.byteLength;
-      if (size > 128 * 1024) return null;
+      if (size > maxBytes) return null;
       chunks.push(result.value);
     }
     const bytes = new Uint8Array(size);
@@ -6702,7 +5750,7 @@ async function boundedCommandProofBody(request: Request): Promise<string | null>
   }
 }
 
-async function githubEtagCacheRequest(env, path: string, body: string) {
+async function githubEtagCacheRequest(env, path: string, body: string, signal?: AbortSignal) {
   const namespace: DurableObjectNamespace | undefined = env.GITHUB_ETAG_CACHE;
   if (!namespace) return json({ error: "github_etag_cache_not_configured" }, 503);
   try {
@@ -6715,7 +5763,7 @@ async function githubEtagCacheRequest(env, path: string, body: string) {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
-        signal: statusRequestSignal(env),
+        signal: statusRequestSignal(env, signal),
       }),
       "github_etag_cache",
     );
@@ -6738,12 +5786,7 @@ async function authenticatedGithubEtagCacheRequest(request: Request, env, path: 
   return githubEtagCacheRequest(env, path, body);
 }
 
-async function authenticatedExactReviewQueueRequest(
-  request,
-  env,
-  path: string,
-  onAuthenticatedResponse?: (body: string, response: Response) => Promise<void>,
-) {
+async function authenticatedExactReviewQueueRequest(request, env, path: string) {
   const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const body = await request.text();
@@ -6751,7 +5794,7 @@ async function authenticatedExactReviewQueueRequest(
   if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
-  const response = await exactReviewQueueRequest(
+  return exactReviewQueueRequest(
     env,
     path,
     new Request(`https://clawsweeper-exact-review-queue${path}`, {
@@ -6760,8 +5803,6 @@ async function authenticatedExactReviewQueueRequest(
       body,
     }),
   );
-  if (onAuthenticatedResponse) await onAuthenticatedResponse(body, response);
-  return response;
 }
 
 async function authenticatedHostedTargetQueueRequest(request, env, path: string) {
@@ -6772,9 +5813,123 @@ async function authenticatedHostedTargetQueueRequest(request, env, path: string)
   if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
+  return hostedTargetQueueRequest(env, path, body);
+}
+
+// Target dispatchers enqueue here with their workflow's OIDC identity instead of
+// spending one ClawSweeper Actions relay run per `repository_dispatch`. Any
+// non-2xx answer leaves delivery to the independent App webhook route.
+async function githubTargetDispatch(request: Request, env, ctx) {
+  const text = await boundedTargetDispatchBody(request, TARGET_DISPATCH_MAX_BODY_BYTES);
+  if (text === null) return json({ error: "target_dispatch_too_large_or_invalid" }, 413);
+  const authentication = await authenticateTargetDispatchToken(bearerToken(request));
+  if (authentication.ok === false) {
+    if (authentication.reason === "unavailable") {
+      const response = json({ error: "target_dispatch_verifier_unavailable" }, 503);
+      response.headers.set("retry-after", "30");
+      return response;
+    }
+    return json({ error: "target_dispatch_not_authorized" }, 401);
+  }
+  const { identity } = authentication;
+  const payload = parseJsonObject(text);
+  if (identity.eventName === "issue_comment" || payload?.source_event === "issue_comment") {
+    return githubTargetCommentDispatch(payload, identity, env, ctx);
+  }
+  const intake = targetDispatchQueueIntake(payload, identity);
+  if ("error" in intake) return json({ error: intake.error }, intake.status);
+  return hostedTargetQueueRequest(env, "/enqueue", JSON.stringify(intake.body));
+}
+
+async function githubTargetCommentDispatch(payload, identity: TargetDispatchIdentity, env, ctx) {
+  const intake = targetDispatchCommentIntake(payload, identity);
+  if (!intake.ok) return json({ error: intake.error }, intake.status);
+  const eligibility = await workerHostedTargetEligibility(env, intake.targetRepo);
+  if (eligibility.outcome !== "eligible") {
+    if (eligibility.outcome === "terminal")
+      return hostedTargetProbeResponse({ outcome: "terminal" });
+    return hostedTargetProbeResponse({ outcome: "retryable" });
+  }
+  const admission = await workerHostedTargetVisibilityAdmission(env, intake.targetRepo);
+  if (admission.outcome !== "public") return hostedTargetProbeResponse(admission);
+  const credentials = githubAppCredentials(env);
+  if (!credentials) return json({ error: "github_app_not_configured" }, 503);
+  try {
+    const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
+    const installationId = await githubAppInstallationId(appJwt, intake.targetRepo, env);
+    const token = await createGithubAppTokenFor({
+      env,
+      appJwt,
+      installationId,
+      label: intake.targetRepo,
+      repositories: [repoName(intake.targetRepo)],
+      permissions: { issues: "read", pull_requests: "read" },
+    });
+    const repository = await githubTokenJson({
+      env,
+      token,
+      path: `/repos/${intake.targetRepo}`,
+      body: undefined,
+      errorLabel: "target dispatch repository",
+    });
+    if (
+      String(repository.full_name || "").toLowerCase() !== intake.targetRepo.toLowerCase() ||
+      !repository.default_branch ||
+      identity.ref !== `refs/heads/${repository.default_branch}` ||
+      repository.private !== false
+    )
+      return json({ error: "target_dispatch_identity_mismatch" }, 403);
+    const comment = await githubTokenJson({
+      env,
+      token,
+      path: `/repos/${intake.targetRepo}/issues/comments/${intake.commentId}`,
+      body: undefined,
+      errorLabel: "target dispatch live comment",
+    });
+    if (
+      comment.id !== intake.commentId ||
+      String(comment.issue_url || "").toLowerCase() !==
+        `https://api.github.com/repos/${intake.targetRepo}/issues/${intake.itemNumber}`.toLowerCase() ||
+      typeof comment.body !== "string" ||
+      !exactWebhookTimestamp(comment.updated_at)
+    )
+      return json({ error: "target_dispatch_comment_mismatch" }, 403);
+    const issue = await githubTokenJson({
+      env,
+      token,
+      path: `/repos/${intake.targetRepo}/issues/${intake.itemNumber}`,
+      body: undefined,
+      errorLabel: "target dispatch live item",
+    });
+    if (issue.number !== intake.itemNumber)
+      return json({ error: "target_dispatch_comment_mismatch" }, 403);
+    const livePayload = {
+      action: intake.sourceAction,
+      repository,
+      issue,
+      comment,
+      installation: { id: installationId },
+    };
+    const decision = classifyGithubIssueCommentWebhook({
+      event: "issue_comment",
+      payload: livePayload,
+      hostedTargetEligible: true,
+    });
+    if (!decision.accepted || decision.type !== "issue_comment") {
+      return json({ ok: true, accepted: false, reason: "not an authorized command" }, 202);
+    }
+    return await handleGithubCommentCommand(env, ctx, decision, livePayload);
+  } catch {
+    return json({ error: "target_dispatch_comment_unavailable" }, 503);
+  }
+}
+
+async function hostedTargetQueueRequest(env, path: string, body: string) {
+  // The queue trims the repository. Trim it here too, so that a padded slug gets
+  // the same eligibility check before the header tells the queue it passed.
   const targetRepo = String(
     objectValue(objectValue(parseJsonObject(body)).decision).targetRepo || "",
-  );
+  ).trim();
   if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) {
     const eligibility = await workerHostedTargetEligibility(env, targetRepo);
     if (eligibility.outcome === "terminal") {
@@ -6787,10 +5942,14 @@ async function authenticatedHostedTargetQueueRequest(request, env, path: string)
       });
     }
   }
-  const headers = new Headers({
-    "content-type": "application/json",
-    [HOSTED_TARGET_ELIGIBILITY_HEADER]: targetRepo,
-  });
+  const headers = new Headers({ "content-type": "application/json" });
+  try {
+    headers.set(HOSTED_TARGET_ELIGIBILITY_HEADER, targetRepo);
+  } catch {
+    // Headers rejects a value with CR, LF or NUL inside it, or with a character
+    // above U+00FF. Such a value is not a repository slug. Send the request
+    // without this header, and the queue rejects the decision with its own error.
+  }
   if (path === "/enqueue") {
     headers.set(
       EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER,
@@ -6805,59 +5964,6 @@ async function authenticatedHostedTargetQueueRequest(request, env, path: string)
       headers,
       body,
     }),
-  );
-}
-
-async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {
-  return authenticatedExactReviewQueueRequest(
-    request,
-    env,
-    "/lifecycle/command-ack/observed",
-    async (body, response) => {
-      if (!env.STATUS_STORE || !response.ok) return;
-      const result = objectValue(
-        await response
-          .clone()
-          .json()
-          .catch(() => null),
-      );
-      const receipt = objectValue(parseJsonObject(body));
-      const statusMarker = String(receipt.status_marker || "");
-      const target = String(receipt.canonical_target_key || "").match(/^([^#]+)#(\d+)$/);
-      const completionCommentId = Number(receipt.completion_comment_id);
-      const completedAt = exactWebhookTimestamp(receipt.completed_at);
-      if (
-        result.accepted === true &&
-        target &&
-        completedAt &&
-        /<!--\s*clawsweeper-command-status:\d+:(review|re_review):/i.test(statusMarker)
-      ) {
-        await recordBayJourneyTelemetry(
-          env,
-          ctx,
-          [],
-          [
-            {
-              repository: target[1],
-              number: Number(target[2]),
-              source_comment_id: Number(receipt.command_comment_id),
-              ...(nullableString(result.bay_journey_delivery_id) ||
-              nullableString(result.source_delivery_id)
-                ? {
-                    source_delivery_id:
-                      nullableString(result.bay_journey_delivery_id) ??
-                      nullableString(result.source_delivery_id),
-                  }
-                : {}),
-              completed_at: completedAt,
-              completion_kind: "final_command_status",
-              completion_outcome: receipt.completion_outcome === "failure" ? "failure" : "success",
-              completion_comment_id: completionCommentId,
-            },
-          ],
-        );
-      }
-    },
   );
 }
 
@@ -7031,6 +6137,26 @@ async function authenticatedExactReviewOperatorRequest(request, env, path: strin
       body,
     }),
   );
+}
+
+async function authenticatedReviewUsage(request: Request, env: DashboardEnv): Promise<Response> {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const body = await request.text();
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+    return json({ error: "invalid_signature" }, 401);
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return json({ error: "invalid_review_usage" }, 400);
+  }
+  if (!isReviewUsageRecord(payload)) return json({ error: "invalid_review_usage" }, 400);
+  if (!env.REVIEW_USAGE) return json({ error: "review_usage_unconfigured" }, 503);
+  writeReviewUsage(env.REVIEW_USAGE, payload);
+  return json({ ok: true }, 202);
 }
 
 async function authenticatedApplyObservability(request, env) {
@@ -7254,8 +6380,8 @@ async function enqueueExactReview({
   return body;
 }
 
-async function acknowledgePullRequestReceipt({ env, ctx, decision }) {
-  if (decision.itemKind !== "pull_request") return null;
+async function acknowledgePullRequestReceipt({ env, ctx, decision, maintainerOptIn = false }) {
+  if (decision.itemKind !== "pull_request" && !maintainerOptIn) return null;
   const credentials = githubAppCredentials(env);
   if (!credentials || !Number.isInteger(decision.installationId) || decision.installationId <= 0) {
     return null;
@@ -7283,6 +6409,7 @@ async function acknowledgePullRequestReceipt({ env, ctx, decision }) {
     targetRepo: decision.targetRepo,
     itemNumber: decision.itemNumber,
     sourceAction: decision.sourceAction,
+    maintainerOptIn,
   });
   if (acknowledgement.outcome === "lookup_limit") {
     console.warn("ClawSweeper pull request acknowledgement lookup limit reached");
@@ -7305,6 +6432,7 @@ async function acknowledgePullRequestReceipt({ env, ctx, decision }) {
           targetRepo: decision.targetRepo,
           itemNumber: decision.itemNumber,
           sourceAction: decision.sourceAction,
+          maintainerOptIn,
         });
       }
     };
@@ -7322,7 +6450,7 @@ async function createFastAckComment({
   repo,
   itemNumber,
   sourceCommentId = undefined,
-  ackMarker = fastAckMarker(sourceCommentId),
+  ackMarker = commandAckMarker(sourceCommentId),
   ackMatch = undefined,
   ackBody = renderFastAckComment(sourceCommentId),
   sinceMs = 24 * 60 * 60 * 1000,
@@ -7358,7 +6486,7 @@ function settleFastAckComments({
   repo,
   itemNumber,
   sourceCommentId = undefined,
-  ackMarker = fastAckMarker(sourceCommentId),
+  ackMarker = commandAckMarker(sourceCommentId),
   ackMatch = undefined,
   sinceMs = 24 * 60 * 60 * 1000,
   delaysMs = DEFAULT_FAST_ACK_SETTLE_DELAYS_MS,
@@ -7398,7 +6526,7 @@ async function createFastAckCommentOnce({
   repo,
   itemNumber,
   sourceCommentId = undefined,
-  ackMarker = fastAckMarker(sourceCommentId),
+  ackMarker = commandAckMarker(sourceCommentId),
   ackMatch = undefined,
   ackDedupeKey = ackMarker,
   ackBody = renderFastAckComment(sourceCommentId),
@@ -7440,7 +6568,7 @@ async function pruneFastAckComments({
   repo,
   itemNumber,
   sourceCommentId = undefined,
-  ackMarker = fastAckMarker(sourceCommentId),
+  ackMarker = commandAckMarker(sourceCommentId),
   ackMatch = undefined,
   sinceMs = 24 * 60 * 60 * 1000,
 }) {
@@ -7551,16 +6679,12 @@ async function listFastAckComments({
 
 function renderFastAckComment(sourceCommentId) {
   return [
-    fastAckMarker(sourceCommentId),
+    commandAckMarker(sourceCommentId),
     "🦞👀",
     "ClawSweeper picked this up.",
     "",
     "Command router queued. I will update this comment with the next step.",
   ].join("\n");
-}
-
-function fastAckMarker(sourceCommentId) {
-  return `<!-- clawsweeper-command-ack:${sourceCommentId} -->`;
 }
 
 async function addIssueCommentReaction({ env, token, repo, commentId, content }) {
@@ -7723,27 +6847,15 @@ async function statusSnapshot(env) {
   const allowedRepositories = verifiedPublicBayRepositories(env);
   const publicBayScope = publicBayRepositoryScope(allowedRepositories);
   const scopedCached = await readCachedSnapshot(env, ttl, publicBayScope);
-  // A legacy cache entry without scope provenance can still describe a
-  // malformed document. Keep that fail-closed path, but never reuse it as a
-  // complete durable lifecycle snapshot.
+  // Unscoped legacy entries are only used to retain the fail-closed response
+  // for malformed documents; complete entries must have current scope provenance.
   const cached = scopedCached || (await readCachedSnapshot(env, ttl));
-  const cachedTimings = objectValue(cached?.bay?.timings);
-  const cachedIncludingLegacyBatch = objectValue(cachedTimings.including_legacy_batch);
   const cachedProjection = cached ? publicStatusProjection(cached, allowedRepositories) : null;
   // A malformed durable document should fail closed without triggering a
   // costly background collection. A complete legacy document, however, must
   // be rebuilt before it can be copied into the current cache generation.
   if (cachedProjection?.public_projection_complete === false) return cachedProjection;
-  if (
-    cachedTimings.sample_kind === "completed_review_journeys" &&
-    cachedTimings.source === "durable_exact_review_lifecycles" &&
-    cachedTimings.completion_source === "verified_final_review_receipts" &&
-    Object.prototype.hasOwnProperty.call(cachedIncludingLegacyBatch, "overall") &&
-    Object.prototype.hasOwnProperty.call(cachedIncludingLegacyBatch, "history") &&
-    scopedCached === cached
-  ) {
-    return cachedProjection;
-  }
+  if (scopedCached && scopedCached === cached) return cachedProjection;
 
   const github = createGithubJsonCache(env);
   const generatedAt = new Date().toISOString();
@@ -7755,97 +6867,31 @@ async function statusSnapshot(env) {
     .filter(Boolean);
   const budget = numberFrom(env.WORKER_BUDGET, 32);
   const activeRunErrors = [];
-  const useWorkflowReadModel = dashboardWorkflowSource(env) === "webhook";
-  const workflowReadModel =
-    useWorkflowReadModel && stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
-      ? await githubWebhookReadModelQueuePost(env, "workflows", {
-          repository: repo,
-        }).catch(() => null)
-      : null;
-  const workflowReadModelUsable = workflowReadModel?.usable === true;
-  if (useWorkflowReadModel && !workflowReadModelUsable) {
-    reportGithubReadModelDashboardFallback(workflowReadModel);
-  }
-  let runs;
-  let completedRuns;
-  let activeRunCandidates;
-  let operationalRunCandidates;
-  if (workflowReadModelUsable) {
-    const reconciled = await revalidateStaleWorkflowHealthRuns({
-      env,
-      repo,
-      runs: Array.isArray(workflowReadModel.runs) ? workflowReadModel.runs : [],
-      observations: Array.isArray(workflowReadModel.run_observations)
-        ? workflowReadModel.run_observations
-        : [],
-      checkedAt: generatedAt,
-      github,
-    });
-    activeRunErrors.push(...reconciled.errors);
-    runs = { workflow_runs: reconciled.runs };
-    completedRuns = {
-      workflow_runs: reconciled.runs.filter((run) => objectValue(run).status === "completed"),
-    };
-    activeRunCandidates = reconciled.runs.filter((run) => isActiveWorkflowRun(run));
-    operationalRunCandidates = reconciled.runs.filter((run) =>
-      ACTIVE_RUN_STATUSES.has(String(objectValue(run).status || "")),
-    );
-  } else {
-    [runs, completedRuns, activeRunCandidates] = await Promise.all([
-      github(`/repos/${repo}/actions/runs?per_page=100`).catch((error) => {
-        errors.push(`workflow runs: ${error.message}`);
-        return null;
-      }),
-      github(`/repos/${repo}/actions/runs?status=completed&per_page=100`).catch((error) => {
-        errors.push(`workflow runs completed: ${error.message}`);
-        return null;
-      }),
-      activeWorkflowRunCandidates(env, repo, activeRunErrors, github),
-    ]);
-    operationalRunCandidates = activeRunCandidates;
-  }
+  // The status-filtered reads cover every run state. An unfiltered listing is
+  // slow on this repository's run history and timed out the refresh deadline.
+  const [completedRuns, activeRunCandidates] = await Promise.all([
+    github(`/repos/${repo}/actions/runs?status=completed&per_page=100`).catch((error) => {
+      errors.push(statusTelemetryError("completed_workflow_runs_unavailable", error));
+      return null;
+    }),
+    activeWorkflowRunCandidates(env, repo, activeRunErrors, github),
+  ]);
   errors.push(...activeRunErrors);
-  const workflowRuns = Array.isArray(runs?.workflow_runs) ? runs.workflow_runs : [];
-  const completedWorkflowRuns = uniqueWorkflowRuns([
+  // Reconcile observations before splitting lifecycle views, so a completion or
+  // rerun retires stale rows everywhere. Feed position cannot establish recency.
+  const workflowRuns = uniqueWorkflowRuns([
+    ...activeRunCandidates,
     ...(Array.isArray(completedRuns?.workflow_runs) ? completedRuns.workflow_runs : []),
-    ...workflowRuns.filter((run) => run.status === "completed"),
-  ]).sort(newestWorkflowRunFirst);
-  const activeRuns = uniqueWorkflowRuns([
-    ...activeRunCandidates.filter((run) => isActiveWorkflowRun(run)),
-    ...workflowRuns.filter((run) => isActiveWorkflowRun(run)),
-  ]).sort(newestWorkflowRunFirst);
-  if (
-    useWorkflowReadModel &&
-    !workflowReadModelUsable &&
-    stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
-  ) {
-    const objects = uniqueWorkflowRuns([
-      ...workflowRuns,
-      ...completedWorkflowRuns,
-      ...activeRuns,
-    ]).flatMap((run) => {
-      const object = githubWebhookReadModelWorkflowObject(repo, "workflow_run", run);
-      return object ? [object] : [];
-    });
-    if (objects.length > 0) {
-      await githubWebhookReadModelQueuePost(env, "repair", {
-        repository: repo,
-        repair_kind: "workflows",
-        ...(runs && completedRuns && activeRunErrors.length === 0
-          ? {
-              workflow_run_census_complete: true,
-              workflow_run_census_started_at: generatedAt,
-            }
-          : {}),
-        objects,
-      }).catch(() => null);
-    }
-  }
+  ]);
+  const completedWorkflowRuns = workflowRuns
+    .filter((run) => run.status === "completed")
+    .sort(newestWorkflowRunFirst);
+  const activeRuns = workflowRuns.filter(isActiveWorkflowRun).sort(newestWorkflowRunFirst);
   const workerRuns = activeRuns.filter((run) => !isSupportWorkflowRun(run));
   const supportRuns = activeRuns.filter((run) => isSupportWorkflowRun(run));
   const controlPlane = controlPlaneSnapshot(activeRuns);
   const operationalHealth = summarizeOperationalHealth(
-    operationalRunCandidates.filter((run) => !isSupportWorkflowRun(run)),
+    workflowRuns.filter((run) => !isSupportWorkflowRun(run)),
     generatedAt,
     activeRunErrors.length === 0,
   );
@@ -7856,48 +6902,24 @@ async function statusSnapshot(env) {
       isCodexWorkflowFallback(run) &&
       TERMINAL_BAD_CONCLUSIONS.has(String(run.conclusion)),
   );
-  const readModelJobs =
-    workflowReadModel?.jobs_usable === true && Array.isArray(workflowReadModel?.jobs)
-      ? {
-          jobs: workflowReadModel.jobs as unknown[],
-          coveredRunIds: new Set<number>(
-            (Array.isArray(workflowReadModel.job_coverage_run_ids)
-              ? workflowReadModel.job_coverage_run_ids
-              : []
-            )
-              .map((value) => Number(value))
-              .filter((value) => Number.isSafeInteger(value) && value > 0),
-          ),
-        }
-      : undefined;
   const activeJobs = await activeWorkerSnapshot(
     env,
     repo,
     workerRuns,
     github,
-    readModelJobs,
     activeRunErrors.length === 0,
   );
   statusCollections.get(env)?.check();
-  const [
-    workerHealth,
-    pipeline,
-    clusterRepair,
-    applyHealth,
-    automerge,
-    automergeReliability,
-    closed,
-    storedEvents,
-  ] = await Promise.all([
+  const [workerHealth, pipeline, applyHealth, closed, storedEvents] = await Promise.all([
     withTimeout(
-      recentWorkerHealth(env, repo, completedWorkflowRuns, github, readModelJobs),
+      recentWorkerHealth(env, repo, completedWorkflowRuns, github),
       workerHealthSectionTimeoutMs(
         workerHealthFetchConcurrency(env),
         env.WORKER_HEALTH_SECTION_TIMEOUT_MS,
       ),
       "worker health",
     ).catch((error) => {
-      errors.push(error.message);
+      errors.push(statusTelemetryError("worker_health_unavailable", error));
       return emptyWorkerHealth(generatedAt);
     }),
     withTimeout(
@@ -7905,87 +6927,37 @@ async function statusSnapshot(env) {
       OPTIONAL_SECTION_TIMEOUT_MS,
       "pipeline",
     ).catch((error) => {
-      errors.push(error.message);
+      errors.push(statusTelemetryError("pipeline_unavailable", error));
       return workerRuns.slice(0, 30).map((run) => classifyRun(run));
-    }),
-    withTimeout(
-      clusterRepairStatus(env, repo, targetRepos, activeRuns, github),
-      OPTIONAL_SECTION_TIMEOUT_MS,
-      "cluster repair intake",
-    ).catch((error) => {
-      errors.push(error.message);
-      return emptyClusterRepairStatus(targetRepos);
     }),
     withTimeout(
       applyHealthStatus(env, targetRepos, github),
       OPTIONAL_SECTION_TIMEOUT_MS,
       "apply health",
     ).catch((error) => {
-      errors.push(error.message);
+      errors.push(statusTelemetryError("apply_health_unavailable", error));
       return emptyApplyHealthStatus(targetRepos);
-    }),
-    withTimeout(
-      recentAutomerge(env, targetRepos[0] || "openclaw/openclaw", github),
-      OPTIONAL_SECTION_TIMEOUT_MS,
-      "automerge timing",
-    ).catch((error) => {
-      errors.push(error.message);
-      return { average_ms: null, samples: 0, items: [] };
-    }),
-    withTimeout(
-      recentAutomergeReliability(env, repo, targetRepos, github),
-      OPTIONAL_SECTION_TIMEOUT_MS,
-      "automerge reliability",
-    ).catch((error) => {
-      errors.push(error.message);
-      return emptyAutomergeReliability(generatedAt);
     }),
     withTimeout(
       recentClawsweeperClosed(env, targetRepos, github),
       OPTIONAL_SECTION_TIMEOUT_MS,
       "recent closed",
     ).catch((error) => {
-      errors.push(error.message);
+      errors.push(statusTelemetryError("recent_closed_unavailable", error));
       return { items: [], stats: emptyClosedStats(generatedAt) };
     }),
     readEvents(env).catch((error) => {
-      errors.push(`events: ${error.message}`);
+      errors.push(statusTelemetryError("events_unavailable", error));
       return [];
     }),
   ]);
-  errors.push(...activeJobs.errors);
-  errors.push(...workerHealth.errors);
+  errors.push(
+    ...activeJobs.errors.map((error) => statusTelemetryError("active_jobs_unavailable", error)),
+  );
+  errors.push(
+    ...workerHealth.errors.map((error) => statusTelemetryError("worker_health_unavailable", error)),
+  );
   statusCollections.get(env)?.check();
-  const authoritativeBay = await withTimeout(
-    exactReviewBayLifecycleMetricsSnapshot(env),
-    OPTIONAL_SECTION_TIMEOUT_MS,
-    "Bay lifecycle metrics",
-  ).catch((error) => {
-    errors.push(error.message);
-    return null;
-  });
-  const bay = authoritativeBay
-    ? { ...authoritativeBay, active_census_complete: activeJobs.complete }
-    : {
-        ...emptyBayTerminalState(generatedAt),
-        active_census_complete: activeJobs.complete,
-        metrics_state: "unavailable",
-        timing_coverage_complete: false,
-        timing_coverage_started_at: null,
-        timings: {
-          window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
-          sample_kind: "completed_review_journeys",
-          source: "durable_exact_review_lifecycles",
-          completion_source: "verified_final_review_receipts",
-          sample_limit: 0,
-          overall: { average_ms: null, median_ms: null, samples: 0 },
-          history: { bucket_minutes: 5, points: [] },
-          including_legacy_batch: {
-            overall: { average_ms: null, median_ms: null, samples: 0 },
-            history: { bucket_minutes: 5, points: [] },
-          },
-        },
-      };
   const { recent_attempts: _recentAttempts, ...publicWorkerHealth } = workerHealth;
 
   const snapshot = {
@@ -8010,19 +6982,11 @@ async function statusSnapshot(env) {
     control_plane: controlPlane,
     health: publicWorkerHealth,
     operational_health: operationalHealth,
-    averages: {
-      automerge_command_to_merge_ms: automerge.average_ms,
-      automerge_samples: automerge.samples,
-    },
     workers: activeJobs.workers,
-    automatic_work: automaticIssueWork(storedEvents, activeJobs.workers),
     pipeline,
-    bay,
+    bay: { active_census_complete: activeJobs.complete },
     recent: {
-      cluster_repair: clusterRepair,
       apply_health: applyHealth,
-      automerge: automerge.items,
-      automerge_reliability: automergeReliability,
       closed_items: closed.items,
       closed_stats: closed.stats,
       operation_counts: operationEventCounts(storedEvents),
@@ -8040,23 +7004,15 @@ async function statusSnapshot(env) {
 
 async function attachExactReviewQueueStatus(snapshot, env) {
   const diagnostics = objectValue(snapshot.diagnostics);
-  const bay = objectValue(snapshot.bay);
   const activeTargets = publicBayActiveTargets(
     snapshot.workers,
-    bay.active_census_complete === true,
+    objectValue(snapshot.bay).active_census_complete === true,
     verifiedPublicBayRepositories(env),
   );
   const activeKeys = activeTargets.keys;
-  const bayPriorityKeys = [
-    ...(Array.isArray(bay.terminal_buffer) ? bay.terminal_buffer : []),
-    ...(Array.isArray(bay.recently_washed) ? bay.recently_washed : []),
-  ]
-    .map((item) => String(objectValue(item).item_key || ""))
-    .filter(Boolean);
   let recentDurablePublicationEvents = null;
   const exactReviewQueueRequest = withTimeout(
     exactReviewQueueStatusSnapshot(env, {
-      bayPriorityKeys,
       bayActiveKeys: activeKeys,
       bayActiveLegacyKeys: activeTargets.legacyKeys,
     }),
@@ -8109,7 +7065,7 @@ async function attachExactReviewQueueStatus(snapshot, env) {
   if (retainedPriorExactReviewQueue) {
     // The optional queue probe can fail while its direct endpoint and the review
     // pipeline remain healthy. Retain the last internally consistent, public-only
-    // queue document rather than caching a null projection that empties the Bay.
+    // queue document rather than caching a null projection that empties Overview.
     // Live activity is generation-coupled to the failed probe, so never preserve
     // a prior complete activity aggregate as current evidence.
     exactReviewQueue = {
@@ -8785,9 +7741,6 @@ function proofStateFromLabels(labels) {
   if (has("proof: sufficient")) return "Sufficient";
   if (has("triage: mock-only-proof")) return "Mock-only proof";
   if (has("triage: needs-real-behavior-proof")) return "Needs proof";
-  if (has("mantis: telegram-visible-proof") || has("proof: telegram-e2e")) {
-    return "Telegram proof";
-  }
   return "";
 }
 
@@ -8826,7 +7779,6 @@ async function activeWorkerSnapshot(
   repo,
   runs,
   github: GithubJsonReader = (path) => githubJson(env, path),
-  readModelJobs?: { jobs: unknown[]; coveredRunIds: Set<number> },
   runCensusComplete = false,
 ) {
   const detailRunLimit = Math.max(
@@ -8843,14 +7795,7 @@ async function activeWorkerSnapshot(
     fetchConcurrency,
     async (run) => {
       try {
-        const jobSnapshot = await workflowJobsForRunSnapshot(
-          env,
-          repo,
-          run.id,
-          github,
-          run,
-          readModelJobs,
-        );
+        const jobSnapshot = await workflowJobsForRunSnapshot(env, repo, run.id, github, run);
         const jobs = jobSnapshot.jobs;
         const activeJobs = jobs.filter((job) => isActiveWorkflowJob(job));
         return {
@@ -8870,7 +7815,7 @@ async function activeWorkerSnapshot(
           codexWorkers: 0,
           hasWorkerJobs: false,
           complete: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: statusTelemetryError("active_jobs_unavailable", error),
         };
       }
     },
@@ -8883,7 +7828,7 @@ async function activeWorkerSnapshot(
   for (const result of results) {
     codexWorkers += result.codexWorkers;
     if (result.error) {
-      errors.push(`workflow jobs ${result.run.id}: ${result.error}`);
+      errors.push(result.error);
       if (isCodexWorkflowFallback(result.run)) {
         workers.push(normalizeFallbackWorker(result.run));
         fallbacks += 1;
@@ -8949,7 +7894,6 @@ async function recentWorkerHealth(
   repo,
   runs: WorkflowRunSummary[],
   github: GithubJsonReader = (path) => githubJson(env, path),
-  readModelJobs?: { jobs: unknown[]; coveredRunIds: Set<number> },
 ) {
   const cacheKey = `worker-health:v3:${String(repo || "").toLowerCase()}`;
   const cached = await readStoredJson(env, cacheKey);
@@ -8963,7 +7907,7 @@ async function recentWorkerHealth(
     async (run) => {
       try {
         return {
-          attempts: (await workflowJobsForRun(env, repo, run.id, github, run, readModelJobs))
+          attempts: (await workflowJobsForRun(env, repo, run.id, github, run))
             .filter((job) => isCodexWorkerJob(job))
             .map((job) => workerHealthAttempt(run, job))
             .filter(Boolean),
@@ -8972,9 +7916,7 @@ async function recentWorkerHealth(
       } catch (error) {
         return {
           attempts: [],
-          error: `worker health run ${run.id}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          error: statusTelemetryError("worker_health_unavailable", error),
         };
       }
     },
@@ -9051,7 +7993,10 @@ function workerHealthStorageProjection(health) {
     // the in-memory status projection for the current request.
     recent_attempts: [],
     failures: publicStatusValue(health.failures, "failures", 0),
-    errors: [],
+    // A cached partial sample must retain the same failure signal as its first read.
+    errors: health.errors
+      .slice(0, 10)
+      .map((error) => statusTelemetryError("worker_health_unavailable", error)),
     updated_at: health.updated_at,
   };
 }
@@ -9081,461 +8026,6 @@ function boundedBayTimingDuration(startedAt, completedAt) {
   if (!Number.isFinite(started) || !Number.isFinite(completed) || duration < 0) return null;
   if (duration > BAY_TIMING_MAX_SAMPLE_MS) return null;
   return duration;
-}
-
-export function summarizeBayJourneyTimings(journeys, generatedAt) {
-  const parsedNow = Date.parse(String(generatedAt || ""));
-  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
-  const cutoff = now - BAY_TIMING_WINDOW_MS;
-  const overallDurations: number[] = [];
-  for (const journey of Array.isArray(journeys) ? journeys : []) {
-    const triggeredAt = Date.parse(String(journey?.triggered_at || ""));
-    const completedAt = Date.parse(String(journey?.completed_at || ""));
-    if (!Number.isFinite(completedAt) || completedAt < cutoff || completedAt > now) continue;
-    const totalDuration = completedAt - triggeredAt;
-    if (
-      Number.isFinite(totalDuration) &&
-      totalDuration >= 0 &&
-      totalDuration <= BAY_TIMING_MAX_SAMPLE_MS
-    ) {
-      overallDurations.push(totalDuration);
-    }
-  }
-  return {
-    window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
-    sample_kind: "completed_review_journeys",
-    sample_limit: BAY_JOURNEY_LIMIT,
-    overall: {
-      average_ms: overallDurations.length
-        ? Math.round(
-            overallDurations.reduce((total, value) => total + value, 0) / overallDurations.length,
-          )
-        : null,
-      median_ms: overallDurations.length
-        ? (() => {
-            const ordered = [...overallDurations].sort((left, right) => left - right);
-            const middle = Math.floor(ordered.length / 2);
-            return ordered.length % 2
-              ? ordered[middle]
-              : Math.round((ordered[middle - 1] + ordered[middle]) / 2);
-          })()
-        : null,
-      samples: overallDurations.length,
-    },
-  };
-}
-
-function bayJourneyId(repository, itemNumber, sourceCommentId, sourceDeliveryId, triggeredAt) {
-  const prefix = `${String(repository || "").toLowerCase()}#${Number(itemNumber)}:command:${Number(sourceCommentId)}`;
-  return sourceDeliveryId
-    ? `${prefix}:delivery:${sourceDeliveryId}`
-    : `${prefix}:at:${Date.parse(triggeredAt)}`;
-}
-
-function bayJourneyCompletionId(
-  repository,
-  itemNumber,
-  sourceCommentId,
-  completionCommentId,
-  completedAt,
-  sourceDeliveryId,
-) {
-  const completedMarker = Date.parse(completedAt);
-  const marker =
-    Number.isSafeInteger(Number(completionCommentId)) && Number(completionCommentId) > 0
-      ? `comment:${Number(completionCommentId)}:at:${completedMarker}`
-      : `at:${completedMarker}`;
-  const delivery = sourceDeliveryId ? `:delivery:${sourceDeliveryId}` : "";
-  return `${String(repository || "").toLowerCase()}#${Number(itemNumber)}:command:${Number(sourceCommentId)}${delivery}:completion:${marker}`;
-}
-
-function bayJourneyTimestamp(value) {
-  const text = String(value || "").trim();
-  return text && Number.isFinite(Date.parse(text)) ? text : null;
-}
-
-function normalizeBayJourneyTrigger(value) {
-  const trigger = objectValue(value);
-  const repository = nullableString(trigger.repository)?.toLowerCase() || null;
-  const number = Number(trigger.number);
-  const sourceCommentId = Number(trigger.source_comment_id);
-  const sourceDeliveryId = nullableString(trigger.source_delivery_id);
-  const triggeredAt = bayJourneyTimestamp(trigger.triggered_at);
-  if (
-    !repository ||
-    !Number.isInteger(number) ||
-    number <= 0 ||
-    !Number.isSafeInteger(sourceCommentId) ||
-    sourceCommentId <= 0 ||
-    !triggeredAt
-  ) {
-    return null;
-  }
-  return {
-    id: bayJourneyId(repository, number, sourceCommentId, sourceDeliveryId, triggeredAt),
-    item_key: `${repository}#${number}`,
-    repository,
-    number,
-    source_comment_id: sourceCommentId,
-    source_delivery_id: sourceDeliveryId,
-    triggered_at: triggeredAt,
-  };
-}
-
-function normalizeBayJourneyCompletion(value) {
-  const completion = objectValue(value);
-  const repository = nullableString(completion.repository)?.toLowerCase() || null;
-  const number = Number(completion.number);
-  const sourceCommentId = Number(completion.source_comment_id);
-  const sourceDeliveryId = nullableString(completion.source_delivery_id);
-  const completedAt = bayJourneyTimestamp(completion.completed_at);
-  const completionKind = nullableString(completion.completion_kind);
-  const completionCommentId = Number(completion.completion_comment_id);
-  const completionOutcome = nullableString(completion.completion_outcome);
-  if (
-    !repository ||
-    !Number.isInteger(number) ||
-    number <= 0 ||
-    !Number.isSafeInteger(sourceCommentId) ||
-    sourceCommentId <= 0 ||
-    !completedAt
-  ) {
-    return null;
-  }
-  return {
-    id: bayJourneyCompletionId(
-      repository,
-      number,
-      sourceCommentId,
-      completionCommentId,
-      completedAt,
-      sourceDeliveryId,
-    ),
-    item_key: `${repository}#${number}`,
-    repository,
-    number,
-    source_comment_id: sourceCommentId,
-    ...(sourceDeliveryId ? { source_delivery_id: sourceDeliveryId } : {}),
-    completed_at: completedAt,
-    completion_kind: completionKind || "final_command_status",
-    completion_outcome:
-      completionOutcome === "success" ||
-      completionOutcome === "failure" ||
-      completionOutcome === "cancelled"
-        ? completionOutcome
-        : null,
-    completion_comment_id:
-      Number.isSafeInteger(completionCommentId) && completionCommentId > 0
-        ? completionCommentId
-        : null,
-  };
-}
-
-function normalizeBayJourneyRecord(value) {
-  const record = objectValue(value);
-  const trigger = normalizeBayJourneyTrigger(record);
-  const completion = normalizeBayJourneyCompletion({
-    ...record,
-    source_delivery_id: nullableString(record.completion_source_delivery_id),
-  });
-  if (!trigger && !completion) return null;
-  const source = trigger || completion;
-  return {
-    id: source.id,
-    item_key: source.item_key,
-    repository: source.repository,
-    number: source.number,
-    source_comment_id: source.source_comment_id,
-    source_delivery_id: trigger?.source_delivery_id || completion?.source_delivery_id || null,
-    triggered_at: trigger?.triggered_at || null,
-    completed_at: completion?.completed_at || null,
-    completion_kind: completion?.completion_kind || null,
-    completion_outcome: completion?.completion_outcome || null,
-    completion_comment_id: completion?.completion_comment_id || null,
-    ...(completion?.source_delivery_id
-      ? { completion_source_delivery_id: completion.source_delivery_id }
-      : {}),
-  };
-}
-
-export function mergeBayJourneyState(previous, triggers, completions, generatedAt) {
-  const parsedNow = Date.parse(String(generatedAt || ""));
-  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
-  const cutoff = now - BAY_JOURNEY_TTL_SECONDS * 1000;
-  const records = new Map();
-  for (const value of Array.isArray(previous?.journeys) ? previous.journeys : []) {
-    const record = normalizeBayJourneyRecord(value);
-    const activityAt = Math.max(
-      Date.parse(String(record?.completed_at || "")) || 0,
-      Date.parse(String(record?.triggered_at || "")) || 0,
-    );
-    if (record && activityAt >= cutoff) records.set(record.id, record);
-  }
-  for (const value of Array.isArray(triggers) ? triggers : []) {
-    const trigger = normalizeBayJourneyTrigger(value);
-    if (!trigger) continue;
-    const completedOrphan = [...records.values()]
-      .filter(
-        (record) =>
-          record.repository === trigger.repository &&
-          record.number === trigger.number &&
-          record.source_comment_id === trigger.source_comment_id &&
-          (!record.source_delivery_id ||
-            !trigger.source_delivery_id ||
-            record.source_delivery_id === trigger.source_delivery_id) &&
-          !record.triggered_at &&
-          (Date.parse(String(record.completed_at || "")) || 0) >= Date.parse(trigger.triggered_at),
-      )
-      .sort(
-        (left, right) =>
-          (trigger.source_delivery_id
-            ? Number(right.source_delivery_id === trigger.source_delivery_id) -
-              Number(left.source_delivery_id === trigger.source_delivery_id)
-            : 0) ||
-          (Date.parse(String(left.completed_at || "")) || 0) -
-            (Date.parse(String(right.completed_at || "")) || 0),
-      )[0];
-    const current = records.get(trigger.id) || completedOrphan || {};
-    if (completedOrphan && completedOrphan.id !== trigger.id) records.delete(completedOrphan.id);
-    records.set(trigger.id, {
-      ...current,
-      ...trigger,
-      id: trigger.id,
-      triggered_at: trigger.triggered_at,
-    });
-  }
-  for (const value of Array.isArray(completions) ? completions : []) {
-    const completion = normalizeBayJourneyCompletion(value);
-    if (!completion) continue;
-    if (completion.source_delivery_id) {
-      const legacyCompletionOnIdentifiedJourney = [...records.values()].find(
-        (record) =>
-          record.repository === completion.repository &&
-          record.number === completion.number &&
-          record.source_comment_id === completion.source_comment_id &&
-          record.source_delivery_id === completion.source_delivery_id &&
-          record.triggered_at &&
-          record.completed_at &&
-          !record.completion_source_delivery_id &&
-          (record.completed_at !== completion.completed_at ||
-            record.completion_comment_id !== completion.completion_comment_id),
-      );
-      if (legacyCompletionOnIdentifiedJourney) {
-        const legacyCompletion = normalizeBayJourneyCompletion({
-          ...legacyCompletionOnIdentifiedJourney,
-          source_delivery_id: undefined,
-        });
-        if (legacyCompletion) {
-          records.set(legacyCompletion.id, {
-            ...legacyCompletion,
-            id: legacyCompletion.id,
-            source_delivery_id: null,
-            triggered_at: null,
-            completed_at: legacyCompletion.completed_at,
-            completion_kind: legacyCompletion.completion_kind,
-            completion_comment_id: legacyCompletion.completion_comment_id,
-          });
-        }
-        records.set(legacyCompletionOnIdentifiedJourney.id, {
-          ...legacyCompletionOnIdentifiedJourney,
-          completed_at: null,
-          completion_kind: null,
-          completion_comment_id: null,
-        });
-      }
-    }
-    let exactCompletion = [...records.values()].find(
-      (record) =>
-        record.repository === completion.repository &&
-        record.number === completion.number &&
-        record.source_comment_id === completion.source_comment_id &&
-        (!completion.source_delivery_id ||
-          !record.completion_source_delivery_id ||
-          record.completion_source_delivery_id === completion.source_delivery_id) &&
-        record.completion_comment_id === completion.completion_comment_id &&
-        record.completed_at === completion.completed_at,
-    );
-    if (
-      exactCompletion &&
-      completion.source_delivery_id &&
-      exactCompletion.source_delivery_id !== completion.source_delivery_id &&
-      !exactCompletion.completion_source_delivery_id
-    ) {
-      if (!exactCompletion.triggered_at) {
-        records.delete(exactCompletion.id);
-      } else {
-        records.set(exactCompletion.id, {
-          ...exactCompletion,
-          completed_at: null,
-          completion_kind: null,
-          completion_comment_id: null,
-        });
-      }
-      exactCompletion = undefined;
-    }
-    const current =
-      exactCompletion ||
-      (completion.source_delivery_id
-        ? [...records.values()].find(
-            (record) =>
-              record.repository === completion.repository &&
-              record.number === completion.number &&
-              record.source_comment_id === completion.source_comment_id &&
-              record.source_delivery_id === completion.source_delivery_id &&
-              record.completion_source_delivery_id === completion.source_delivery_id &&
-              (!record.triggered_at ||
-                Date.parse(record.triggered_at) <= Date.parse(completion.completed_at)),
-          )
-        : undefined) ||
-      [...records.values()]
-        .filter(
-          (record) =>
-            record.repository === completion.repository &&
-            record.number === completion.number &&
-            record.source_comment_id === completion.source_comment_id &&
-            (!completion.source_delivery_id ||
-              !record.source_delivery_id ||
-              record.source_delivery_id === completion.source_delivery_id) &&
-            record.triggered_at &&
-            !record.completed_at &&
-            Date.parse(record.triggered_at) <= Date.parse(completion.completed_at),
-        )
-        .sort(
-          (left, right) =>
-            (completion.source_delivery_id
-              ? Number(right.source_delivery_id === completion.source_delivery_id) -
-                Number(left.source_delivery_id === completion.source_delivery_id)
-              : 0) ||
-            (Date.parse(String(right.triggered_at || "")) || 0) -
-              (Date.parse(String(left.triggered_at || "")) || 0),
-        )[0] ||
-      records.get(completion.id) ||
-      {};
-    const recordId = current.id || completion.id;
-    const currentCompletedAt = Date.parse(String(current.completed_at || ""));
-    const completionAt = Date.parse(completion.completed_at);
-    if (
-      Number.isFinite(currentCompletedAt) &&
-      (currentCompletedAt > completionAt ||
-        (currentCompletedAt === completionAt &&
-          Number(current.completion_comment_id || 0) >
-            Number(completion.completion_comment_id || 0)))
-    ) {
-      continue;
-    }
-    if (current.id && current.id !== recordId) records.delete(current.id);
-    records.set(recordId, {
-      ...current,
-      ...completion,
-      id: recordId,
-      completed_at: completion.completed_at,
-      completion_kind: completion.completion_kind,
-      completion_comment_id: completion.completion_comment_id,
-      ...(completion.source_delivery_id
-        ? { completion_source_delivery_id: completion.source_delivery_id }
-        : {}),
-    });
-  }
-  for (const record of records.values()) {
-    if (!record.triggered_at || record.completed_at || !record.source_delivery_id) continue;
-    const completedOrphan = [...records.values()]
-      .filter(
-        (candidate) =>
-          !candidate.triggered_at &&
-          candidate.completed_at &&
-          candidate.repository === record.repository &&
-          candidate.number === record.number &&
-          candidate.source_comment_id === record.source_comment_id &&
-          (candidate.source_delivery_id === record.source_delivery_id ||
-            (!candidate.source_delivery_id &&
-              [...records.values()].filter(
-                (journey) =>
-                  journey.triggered_at &&
-                  !journey.completed_at &&
-                  journey.repository === candidate.repository &&
-                  journey.number === candidate.number &&
-                  journey.source_comment_id === candidate.source_comment_id &&
-                  Date.parse(journey.triggered_at) <= Date.parse(candidate.completed_at),
-              ).length === 1)) &&
-          Date.parse(candidate.completed_at) >= Date.parse(record.triggered_at),
-      )
-      .sort(
-        (left, right) =>
-          (Date.parse(String(left.completed_at || "")) || 0) -
-          (Date.parse(String(right.completed_at || "")) || 0),
-      )[0];
-    if (!completedOrphan) continue;
-    records.delete(completedOrphan.id);
-    records.set(record.id, {
-      ...record,
-      completed_at: completedOrphan.completed_at,
-      completion_kind: completedOrphan.completion_kind,
-      completion_outcome: completedOrphan.completion_outcome,
-      completion_comment_id: completedOrphan.completion_comment_id,
-      ...(completedOrphan.completion_source_delivery_id
-        ? { completion_source_delivery_id: completedOrphan.completion_source_delivery_id }
-        : {}),
-    });
-  }
-  const journeys = [...records.values()]
-    .sort(
-      (left, right) =>
-        Math.max(
-          Date.parse(String(right.completed_at || "")) || 0,
-          Date.parse(String(right.triggered_at || "")) || 0,
-        ) -
-        Math.max(
-          Date.parse(String(left.completed_at || "")) || 0,
-          Date.parse(String(left.triggered_at || "")) || 0,
-        ),
-    )
-    .slice(0, BAY_JOURNEY_LIMIT);
-  return {
-    schema_version: 1,
-    journeys,
-    updated_at: new Date(now).toISOString(),
-  };
-}
-
-function bayJourneyStateSignature(state) {
-  return JSON.stringify({
-    schema_version: state?.schema_version,
-    journeys: state?.journeys,
-  });
-}
-
-function publicBayJourneyState(state) {
-  const journeys = (Array.isArray(state?.journeys) ? state.journeys : [])
-    .map(normalizeBayJourneyRecord)
-    .filter(Boolean)
-    .slice(0, BAY_JOURNEY_LIMIT);
-  return { journeys };
-}
-
-async function updateBayJourneyState(env, triggers, completions, generatedAt) {
-  if (!env.STATUS_STORE) return { journeys: [] };
-  if (isDurableStatusStore(env.STATUS_STORE)) {
-    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(
-      statusStoreRequest(BAY_JOURNEY_STATE_KEY, "POST"),
-      {
-        method: "POST",
-        body: JSON.stringify({
-          triggers,
-          completions,
-          generated_at: generatedAt,
-          ttl_seconds: BAY_JOURNEY_TTL_SECONDS,
-        }),
-      },
-    );
-    if (!response.ok) throw new Error(`status store Bay journey merge failed: ${response.status}`);
-    return publicBayJourneyState(await response.json());
-  }
-  const stored = await readStoredJson(env, BAY_JOURNEY_STATE_KEY);
-  const next = mergeBayJourneyState(stored, triggers, completions, generatedAt);
-  if (!stored || bayJourneyStateSignature(stored) !== bayJourneyStateSignature(next)) {
-    await writeStoredJson(env, BAY_JOURNEY_STATE_KEY, next, BAY_JOURNEY_TTL_SECONDS);
-  }
-  return publicBayJourneyState(next);
 }
 
 function workerHealthAttempt(run, job) {
@@ -9605,553 +8095,6 @@ function workerHealthAttempt(run, job) {
   };
 }
 
-export function activeBayItemKeys(workers, limits: { workers?: number; items?: number } = {}) {
-  const keys = new Set<string>();
-  const workerList = Array.isArray(workers) ? workers : [];
-  const boundedWorkers = Number.isSafeInteger(limits.workers)
-    ? workerList.slice(0, Math.max(0, Number(limits.workers)))
-    : workerList;
-  for (const worker of boundedWorkers) {
-    const targetItems = Array.isArray(worker?.target_items) ? worker.target_items : [];
-    const boundedTargetItems = Number.isSafeInteger(limits.items)
-      ? targetItems.slice(0, Math.max(0, Number(limits.items)))
-      : targetItems;
-    const targets = new Map<number, Record<string, unknown>>(
-      boundedTargetItems.map((item): [number, Record<string, unknown>] => {
-        const target = objectValue(item);
-        return [Number(target.number), target];
-      }),
-    );
-    const sourceNumbers = Array.isArray(worker?.item_numbers)
-      ? worker.item_numbers
-      : worker?.item_number
-        ? [worker.item_number]
-        : [];
-    const numbers = Number.isSafeInteger(limits.items)
-      ? sourceNumbers.slice(0, Math.max(0, Number(limits.items)))
-      : sourceNumbers;
-    for (const value of numbers) {
-      const number = Number(value);
-      const target = targets.get(number);
-      const repository = nullableString(worker?.repository || target?.repository);
-      const itemKey = repository ? `${repository}#${number}` : "";
-      if (
-        Number.isInteger(number) &&
-        number > 0 &&
-        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(itemKey)
-      ) {
-        keys.add(itemKey.toLowerCase());
-      }
-    }
-  }
-  return [...keys];
-}
-
-export function completedBayReviews(journeys) {
-  return (Array.isArray(journeys) ? journeys : []).flatMap((journey) => {
-    const record = normalizeBayJourneyRecord(journey);
-    if (
-      !record?.triggered_at ||
-      !record.completed_at ||
-      !record.repository ||
-      !Number.isInteger(record.number) ||
-      !new Set(["success", "failure", "cancelled"]).has(String(record.completion_outcome || ""))
-    )
-      return [];
-    return [
-      {
-        event_id: [
-          "review",
-          record.repository,
-          record.number,
-          "completion",
-          record.completion_source_delivery_id || "legacy",
-          record.completion_comment_id || "status",
-          record.completed_at,
-        ].join(":"),
-        target: {
-          repository: record.repository,
-          number: record.number,
-          url: `https://github.com/${record.repository}/issues/${record.number}`,
-        },
-        revision: record.source_delivery_id || record.id,
-        outcome: record.completion_outcome,
-        trigger_kind: "review_journey",
-        triggered_at: record.triggered_at,
-        completed_at: record.completed_at,
-      },
-    ];
-  });
-}
-
-export function mergeBayTerminalState(
-  previous,
-  attempts,
-  closedItems,
-  generatedAt,
-  activeItemKeys = [],
-  completedReviews = [],
-  completedReviewsAuthoritative = false,
-  activeItemKeysAuthoritative = true,
-) {
-  const now = Date.parse(generatedAt);
-  const source = previous && previous.schema_version === 1 ? previous : {};
-  const lifecycleAvailable = completedReviewsAuthoritative === true;
-  // Journey telemetry is bounded and its writes are best-effort, so it can
-  // reconcile known fallback outcomes but cannot globally replace them.
-  const lifecycleAuthoritative = false;
-  const storedWindowStartedAt = nullableString(source.terminal_window_started_at);
-  const bootstrapWindowStartedAt = Number.isFinite(Date.parse(storedWindowStartedAt || ""))
-    ? storedWindowStartedAt
-    : bayTerminalBootstrapWindowStartedAt(now);
-  const activeKeys = new Set(
-    (activeItemKeysAuthoritative
-      ? activeItemKeys
-      : [...(source.active_item_keys || []), ...activeItemKeys]
-    )
-      .filter((value) => typeof value === "string")
-      .map((value) => String(value).toLowerCase()),
-  );
-  let pendingFallbackSuccesses = Array.isArray(source.pending_fallback_successes)
-    ? source.pending_fallback_successes.filter(
-        (item) => item?.event_id && item?.item_key && item?.source === "worker_attempt",
-      )
-    : [];
-  const sourceTerminalBuffer = Array.isArray(source.terminal_buffer) ? source.terminal_buffer : [];
-  for (const item of sourceTerminalBuffer) {
-    if (
-      item?.source === "worker_attempt" &&
-      item?.outcome === "success" &&
-      activeKeys.has(String(item.item_key).toLowerCase()) &&
-      !pendingFallbackSuccesses.some((pending) => pending.event_id === item.event_id)
-    ) {
-      pendingFallbackSuccesses.push(item);
-    }
-  }
-  const restoredFallbackSuccesses = pendingFallbackSuccesses.filter(
-    (item) => !activeKeys.has(String(item.item_key).toLowerCase()),
-  );
-  pendingFallbackSuccesses = pendingFallbackSuccesses.filter((item) =>
-    activeKeys.has(String(item.item_key).toLowerCase()),
-  );
-  const bufferInputs = [...sourceTerminalBuffer, ...restoredFallbackSuccesses].filter(
-    (item, index, items) =>
-      items.findIndex((candidate) => candidate.event_id === item.event_id) === index,
-  );
-  const bootstrapBuffer = bufferInputs.filter(
-    (item) =>
-      item?.event_id &&
-      item?.item_key &&
-      isBayTerminalAtOrAfterWindowStart(item, bootstrapWindowStartedAt) &&
-      (item.source === "completed_review" || !activeKeys.has(String(item.item_key).toLowerCase())),
-  );
-  let terminalWindowStartedAt = bayTerminalWindowStartedAt(source, now, bootstrapBuffer);
-  const buffer = bootstrapBuffer.filter((item) =>
-    isBayTerminalAtOrAfterWindowStart(item, terminalWindowStartedAt),
-  );
-  const seenEvents = Array.isArray(source.seen_events)
-    ? source.seen_events.filter((item) => item?.event_id)
-    : [];
-  const seenIds = new Set(seenEvents.map((item) => item.event_id));
-  const fallbackAttempts = bayFallbackTerminalAttempts([
-    ...sourceTerminalBuffer,
-    ...pendingFallbackSuccesses,
-    ...seenEvents,
-  ]);
-  let terminalWindowEventIds = Array.isArray(source.terminal_window_event_ids)
-    ? source.terminal_window_event_ids.map((eventId) => String(eventId)).filter(Boolean)
-    : [];
-  let terminalWindowEventIdSet = new Set(terminalWindowEventIds);
-  const recentlyWashed =
-    Array.isArray(source.recently_washed) &&
-    Number.isFinite(now) &&
-    now - Date.parse(source.washed_at || "") <= BAY_WASH_VISIBLE_MS
-      ? source.recently_washed
-      : [];
-  let washedAt = recentlyWashed.length ? source.washed_at || null : null;
-  let tideGeneration = Math.max(0, Number(source.tide_generation) || 0);
-  let lastTideAt = nullableString(source.last_tide_at);
-  let replacedWashedFallback = false;
-
-  for (const candidate of bayTerminalCandidates(attempts, closedItems, completedReviews)) {
-    const itemKey = String(candidate.item_key).toLowerCase();
-    if (
-      lifecycleAuthoritative &&
-      candidate.source === "worker_attempt" &&
-      candidate.outcome === "success"
-    )
-      continue;
-    if (activeKeys.has(itemKey) && candidate.source === "worker_attempt") {
-      if (
-        !lifecycleAuthoritative &&
-        candidate.outcome === "success" &&
-        !pendingFallbackSuccesses.some((pending) => pending.event_id === candidate.event_id)
-      ) {
-        pendingFallbackSuccesses.push(candidate);
-      }
-      continue;
-    }
-    const withinTerminalWindow = isBayTerminalAfterWindowStart(
-      candidate,
-      terminalWindowStartedAt,
-      terminalWindowEventIdSet,
-    );
-    if (!withinTerminalWindow && candidate.source !== "completed_review") continue;
-    if (seenIds.has(candidate.event_id)) continue;
-    if (candidate.source === "completed_review") {
-      const fallbackAttempt = takeMatchingBayFallbackAttempt(fallbackAttempts, candidate);
-      // A bounded lifecycle snapshot cannot introduce a completion from before
-      // the current tide window. It may still replace a known worker fallback,
-      // including one already washed, without counting it a second time.
-      if (!withinTerminalWindow && !fallbackAttempt) continue;
-      seenIds.add(candidate.event_id);
-      seenEvents.push({
-        event_id: candidate.event_id,
-        seen_at: candidate.completed_at,
-        started_at: candidate.started_at,
-      });
-      if (fallbackAttempt) {
-        const existingIndex = buffer.findIndex(
-          (item) => item.event_id === fallbackAttempt.event_id,
-        );
-        if (existingIndex !== -1) buffer[existingIndex] = candidate;
-        else if (
-          pendingFallbackSuccesses.some((pending) => pending.event_id === fallbackAttempt.event_id)
-        )
-          buffer.push(candidate);
-        else replacedWashedFallback = true;
-        pendingFallbackSuccesses = pendingFallbackSuccesses.filter(
-          (pending) => pending.event_id !== fallbackAttempt.event_id,
-        );
-        continue;
-      }
-      buffer.push(candidate);
-      continue;
-    }
-    seenIds.add(candidate.event_id);
-    seenEvents.push({
-      event_id: candidate.event_id,
-      seen_at: candidate.completed_at,
-      started_at: candidate.started_at,
-    });
-    if (candidate.source === "worker_attempt") {
-      const lifecycleIndex = buffer.findIndex(
-        (item) =>
-          item.source === "completed_review" &&
-          isLateBayWorkerFallbackForLifecycle(candidate, item),
-      );
-      if (lifecycleIndex !== -1) {
-        seenIds.add(candidate.event_id);
-        seenEvents.push({
-          event_id: candidate.event_id,
-          seen_at: candidate.completed_at,
-          started_at: candidate.started_at,
-        });
-        continue;
-      }
-      fallbackAttempts.push(candidate);
-    }
-    const existingIndex = buffer.findIndex(
-      (item) => item.item_key === candidate.item_key && item.source !== "completed_review",
-    );
-    if (existingIndex === -1) {
-      buffer.push(candidate);
-      continue;
-    }
-    if (
-      Date.parse(candidate.completed_at || "") >=
-      Date.parse(buffer[existingIndex]?.completed_at || "")
-    ) {
-      buffer[existingIndex] = candidate;
-    }
-  }
-  buffer.sort(
-    (left, right) => Date.parse(left.completed_at || "") - Date.parse(right.completed_at || ""),
-  );
-
-  let washed = recentlyWashed;
-  let newTides = 0;
-  while (buffer.length >= BAY_TIDE_THRESHOLD) {
-    washed = buffer.splice(0, BAY_TIDE_THRESHOLD);
-    const tideCompletedAt = nullableString(washed.at(-1)?.completed_at) || generatedAt;
-    washedAt = generatedAt;
-    if (!lastTideAt || Date.parse(tideCompletedAt) >= Date.parse(String(lastTideAt || ""))) {
-      lastTideAt = tideCompletedAt;
-    }
-    terminalWindowStartedAt = tideCompletedAt;
-    terminalWindowEventIds = washed
-      .filter((item) => item.completed_at === terminalWindowStartedAt)
-      .map((item) => String(item.event_id));
-    terminalWindowEventIdSet = new Set(terminalWindowEventIds);
-    tideGeneration += 1;
-    newTides += 1;
-  }
-  if (replacedWashedFallback && newTides === 0) {
-    washed = [];
-    washedAt = null;
-  }
-
-  return {
-    schema_version: 1,
-    source_kind: "completed_reviews_v1",
-    completed_reviews_authoritative: lifecycleAuthoritative,
-    completed_reviews_available: lifecycleAvailable,
-    active_item_keys: [...activeKeys],
-    pending_fallback_successes: pendingFallbackSuccesses.slice(-BAY_SEEN_EVENT_LIMIT),
-    tide_threshold: BAY_TIDE_THRESHOLD,
-    tide_generation: tideGeneration,
-    last_tide_at: lastTideAt,
-    terminal_window_started_at: terminalWindowStartedAt,
-    terminal_window_event_ids: terminalWindowEventIds,
-    terminal_count: buffer.length,
-    terminal_buffer: buffer,
-    washed_at: washedAt,
-    recently_washed: washed,
-    seen_events: seenEvents.slice(-BAY_SEEN_EVENT_LIMIT),
-    updated_at: generatedAt,
-  };
-}
-
-function bayTerminalStateSignature(state) {
-  return JSON.stringify({
-    schema_version: state?.schema_version,
-    source_kind: state?.source_kind,
-    completed_reviews_authoritative: state?.completed_reviews_authoritative,
-    completed_reviews_available: state?.completed_reviews_available,
-    active_item_keys: state?.active_item_keys,
-    pending_fallback_successes: state?.pending_fallback_successes,
-    tide_threshold: state?.tide_threshold,
-    tide_generation: state?.tide_generation,
-    last_tide_at: state?.last_tide_at,
-    terminal_window_started_at: state?.terminal_window_started_at,
-    terminal_window_event_ids: state?.terminal_window_event_ids,
-    terminal_count: state?.terminal_count,
-    terminal_buffer: state?.terminal_buffer,
-    washed_at: state?.washed_at,
-    recently_washed: state?.recently_washed,
-    seen_events: state?.seen_events,
-  });
-}
-
-function bayTerminalWindowStartedAt(source, now, bootstrapBuffer = []) {
-  const storedWindowStart = nullableString(source?.terminal_window_started_at);
-  if (Number.isFinite(Date.parse(storedWindowStart || ""))) return storedWindowStart;
-  const bufferedWindowStart = [...bootstrapBuffer]
-    .map((item) => nullableString(item?.completed_at))
-    .filter((value) => Number.isFinite(Date.parse(value || "")))
-    .sort()[0];
-  if (bufferedWindowStart) return bufferedWindowStart;
-  const lastTideAt = nullableString(source?.last_tide_at);
-  if (Number.isFinite(Date.parse(lastTideAt || ""))) return lastTideAt;
-  return bayTerminalBootstrapWindowStartedAt(now);
-}
-
-function bayTerminalBootstrapWindowStartedAt(now) {
-  if (!Number.isFinite(now)) return null;
-  return new Date(now - BAY_INITIAL_TERMINAL_LOOKBACK_MS).toISOString();
-}
-
-function isBayTerminalAfterWindowStart(
-  candidate,
-  terminalWindowStartedAt,
-  terminalWindowEventIds = new Set(),
-) {
-  const completedAt = Date.parse(String(candidate?.completed_at || ""));
-  const windowStart = Date.parse(String(terminalWindowStartedAt || ""));
-  if (!Number.isFinite(completedAt) || !Number.isFinite(windowStart)) return false;
-  if (completedAt > windowStart) return true;
-  return completedAt === windowStart && !terminalWindowEventIds.has(String(candidate?.event_id));
-}
-
-function isBayTerminalAtOrAfterWindowStart(candidate, terminalWindowStartedAt) {
-  const completedAt = Date.parse(String(candidate?.completed_at || ""));
-  const windowStart = Date.parse(String(terminalWindowStartedAt || ""));
-  return Number.isFinite(completedAt) && Number.isFinite(windowStart) && completedAt >= windowStart;
-}
-
-function bayFallbackTerminalAttempts(values) {
-  const attempts = [];
-  const seen = new Set<string>();
-  for (const value of Array.isArray(values) ? values : []) {
-    const eventId = String(value?.event_id || "");
-    if (!eventId || seen.has(eventId)) continue;
-    if (
-      value?.source === "worker_attempt" &&
-      new Set(["success", "failure", "cancelled"]).has(String(value?.outcome || ""))
-    ) {
-      attempts.push(value);
-      seen.add(eventId);
-      continue;
-    }
-    const match = /^worker:[^:]+:[^:]+:([^:]+#[0-9]+):(success|failure|cancelled):(.+)$/.exec(
-      eventId,
-    );
-    if (!match?.[1] || !match[2] || !match[3]) continue;
-    attempts.push({
-      event_id: eventId,
-      item_key: match[1],
-      started_at: nullableString(value?.started_at),
-      completed_at: match[3],
-      source: "worker_attempt",
-      outcome: match[2],
-    });
-    seen.add(eventId);
-  }
-  return attempts;
-}
-
-function takeMatchingBayFallbackAttempt(fallbackAttempts, review) {
-  const reviewCompletedAt = Date.parse(String(review?.completed_at || ""));
-  const reviewTriggeredAt = Date.parse(String(review?.triggered_at || ""));
-  const itemKey = String(review?.item_key || "").toLowerCase();
-  if (!Number.isFinite(reviewCompletedAt) || !itemKey) return null;
-  let matchIndex = -1;
-  let latestCompletedAt = Number.NEGATIVE_INFINITY;
-  for (let index = 0; index < fallbackAttempts.length; index += 1) {
-    const fallback = fallbackAttempts[index];
-    const fallbackCompletedAt = Date.parse(String(fallback?.completed_at || ""));
-    const fallbackStartedAt = Date.parse(String(fallback?.started_at || ""));
-    if (
-      String(fallback?.item_key || "").toLowerCase() !== itemKey ||
-      !Number.isFinite(fallbackCompletedAt) ||
-      !Number.isFinite(fallbackStartedAt) ||
-      !Number.isFinite(reviewTriggeredAt) ||
-      fallbackCompletedAt > reviewCompletedAt ||
-      fallbackStartedAt < reviewTriggeredAt ||
-      fallbackStartedAt > reviewCompletedAt ||
-      fallbackCompletedAt < latestCompletedAt
-    )
-      continue;
-    matchIndex = index;
-    latestCompletedAt = fallbackCompletedAt;
-  }
-  return matchIndex === -1 ? null : fallbackAttempts.splice(matchIndex, 1)[0];
-}
-
-function isLateBayWorkerFallbackForLifecycle(fallback, review) {
-  const itemKey = String(review?.item_key || "").toLowerCase();
-  const fallbackStartedAt = Date.parse(
-    String(fallback?.started_at || fallback?.completed_at || ""),
-  );
-  const reviewTriggeredAt = Date.parse(String(review?.triggered_at || ""));
-  const reviewCompletedAt = Date.parse(String(review?.completed_at || ""));
-  return (
-    !!itemKey &&
-    String(fallback?.item_key || "").toLowerCase() === itemKey &&
-    Number.isFinite(fallbackStartedAt) &&
-    Number.isFinite(reviewTriggeredAt) &&
-    Number.isFinite(reviewCompletedAt) &&
-    fallbackStartedAt >= reviewTriggeredAt &&
-    fallbackStartedAt <= reviewCompletedAt
-  );
-}
-
-function bayTerminalCandidates(attempts, closedItems, completedReviews = []) {
-  const candidates = [];
-  for (const attempt of Array.isArray(attempts) ? attempts : []) {
-    const outcome = String(attempt?.terminal_outcome || "");
-    if (!new Set(["success", "failure", "cancelled"]).has(outcome)) continue;
-    const repository = nullableString(attempt?.repository);
-    const completedAt = nullableString(attempt?.completed_at || attempt?.started_at);
-    if (!repository || !completedAt) continue;
-    for (const numberValue of Array.isArray(attempt?.item_numbers) ? attempt.item_numbers : []) {
-      const number = Number(numberValue);
-      if (!Number.isInteger(number) || number <= 0) continue;
-      const itemKey = `${repository}#${number}`;
-      const eventId = [
-        "worker",
-        attempt?.run_id || "run",
-        attempt?.job_id || "job",
-        itemKey,
-        outcome,
-        completedAt,
-      ].join(":");
-      candidates.push({
-        event_id: eventId,
-        item_key: itemKey,
-        repository,
-        number,
-        outcome,
-        title: nullableString(attempt?.workflow_title || attempt?.job_name) || itemKey,
-        item_url: `https://github.com/${repository}/issues/${number}`,
-        job_url: nullableString(attempt?.url),
-        run_id: attempt?.run_id || null,
-        job_id: attempt?.job_id || null,
-        started_at: nullableString(attempt?.started_at),
-        steps: Array.isArray(attempt?.steps) ? attempt.steps : undefined,
-        completed_at: completedAt,
-        current_step: nullableString(attempt?.failed_step || attempt?.conclusion),
-        source: "worker_attempt",
-      });
-    }
-  }
-  for (const item of Array.isArray(closedItems) ? closedItems : []) {
-    const repository = nullableString(item?.repository);
-    const number = Number(item?.number);
-    const completedAt = nullableString(item?.closed_at);
-    if (!repository || !Number.isInteger(number) || number <= 0 || !completedAt) continue;
-    const itemKey = `${repository}#${number}`;
-    candidates.push({
-      event_id: ["closed", itemKey, completedAt].join(":"),
-      item_key: itemKey,
-      repository,
-      number,
-      outcome: "success",
-      title: nullableString(item?.title) || itemKey,
-      item_url: nullableString(item?.url) || `https://github.com/${repository}/issues/${number}`,
-      job_url: null,
-      run_id: null,
-      completed_at: completedAt,
-      current_step: "Closed by ClawSweeper",
-      source: "closed_item",
-    });
-  }
-  for (const review of Array.isArray(completedReviews) ? completedReviews : []) {
-    const target = objectValue(review?.target);
-    const repository = nullableString(target.repository || review?.repository)?.toLowerCase();
-    const number = Number(target.number || review?.number);
-    const completedAt = nullableString(review?.completed_at);
-    const eventId = nullableString(review?.event_id);
-    if (!repository || !Number.isInteger(number) || number <= 0 || !completedAt || !eventId)
-      continue;
-    const outcome = String(review?.outcome || "success");
-    if (!new Set(["success", "failure", "cancelled"]).has(outcome)) continue;
-    const itemKey = `${repository}#${number}`;
-    candidates.push({
-      event_id: eventId,
-      item_key: itemKey,
-      repository,
-      number,
-      outcome,
-      title: `Completed review ${itemKey}`,
-      item_url: nullableString(target.url) || `https://github.com/${repository}/issues/${number}`,
-      job_url: null,
-      run_id: null,
-      triggered_at: nullableString(review?.triggered_at),
-      completed_at: completedAt,
-      current_step: outcome === "success" ? "Review completed" : `Review ${outcome}`,
-      source: "completed_review",
-    });
-  }
-  return candidates.sort(
-    (left, right) => Date.parse(left.completed_at) - Date.parse(right.completed_at),
-  );
-}
-
-function emptyBayTerminalState(generatedAt) {
-  return {
-    schema_version: 1,
-    tide_threshold: BAY_TIDE_THRESHOLD,
-    tide_generation: 0,
-    last_tide_at: null,
-    terminal_count: 0,
-    terminal_buffer: [],
-    washed_at: null,
-    recently_washed: [],
-    updated_at: generatedAt,
-  };
-}
-
 function ratePercent(numerator, denominator) {
   return denominator > 0 ? Math.round((numerator / denominator) * 1000) / 10 : 0;
 }
@@ -10213,11 +8156,7 @@ async function attachWorkerTargets(env, workers, errors) {
               ),
             );
           } catch (error) {
-            errors.push(
-              `worker target titles ${repository}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
+            errors.push(statusTelemetryError("active_jobs_unavailable", error));
           }
         }),
       ),
@@ -10310,9 +8249,8 @@ async function workflowJobsForRun(
   runId,
   github: GithubJsonReader = (path) => githubJson(env, path),
   run?: WorkflowRunSummary,
-  readModelJobs?: { jobs: unknown[]; coveredRunIds: Set<number> },
 ) {
-  return (await workflowJobsForRunSnapshot(env, repo, runId, github, run, readModelJobs)).jobs;
+  return (await workflowJobsForRunSnapshot(env, repo, runId, github, run)).jobs;
 }
 
 function boundedWorkflowJobCensus(value: unknown, runId, claimedComplete: boolean) {
@@ -10345,15 +8283,7 @@ export async function workflowJobsForRunSnapshot(
   runId,
   github: GithubJsonReader = (path) => githubJson(env, path),
   run?: WorkflowRunSummary,
-  readModelJobs?: { jobs: unknown[]; coveredRunIds: Set<number> },
 ) {
-  if (readModelJobs?.coveredRunIds.has(Number(runId))) {
-    return boundedWorkflowJobCensus(
-      readModelJobs.jobs.filter((job) => Number(objectValue(job).run_id) === Number(runId)),
-      runId,
-      true,
-    );
-  }
   const key = `workflow-jobs:${repo}:${runId}`;
   const cached = await readStoredJson(env, key);
   if (Array.isArray(cached)) return boundedWorkflowJobCensus(cached, runId, false);
@@ -10381,7 +8311,6 @@ export async function workflowJobsForRunSnapshot(
   const jobs = [];
   let complete = false;
   let expectedTotalCount: number | null = null;
-  const jobCensusStartedAt = new Date().toISOString();
   for (let page = 1; page <= WORKER_JOB_PAGE_LIMIT; page += 1) {
     const payload = await github(
       `/repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100&page=${page}`,
@@ -10422,24 +8351,6 @@ export async function workflowJobsForRunSnapshot(
       ? numberFrom(env.WORKER_JOB_CACHE_TTL_SECONDS, WORKER_JOB_CACHE_TTL_SECONDS)
       : WORKER_JOB_IDLE_CACHE_TTL_SECONDS,
   );
-  const repairObjects = census.jobs.flatMap((job) => {
-    const object = githubWebhookReadModelWorkflowObject(repo, "workflow_job", job);
-    return object ? [object] : [];
-  });
-  if (
-    dashboardWorkflowSource(env) === "webhook" &&
-    (repairObjects.length > 0 || census.complete) &&
-    stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
-  ) {
-    await githubWebhookReadModelQueuePost(env, "repair", {
-      repository: repo,
-      repair_kind: "workflows",
-      ...(census.complete ? { complete_workflow_job_runs: [Number(runId)] } : {}),
-      ...(census.complete ? { workflow_job_census_started_at: jobCensusStartedAt } : {}),
-      ...(census.complete ? { workflow_job_census_version: 2 } : {}),
-      objects: repairObjects,
-    }).catch(() => null);
-  }
   return census;
 }
 
@@ -10479,7 +8390,6 @@ function normalizeWorkerJob(run, job) {
   const runItem = classifyRun(run);
   const target = workerTargetFromJob(runItem, job.name);
   const mode = workerMode(runItem.mode, job.name);
-  const workKind = workerWorkKind(runItem, job.name);
   const steps = Array.isArray(job.steps)
     ? job.steps.map((step) => ({
         number: numberOrNull(step.number),
@@ -10500,7 +8410,6 @@ function normalizeWorkerJob(run, job) {
     is_codex_worker: isCodexWorkerJob(job),
     name: String(job.name || runItem.title || "Codex worker"),
     mode,
-    work_kind: workKind,
     stage: runItem.stage,
     status: String(job.status || run.status || "unknown"),
     conclusion: nullableString(job.conclusion),
@@ -10527,29 +8436,7 @@ function workerMode(runMode, jobName) {
   const name = String(jobName || "").toLowerCase();
   if (name.includes("assist")) return "assist";
   if (name.includes("review commit")) return "commit-review";
-  if (name.includes("cluster actions") || name.includes("review cluster")) return "repair";
   return runMode;
-}
-
-export function workerWorkKind(runItem, jobName) {
-  const text = `${runItem?.title || ""} ${runItem?.workflow || ""} ${jobName || ""}`.toLowerCase();
-  if (
-    text.includes("issue implementation") ||
-    /\bissue-[a-z0-9_.-]+-[a-z0-9_.-]+-\d+\b/.test(text)
-  ) {
-    return "issue_to_pr";
-  }
-  if (text.includes("automerge") || text.includes("autofix") || text.includes("pr repair")) {
-    return "pr_repair";
-  }
-  if (
-    text.includes("repair cluster") ||
-    text.includes("cluster actions") ||
-    text.includes("review cluster")
-  ) {
-    return "repair_cluster";
-  }
-  return "other";
 }
 
 function normalizeFallbackWorker(run) {
@@ -10560,7 +8447,6 @@ function normalizeFallbackWorker(run) {
     is_codex_worker: true,
     name: item.title || item.workflow || "Codex worker",
     mode: item.mode,
-    work_kind: workerWorkKind(item, ""),
     stage: item.stage,
     status: item.status,
     conclusion: item.conclusion,
@@ -10620,18 +8506,54 @@ async function activeWorkflowRunCandidates(
 ) {
   const pages = await Promise.all(
     ACTIVE_RUN_STATUS_FILTERS.map(async (status) => {
-      const runs = await github(`/repos/${repo}/actions/runs?status=${status}&per_page=100`).catch(
-        (error) => {
-          errors.push(`workflow runs ${status}: ${error.message}`);
-          return null;
-        },
-      );
-      const workflowRuns = Array.isArray(runs?.workflow_runs) ? runs.workflow_runs : [];
-      // Sampling stays at five cheap status queries. A full page may omit the
-      // oldest (and therefore least healthy) runs, so fail closed instead of
-      // spending an unbounded number of follow-up requests.
-      if (workflowRuns.length >= 100) errors.push(`workflow runs ${status}: page may be truncated`);
-      return workflowRuns;
+      for (let attempt = 0; ; attempt += 1) {
+        const workflowRuns = [];
+        let expectedTotalCount: number | null = null;
+        let complete = false;
+        let changedDuringRead = false;
+        // Include the oldest runs without allowing a large backlog to make the
+        // status refresh unbounded. An unfinished census must remain unknown.
+        for (let page = 1; page <= ACTIVE_RUN_PAGE_LIMIT; page += 1) {
+          const runs = await github(
+            `/repos/${repo}/actions/runs?status=${status}&per_page=100${page > 1 ? `&page=${page}` : ""}`,
+            { fresh: attempt > 0 },
+          ).catch((error) => {
+            errors.push(statusTelemetryError("active_runs_unavailable", error));
+            return undefined;
+          });
+          if (runs === undefined) return workflowRuns;
+          if (!Array.isArray(runs?.workflow_runs) || runs.workflow_runs.length > 100) break;
+          const totalCount = runs.total_count;
+          if (totalCount !== undefined) {
+            if (!Number.isSafeInteger(totalCount) || totalCount < 0) break;
+            if (expectedTotalCount !== null && totalCount !== expectedTotalCount) {
+              changedDuringRead = true;
+              break;
+            }
+            expectedTotalCount = totalCount;
+          }
+          workflowRuns.push(...runs.workflow_runs);
+          if (uniqueWorkflowRuns(workflowRuns).length !== workflowRuns.length) {
+            changedDuringRead = true;
+            break;
+          }
+          if (expectedTotalCount !== null && workflowRuns.length >= expectedTotalCount) {
+            complete = workflowRuns.length === expectedTotalCount;
+            changedDuringRead = !complete;
+            break;
+          }
+          if (runs.workflow_runs.length < 100) {
+            complete = expectedTotalCount === null;
+            changedDuringRead = !complete;
+            break;
+          }
+        }
+        // Actions can change between pages, or even between its count and rows.
+        // Rebuild that census once from fresh reads; never combine generations.
+        if (changedDuringRead && attempt === 0) continue;
+        if (!complete) errors.push("active_runs_unavailable:census_incomplete");
+        return workflowRuns;
+      }
     }),
   );
   return uniqueWorkflowRuns(pages.flat());
@@ -10653,7 +8575,19 @@ function uniqueWorkflowRuns(runs) {
       run?.id ??
       run?.html_url ??
       `${run?.name || ""}:${run?.display_title || ""}:${run?.created_at || ""}`;
-    if (key) seen.set(String(key), run);
+    if (!key) continue;
+    const previous = seen.get(String(key));
+    if (previous) {
+      // A rerun keeps its ID but advances its attempt. Within that generation,
+      // prefer the last update, then terminal state for equal-second timestamps.
+      // Remaining ties retain the first feed's whole observation.
+      const newer =
+        (run?.run_attempt || 0) - (previous?.run_attempt || 0) ||
+        (Date.parse(run?.updated_at || "") || 0) - (Date.parse(previous?.updated_at || "") || 0) ||
+        Number(run?.status === "completed") - Number(previous?.status === "completed");
+      if (newer <= 0) continue;
+    }
+    seen.set(String(key), run);
   }
   return [...seen.values()];
 }
@@ -10706,13 +8640,7 @@ function classifyRun(run) {
   const lower = `${workflow} ${title}`.toLowerCase();
   let mode = "background-review";
   let stage = "running";
-  if (lower.includes("automerge")) {
-    mode = "automerge";
-    stage = lower.includes("repair") ? "repairing" : "reviewing";
-  } else if (lower.includes("repair cluster")) {
-    mode = "repair";
-    stage = "repairing";
-  } else if (lower.includes("review event item")) {
+  if (lower.includes("review event item")) {
     mode = "exact-review";
     stage = "reviewing";
   } else if (lower.includes("apply clawsweeper closures")) {
@@ -10806,318 +8734,6 @@ async function attachCiStatus(
     if (!item.ci)
       item.ci = { state: "unknown", source: "live", error: String(error?.message || error) };
   }
-}
-
-function emptyAutomergeReliability(updatedAt) {
-  return {
-    sampled_runs: 0,
-    completed_attempts: 0,
-    failed_attempts: 0,
-    failure_rate_percent: null,
-    active_attempts: 0,
-    stalled_attempts: 0,
-    average_duration_ms: null,
-    longest_duration_ms: null,
-    unresolved_failures: 0,
-    recovered_failures: 0,
-    failures: [],
-    updated_at: updatedAt,
-  };
-}
-
-function automergeRepairTarget(run, targetRepos) {
-  const title = String(run?.display_title || "").toLowerCase();
-  const candidates = targetRepos
-    .map((repository) => ({
-      repository: String(repository).trim(),
-      slug: String(repository).trim().toLowerCase().replaceAll("/", "-"),
-    }))
-    .filter((candidate) => candidate.repository && candidate.slug)
-    .sort((left, right) => right.slug.length - left.slug.length);
-  for (const candidate of candidates) {
-    const marker = `automerge-${candidate.slug}-`;
-    const markerIndex = title.indexOf(marker);
-    if (markerIndex < 0) continue;
-    const suffix = title.slice(markerIndex + marker.length);
-    const match = suffix.match(/^(\d+)\.md(?:\s|$)/);
-    if (!match) continue;
-    const number = Number(match[1]);
-    return {
-      repository: candidate.repository,
-      number,
-      item_url: `https://github.com/${candidate.repository}/pull/${number}`,
-    };
-  }
-  return null;
-}
-
-function automergeRunDurationMs(run, nowMs) {
-  const startedMs = Date.parse(String(run?.created_at || ""));
-  if (!Number.isFinite(startedMs)) return null;
-  const completedMs =
-    run?.status === "completed" ? Date.parse(String(run?.updated_at || "")) : nowMs;
-  if (!Number.isFinite(completedMs) || completedMs < startedMs) return null;
-  return completedMs - startedMs;
-}
-
-export function summarizeAutomergeReliability(runs, targetRepos, now = new Date().toISOString()) {
-  const nowMs = Date.parse(now);
-  const effectiveNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
-  const attempts = runs
-    .filter((run) => /\bautomerge repair\b/i.test(String(run?.display_title || "")))
-    .map((run) => {
-      const target = automergeRepairTarget(run, targetRepos);
-      if (!target) return null;
-      return {
-        run,
-        target,
-        startedMs: Date.parse(String(run?.created_at || "")),
-        completedMs: Date.parse(String(run?.updated_at || "")),
-        duration_ms: automergeRunDurationMs(run, effectiveNowMs),
-      };
-    })
-    .filter(Boolean);
-  const completed = attempts.filter((attempt) => attempt.run.status === "completed");
-  const failed = completed.filter((attempt) =>
-    TERMINAL_BAD_CONCLUSIONS.has(String(attempt.run.conclusion)),
-  );
-  const successes = completed.filter((attempt) => attempt.run.conclusion === "success");
-  const active = attempts.filter((attempt) => ACTIVE_RUN_STATUSES.has(String(attempt.run.status)));
-  const durations = completed
-    .map((attempt) => attempt.duration_ms)
-    .filter((duration) => Number.isFinite(duration) && duration >= 0);
-  const failureAttempts = failed
-    .map((attempt) => {
-      const recovery = successes.find(
-        (candidate) =>
-          candidate.target.repository === attempt.target.repository &&
-          candidate.target.number === attempt.target.number &&
-          candidate.startedMs >= attempt.completedMs,
-      );
-      return {
-        repository: attempt.target.repository,
-        number: attempt.target.number,
-        item_url: attempt.target.item_url,
-        run_url: attempt.run.html_url,
-        status: recovery ? "recovered" : "unresolved",
-        conclusion: attempt.run.conclusion,
-        started_at: attempt.run.created_at,
-        completed_at: attempt.run.updated_at,
-        duration_ms: attempt.duration_ms,
-        recovered: Boolean(recovery),
-      };
-    })
-    .sort(
-      (left, right) =>
-        Date.parse(String(right.started_at || "")) - Date.parse(String(left.started_at || "")),
-    );
-  const failuresByTarget = new Map();
-  for (const failure of failureAttempts) {
-    const targetKey = `${failure.repository}#${failure.number}`;
-    if (!failuresByTarget.has(targetKey)) failuresByTarget.set(targetKey, failure);
-  }
-  const failures = [...failuresByTarget.values()]
-    // Unresolved targets stay visible even when recovered retries fill the sample.
-    .sort(
-      (left, right) =>
-        Number(left.recovered) - Number(right.recovered) ||
-        Date.parse(String(right.started_at || "")) - Date.parse(String(left.started_at || "")),
-    );
-  const unresolvedFailures = failures.filter((failure) => !failure.recovered).length;
-  const result = emptyAutomergeReliability(new Date(effectiveNowMs).toISOString());
-  return {
-    ...result,
-    sampled_runs: attempts.length,
-    completed_attempts: completed.length,
-    failed_attempts: failed.length,
-    failure_rate_percent: completed.length
-      ? Math.round((failed.length / completed.length) * 1000) / 10
-      : null,
-    active_attempts: active.length,
-    stalled_attempts: active.filter(
-      (attempt) =>
-        Number.isFinite(attempt.duration_ms) && attempt.duration_ms >= AUTOMERGE_STALLED_AFTER_MS,
-    ).length,
-    average_duration_ms: durations.length
-      ? Math.round(durations.reduce((sum, duration) => sum + duration, 0) / durations.length)
-      : null,
-    longest_duration_ms: durations.length ? Math.max(...durations) : null,
-    unresolved_failures: unresolvedFailures,
-    recovered_failures: failures.length - unresolvedFailures,
-    failures: failures.slice(0, AUTOMERGE_FAILURE_DISPLAY_LIMIT),
-  };
-}
-
-async function recentAutomergeReliability(
-  env,
-  repo,
-  targetRepos,
-  github: GithubJsonReader = (path) => githubJson(env, path),
-) {
-  const targetKey = targetRepos
-    .map((target) => target.toLowerCase())
-    .sort()
-    .join(",");
-  const cacheKey = `automerge-reliability:${String(repo).toLowerCase()}:${targetKey}`;
-  const cached = await readStoredJson(env, cacheKey);
-  if (cached && Array.isArray(cached.failures)) return cached;
-
-  const response = await github(
-    `/repos/${repo}/actions/workflows/${AUTOMERGE_REPAIR_WORKFLOW}/runs?per_page=${AUTOMERGE_RELIABILITY_RUN_LIMIT}`,
-  );
-  const runs = Array.isArray(response?.workflow_runs) ? response.workflow_runs : [];
-  const result = summarizeAutomergeReliability(runs, targetRepos);
-  await writeStoredJson(
-    env,
-    cacheKey,
-    result,
-    numberFrom(env.AUTOMERGE_CACHE_TTL_SECONDS, AUTOMERGE_CACHE_TTL_SECONDS),
-  ).catch(() => undefined);
-  return result;
-}
-
-async function recentAutomerge(
-  env,
-  repo,
-  github: GithubJsonReader = (path) => githubJson(env, path),
-) {
-  const cacheKey = `recent-automerge:${String(repo).toLowerCase()}`;
-  const cached = await readStoredJson(env, cacheKey);
-  if (cached?.items && Array.isArray(cached.items)) return cached;
-
-  const search = await github(
-    `/search/issues?q=${encodeURIComponent(`repo:${repo} is:pr is:merged label:clawsweeper:automerge sort:updated-desc`)}&per_page=${AVERAGE_LIMIT}`,
-  );
-  const issues = Array.isArray(search?.items) ? search.items : [];
-  const items = await recentAutomergeItems(env, repo, issues, github);
-  const durations = items
-    .map((item) => item.duration_ms)
-    .filter((value) => Number.isFinite(value) && value >= 0);
-  const result = {
-    average_ms: durations.length
-      ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
-      : null,
-    samples: durations.length,
-    items,
-  };
-  await writeStoredJson(
-    env,
-    cacheKey,
-    result,
-    numberFrom(env.AUTOMERGE_CACHE_TTL_SECONDS, AUTOMERGE_CACHE_TTL_SECONDS),
-  ).catch(() => undefined);
-  return result;
-}
-
-async function recentAutomergeItems(env, repo, issues, github: GithubJsonReader) {
-  if (hasGithubAuth(env) && issues.length) {
-    try {
-      return await recentAutomergeItemsGraphql(env, repo, issues);
-    } catch {
-      // Keep dashboards on the existing REST path when GraphQL hydration is unavailable.
-    }
-  }
-  return Promise.all(issues.map((issue) => recentAutomergeItemRest(repo, issue, github)));
-}
-
-async function recentAutomergeItemsGraphql(env, repo, issues) {
-  const [owner, name] = String(repo || "").split("/");
-  if (!owner || !name) throw new Error(`invalid repository ${repo}`);
-  const aliases = issues
-    .map(
-      (issue, index) => `
-        pr${index}: pullRequest(number: ${Number(issue.number)}) {
-          mergedAt
-          mergeCommit { oid }
-          comments(first: 100) {
-            nodes {
-              body
-              createdAt
-            }
-          }
-        }`,
-    )
-    .join("\n");
-  const data = await githubGraphql(
-    env,
-    `query RecentAutomerge($owner: String!, $name: String!) {
-      repository(owner: $owner, name: $name) {
-        ${aliases}
-      }
-    }`,
-    { owner, name },
-  );
-  const repository = data?.repository || {};
-  return issues.map((issue, index) => {
-    const pr = repository[`pr${index}`];
-    if (!pr) throw new Error(`missing automerge PR ${issue.number}`);
-    const comments = Array.isArray(pr?.comments?.nodes)
-      ? pr.comments.nodes.map((comment) => ({
-          body: comment?.body || "",
-          created_at: comment?.createdAt || null,
-        }))
-      : [];
-    return recentAutomergeItem(issue, {
-      merged_at: pr.mergedAt || null,
-      merge_commit_sha: pr.mergeCommit?.oid || null,
-      comments,
-    });
-  });
-}
-
-async function recentAutomergeItemRest(repo, issue, github: GithubJsonReader) {
-  const number = issue.number;
-  const [pr, comments] = await Promise.all([
-    github(`/repos/${repo}/pulls/${number}`),
-    github(`/repos/${repo}/issues/${number}/comments?per_page=100`),
-  ]);
-  return recentAutomergeItem(issue, {
-    merged_at: pr?.merged_at || null,
-    merge_commit_sha: pr?.merge_commit_sha || null,
-    comments,
-  });
-}
-
-function recentAutomergeItem(issue, details) {
-  const commandAt = firstAutomergeCommandAt(details.comments);
-  const mergedAt = details.merged_at || null;
-  const durationMs = commandAt && mergedAt ? Date.parse(mergedAt) - Date.parse(commandAt) : null;
-  return {
-    url: issue.html_url,
-    title: issue.title,
-    number: issue.number,
-    command_at: commandAt,
-    merged_at: mergedAt,
-    duration_ms: durationMs,
-    merge_commit_sha: details.merge_commit_sha || null,
-  };
-}
-
-async function clusterRepairStatus(
-  env,
-  repo,
-  targetRepos,
-  activeRuns,
-  github: GithubJsonReader = (path) => githubJson(env, path),
-) {
-  const [workflowRuns, markers] = await Promise.all([
-    github(
-      `/repos/${repo}/actions/workflows/${encodeURIComponent(CLUSTER_REPAIR_INTAKE_WORKFLOW)}/runs?per_page=5`,
-    ).catch(() => ({ workflow_runs: [] })),
-    Promise.all(targetRepos.map((targetRepo) => readClusterRepairMarker(env, targetRepo, github))),
-  ]);
-  const intakeRuns = Array.isArray(workflowRuns?.workflow_runs) ? workflowRuns.workflow_runs : [];
-  return {
-    workflow: CLUSTER_REPAIR_INTAKE_WORKFLOW,
-    markers,
-    latest_runs: intakeRuns.slice(0, 5).map(workflowRunSummary),
-    active_intake_runs: activeRuns
-      .filter((run) => workflowRunNameIncludes(run, "repair cluster intake"))
-      .map(workflowRunSummary),
-    active_worker_runs: activeRuns
-      .filter((run) => workflowRunNameIncludes(run, "repair cluster worker"))
-      .map(workflowRunSummary),
-  };
 }
 
 async function applyHealthStatus(
@@ -11356,75 +8972,6 @@ function numericRecord(value) {
   );
 }
 
-async function readClusterRepairMarker(
-  env,
-  targetRepo,
-  github: GithubJsonReader = (path) => githubJson(env, path),
-) {
-  const stateRepo = String(env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO);
-  const stateRef = String(env.CLAWSWEEPER_STATE_REF || CLAWSWEEPER_STATE_REF);
-  const repoSlug = String(targetRepo || "").replace(/\//g, "-");
-  const markerPath = `results/cluster-repair-intake/${repoSlug}.json`;
-  try {
-    const content = await github(
-      `/repos/${stateRepo}/contents/${githubPath(markerPath)}?ref=${encodeURIComponent(stateRef)}`,
-    );
-    const marker = JSON.parse(decodeGithubContent(content?.content));
-    const generatedJobs = Array.isArray(marker.generated_jobs) ? marker.generated_jobs : [];
-    const storeSha = nullableString(marker.last_processed_store_sha256);
-    return {
-      target_repo: nullableString(marker.target_repo) || targetRepo,
-      marker_path: markerPath,
-      status: generatedJobs.length > 0 ? "imported" : "checked",
-      last_processed_store_sha256: storeSha,
-      last_processed_store_short_sha: storeSha ? storeSha.slice(0, 10) : null,
-      last_processed_store_exported_at: nullableString(marker.last_processed_store_exported_at),
-      generated_count: Math.max(0, numberOrNull(marker.generated_count) ?? generatedJobs.length),
-      generated_jobs: generatedJobs.slice(0, 8).map((job) => String(job)),
-      run_url: nullableString(marker.run_url),
-      updated_at: nullableString(marker.updated_at),
-    };
-  } catch {
-    return {
-      target_repo: targetRepo,
-      marker_path: markerPath,
-      status: "not_recorded",
-      last_processed_store_sha256: null,
-      last_processed_store_short_sha: null,
-      last_processed_store_exported_at: null,
-      generated_count: 0,
-      generated_jobs: [],
-      run_url: null,
-      updated_at: null,
-    };
-  }
-}
-
-function emptyClusterRepairStatus(targetRepos) {
-  return {
-    workflow: CLUSTER_REPAIR_INTAKE_WORKFLOW,
-    markers: targetRepos.map((targetRepo) => ({
-      target_repo: targetRepo,
-      marker_path: `results/cluster-repair-intake/${String(targetRepo).replace(/\//g, "-")}.json`,
-      status: "unavailable",
-      last_processed_store_sha256: null,
-      last_processed_store_short_sha: null,
-      last_processed_store_exported_at: null,
-      generated_count: 0,
-      generated_jobs: [],
-      run_url: null,
-      updated_at: null,
-    })),
-    latest_runs: [],
-    active_intake_runs: [],
-    active_worker_runs: [],
-  };
-}
-
-function workflowRunNameIncludes(run, needle) {
-  return `${run?.name || ""} ${run?.display_title || ""}`.toLowerCase().includes(needle);
-}
-
 function githubPath(value) {
   return String(value).split("/").map(encodeURIComponent).join("/");
 }
@@ -11549,182 +9096,8 @@ function recentActivityEvents(storedEvents, closedItems) {
     .slice(0, 25);
 }
 
-export function automaticIssueWork(storedEvents, workers) {
-  const grouped = new Map();
-  const allEvents = Array.isArray(storedEvents) ? storedEvents : [];
-  const automaticKeys = new Set();
-  for (const event of allEvents) {
-    if (
-      event?.automatic !== true &&
-      !String(event?.event_type || "").startsWith("clawsweeper.issue_build_")
-    ) {
-      continue;
-    }
-    const repository = nullableString(event.repository);
-    const issueNumber =
-      numberOrNull(event.source_item_number) ??
-      issueNumberFromUrl(event.source_item_url) ??
-      issueNumberFromUrl(event.item_url);
-    if (repository && issueNumber) automaticKeys.add(`${repository}#${issueNumber}`);
-  }
-  for (const event of [...allEvents].reverse()) {
-    const repository = nullableString(event.repository);
-    const issueNumber =
-      numberOrNull(event.source_item_number) ??
-      issueNumberFromUrl(event.source_item_url) ??
-      issueNumberFromUrl(event.item_url);
-    if (!repository || !issueNumber) continue;
-    const key = `${repository}#${issueNumber}`;
-    if (!automaticKeys.has(key)) continue;
-    const row = grouped.get(key) ?? {
-      id: key,
-      repository,
-      issue_number: issueNumber,
-      issue_url:
-        nullableString(event.source_item_url) ||
-        `https://github.com/${repository}/issues/${issueNumber}`,
-      title: nullableString(event.title) || `Issue #${issueNumber}`,
-      phase: "queued",
-      status: "queued",
-      run_url: null,
-      pr_url: null,
-      updated_at: null,
-      active: false,
-      worker_id: null,
-      timeline: [],
-    };
-    const eventTitle = nullableString(event.title);
-    if (
-      eventTitle &&
-      isAutomaticWorkPlaceholderTitle(row.title, repository, issueNumber) &&
-      !isAutomaticWorkPlaceholderTitle(eventTitle, repository, issueNumber)
-    ) {
-      row.title = eventTitle;
-    }
-    row.phase = nullableString(event.stage) || row.phase;
-    row.status = nullableString(event.status) || row.status;
-    row.run_url = nullableString(event.run_url) || row.run_url;
-    row.pr_url =
-      nullableString(event.pr_url) ||
-      (String(event.item_url || "").includes("/pull/") ? event.item_url : row.pr_url);
-    row.updated_at = nullableString(event.received_at) || row.updated_at;
-    row.timeline.push({
-      event_type: nullableString(event.event_type),
-      phase: nullableString(event.stage) || "update",
-      status: nullableString(event.status) || "unknown",
-      note: nullableString(event.note),
-      run_url: nullableString(event.run_url),
-      received_at: nullableString(event.received_at),
-    });
-    grouped.set(key, row);
-  }
-
-  for (const worker of Array.isArray(workers) ? workers : []) {
-    if (worker?.work_kind !== "issue_to_pr") continue;
-    const issueNumber = numberOrNull(worker.item_number) ?? numberOrNull(worker.item_numbers?.[0]);
-    let key = worker.repository && issueNumber ? `${worker.repository}#${issueNumber}` : null;
-    if (!key && worker.run_url) {
-      const matches = [...grouped.values()].filter((row) => row.run_url === worker.run_url);
-      if (matches.length === 1) key = matches[0].id;
-    }
-    if (!key) continue;
-    if (!grouped.has(key)) continue;
-    const matchedRow = grouped.get(key);
-    const resolvedIssueNumber = issueNumber || matchedRow.issue_number;
-    worker.repository ||= matchedRow.repository;
-    worker.item_number ||= resolvedIssueNumber;
-    if (!Array.isArray(worker.item_numbers) || !worker.item_numbers.length) {
-      worker.item_numbers = [resolvedIssueNumber];
-    }
-    if (!Array.isArray(worker.target_items) || !worker.target_items.length) {
-      worker.target_items = [
-        {
-          repository: matchedRow.repository,
-          number: resolvedIssueNumber,
-          title: matchedRow.title,
-          url: matchedRow.issue_url,
-          type: "issue",
-        },
-      ];
-    }
-    const target = (worker.target_items || []).find(
-      (item) => Number(item.number) === resolvedIssueNumber,
-    );
-    const row = grouped.get(key) ?? {
-      id: key,
-      repository: worker.repository,
-      issue_number: worker.item_number,
-      issue_url:
-        target?.url || `https://github.com/${worker.repository}/issues/${worker.item_number}`,
-      title: target?.title || `Issue #${worker.item_number}`,
-      phase: "worker",
-      status: worker.status || "running",
-      run_url: worker.run_url || null,
-      pr_url: null,
-      updated_at: worker.updated_at || worker.started_at || null,
-      active: true,
-      worker_id: String(worker.id),
-      timeline: [],
-    };
-    row.active = true;
-    row.worker_id = String(worker.id);
-    row.phase = worker.current_step || worker.stage || row.phase;
-    row.status = worker.status || row.status;
-    row.run_url = worker.run_url || row.run_url;
-    row.updated_at = worker.updated_at || worker.started_at || row.updated_at;
-    if (
-      target?.title &&
-      isAutomaticWorkPlaceholderTitle(row.title, row.repository, row.issue_number) &&
-      !isAutomaticWorkPlaceholderTitle(target.title, row.repository, row.issue_number)
-    ) {
-      row.title = target.title;
-    }
-    row.timeline.push({
-      event_type: "clawsweeper.worker_active",
-      phase: worker.current_step || worker.stage || "worker",
-      status: worker.status || "running",
-      note: worker.name || null,
-      run_url: worker.run_url || null,
-      received_at: worker.updated_at || worker.started_at || null,
-    });
-    grouped.set(key, row);
-  }
-
-  return [...grouped.values()]
-    .map((row) => ({
-      ...row,
-      timeline: row.timeline.sort(
-        (left, right) => Date.parse(left.received_at || "") - Date.parse(right.received_at || ""),
-      ),
-    }))
-    .sort(
-      (left, right) =>
-        Number(right.active) - Number(left.active) ||
-        Date.parse(right.updated_at || "") - Date.parse(left.updated_at || ""),
-    )
-    .slice(0, 20);
-}
-
-function issueNumberFromUrl(value) {
-  const match = String(value || "").match(/\/issues\/(\d+)(?:\/|$)/);
-  return match ? Number(match[1]) : null;
-}
-
-function isAutomaticWorkPlaceholderTitle(value, repository, issueNumber) {
-  const title = String(value || "").trim();
-  if (!title) return true;
-  const escapedRepository = String(repository || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return (
-    new RegExp(`^Issue #${issueNumber}$`, "i").test(title) ||
-    /^PR #\d+$/i.test(title) ||
-    new RegExp(`^${escapedRepository}#\\d+$`, "i").test(title)
-  );
-}
-
 function operationEventCounts(storedEvents) {
   const counts = {
-    inherited_label_cleanups: 0,
-    self_heal_conflict_repairs: 0,
     failed_review_retries: 0,
     failed_review_retry_exhaustions: 0,
     bot_owned_proof_decisions_requested: 0,
@@ -11744,20 +9117,6 @@ function countOperationEvent(event, counts) {
         .replaceAll("-", "_"),
     )
     .join(" ");
-  if (
-    key.includes("inherited_label_cleanup") ||
-    key.includes("replacement_label_cleanup") ||
-    key.includes("removed_inherited_labels")
-  ) {
-    counts.inherited_label_cleanups += 1;
-  }
-  if (
-    key.includes("self_heal_conflict") ||
-    key.includes("conflict_self_heal") ||
-    key.includes("clawsweeper_self_rebase")
-  ) {
-    counts.self_heal_conflict_repairs += 1;
-  }
   if (
     key.includes("failed_review_retry_exhausted") ||
     key.includes("failed_review_retries_exhausted")
@@ -11831,7 +9190,7 @@ function clawsweeperBotLogins(env) {
     .split(",")
     .map((login) => login.trim())
     .filter(Boolean);
-  return new Set(configured.length ? configured : DEFAULT_CLAWSWEEPER_BOT_LOGINS);
+  return new Set(configured.length ? configured : CLAWSWEEPER_APP_BOT_LOGINS);
 }
 
 function closedStats(items, since) {
@@ -11871,31 +9230,28 @@ function emptyClosedStats(generatedAt) {
   };
 }
 
-function firstAutomergeCommandAt(comments) {
-  if (!Array.isArray(comments)) return null;
-  const command = comments
-    .slice()
-    .sort((left, right) => automergeCommentTime(left) - automergeCommentTime(right))
-    .find((comment) =>
-      /@clawsweeper\s+auto\s*-?\s*merge|@clawsweeper\s+automerge|\/clawsweeper\s+auto\s*-?\s*merge|\/clawsweeper\s+automerge/i.test(
-        String(comment.body || ""),
-      ),
-    );
-  return command?.created_at || null;
-}
-
-function automergeCommentTime(comment) {
-  const timestamp = Date.parse(String(comment?.created_at || ""));
-  return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
-}
-
 const STATUS_SNAPSHOT_KEY = "snapshot";
-const STATUS_SNAPSHOT_BAY_SCOPE_KEY_PREFIX = "snapshot:bay-scope:v1:";
+const STATUS_SNAPSHOT_BAY_SCOPE_KEY_PREFIX = "snapshot:bay-scope:v2:";
 
 function cachedStatusSnapshotKey(publicBayScope) {
   return `${STATUS_SNAPSHOT_BAY_SCOPE_KEY_PREFIX}${
     publicBayScope ? encodeURIComponent(publicBayScope) : "_"
   }`;
+}
+
+function statusPublicationTime(body: string, now: number): number | null {
+  try {
+    const snapshot = JSON.parse(body);
+    const at = Date.parse(snapshot?.generated_at);
+    return snapshot?.schema_version === 1 &&
+      snapshot.public_projection_complete === true &&
+      Number.isFinite(at) &&
+      at <= now + 60_000
+      ? at
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 async function writeCachedStatusSnapshot(store, body, publicBayScope) {
@@ -11922,10 +9278,7 @@ export async function readCachedSnapshot(env, ttlSeconds, expectedBayScope?: str
     !snapshot ||
     typeof snapshot !== "object" ||
     Array.isArray(snapshot) ||
-    snapshot.schema_version !== 1 ||
-    !snapshot.bay ||
-    typeof snapshot.bay !== "object" ||
-    Array.isArray(snapshot.bay)
+    snapshot.schema_version !== 1
   ) {
     return null;
   }
@@ -12058,11 +9411,11 @@ function statusStoreRequest(key, method = "GET") {
 
 function createGithubJsonCache(env): GithubJsonReader {
   const cache = new Map<string, ReturnType<typeof githubJson>>();
-  return (path: string) => {
+  return (path: string, options) => {
     statusCollections.get(env)?.check();
     const key = String(path);
     let request = cache.get(key);
-    if (!request) {
+    if (!request || options?.fresh) {
       request = statusOperation(env, "github", () => githubJson(env, key));
       cache.set(key, request);
     }
@@ -12071,7 +9424,7 @@ function createGithubJsonCache(env): GithubJsonReader {
 }
 
 async function githubJson(env, path) {
-  const token = await statusOperation(env, "github_auth", () => githubAuthToken(env));
+  const scope = githubReadScope(env, path);
   const key = githubEtagCacheKey({
     credentialPool: env.GITHUB_TOKEN ? "repository_actions" : "target_app",
     route: path,
@@ -12090,7 +9443,9 @@ async function githubJson(env, path) {
       cachedEntry = null;
     }
   }
-  let response = await githubJsonResponse(env, path, token, String(cachedEntry?.etag || ""));
+  const read = (etag: string) =>
+    githubRequestWithAuth(env, scope, (token) => githubJsonResponse(env, path, token, etag));
+  let response = await read(String(cachedEntry?.etag || ""));
   if (response.status === 304 && etagBrokerEnabled && requestBody && cachedEntry) {
     try {
       const confirmed = await githubEtagCachePost(env, "confirm", {
@@ -12112,10 +9467,19 @@ async function githubJson(env, path) {
     } catch {
       // The final guard may use a 304, but it never consumes an unconfirmed body.
     }
-    response = await githubJsonResponse(env, path, token, "");
+    response = await read("");
   }
-  if (!response.ok) throw new Error(`GitHub ${response.status} for ${path}`);
-  const body = await response.text();
+  if (!response.ok) {
+    throw new GitHubRequestError(
+      `GitHub ${response.status} for ${path}`,
+      response.status,
+      false,
+      githubResponseRateLimited(response, ""),
+    );
+  }
+  const body = await response
+    .text()
+    .catch((error) => githubTransportFailure(env, error, githubResponseSignals.get(response)));
   if (etagBrokerEnabled && requestBody) {
     const etag = response.headers.get("etag") || "";
     const bodyBytes = new TextEncoder().encode(body).byteLength;
@@ -12130,36 +9494,61 @@ async function githubJson(env, path) {
 
 export const githubJsonForTest = githubJson;
 
-function githubJsonResponse(env, path, token: string, ifNoneMatch: string) {
-  return fetch(githubApiUrl(env, path), {
-    signal: statusRequestSignal(env, AbortSignal.timeout(GITHUB_TIMEOUT_MS)),
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "openclaw-clawsweeper-status",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(ifNoneMatch ? { "If-None-Match": ifNoneMatch } : {}),
-    },
-  });
+async function githubJsonResponse(env, path, token: string, ifNoneMatch: string) {
+  const url = githubApiUrl(env, path);
+  const signal = statusRequestSignal(env, AbortSignal.timeout(GITHUB_TIMEOUT_MS));
+  try {
+    const response = await fetch(url, {
+      signal,
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "openclaw-clawsweeper-status",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(ifNoneMatch ? { "If-None-Match": ifNoneMatch } : {}),
+      },
+    });
+    githubResponseSignals.set(response, signal);
+    return response;
+  } catch (error) {
+    return githubTransportFailure(env, error, signal);
+  }
+}
+
+function githubTransportFailure(env, error: unknown, signal?: AbortSignal): never {
+  if (statusCollections.get(env)?.controller.signal.aborted) throw error;
+  throw new GitHubRequestError("GitHub request failed", undefined, signal?.aborted === true);
 }
 
 async function githubEtagCachePost(env, operation: "lookup" | "store" | "confirm", body) {
-  return statusOperation(env, "github", async () => {
-    const response = await githubEtagCacheRequest(
-      env,
-      `/github-etag-cache/${operation}`,
-      JSON.stringify(body),
+  const controller = new AbortController();
+  try {
+    // This cache is advisory. Its own request/body deadline must leave time
+    // for the authoritative GitHub read and the rest of the status snapshot.
+    return await withTimeout(
+      statusOperation(env, "github", async () => {
+        const response = await githubEtagCacheRequest(
+          env,
+          `/github-etag-cache/${operation}`,
+          JSON.stringify(body),
+          controller.signal,
+        );
+        const result = objectValue(await response.json().catch(() => null));
+        if (!response.ok) throw new Error(String(result.error || "GitHub ETag cache unavailable"));
+        return result;
+      }),
+      GITHUB_ETAG_CACHE_TIMEOUT_MS,
+      "GitHub ETag cache",
     );
-    const result = objectValue(await response.json().catch(() => null));
-    if (!response.ok) throw new Error(String(result.error || "GitHub ETag cache unavailable"));
-    return result;
-  });
+  } finally {
+    controller.abort();
+  }
 }
 
 function parseGithubJsonBody(body: string, path: string) {
   try {
     return JSON.parse(body);
   } catch {
-    throw new Error(`GitHub returned invalid JSON for ${path}`);
+    throw new SyntaxError(`GitHub returned invalid JSON for ${path}`);
   }
 }
 
@@ -12169,20 +9558,35 @@ async function sha256Utf8(value: string): Promise<string> {
 }
 
 async function githubGraphql(env, query, variables) {
-  const token = await statusOperation(env, "github_auth", () => githubAuthToken(env));
-  if (!token) throw new Error("GitHub auth is required for GraphQL");
-  const response = await fetch(githubApiUrl(env, "/graphql"), {
-    method: "POST",
-    signal: statusRequestSignal(env, AbortSignal.timeout(OPTIONAL_SECTION_TIMEOUT_MS)),
-    headers: {
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "User-Agent": "openclaw-clawsweeper-status",
-      Authorization: `Bearer ${token}`,
+  const response = await githubRequestWithAuth(
+    env,
+    {
+      repos: [`${variables.owner}/${variables.name}`],
+      permissions: { issues: "read", pull_requests: "read" },
     },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (!response.ok) throw new Error(`GitHub GraphQL ${response.status}`);
+    (token) => {
+      if (!token) throw new Error("GitHub auth is required for GraphQL");
+      return fetch(githubApiUrl(env, "/graphql"), {
+        method: "POST",
+        signal: statusRequestSignal(env, AbortSignal.timeout(OPTIONAL_SECTION_TIMEOUT_MS)),
+        headers: {
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": "openclaw-clawsweeper-status",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    },
+  );
+  if (!response.ok) {
+    throw new GitHubRequestError(
+      `GitHub GraphQL ${response.status}`,
+      response.status,
+      false,
+      githubResponseRateLimited(response, ""),
+    );
+  }
   const payload = await response.json();
   if (Array.isArray(payload.errors) && payload.errors.length) {
     throw new Error(payload.errors.map((error) => error.message).join("; "));
@@ -12190,72 +9594,107 @@ async function githubGraphql(env, query, variables) {
   return payload.data;
 }
 
+export const githubGraphqlForTest = githubGraphql;
+
+async function githubRequestWithAuth(env, scope, request: (token: string) => Promise<Response>) {
+  const tokenForScope = () =>
+    statusOperation(env, "github_auth", () => githubAuthToken(env, scope));
+  let token = await tokenForScope();
+  let response = await request(token);
+  if (response.status !== 401 || env.GITHUB_TOKEN || !token) return response;
+
+  // A delayed 401 must not evict a replacement minted by another request.
+  const evictRejectedToken = () => {
+    for (const [key, entry] of githubAppTokenCache) {
+      if (entry.token === token) githubAppTokenCache.delete(key);
+    }
+  };
+  evictRejectedToken();
+  await response.body?.cancel();
+  token = await tokenForScope();
+  response = await request(token);
+  if (response.status === 401) evictRejectedToken();
+  return response;
+}
+
 function hasGithubAuth(env) {
   return Boolean(env.GITHUB_TOKEN || githubAppCredentials(env));
 }
 
-async function githubAuthToken(env) {
+function githubReadScope(env, path: string) {
+  const match = /^\/repos\/([^/]+\/[^/]+)(?:\/([^/?]+))?/.exec(path);
+  if (match) {
+    const permission = /\/commits\/[^/]+\/check-runs(?:[/?]|$)/.test(path)
+      ? "checks"
+      : {
+          actions: "actions",
+          contents: "contents",
+          pulls: "pull_requests",
+          issues: "issues",
+          labels: "issues",
+          commits: "contents",
+        }[match[2]] || "metadata";
+    return { repos: [match[1]], permissions: { [permission]: "read" } };
+  }
+  const query = new URL(path, "https://api.github.com").searchParams.get("q") || "";
+  // Search builders put scope first; quoted label text must not widen it.
+  const repository = /^repo:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?=\s|$)/.exec(query)?.[1];
+  const itemKind = /^repo:\S+\s+is:(pr|issue)(?=\s|$)/.exec(query)?.[1];
+  const permissions =
+    itemKind === "pr"
+      ? { pull_requests: "read" }
+      : itemKind === "issue"
+        ? { issues: "read" }
+        : { issues: "read", pull_requests: "read" };
+  return { repos: repository ? [repository] : triageTargetRepos(env), permissions };
+}
+
+async function githubAuthToken(env, scope) {
   if (env.GITHUB_TOKEN) return String(env.GITHUB_TOKEN);
   const credentials = githubAppCredentials(env);
   if (!credentials) return "";
 
   const now = Date.now();
-  const repos = triageTargetRepos(env);
-  const cacheKey = [
+  const owners = new Set(scope.repos.map((repo: string) => repo.split("/")[0].toLowerCase()));
+  if (owners.size !== 1) throw new Error("GitHub App token repositories must share an owner");
+  const request = githubAppTokenRequest(scope.repos.map(repoName), scope.permissions);
+  const cacheKey = JSON.stringify([
     credentials.issuer,
-    credentials.installationId || repos[0] || "",
-    repos.join(","),
-  ].join("|");
-  if (
-    githubAppTokenCache?.key === cacheKey &&
-    githubAppTokenCache.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_SKEW_MS > now
-  ) {
-    return githubAppTokenCache.token;
+    credentials.installationId,
+    owners.values().next().value,
+    githubApiUrl(env, "/"),
+    request,
+  ]);
+  for (const [key, entry] of githubAppTokenCache) {
+    if (entry.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_SKEW_MS <= now)
+      githubAppTokenCache.delete(key);
   }
-  if (githubAppTokenCache?.key === cacheKey && githubAppTokenCache.promise) {
-    return githubAppTokenCache.promise;
-  }
+  const cached = githubAppTokenCache.get(cacheKey);
+  if (cached) return cached.token;
 
-  const promise = createGithubAppInstallationToken(env, credentials, repos)
+  const mints = statusCollections.get(env)?.githubAppTokenMints;
+  const inFlight = mints?.get(cacheKey);
+  if (inFlight) return inFlight;
+  const promise = createGithubAppInstallationToken(env, credentials, scope.repos, request)
     .then((result) => {
-      githubAppTokenCache = {
-        key: cacheKey,
-        token: result.token,
-        expiresAtMs: result.expiresAtMs,
-      };
+      githubAppTokenCache.set(cacheKey, result);
       return result.token;
     })
-    .catch((error) => {
-      githubAppTokenCache = null;
-      throw error;
-    });
-  githubAppTokenCache = {
-    key: cacheKey,
-    token: "",
-    expiresAtMs: 0,
-    promise,
-  };
+    .finally(() => mints?.delete(cacheKey));
+  mints?.set(cacheKey, promise);
   return promise;
 }
 
-async function createGithubAppInstallationToken(env, credentials, repos) {
+async function createGithubAppInstallationToken(env, credentials, repos, request) {
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
   const installationId =
-    credentials.installationId || (await githubAppInstallationId(appJwt, repos[0], env));
+    credentials.installationId || (await typedGithubAppInstallationId(appJwt, repos[0], env));
   const payload = await githubAppJson(
     `/app/installations/${installationId}/access_tokens`,
     appJwt,
     {
       method: "POST",
-      body: JSON.stringify({
-        permissions: {
-          actions: "read",
-          checks: "read",
-          contents: "read",
-          issues: "read",
-          pull_requests: "read",
-        },
-      }),
+      body: JSON.stringify(request),
       errorLabel: "GitHub App token",
     },
     env,
@@ -12386,7 +9825,7 @@ function isCodexWorkflowFallback(run) {
   ) {
     return false;
   }
-  return /review clawsweeper items|review hot (?:clawsweeper items|target repo)|review target repo|review event items?|retry failed codex reviews|commit review|repair cluster|automerge repair|issue implementation|assist\b/i.test(
+  return /review clawsweeper items|review hot (?:clawsweeper items|target repo)|review target repo|review event items?|review exact item|review scheduled (?:hot|normal) item|retry failed codex reviews|commit review|repair cluster|automerge repair|issue implementation|assist\b/i.test(
     name,
   );
 }
@@ -12419,8 +9858,6 @@ function controlPlaneSnapshot(runs) {
 function laneRank(mode) {
   return (
     {
-      automerge: 0,
-      repair: 1,
       "exact-review": 2,
       "hot-review": 3,
       apply: 4,
@@ -12485,20 +9922,6 @@ function html(value) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-    },
-  });
-}
-
-function demoHtml(value) {
-  return new Response(value, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store",
-      "content-security-policy":
-        "default-src 'self'; img-src 'self' data:; connect-src 'self' https://*.openclaw.ai; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors https://team.openclaw.ai; form-action 'self'",
-      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
-      "referrer-policy": "no-referrer",
-      "x-content-type-options": "nosniff",
     },
   });
 }

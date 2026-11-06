@@ -1,9 +1,5 @@
-import type {
-  ExistingReview,
-  ExistingReviewIndex,
-  FailedReviewRetryState,
-  Item,
-} from "./clawsweeper-types.js";
+import type { FailedReviewRetryState, Item } from "./clawsweeper-types.js";
+import type { itemSourceRevisionSha256 } from "./clawsweeper-source-revision.js";
 
 export interface ReviewPlanningDependencies {
   maxPlanShardCount: number;
@@ -16,20 +12,9 @@ export interface ReviewPlanningDependencies {
   ) => string | null;
   ghPaged: <T>(path: string) => T[];
   githubCount: (value: unknown) => number | null;
-  itemSourceRevisionSha256: (issue: unknown, comments?: unknown[]) => string;
-  asRecord: (value: unknown) => Record<string, unknown>;
+  itemSourceRevisionSha256: typeof itemSourceRevisionSha256;
   normalizeAuthorAssociation: (value: unknown) => string;
-  shouldPlanItem: (item: Pick<Item, "authorAssociation" | "labels">) => boolean;
-  frontMatterValue: (markdown: string, key: string) => string | undefined;
-  buildExistingReviewIndex: (itemsDir: string) => ExistingReviewIndex;
-  indexedExistingReview: (
-    item: Pick<Item, "number" | "repo">,
-    itemsDir: string,
-    reviewIndex?: ExistingReviewIndex,
-  ) => ExistingReview | null;
-  effectiveReviewStatus: (markdown: string) => string;
-  stringOrUndefined: (value: unknown) => string | undefined;
-  pullHeadShaFromReport: (markdown: string) => string | null;
+  shouldPlanItem: (item: Pick<Item, "authorAssociation" | "createdAt" | "labels">) => boolean;
   failedReviewRetryStatePath: (stateDir: string, number: number) => string;
   readFailedReviewRetryState: (statePath: string) => FailedReviewRetryState | null;
   failedReviewRetryMarkdownWithState: (
@@ -37,7 +22,6 @@ export interface ReviewPlanningDependencies {
     state: FailedReviewRetryState | null,
   ) => string;
   repoRelativePath: (filePath: string) => string;
-  dashboardClosedAt: (markdown: string) => string | undefined;
   githubReadModelRequestSync?: (
     operation: "item" | "comments" | "activity" | "workflows" | "placeholders" | "repair",
     payload: Record<string, unknown>,

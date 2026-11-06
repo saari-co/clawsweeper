@@ -29,24 +29,87 @@ Subscription readiness is detected per event class. A class remains unavailable 
 
 ### Dashboard workflow source
 
-`CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE=poll` selects the existing bounded
-GitHub run/job polls for dashboard health. This deployment selects `poll` in
-`dashboard/wrangler.toml`; it neither reads nor repairs the workflow read model
-and does not warn about missing workflow subscriptions. Leaving the setting
-unset, or setting `webhook`, preserves snapshot reuse, fallback warnings, and
-repair. The shared signing secret remains required for those read-model calls.
-Item/comment consumers, signed ingress, queue operations, and ETag caching are
-unchanged. Poll mode does not require new GitHub App event subscriptions.
+Dashboard workflow health always uses bounded GitHub run/job polling. The
+retired workflow-source setting is no longer read: dashboard health neither
+reads nor repairs workflow webhook snapshots and does not warn about missing
+workflow subscriptions. Item/comment consumers, signed ingress, queue
+operations, and ETag caching are unchanged. Dashboard polling does not require
+new GitHub App event subscriptions.
 
 ## Stored schema and bounds
 
 The Durable Object assigns one monotonic repository-wide watermark to every unique GitHub delivery GUID. Per-object rows retain the source `updated_at`, delivery GUID, object watermark, receipt time, and normalized JSON. Older deliveries with previously unseen GUIDs advance the global observation watermark but cannot replace a newer object row.
+
+Comment and inline-review-comment deletions can retain the previous edit timestamp. At equal source time, a deletion replaces a live row with a tombstone; later delivery of an equal-time live event cannot restore it or renew its lifetime.
 
 - One item row per repository and issue/PR number.
 - Comments ordered by numeric ID, including deletion tombstones; at most 500 rows per item and 64 KiB per comment body.
 - Reviews and inline review comments stored separately with tombstones, counts, and a stable activity digest; at most 500 rows per item.
 - Workflow runs, jobs, check runs, and check suites; at most 1,000 current/recent objects.
 - Delivery GUID receipts retained for 30 days.
+
+Workflow-job coverage expires at the same five-minute boundary as its reader.
+The queue alarm deletes at most 256 expired `run_jobs` or `run_jobs_v2` receipts
+per pass, including historical receipts. The timestamp index also supplies the
+next wake, so an idle queue drains without new webhooks. Initialization builds
+this partial index once on existing history; that cost is separate from the
+bounded alarm passes. Run-census receipts and unknown coverage kinds remain.
+
+Item, comment, and review payloads become eligible after their issue/PR family
+has no accepted observation or complete comment repair for 30 minutes. This
+matches the longest ordinary reader TTL. Keep older members of an active family:
+the newest comment can make the whole collection fresh, including older bodies
+and the parent's count guards. Placeholder recovery has a separate six-hour
+census TTL and explicit protection below; it does not require ordinary payloads.
+Each queue alarm examines at most 64 payload candidates. Ingest and repair only
+arm the next maintenance wake after committing; they do not classify old families.
+Indexed deadlines exclude payloads already retired and
+preserve actual deletion tombstones. Retention also preserves unresolved placeholder
+comments and their parent item snapshots because recovery still needs them.
+The first pass marks these protected rows with a deadline of -1 so later passes skip them.
+Active families receive a later deadline. Each pass reads their bounded child
+collections once per family, so a hot prefix cannot block cold candidates.
+Accepted comment changes or complete repairs make the parent eligible for reconsideration.
+Retirement replaces only the JSON payload
+with an empty object. It retains the row identity, source timestamp, delivery
+GUID, and watermark to reject delayed older events.
+
+Retired payloads make the affected read unusable. Retirement invalidates affected
+comment completeness in the same transaction. Protected placeholder candidates
+survive, so ordinary retirement preserves the repository's placeholder census.
+A fresh fragment cannot make a partially retired collection usable.
+An authoritative repair can restore a payload with the same source timestamp.
+An ordinary webhook with that timestamp cannot replace it or renew its lifetime.
+Newer partial webhooks cannot make a retired item usable before authoritative repair.
+A placeholder with a missing or retired parent makes discovery unusable until repair.
+A complete comment repair establishes freshness and completeness independently
+of an older parent payload or count. A newer parent observation fences that proof.
+If the row cap truncates a comment collection, its stored completeness flag
+remains false through retirement and partial repair. A complete repair must fit
+within the cap before the collection becomes usable. Legacy receipts start
+unconfirmed because older repairs could already have exceeded the cap.
+
+The schema initializer adds a retirement marker, deadline, and partial retention index to
+each of the three existing tables. Existing rows retain their payloads during
+initialization. It also adds a completeness flag to comment receipts.
+Initialization and successful ingress or repair arm the earliest indexed
+payload deadline. The alarm scheduler preserves earlier queue work and keeps
+maintenance alive when the queue is otherwise empty. An overdue backlog schedules
+another pass no sooner than one second later; future deadlines wake without
+new traffic, including after an object restart. Each committed pass logs
+`github_read_model_payload_maintenance` with scanned, retired, deferred, protected,
+logical JSON bytes removed, and the next eligible deadline. Byte counts exclude
+SQLite page/index overhead and do not establish physical storage reclamation.
+Deploying this change therefore enables destructive payload retirement. Obtain
+the production operator's approval before deployment. Redeploying old code does
+not recover retired payloads and does not support their marker semantics.
+
+This is eligibility, not an exact deletion deadline: alarm delivery can be delayed,
+and each pass is bounded. It does not bound active family age,
+the number of ordering rows, or total database size.
+Canonical reports, lifecycle history, queue ownership, and R2 objects are outside
+this retention policy. Measure production eligibility and storage separately.
+The local Worker proof is in [webhook payload retention](proof/webhook-payload-retention/README.md).
 
 Receipt cleanup uses a single-column `received_at` index, added idempotently by
 the store initializer for both new and existing databases. Each accepted unique
@@ -58,31 +121,35 @@ the SQLite access path, not retention, constraints, transaction rollback, or
 the public read-model contract. Building it on existing history has a one-time
 initialization cost and adds storage and receipt-write work.
 
-Item snapshots are stale after 15 minutes, comment and review collections after 30 minutes, and workflow state after 5 minutes. Placeholder discovery additionally requires a successful repair census within 6 hours. Missing, stale, incomplete, unsubscribed, or gap-detected snapshots fall back to GitHub and repair the Durable Object before later reads reuse it.
+Item snapshots are stale after 15 minutes, comment and review collections after 30 minutes, and workflow state after 5 minutes. Placeholder discovery additionally requires a successful repair census within 6 hours. Missing, stale, incomplete, unsubscribed, or gap-detected snapshots fall back to GitHub. Item, comment, and placeholder repairs persist only after the event class required by their reader has been observed. Otherwise the repair returns `accepted: false` with `reason: event_class_unavailable` and leaves snapshots, watermarks, completeness receipts, and retirement deadlines unchanged. Live polling still returns its result; it does not make an unsubscribed cache usable. Placeholder repairs require issue-comment coverage, including when they also carry parent issue or PR snapshots.
+
+Item and placeholder projections preserve the stored issue/PR kind using the
+Issues API's `pull_request` marker, including older rows whose JSON lacks that
+marker. Raw PR webhook objects do not contain a nested marker. Planning therefore
+keeps PR lease revisions tied to the live PR head, while issues retain their
+source digest; the live head-drift and mutation guards are unchanged.
 
 ## Read and repair endpoints
 
 Publisher-authenticated POST routes live below `/internal/state/github-read-model/`: `item`, `comments`, `activity`, `workflows`, `placeholders`, and `repair`. Authentication uses the same body HMAC as the other automated queue data-plane routes. Responses carry `watermark`, per-class subscription state, `freshness`, and `usable`; callers must not infer freshness from a successful HTTP response alone.
 
-The migrated consumers are exact-item review planning, dashboard workflow-run/job health, review-placeholder discovery, and repair-loop comment hydration in the comment router. Each retains a bounded repair poll. The dashboard's composed live snapshot TTL is 60 seconds; webhook workflow state is independently capped at 5 minutes.
+The consumers are exact-item review planning and review-placeholder discovery.
+Each retains a bounded repair poll. The comment router and dashboard workflow
+health use GitHub polling directly.
 
-Workflow rows alone never establish completeness. Dashboard run snapshots require a persisted successful bounded run census, and job snapshots require fresh complete coverage for each run before that run can avoid its live job poll. Census repair removes older rows absent from the authoritative result while preserving webhook rows received after the census began.
+Placeholder repairs retain bodies only for unresolved placeholder comments.
+Other live comments retain ordering metadata with an empty, retired payload;
+this also clears completed placeholders without letting delayed events restore
+them. Deletion tombstones remain intact. These repairs do not establish a usable
+full comment collection. Signed webhook ingestion and full comment repairs still
+retain ordinary bodies for the comment API.
 
-Each workflow-run row also exposes its last delivery-or-poll confirmation time.
-Before an over-threshold queued row with an expired confirmation can affect
-operational health, the dashboard re-reads that exact run from GitHub. Each
-20-second status refresh checks at most the ten oldest stale rows, which keeps
-the work to two five-way request waves. Unconfirmed rows omitted from that
-batch are excluded from queue pressure and make health `unknown`; later
-refreshes continue with the next-oldest rows. Structured
-`github_read_model_workflow_run_revalidation_batch` telemetry records the batch
-limit, selected count, and omitted count. A live active run refreshes the row;
-a completed or missing run is evicted with
-`github_read_model_workflow_run_evicted` telemetry. If exact verification
-fails, operational health is `unknown` rather than reporting an unconfirmed
-queued run. The eviction is bounded by the verification start time so a newer
-webhook delivery cannot be deleted by the repair. Rows beyond the existing
-24-hour zombie boundary remain separately observable without exact rechecks.
+Stored workflow rows alone never establish completeness. Workflow read-model
+snapshots require a persisted successful bounded run census, and job snapshots
+require fresh complete coverage for each run. Census repair removes older rows
+absent from the authoritative result while preserving webhook rows received
+after the census began.
+
 
 Publisher-HMAC remains the normal automated read credential. Exact-review planning intentionally does not receive that shared secret; its item read instead uses the already-issued full lease tuple as a scoped capability. The queue accepts that capability only for the tuple's live leased repository and item, and it cannot write or repair the read model.
 

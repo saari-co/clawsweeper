@@ -3,7 +3,6 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import { createLabelMutationOperations } from "../dist/clawsweeper-label-mutations.js";
-import { normalizeLabelName } from "../dist/clawsweeper-item-policy.js";
 
 type ObservedMutation = {
   identity: string;
@@ -13,27 +12,26 @@ type ObservedMutation = {
 
 function createOperations(options?: {
   catalog?: unknown[];
+  pages?: unknown;
+  readError?: Error;
   mutate?: (mutation: ObservedMutation) => void;
 }) {
-  const reads: string[][] = [];
+  const reads: unknown[] = [];
   const mutations: ObservedMutation[] = [];
   const operations = createLabelMutationOperations({
-    ghJson: <T>(args: string[]): T => {
-      reads.push(args);
-      return (options?.catalog ?? []) as T;
+    readLabelCatalogPages: () => {
+      if (options?.readError) throw options.readError;
+      const pages = options && "pages" in options ? options.pages : [options?.catalog ?? []];
+      reads.push(pages);
+      return pages;
     },
-    ghObservedMutationCommand: (mutation: ObservedMutation): void => {
+    ghObservedMutationCommand: (mutation: ObservedMutation): string => {
       mutations.push(mutation);
       options?.mutate?.(mutation);
       mutation.onMutation?.();
+      return "";
     },
-    normalizeLabelName,
-    prStatusLabelForKind: () => ({
-      name: "status:ready",
-      color: "1F883D",
-      description: "Ready for maintainer review.",
-    }),
-  } as never);
+  });
   return { mutations, operations, reads };
 }
 
@@ -53,9 +51,7 @@ test("an exact-publication label batch emits one combined deterministic issue ed
 
   assert.equal(operations.flushIssueLabelMutationBatch(321).itemMutationPublished, true);
   assert.equal(mutationCount, 1);
-  assert.deepEqual(reads, [
-    ["label", "list", "--limit", "1000", "--json", "name,color,description"],
-  ]);
+  assert.equal(reads.length, 1);
   assert.deepEqual(
     mutations.map(({ args }) => args),
     [
@@ -70,6 +66,58 @@ test("an exact-publication label batch emits one combined deterministic issue ed
       ],
     ],
   );
+});
+
+test("an empty REST catalog creates the required definition and publishes once", () => {
+  const { mutations, operations } = createOperations({ pages: [[]] });
+  operations.beginIssueLabelMutationBatch(321);
+  operations.ensurePriorityLabel({ name: "P2", color: "FBCA04", description: "Priority two" });
+  operations.addIssueLabel(321, "P2");
+  assert.equal(operations.flushIssueLabelMutationBatch(321).itemMutationPublished, true);
+  assert.deepEqual(
+    mutations.map(({ args }) => args),
+    [
+      ["label", "create", "P2", "--color", "FBCA04", "--description", "Priority two"],
+      ["issue", "edit", "321", "--add-label", "P2"],
+    ],
+  );
+});
+
+test("catalog definitions on later REST pages are reused without creation", () => {
+  const { mutations, operations } = createOperations({
+    pages: [
+      Array.from({ length: 100 }, (_, index) => ({ name: `existing-${index}`, color: "000000" })),
+      [{ name: "P2", color: "FBCA04", description: "Priority two" }],
+    ],
+  });
+  operations.beginIssueLabelMutationBatch(321);
+  operations.ensurePriorityLabel({ name: "P2", color: "FBCA04", description: "Priority two" });
+  operations.addIssueLabel(321, "P2");
+  operations.flushIssueLabelMutationBatch(321);
+  assert.deepEqual(
+    mutations.map(({ args }) => args),
+    [["issue", "edit", "321", "--add-label", "P2"]],
+  );
+});
+
+test("invalid catalog pages and failed reads prevent every label write", () => {
+  for (const pages of [null, {}, [null], [[], { message: "not a label page" }]]) {
+    const { mutations, operations } = createOperations({ pages });
+    operations.beginIssueLabelMutationBatch(321);
+    operations.ensurePriorityLabel({ name: "P2", color: "FBCA04", description: "Priority two" });
+    operations.addIssueLabel(321, "P2");
+    assert.throws(
+      () => operations.flushIssueLabelMutationBatch(321),
+      /catalog pages were not arrays/,
+    );
+    assert.deepEqual(mutations, []);
+  }
+  const failure = new Error("Resource not accessible by integration");
+  const { mutations, operations } = createOperations({ readError: failure });
+  operations.beginIssueLabelMutationBatch(321);
+  operations.addIssueLabel(321, "P2");
+  assert.throws(() => operations.flushIssueLabelMutationBatch(321), failure);
+  assert.deepEqual(mutations, []);
 });
 
 test("label definition discovery is cached across item batches", () => {

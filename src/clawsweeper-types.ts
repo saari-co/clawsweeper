@@ -1,3 +1,5 @@
+import type { MergeRiskLabelName } from "./clawsweeper-policy.js";
+import type { BULK_FILED_LABEL } from "./repair/exact-review-guard-labels.js";
 import type { MaintainerDecision } from "./decision-packets.js";
 import type { PrCloseCoverageProofModelResult } from "./pr-close-coverage-proof.js";
 import type { RepositoryProfile } from "./repository-profiles.js";
@@ -7,7 +9,8 @@ import type {
   reviewHistoryForReviewer,
 } from "./review-history.js";
 import type { ReviewStructuralRecord } from "./review-structural-cache.js";
-import type { PrHydrationSnapshot } from "./pr-hydration-snapshot.js";
+import type { ReviewHistoryCoverage } from "./pr-review-history.js";
+import type { ProvenanceEvidence } from "./pr-review-provenance.js";
 import type { SchedulerDueCandidate } from "./scheduler-policy.js";
 
 /** Shared ClawSweeper domain, review, scheduling, and dashboard shapes. */
@@ -17,7 +20,7 @@ export type ItemKind = "issue" | "pull_request";
 export type ApplyKind = ItemKind | "all";
 export type DecisionKind = "close" | "keep_open";
 export type WorkCandidateKind = "none" | "manual_review" | "queue_fix_pr";
-export type NextStepAssessment = { kind: "none" | "required"; text: string };
+export type NextStepAssessment = { kind: "none" | "required" | "maintainer"; text: string };
 export type FailedReviewRetryRevisionKind = "pull_head_sha" | "item_source_revision";
 export interface FailedReviewRetryRevision {
   kind: FailedReviewRetryRevisionKind;
@@ -61,15 +64,6 @@ export type ImpactLabelName =
   | "impact:ux-release-blocker"
   | "impact:ux-friction"
   | "impact:other";
-export type MergeRiskLabelName =
-  | "merge-risk: 🚨 compatibility"
-  | "merge-risk: 🚨 message-delivery"
-  | "merge-risk: 🚨 session-state"
-  | "merge-risk: 🚨 auth-provider"
-  | "merge-risk: 🚨 security-boundary"
-  | "merge-risk: 🚨 availability"
-  | "merge-risk: 🚨 automation"
-  | "merge-risk: 🚨 other";
 export type MaturityLabelName = "maturity:stable";
 export type MergeRiskOptionCategory = "fix_before_merge" | "accept_risk" | "pause_or_close";
 export type ReviewLabelName =
@@ -120,6 +114,29 @@ export type RealBehaviorProofEvidenceKind =
   | "none"
   | "not_applicable";
 export type PrRatingTier = "S" | "A" | "B" | "C" | "D" | "F" | "NA";
+export type ProductReviewKind =
+  | "bug_fix"
+  | "preference"
+  | "feature"
+  | "refactor"
+  | "performance"
+  | "test_only"
+  | "docs"
+  | "maintenance"
+  | "not_applicable";
+export type ProductFixScope = "complete" | "partial" | "not_applicable";
+export type ProductWorthIt = "yes" | "no" | "needs_maintainer" | "not_applicable";
+export type ProvenanceVerdict =
+  | "respects"
+  | "overrides_with_reason"
+  | "overrides_without_reason"
+  | "unknown";
+export type TestingProofPath =
+  | "shipped_entry_point"
+  | "in_process_harness"
+  | "unit_only"
+  | "none"
+  | "not_applicable";
 export type PrStatusLabelKind =
   | "automerge_armed"
   | "re_review_loop"
@@ -127,42 +144,11 @@ export type PrStatusLabelKind =
   | "needs_proof"
   | "needs_maintainer_proof_decision"
   | "waiting_on_author"
+  | "waiting_on_maintainer"
   | "ready_for_maintainer_look";
 export type FeatureShowcaseStatus = "showcase" | "none";
-export type TelegramVisibleProofStatus = "needed" | "not_needed";
-export type LiveProofPlanStatus = "recommended" | "not_applicable" | "declined_suspicious";
-export type LiveProofSurface = "browser" | "terminal" | "none";
-export type LiveProofTerminalCompletion = "exit_zero" | "ready_while_running" | "not_applicable";
-export type LiveProofPayoffKind =
-  | "progressive_output"
-  | "ui_interaction"
-  | "tui_or_color"
-  | "animation"
-  | "static_text";
-export type LiveProofBrowserStep =
-  | { action: "goto"; path: string }
-  | { action: "click"; target: string }
-  | { action: "fill"; target: string; value: string }
-  | { action: "press"; key: string }
-  | { action: "wait_for"; target: string }
-  | { action: "wait"; seconds: number }
-  | { action: "expect_text"; text: string };
-export type LiveProofTerminalStep =
-  | { action: "run"; command: string }
-  | { action: "wait"; seconds: number }
-  | { action: "expect_output"; text: string };
-export type LiveProofStep = LiveProofBrowserStep | LiveProofTerminalStep;
-export type MantisRecommendationStatus = "recommended" | "not_recommended";
-export type MantisRecommendationScenario =
-  | "none"
-  | "discord_status_reactions"
-  | "discord_thread_attachment"
-  | "web_ui_chat_proof"
-  | "slack_desktop_smoke"
-  | "visual_task";
-export type VisionFitStatus = "aligned" | "rejected" | "unclear" | "not_applicable";
 export type ImplementationComplexity = "small" | "medium" | "large" | "unclear" | "not_applicable";
-export type AutoImplementationCandidate = "none" | "strict_bug" | "vision_fit";
+export type AutoImplementationCandidate = "none" | "strict_bug";
 export type RootCauseRelationship =
   | "canonical"
   | "duplicate"
@@ -233,6 +219,7 @@ export interface GitHubIssueListItem {
   user?: GitHubUser;
   labels?: string[];
   pull_request?: unknown;
+  locked?: boolean;
 }
 
 export interface Item {
@@ -257,13 +244,15 @@ export interface BulkFilerReviewContext {
   threshold: number;
   windowDays: number;
   windowStart: string;
-  label: "clawsweeper:bulk-filed";
+  label: typeof BULK_FILED_LABEL;
 }
 
 export interface BulkFilerDetectionResult {
   context: BulkFilerReviewContext | null;
   labelPending: boolean;
   labelApplied: boolean;
+  /** Set only when the count search succeeded and stayed below the threshold. */
+  belowThreshold?: true;
 }
 
 export type BulkFilerCountCache = Map<string, number | null>;
@@ -274,7 +263,7 @@ export interface BulkFilerDetectionOptions {
   cache: BulkFilerCountCache;
   now: number;
   env?: Record<string, string | undefined>;
-  searchCount: (options: { author: string; windowStart: string }) => number;
+  searchCount: (options: { author: string; windowStart: string; windowEnd: string }) => number;
   onSearchError?: (error: unknown) => void;
 }
 
@@ -423,30 +412,36 @@ export interface PrRating {
   nextSteps: string[];
 }
 
-export interface TelegramVisibleProof {
-  status: TelegramVisibleProofStatus;
-  summary: string;
+export interface ChangeExample {
+  scenario: string;
+  before: string;
+  after: string;
 }
 
-export interface LiveProofPlan {
-  status: LiveProofPlanStatus;
-  surface: LiveProofSurface;
-  terminalCompletion: LiveProofTerminalCompletion;
-  invalid?: true;
+export interface ProductReview {
+  kind: ProductReviewKind;
+  userProblem: string;
+  fixScope: ProductFixScope;
+  worthIt: ProductWorthIt;
   reason: string;
-  payoff: {
-    kind: LiveProofPayoffKind;
-    justification: string;
-  };
-  entry: string;
-  steps: LiveProofStep[];
 }
 
-export interface MantisRecommendation {
-  status: MantisRecommendationStatus;
-  scenario: MantisRecommendationScenario;
+export interface ProvenanceEntry {
+  area: string;
+  introducedBy: string;
+  originalReason: string;
+  verdict: ProvenanceVerdict;
+}
+
+export interface LowValueTest {
+  file: string;
   reason: string;
-  maintainerComment: string;
+}
+
+export interface TestingReview {
+  proofPath: TestingProofPath;
+  lowValueTests: LowValueTest[];
+  missingE2e: string;
 }
 
 export interface FeatureShowcase {
@@ -468,6 +463,14 @@ export interface RootCauseClusterAssessment {
   members: RootCauseClusterMember[];
 }
 
+/** Who identified the fixing PR. Only the "GitHub ..." sources are GitHub-verified. */
+export type FixedPullRequestSource =
+  | "GitHub closing PR reference"
+  | "GitHub linked-issue current closing PR"
+  | "GitHub reviewed implementation landing"
+  | "GitHub commit PR lookup"
+  | "report metadata";
+
 export interface FixedPullRequest {
   repo: string;
   number: number;
@@ -476,7 +479,7 @@ export interface FixedPullRequest {
   mergedAt: string | null;
   sha: string | null;
   confidence: Confidence;
-  source: string;
+  source: FixedPullRequestSource;
 }
 
 /**
@@ -536,7 +539,6 @@ export interface MergeRiskOption {
   body: string;
   category: MergeRiskOptionCategory;
   recommended: boolean;
-  automergeInstruction: string;
 }
 
 export interface LabelJustification {
@@ -575,6 +577,7 @@ export interface Decision {
   confidence: Confidence;
   summary: string;
   changeSummary: string;
+  changeExample: ChangeExample;
   systemContext: string;
   architectureDiagram: string;
   evidence: Evidence[];
@@ -597,20 +600,17 @@ export interface Decision {
   requiresProductDecision: boolean;
   reproductionAssessment: string;
   solutionAssessment: string;
-  visionFit: VisionFitStatus;
-  visionFitReason: string;
-  visionFitEvidence: string[];
   implementationComplexity: ImplementationComplexity;
   autoImplementationCandidate: AutoImplementationCandidate;
   rootCauseCluster: RootCauseClusterAssessment;
   agentsPolicyStatus: AgentsPolicyStatus;
+  productReview: ProductReview;
+  provenance: ProvenanceEntry[];
+  testingReview: TestingReview;
   reviewFindings: ReviewFinding[];
   securityReview: SecurityReview;
   realBehaviorProof: RealBehaviorProof;
   prRating: PrRating;
-  telegramVisibleProof: TelegramVisibleProof;
-  liveProofPlan: LiveProofPlan;
-  mantisRecommendation: MantisRecommendation;
   featureShowcase: FeatureShowcase;
   overallCorrectness: OverallCorrectness;
   overallConfidenceScore: number;
@@ -658,6 +658,7 @@ export interface CompleteActivityContext {
 }
 
 export interface ItemContext {
+  securityReview?: SecurityReview;
   [completeActivityContextSymbol]?: CompleteActivityContext;
   issue: unknown;
   comments: unknown[];
@@ -677,7 +678,7 @@ export interface ItemContext {
   pullReviewComments?: unknown[];
   pullReviewCommentsRevision?: string;
   pullReviewActivityCursor?: string;
-  prHydrationSnapshot?: PrHydrationSnapshot;
+  pullFilesRaw?: unknown[];
   pullChecks?: unknown;
   bulkFiler?: BulkFilerReviewContext;
   counts?: {
@@ -780,6 +781,7 @@ export interface ReviewContextLedgerEntry {
 }
 
 export interface ReviewPromptRuntimeHints {
+  localRange?: boolean;
   networkCapability?: "allowlisted-proxy" | "unrestricted" | "none";
   hasGitHubToken?: boolean;
   targetDir?: string;
@@ -787,6 +789,10 @@ export interface ReviewPromptRuntimeHints {
   mediaProofManifestPath?: string;
   mediaProofSummary?: string;
   exactTuplePrompt?: string;
+  // Host-computed before the review; pull request prompts render it as evidence.
+  provenanceEvidence?: ProvenanceEvidence;
+  // Host-prefetched Git history; pull request prompts state what is local.
+  historyCoverage?: ReviewHistoryCoverage;
 }
 
 export interface DashboardItem {
@@ -962,6 +968,12 @@ export interface PlanSelectionTelemetry {
 
 export type DueCandidate = SchedulerDueCandidate<Item, ExistingReview>;
 
+export interface ApplyCloseGuardBlock {
+  reason: string;
+  /** A live predicate positively established an intentional non-close outcome. */
+  closePolicyHoldVerified?: true;
+}
+
 export interface ApplyResult {
   repo?: string;
   number: number;
@@ -973,6 +985,7 @@ export interface ApplyResult {
   terminalMissingVerified?: boolean;
   terminalStateVerified?: boolean;
   guardedOpenStateVerified?: boolean;
+  closePolicyHoldVerified?: boolean;
   activeReviewLeaseVerified?: boolean;
   activeReviewLeaseExpiresAt?: string;
   terminalPolicyNoopVerified?: boolean;
@@ -1115,6 +1128,8 @@ export interface GitHubRuntimeBudget {
 
 export type GitHubDeadlineOptions = {
   deadlineAt?: number | undefined;
+  /** Preserve response strings for byte-exact receipt verification. GET-only. */
+  losslessJson?: boolean | undefined;
 };
 
 export type GitHubRequestReservation = {
@@ -1126,9 +1141,17 @@ export type GitHubFallbackClaim = GitHubRequestReservation & {
   env: NodeJS.ProcessEnv;
 };
 
+/** The outcome of a request's first attempt, already dispatched elsewhere. */
+export type GitHubFirstAttempt = { output: string } | { error: unknown };
+
+/** One read of a `ghJsonEach` batch: its value, or the error `ghJson` threw. */
+export type GitHubJsonResult<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
 export type GitHubRetryOptions = GitHubDeadlineOptions & {
   request?: ((args: string[], attempt: number) => string) | undefined;
   sleepBeforeRetry?: ((waitMs: number) => void) | undefined;
+  /** Replayed as attempt one; later attempts, fallbacks and checks are unchanged. */
+  firstAttempt?: GitHubFirstAttempt | undefined;
 };
 
 export type MutationRunner = <T>(options: {
@@ -1144,10 +1167,6 @@ export type GitHubDispatchOutcome =
   | "ambiguous_transport"
   | "accepted";
 
-export type DecisionNormalizationItem = Pick<
-  Item,
-  "repo" | "number" | "kind" | "authorAssociation"
->;
 export type RootCauseNormalizationItem = Pick<Item, "repo" | "number" | "kind">;
 
 export interface ParsedGitHubItemRef {
@@ -1292,23 +1311,6 @@ export interface FileModeSnapshot {
   mode: number;
 }
 
-export type PublicPriority = "P0" | "P1" | "P2";
-
-export interface ConfigSurfaceChange {
-  change: boolean;
-  keys: string[];
-}
-
-export interface DataModelChange {
-  change: boolean;
-  surfaces: string[];
-}
-
-export interface SqliteSchemaChange {
-  change: boolean;
-  files: string[];
-}
-
 export interface IssueAdvisoryLabelState {
   type: string | undefined;
   itemCategory: string | undefined;
@@ -1335,9 +1337,8 @@ export interface PullRequestClosePromotion {
   closeReason: CloseReason;
   summary: string;
   bestSolution: string;
-  evidence: string;
+  evidence: Evidence[];
   closeComment: string;
-  coverageProofFallbackRefs: boolean;
 }
 
 export interface LinkedPullRequestSupersession {
@@ -1349,8 +1350,6 @@ export interface LinkedPullRequestSupersession {
   mergeableState: string | null;
   draft: boolean;
   labels: string[];
-  files: string[];
-  filesKnown: boolean;
 }
 
 export interface LinkedPullRequestSupersessionResolution {
@@ -1372,12 +1371,14 @@ export interface CanonicalPullRequestCommentSyncBlock {
 }
 
 export interface PrCloseCoverageProofGateBlock {
+  closePolicyHoldVerified?: true;
   actionTaken: ActionTaken;
   reason: string;
 }
 
 export interface PrCloseCoverageProofCoveringWitness {
   number: number;
+  mainSha?: string;
   provedAtMs: number;
   snapshotSha256: string;
   updatedAt: string | null;
@@ -1395,18 +1396,35 @@ export interface PrCloseCoverageRuntimeBudget {
   maxRuntimeMs: number;
 }
 
-export type PullRequestReviewState = "ready" | "blocked" | "needs-changes";
+/**
+ * `awaiting-maintainer`: no Before-merge item remains and the only hold is an
+ * outstanding maintainer decision. The PR is not defective, and it is not ready
+ * either: an owner still has to decide. It is a presentation state only: the
+ * published review-state marker keeps the v1 wire value `blocked` and adds
+ * `hold=maintainer_decision`, so released readers keep recognizing the comment.
+ */
+export type PullRequestReviewState = "ready" | "awaiting-maintainer" | "blocked" | "needs-changes";
+
+/** The v1 review-state marker values. Readers fail closed on anything else. */
+export type PullRequestReviewMarkerState = Exclude<PullRequestReviewState, "awaiting-maintainer">;
 
 export interface PublicBeforeMergeItem {
   label: string;
   detail: string;
-  state: Exclude<PullRequestReviewState, "ready">;
+  state: Exclude<PullRequestReviewState, "ready" | "awaiting-maintainer">;
+  /** Explicit routing only; absent ownership must not be inferred from prose. */
+  owner?: "maintainer";
 }
 
 export interface PullRequestReviewReadiness {
   headSha: string | null;
   state: PullRequestReviewState;
   items: PublicBeforeMergeItem[];
+  /**
+   * An outstanding maintainer decision packet. It is the owner's work, not the
+   * contributor's, so it is never a Before-merge item and never counts as one.
+   */
+  maintainerDecisionPending: boolean;
   normalizationFailed: boolean;
 }
 

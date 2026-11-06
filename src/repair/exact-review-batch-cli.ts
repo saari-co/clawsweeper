@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { sha256 } from "../content-hash.js";
+import type { SpawnSyncReturns } from "node:child_process";
+import { errorMessage } from "../value-coerce.js";
+import { runCommandResult } from "./command-runner.js";
 import {
   appendFileSync,
   existsSync,
@@ -139,23 +141,23 @@ function recordRateLimit() {
     throw new Error("EXACT_REVIEW_GITHUB_RATE_LIMIT_TARGET_OWNER is invalid");
   }
   const now = Date.now();
-  const status = spawnSync(
-    "gh",
-    [
-      "api",
-      "rate_limit",
-      "--jq",
-      "{remaining:.resources.core.remaining,reset:.resources.core.reset}",
-    ],
-    {
-      encoding: "utf8",
-      env: process.env,
-      timeout: 20_000,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+  let status: SpawnSyncReturns<string> | null = null;
+  try {
+    status = runCommandResult(
+      "gh",
+      [
+        "api",
+        "rate_limit",
+        "--jq",
+        "{remaining:.resources.core.remaining,reset:.resources.core.reset}",
+      ],
+      { timeoutMs: 20_000 },
+    );
+  } catch (error) {
+    console.error(`gh rate_limit probe failed: ${errorMessage(error)}`);
+  }
   let resetAt = 0;
-  if (status.status === 0) {
+  if (status?.status === 0) {
     try {
       const parsed = JSON.parse(status.stdout || "null") as {
         remaining?: unknown;
@@ -186,7 +188,7 @@ function recordRateLimit() {
       scope,
       category: "rate_status",
       mode: "read",
-      outcome: status.status === 0 ? "success" : "error",
+      outcome: status?.status === 0 ? "success" : "error",
       repeat_revision: false,
       count: 1,
     })}\n`,
@@ -593,16 +595,13 @@ async function complete() {
     receipt.stateWriter,
     true,
   );
-  const retryable = completions.filter(
-    (completion) =>
-      completion.terminalOutcome !== "published" && completion.terminalOutcome !== "superseded",
-  ).length;
   console.log(
     JSON.stringify({
       ok: true,
       batch_id: manifest.batchId,
       accepted: result?.accepted ?? 0,
-      retryable,
+      skipped: result?.skipped ?? 0,
+      submitted_outcomes: submittedOutcomeCounts(completions),
     }),
   );
 }
@@ -660,8 +659,24 @@ async function release() {
       ok: true,
       batch_id: manifest.batchId,
       released: result?.accepted ?? 0,
+      skipped: result?.skipped ?? 0,
+      submitted_outcomes: submittedOutcomeCounts(completions),
     }),
   );
+}
+
+function submittedOutcomeCounts(completions: readonly ExactReviewBatchCompletion[]) {
+  // The server returns aggregate acknowledgements, not accepted identities or
+  // final retry decisions. Keep submitted classifications separate from both.
+  const counts = {
+    published: 0,
+    superseded: 0,
+    retryable_failure: 0,
+    refresh_required: 0,
+    permanent_failure: 0,
+  };
+  for (const completion of completions) counts[completion.terminalOutcome] += 1;
+  return counts;
 }
 
 async function acknowledge(
@@ -724,17 +739,15 @@ function telemetrySubmissionId(
     process.env.GITHUB_RUN_ATTEMPT || "0",
     dirname(env("EXACT_REVIEW_BATCH_MANIFEST")),
   ].join(":");
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        producer,
-        rateLimitStart: acknowledged.rateLimitBytes,
-        rateLimitEnd,
-        requestMetricStart: acknowledged.requestMetricBytes,
-        requestMetricEnd,
-      }),
-    )
-    .digest("hex");
+  return sha256(
+    JSON.stringify({
+      producer,
+      rateLimitStart: acknowledged.rateLimitBytes,
+      rateLimitEnd,
+      requestMetricStart: acknowledged.requestMetricBytes,
+      requestMetricEnd,
+    }),
+  );
 }
 
 function failureCompletion(

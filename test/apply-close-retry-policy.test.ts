@@ -9,7 +9,67 @@ import {
   tmpPrefix,
   verifiedImplementationPullRequestReport,
   withMockGh,
+  withReviewRecord,
 } from "./helpers.ts";
+import {
+  buildExistingReviewIndex,
+  existingReview,
+  hasAutoCloseAllowedMetadata,
+  isApplyCloseCandidateReport,
+  reportCloseReason,
+} from "../dist/clawsweeper-record-metadata.js";
+import { ReviewRecordFormatError } from "../dist/review-record.js";
+
+test("close metadata and existing review indexes use recorded decisions with host apply actions", () => {
+  const legacy = verifiedImplementationPullRequestReport({ action_taken: "proposed_close" });
+  assert.equal(isApplyCloseCandidateReport(legacy), true);
+  const typed = withReviewRecord(legacy, {
+    decision: "keep_open",
+    closeReason: "none",
+    confidence: "high",
+  });
+  assert.equal(reportCloseReason(typed), undefined);
+  assert.equal(isApplyCloseCandidateReport(typed), false);
+  assert.equal(hasAutoCloseAllowedMetadata(typed), false);
+  const promoted = withReviewRecord(legacy.replace("decision: close", "decision: keep_open"), {
+    decision: "close",
+    closeReason: "implemented_on_main",
+    confidence: "high",
+  });
+  assert.equal(isApplyCloseCandidateReport(promoted), true);
+  assert.equal(
+    isApplyCloseCandidateReport(
+      promoted.replace("action_taken: proposed_close", "action_taken: closed"),
+    ),
+    false,
+  );
+  const corrupt = typed.replace(/^review_record: \{/m, "review_record: {broken");
+  assert.throws(() => isApplyCloseCandidateReport(corrupt), ReviewRecordFormatError);
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    writeFileSync(join(root, "321.md"), typed);
+    const subject = { repo: "openclaw/clawsweeper", number: 321 };
+    assert.equal(existingReview(subject, root)?.decision, "keep_open");
+    assert.equal(
+      buildExistingReviewIndex(root).byKey.get("openclaw/clawsweeper#321")?.decision,
+      "keep_open",
+    );
+    writeFileSync(join(root, "321.md"), corrupt);
+    writeFileSync(
+      join(root, "322.md"),
+      withReviewRecord(legacy.replace("number: 321", "number: 322"), {
+        decision: "keep_open",
+        closeReason: "none",
+      }),
+    );
+    assert.equal(existingReview(subject, root), null);
+    const index = buildExistingReviewIndex(root);
+    assert.equal(index.byKey.has("openclaw/clawsweeper#321"), false);
+    assert.equal(index.byKey.get("openclaw/clawsweeper#322")?.decision, "keep_open");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("apply-decisions retries legacy fixed close skips", () => {
   for (const actionTaken of ["skipped_maintainer_authored", "skipped_invalid_decision"]) {
@@ -347,7 +407,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
   const number = Number(issueNumber);
   console.log(JSON.stringify([[{
     id: 9000 + number,
-    html_url: "https://github.com/openclaw/clawsweeper/issues/" + number + "#issuecomment-" + (9000 + number),
+    html_url: "https://github.com/openclaw/openclaw/issues/" + number + "#issuecomment-" + (9000 + number),
     created_at: "2026-05-01T01:00:00Z",
     updated_at: "2026-05-01T01:00:00Z",
     user: { login: "clawsweeper[bot]" },
@@ -359,7 +419,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
   console.log(JSON.stringify({
     number: 320,
     title: "Issue fixed by main",
-    html_url: "https://github.com/openclaw/clawsweeper/issues/320",
+    html_url: "https://github.com/openclaw/openclaw/issues/320",
     created_at: "2026-05-01T00:00:00Z",
     updated_at: "2026-05-01T00:00:00Z",
     closed_at: null,
@@ -376,7 +436,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
   console.log(JSON.stringify({
     number: 321,
     title: "Obsolete linked PR",
-    html_url: "https://github.com/openclaw/clawsweeper/pull/321",
+    html_url: "https://github.com/openclaw/openclaw/pull/321",
     created_at: "2026-05-01T00:00:00Z",
     updated_at: "2026-05-01T00:00:00Z",
     closed_at: null,
@@ -387,7 +447,7 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     user: { login: "reporter" },
     labels: [],
     comments: 1,
-    pull_request: { url: "https://api.github.com/repos/openclaw/clawsweeper/pulls/321" }
+    pull_request: { url: "https://api.github.com/repos/openclaw/openclaw/pulls/321" }
   }));
 } else if (args[0] === "issue" && args[1] === "view" && args[2] === "320") {
   console.log(JSON.stringify({ closedByPullRequestsReferences: [{ number: 321 }] }));
@@ -397,14 +457,14 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
   console.log(JSON.stringify({
     number: 321,
     title: "Obsolete linked PR",
-    html_url: "https://github.com/openclaw/clawsweeper/pull/321",
+    html_url: "https://github.com/openclaw/openclaw/pull/321",
     state: "open",
     body: "Fixes #320.",
     changed_files: 0,
     commits: 0,
     review_comments: 0,
-    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/clawsweeper" } },
-    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/clawsweeper" } },
+    head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
 } else if (args[0] === "api" && /\\/pulls\\/321\\/(files|commits|comments|reviews)(?:\\?|$)/.test(path)) {
@@ -442,10 +502,12 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/(320|321)\\/timeline(?
     assert.equal(
       report.some((entry) => entry.number === 320 && entry.action === "closed"),
       true,
+      JSON.stringify(report),
     );
     assert.equal(
       report.some((entry) => entry.number === 321 && entry.action === "closed"),
       true,
+      JSON.stringify(report),
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

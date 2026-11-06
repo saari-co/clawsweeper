@@ -139,6 +139,32 @@ test("exact-review diagnostics retain distinct safe causes within the aggregate 
   }
 });
 
+test("overlapping environment values redact private paths without losing the safe cause", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
+  const privatePath = "/home/runner/work/private/.git/worktrees/review";
+  try {
+    for (const [index, env] of [
+      {},
+      { USER: "runner" },
+      { CODEX_HOME: "/home/runner" },
+      { CODEX_HOME: privatePath },
+    ].entries()) {
+      const output = write(
+        join(root, String(index)),
+        failure("checkout failed", `fatal: '${privatePath}': Not a directory`),
+        env,
+      );
+      const detail = readFileSync(join(output, "stderr.tail.txt"), "utf8");
+      assert.match(detail, /REDACTED/);
+      assert.match(detail, /Not a directory/);
+      assert.equal(detail.includes(privatePath), false);
+      assert.equal(detail.includes("/home/runner"), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("source-preparation diagnostics survive unsafe raw detail", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
   try {
@@ -326,6 +352,7 @@ test("scan-only diagnostics serialize bounded native finding metadata safely", (
             },
             sourceLine: null,
             sourceLineStatus: "unavailable",
+            sourceLineReason: "not_staged_blob",
           },
           {
             index: 1,
@@ -337,6 +364,7 @@ test("scan-only diagnostics serialize bounded native finding metadata safely", (
             material: null,
             sourceLine: null,
             sourceLineStatus: "unavailable",
+            sourceLineReason: "not_staged_blob",
           },
         ],
       },
@@ -584,7 +612,7 @@ test("dense native inventory remains within the on-disk manifest budget", () => 
           level: "info-0",
           logger: "trufflehog",
           msg: "finished scanning",
-          trufflehog_version: "3.97.4",
+          trufflehog_version: "3.99.4",
           chunks: 1,
           bytes: 1,
           verified_secrets: 0,
@@ -631,6 +659,35 @@ test("dense native inventory remains within the on-disk manifest budget", () => 
     assert.ok(Buffer.byteLength(text) <= 24 * 1024);
     assert.doesNotMatch(text, /NEUTRAL_PRIVATE_CANARY|private-neutral-path/);
     assert.deepEqual(readdirSync(output), ["manifest.json"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic provenance binds the producing Actions run and attempt without untrusted values", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-provenance-"));
+  try {
+    const env = {
+      GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      GITHUB_RUN_ID: "123",
+      GITHUB_RUN_ATTEMPT: "2",
+    };
+    const output = write(join(root, "valid"), new AgentInputScanError("findings"), env);
+    assert.deepEqual(JSON.parse(readFileSync(join(output, "manifest.json"), "utf8")).run, {
+      repository: "openclaw/clawsweeper",
+      id: "123",
+      attempt: "2",
+    });
+    for (const [index, invalid] of [
+      { ...env, GITHUB_REPOSITORY: "owner/repo\n" },
+      { ...env, GITHUB_RUN_ID: "123\n" },
+      { ...env, GITHUB_RUN_ATTEMPT: "0" },
+      { ...env, GITHUB_RUN_ID: "9".repeat(100) },
+      {},
+    ].entries()) {
+      const dir = write(join(root, String(index)), new AgentInputScanError("findings"), invalid);
+      assert.equal(JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).run, undefined);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

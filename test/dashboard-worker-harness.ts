@@ -10,9 +10,7 @@ import { createContext, Script } from "node:vm";
 import { gunzipSync } from "node:zlib";
 
 import runtimeWorker, {
-  automaticIssueWork,
   ExactReviewQueue as RuntimeExactReviewQueue,
-  completedBayReviews,
   exactReviewEffectiveLeaseExpiresAt,
   exactReviewJitteredDelayMs,
   exactReviewPublicationCapacity,
@@ -21,15 +19,10 @@ import runtimeWorker, {
   exactReviewQueueCapacity,
   exactReviewQueueNextWakeAt,
   exactReviewQueueStatusSnapshot,
-  mergeBayJourneyState,
-  mergeBayTerminalState,
   recentWorkerHealthRunSample,
   workerHealthSectionTimeoutMs,
   readCachedSnapshot,
   StatusStore,
-  summarizeAutomergeReliability,
-  summarizeBayJourneyTimings,
-  workerWorkKind,
   workflowJobsForRunSnapshot,
 } from "../dashboard/worker.ts";
 import { ExactReviewPublicationBatchStore } from "../dashboard/exact-review-publication-batches.ts";
@@ -49,7 +42,6 @@ import type {
   HostedTargetAdmission,
 } from "../dashboard/exact-review-queue.ts";
 import { ExactReviewLifecycleTelemetryStore } from "../dashboard/exact-review-lifecycle-telemetry.ts";
-import { LIVE_ACTIVITY_SOURCE_LIMIT, liveActivityBaySnapshot } from "../dashboard/live-activity.ts";
 import { captureCanonicalRecordBaseline } from "../dist/repair/canonical-record-baseline.js";
 import { publishMainWithStateAppend } from "../dist/repair/publish-main.js";
 
@@ -91,6 +83,14 @@ function withHostedTargetAdmissionDefaults<Env extends Record<string, unknown>>(
   // Visibility fencing tests exercise each live probe; cache policy has its own queue tests.
   if (!Object.hasOwn(prepared, "EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS")) {
     Object.defineProperty(prepared, "EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: "0",
+    });
+  }
+  if (!Object.hasOwn(prepared, "EXACT_REVIEW_INITIAL_PR_QUIET_MS")) {
+    Object.defineProperty(prepared, "EXACT_REVIEW_INITIAL_PR_QUIET_MS", {
       configurable: true,
       enumerable: true,
       writable: true,
@@ -820,6 +820,7 @@ function createExactReviewAdmissionHarness(
     targetRepository?: (targetRepo: string, init?: RequestInit) => Response | Promise<Response>;
     targetItem?: (targetRepo: string) => Response | Promise<Response>;
     targetPull?: (targetRepo: string) => Response | Promise<Response>;
+    targetPermission?: (targetRepo: string, author: string) => Response | Promise<Response>;
     targetComments?: (
       targetRepo: string,
       itemNumber: number,
@@ -837,6 +838,8 @@ function createExactReviewAdmissionHarness(
     hostedPublicTargetProbe?: (
       targetRepo: string,
     ) => Promise<HostedPublicTargetProbe | HostedTargetAdmission>;
+    env?: Record<string, string>;
+    rawPullResponse?: boolean;
   } = {},
 ) {
   const originalFetch = globalThis.fetch;
@@ -902,11 +905,30 @@ function createExactReviewAdmissionHarness(
     }
     const targetPull = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/);
     if (targetPull) {
-      return (
-        options.targetPull?.(targetPull[1]) ??
+      const response = await (options.targetPull?.(targetPull[1]) ??
         options.targetItem?.(targetPull[1]) ??
-        liveItem(targetPull[1], Number(targetPull[2]), "pull_request")
-      );
+        liveItem(targetPull[1], Number(targetPull[2]), "pull_request"));
+      if (options.rawPullResponse || !response.ok) return response;
+      // Most queue tests only specify the fields under test. Supply the rest
+      // of GitHub's PR shape; malformed-response tests opt out explicitly.
+      return jsonResponse({
+        state: "open",
+        title: "Pull request",
+        body: "",
+        locked: false,
+        labels: [],
+        head: { sha: "a".repeat(40) },
+        base: { sha: "b".repeat(40) },
+        draft: false,
+        updated_at: "2026-09-24T00:00:00Z",
+        ...(await response.json()),
+      });
+    }
+    const targetPermission = url.pathname.match(
+      /^\/repos\/([^/]+\/[^/]+)\/collaborators\/([^/]+)\/permission$/,
+    );
+    if (targetPermission && options.targetPermission) {
+      return options.targetPermission(targetPermission[1]!, targetPermission[2]!);
     }
     const targetComments = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
     if (targetComments && options.targetComments) {
@@ -938,6 +960,9 @@ function createExactReviewAdmissionHarness(
           ? { hostedPublicTargetProbe: options.hostedPublicTargetProbe }
           : {}),
       EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0",
+      // Like the ordinary debounce above, the active-item hold is off unless a
+      // test opts in; repeated-review tests expect the next dispatch at once.
+      EXACT_REVIEW_ACTIVE_ITEM_WINDOW_MS: "0",
       EXACT_REVIEW_QUEUE_MAX_CONCURRENT: options.maxConcurrent ?? "1",
       ...(options.retryPolicyEpoch
         ? { EXACT_REVIEW_RETRY_POLICY_EPOCH: options.retryPolicyEpoch }
@@ -952,6 +977,7 @@ function createExactReviewAdmissionHarness(
               : {}),
           }
         : {}),
+      ...options.env,
     },
   );
   return {
@@ -1148,9 +1174,7 @@ export {
   Script,
   gunzipSync,
   worker,
-  automaticIssueWork,
   ExactReviewQueue,
-  completedBayReviews,
   exactReviewEffectiveLeaseExpiresAt,
   exactReviewJitteredDelayMs,
   exactReviewPublicationCapacity,
@@ -1159,15 +1183,10 @@ export {
   exactReviewQueueCapacity,
   exactReviewQueueNextWakeAt,
   exactReviewQueueStatusSnapshot,
-  mergeBayJourneyState,
-  mergeBayTerminalState,
   recentWorkerHealthRunSample,
   workerHealthSectionTimeoutMs,
   readCachedSnapshot,
   StatusStore,
-  summarizeAutomergeReliability,
-  summarizeBayJourneyTimings,
-  workerWorkKind,
   workflowJobsForRunSnapshot,
   ExactReviewPublicationBatchStore,
   ExactReviewDirectPublicationStore,
@@ -1177,8 +1196,6 @@ export {
   ExactReviewLifecycleProjectionStore,
   lifecycleState,
   ExactReviewLifecycleTelemetryStore,
-  LIVE_ACTIVITY_SOURCE_LIMIT,
-  liveActivityBaySnapshot,
   captureCanonicalRecordBaseline,
   publishMainWithStateAppend,
   seededRandom,

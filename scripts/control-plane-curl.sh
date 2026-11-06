@@ -4,14 +4,18 @@
 # A subshell keeps scratch cleanup separate from the caller's traps and shell options.
 control_plane_curl() (
   local scratch attempt curl_exit http_status retryable delay
+  # Up to 62 s of backoff (2, 4, 8, 16, 32) outlasts a Worker deploy or Durable
+  # Object reset, which fails control-plane calls for 15-30 s; Retry-After waits
+  # draw from the same budget.
+  local max_attempts=6 wait_budget=62
   scratch="$(mktemp -d)" || return 1
   trap 'rm -rf "$scratch"' EXIT
-  for attempt in 1 2 3 4; do
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     : > "$scratch/headers"
     curl_exit=0
     curl --dump-header "$scratch/headers" "$@" > "$scratch/stdout" || curl_exit=$?
     http_status="$(awk '/^HTTP\// { code=$2 } END { print code }' "$scratch/headers")"
-    echo "::notice::Control-plane request attempt $attempt/4: HTTP ${http_status:-000}, curl exit $curl_exit" >&2
+    echo "::notice::Control-plane request attempt $attempt/$max_attempts: HTTP ${http_status:-000}, curl exit $curl_exit" >&2
     retryable=false
     if [[ "$http_status" == 5[0-9][0-9] ]]; then
       retryable=true
@@ -20,7 +24,7 @@ control_plane_curl() (
         5|6|7|16|18|28|35|52|55|56|92) retryable=true ;;
       esac
     fi
-    if [[ "$retryable" != true || "$attempt" == 4 ]]; then
+    if [[ "$retryable" != true || "$attempt" == "$max_attempts" || "$wait_budget" -le 0 ]]; then
       cat "$scratch/stdout"
       return "$curl_exit"
     fi
@@ -36,7 +40,24 @@ process.stdout.write(String(Number.isFinite(seconds)
   : 2 ** Number(process.argv[3])));
 NODE
     )" || return 1
+    if ((delay > wait_budget)); then delay="$wait_budget"; fi
+    wait_budget=$((wait_budget - delay))
     echo "::notice::Control-plane request retry in ${delay}s" >&2
     sleep "$delay"
   done
 )
+
+# Sign the body with CLAWSWEEPER_WEBHOOK_SECRET and send it as a JSON POST.
+# Usage: control_plane_signed_post <url> <body> [curl options...]
+# The URL stays the last curl argument.
+control_plane_signed_post() {
+  local url="$1" body="$2" signature
+  shift 2
+  signature="$(BODY="$body" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.BODY).digest("hex")}`)')" || return 1
+  control_plane_curl "$@" \
+    --request POST \
+    --header "content-type: application/json" \
+    --header "x-clawsweeper-exact-review-signature: $signature" \
+    --data-binary "$body" \
+    "$url"
+}

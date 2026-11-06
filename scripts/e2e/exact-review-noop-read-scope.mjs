@@ -85,9 +85,12 @@ function snapshot(ref, capsule, runtimes) {
     ? [
         classifierPath,
         "src/repair/exact-review-admission.ts",
+        "src/repair/exact-review-live-item.ts",
+        "src/github-item-identity.ts",
         "src/repair/workflow-utils.ts",
         "src/repair/github-cli.ts",
         "src/repair/process-env.ts",
+        "src/clawsweeper-bot-identity.ts",
         "src/github-public-read.ts",
         "src/github-retry.ts",
         "src/clawsweeper-oversized-pr-policy.ts",
@@ -180,6 +183,93 @@ function scenarios() {
       expected: { proceed: "true", scheduled_semantic_noop: "false" },
       ...extra,
     });
+    const requestedReview = {
+      sourceAction: "re_review",
+      sourceCommentVerified: true,
+      sourceCommentId: 123,
+      sourceCommentUpdatedAt: "2026-10-13T00:00:00Z",
+      commandBodyDigest: "a".repeat(64),
+      commandOrigin: "hosted_webhook",
+      targetBranch: "main",
+    };
+    const maintainer = { ...issue, author_association: "MEMBER" };
+    const skipped = {
+      proceed: "false",
+      scheduled_semantic_noop: "true",
+      review_hold: "maintainer_request_required",
+    };
+    cases.push(
+      make("maintainer-event", "edited", {
+        issue: maintainer,
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-scheduled", "scheduled_normal_backfill", {
+        issue: maintainer,
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-label", "edited", {
+        issue: { ...issue, labels: [{ name: "Maintainer" }] },
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-requested", "re_review", { issue: maintainer, decision: requestedReview }),
+      make("maintainer-stale-request", "source_drift_requeue", {
+        issue: maintainer,
+        decision: { ...requestedReview, sourceAction: "source_drift_requeue" },
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      // A requeue of an unpublished request still carries its command status.
+      make("maintainer-request-continuation", "source_drift_requeue", {
+        issue: maintainer,
+        decision: {
+          ...requestedReview,
+          sourceAction: "source_drift_requeue",
+          supersedesInProgress: true,
+          commandStatusMarker: "<!-- clawsweeper-command-status:41:re_review:test -->",
+        },
+        expected: {
+          proceed: "true",
+          scheduled_semantic_noop: "false",
+          live_head_sha: kind === "pull_request" ? sha : undefined,
+        },
+      }),
+      make("maintainer-marker-only", "re_review", {
+        issue: maintainer,
+        decision: {
+          sourceAction: "re_review",
+          commandStatusMarker: "old-status",
+          targetBranch: "main",
+        },
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      // The retired automation labels no longer exempt a maintainer item.
+      make("maintainer-retired-autofix-label", "edited", {
+        issue: { ...maintainer, labels: [{ name: "clawsweeper:autofix" }] },
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-retired-automerge-label", "edited", {
+        issue: { ...maintainer, labels: [{ name: "clawsweeper:automerge" }] },
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-redacted", "edited", {
+        issue: { ...issue, author_association: "CONTRIBUTOR", user: { login: "maintainer" } },
+        repositoryPermission: "admin",
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+      make("maintainer-oversized", "opened", {
+        issue: maintainer,
+        additions: 50001,
+        expected: skipped,
+        skipSourceRead: true,
+      }),
+    );
     for (const [name, action] of [
       ["normal", "scheduled_normal_backfill"],
       ["event", "edited"],
@@ -401,6 +491,31 @@ function scenarios() {
       }),
     ),
   );
+  for (const entry of cases) {
+    entry.issue = {
+      ...entry.issue,
+      html_url: `https://github.com/${entry.repo}/${entry.issue.pull_request ? "pull" : "issues"}/${entry.number}`,
+    };
+  }
+  for (const [name, number, repository] of [
+    ["different-number", 1756, "example/transferred"],
+    ["same-number", 41, "example/transferred"],
+  ]) {
+    const original = cases.find((entry) => entry.name === "issue:normal");
+    cases.push({
+      ...original,
+      name: `transfer:${name}`,
+      issue: {
+        ...original.issue,
+        number,
+        html_url: `https://github.com/${repository}/issues/${number}`,
+      },
+      expected: { proceed: "false", terminal_missing: "true" },
+      candidateOnly: true,
+      skipSourceRead: true,
+      verifyPublication: true,
+    });
+  }
   return cases;
 }
 
@@ -443,6 +558,7 @@ function ghAdapter(args) {
     [base]: "repo",
     [`${base}/issues/${config.number}`]: "issue",
     [`${base}/pulls/${config.number}`]: "head",
+    [`${base}/collaborators/maintainer/permission`]: "permission",
     [`${base}/issues/${config.number}/comments?per_page=100`]: "comments",
   };
   const kind = endpoints[endpoint];
@@ -513,23 +629,25 @@ function ghAdapter(args) {
       return;
     }
     body =
-      kind === "repo"
-        ? { default_branch: "trunk" }
-        : kind === "issue"
-          ? config.issue
-          : kind === "head"
-            ? {
-                ...config.issue,
-                ...(config.missingAdditions ? {} : { additions: config.additions ?? 1 }),
-                deletions: 0,
-                changed_files: 1,
-                head: { sha: config.head },
-              }
-            : Array.isArray(config.comments)
-              ? Array.from({ length: pages }, (_, i) =>
-                  config.comments.slice(i * 100, (i + 1) * 100),
-                )
-              : [config.comments];
+      kind === "permission"
+        ? { permission: config.repositoryPermission }
+        : kind === "repo"
+          ? { default_branch: "trunk" }
+          : kind === "issue"
+            ? config.issue
+            : kind === "head"
+              ? {
+                  ...config.issue,
+                  ...(config.missingAdditions ? {} : { additions: config.additions ?? 1 }),
+                  deletions: 0,
+                  changed_files: 1,
+                  head: { sha: config.head },
+                }
+              : Array.isArray(config.comments)
+                ? Array.from({ length: pages }, (_, i) =>
+                    config.comments.slice(i * 100, (i + 1) * 100),
+                  )
+                : [config.comments];
   }
   process.stdout.write(
     query === ".head.sha"
@@ -547,7 +665,13 @@ function execute(snapshot, scenario) {
     mkdirSync(join(snapshot.directory, "scripts"), { recursive: true });
     if (!snapshot.native)
       writeFileSync(join(snapshot.directory, legacyClassifierPath), snapshot.classifier);
-    writeFileSync(join(temp, "step.sh"), snapshot.shell);
+    writeFileSync(
+      join(temp, "step.sh"),
+      snapshot.shell +
+        (scenario.verifyPublication
+          ? '\npnpm run --silent workflow -- exact-review-live-item > "$READ_SCOPE_PUBLICATION"\n'
+          : ""),
+    );
     writeFileSync(
       join(temp, "config.json"),
       JSON.stringify({ ...scenario, native: snapshot.native }),
@@ -591,6 +715,7 @@ function execute(snapshot, scenario) {
         READ_SCOPE_GHX_PATH: process.env.PATH,
         READ_SCOPE_CONFIG: join(temp, "config.json"),
         READ_SCOPE_TRACE: join(temp, "trace"),
+        READ_SCOPE_PUBLICATION: join(temp, "publication.json"),
       },
     });
     assert.equal(
@@ -618,6 +743,12 @@ function execute(snapshot, scenario) {
     }
     for (const [key, value] of Object.entries(scenario.expected)) {
       assert.equal(outputs[key], value, `${scenario.name}: ${key}`);
+    }
+    if (scenario.verifyPublication) {
+      assert.deepEqual(JSON.parse(readFileSync(join(temp, "publication.json"), "utf8")), {
+        state: "missing",
+        locked: false,
+      });
     }
     if (scenario.name === "quota:branch-throttle") assert.equal(outputs.retry_kind, undefined);
     if (
@@ -742,6 +873,11 @@ export function runReadScopeProof({
             )
           : undefined;
       const after = execute(candidate, scenario);
+      assert.equal(
+        after.outputs.review_hold,
+        scenario.expected.review_hold,
+        `${scenario.name}: review hold`,
+      );
       if (scenario.credentials)
         assert.deepEqual(
           after.trace
@@ -755,6 +891,7 @@ export function runReadScopeProof({
         ["comments", "classifier"].includes(event.kind),
       );
       const issueSourceRead =
+        !scenario.skipSourceRead &&
         after.outputs.item_kind === "issue" &&
         scenario.issue.state === "open" &&
         !scenario.issue.locked &&
@@ -783,8 +920,8 @@ export function runReadScopeProof({
       ) {
         assert.equal(
           after.trace.filter((event) => event.kind === "head").length,
-          1,
-          `${scenario.name}: PR size admission reads metadata exactly once`,
+          scenario.skipSourceRead ? 0 : 1,
+          `${scenario.name}: PR metadata is read only after maintainer eligibility`,
         );
       }
       if (before && scenario.baselineExpected) {

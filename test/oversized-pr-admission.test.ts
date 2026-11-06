@@ -16,7 +16,9 @@ import { createReviewCommandWorkflow } from "../dist/clawsweeper-review-command-
 import { suppliedReviewStartLeaseFromArgs } from "../dist/clawsweeper-review-lease.js";
 import { parseArgs } from "../dist/clawsweeper-args.js";
 import { repositoryProfileFor } from "../dist/repository-profiles.js";
-import { reviewActionForDecision } from "../dist/clawsweeper.js";
+import { reviewActionForDecision } from "../dist/clawsweeper-report-actions.js";
+import { markdownFor } from "../dist/clawsweeper-report-document.js";
+import { frontMatterValue } from "../dist/report-front-matter.js";
 import { item } from "./helpers.ts";
 
 for (const source of [
@@ -63,7 +65,9 @@ for (const source of [
       const stdout: string[] = [];
       const previousLog = console.log;
       let observedReportPath = "";
+      let observedReport = "";
       let renderedReport = "";
+      let renderedInput: Parameters<typeof markdownFor>[0] | undefined;
       const candidate = item({ kind: "pull_request", authorAssociation: "OWNER" });
       const rawPull = {
         number: candidate.number,
@@ -86,7 +90,6 @@ for (const source of [
       const stop = new Error("CONTROL_REACHED_NORMAL_HYDRATION");
       const base = {
         activeReviewMutationRunner: null,
-        asRecord: (value: unknown) => (value && typeof value === "object" ? value : {}),
         repoFromArgs: () => repositoryProfileFor(candidate.repo),
         targetRepo: () => candidate.repo,
         localExactReviewItem: () => false,
@@ -121,8 +124,9 @@ for (const source of [
               true,
               "ledger must observe the report before pruning",
             );
+            observedReport = readFileSync(reportPath, "utf8");
             assert.equal(
-              JSON.parse(readFileSync(reportPath, "utf8")).decision.closeReason,
+              frontMatterValue(observedReport, "close_reason"),
               "oversized_pull_request",
             );
           }
@@ -149,7 +153,8 @@ for (const source of [
         itemContentDigest: () => "digest",
         reportFileName: () => "123.md",
         markdownFor: (report: any) => {
-          renderedReport = overflow ? "x".repeat(16 * 1024 * 1024 + 1) : JSON.stringify(report);
+          renderedInput = report;
+          renderedReport = overflow ? "x".repeat(16 * 1024 * 1024 + 1) : markdownFor(report);
           return renderedReport;
         },
         reviewActionForDecision,
@@ -178,10 +183,8 @@ for (const source of [
           if (total > 50000) throw new Error("oversized admission must precede cache lookup");
           return null;
         },
-        frontMatterValue: () => undefined,
         bulkFilerPolicyInvalidatesCachedReview: () => false,
         localExactReviewHistoryPath: () => null,
-        stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
       };
       const dependencies = new Proxy(base, {
         get(target, property) {
@@ -242,14 +245,22 @@ for (const source of [
           reviewCommand(args);
           assert.deepEqual(completions, ["completed"]);
           assert.equal(existsSync(observedReportPath), retention !== "none");
-          const rendered = JSON.parse(renderedReport);
-          assert.equal(rendered.reviewLeaseOwner, metadataOnly ? undefined : "reserved-owner");
-          assert.equal(rendered.reviewLeaseCommentId, metadataOnly ? undefined : 5602217053);
+          assert.ok(renderedInput);
+          assert.equal(renderedInput.reviewLeaseOwner, metadataOnly ? undefined : "reserved-owner");
+          assert.equal(renderedInput.reviewLeaseCommentId, metadataOnly ? undefined : 5602217053);
+          assert.ok(observedReport.startsWith(renderedReport));
+          if (metadataOnly) {
+            assert.match(observedReport, /Source unknown\./);
+            assert.equal(observedReport.match(/## Local preflight source/g)?.length, 1);
+          } else assert.equal(observedReport, renderedReport);
           if (retention !== "none") {
-            const report = JSON.parse(readFileSync(observedReportPath, "utf8"));
-            assert.equal(report.decision.closeReason, "oversized_pull_request");
-            assert.equal(report.action.actionTaken, "proposed_close");
-            assert.equal(report.decision.oversizedPullRequest.additions, total);
+            const report = readFileSync(observedReportPath, "utf8");
+            assert.equal(frontMatterValue(report, "close_reason"), "oversized_pull_request");
+            assert.equal(frontMatterValue(report, "action_taken"), "proposed_close");
+            assert.equal(
+              JSON.parse(frontMatterValue(report, "oversized_pull_request")!).additions,
+              total,
+            );
           }
           if (retention === "summary") assert.deepEqual(readdirSync(artifactDir), ["123.md"]);
           if (retention === "none") {
@@ -259,10 +270,10 @@ for (const source of [
                 status: "completed",
                 retention: "none",
                 reports: [
-                  { item_number: candidate.number, artifact_path: null, report: renderedReport },
+                  { item_number: candidate.number, artifact_path: null, report: observedReport },
                 ],
               });
-            } else assert.deepEqual(stdout, [renderedReport]);
+            } else assert.deepEqual(stdout, [observedReport.trimEnd()]);
           }
         } else {
           assert.throws(

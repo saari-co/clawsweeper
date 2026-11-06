@@ -160,8 +160,8 @@ type SignedPostOptions = Omit<SignedRequestOptions, "method"> & {
 // revision 0, so it must stay a small-repo affordance: a slug whose record set
 // outgrows this bound has earned a real snapshot and still refuses cutover.
 // 2000 small records is ~10 export pages and covers hundreds of reviewed items,
-// giving a newly onboarded repository long runway before the first manual
-// snapshot sweep is required.
+// giving a newly onboarded repository long runway before the scheduled
+// snapshot-bootstrap-cold sweep (worker-records-ops.yml) gives it a snapshot.
 export const COLD_HYDRATION_MAX_RECORDS = 2000;
 
 export class WorkerRecordExportBoundError extends Error {
@@ -180,7 +180,7 @@ export class WorkerRecordExportBoundError extends Error {
   }
 }
 
-export async function exportWorkerRecords(options: {
+type ExportWorkerRecordsOptions = {
   baseUrl: string;
   webhookSecret: string;
   repoSlug: string;
@@ -188,11 +188,41 @@ export async function exportWorkerRecords(options: {
   sinceRevision?: number;
   limit?: number;
   maxRecords?: number;
+  // Snapshot producers only: stop between pages once this time (epoch ms, read
+  // from `now`) has passed. Readers never set it and always replay to the end.
+  replayDeadline?: number;
+  now?: () => number;
   fetch?: typeof globalThis.fetch;
-}): Promise<WorkerRecordSnapshot> {
+};
+
+export async function exportWorkerRecords(
+  options: ExportWorkerRecordsOptions,
+): Promise<WorkerRecordSnapshot> {
+  const records = new Map<string, WorkerRecord>();
+  const result = await visitWorkerRecords(options, (record) => {
+    records.set(`${record.section}/${record.id}`, record);
+  });
+  return {
+    repoSlug: result.repoSlug,
+    revision: result.revision,
+    exportStartRevision: result.exportStartRevision,
+    records: [...records.values()].sort((left, right) =>
+      recordRelativePath(left).localeCompare(recordRelativePath(right)),
+    ),
+  };
+}
+
+// Only the current response page owns content. Hydration writes accepted rows
+// into its private staging tree before fetching the next page; the index keeps
+// revision ordering and the cold-repository identity bound without retaining
+// reports that have already been written.
+export async function visitWorkerRecords(
+  options: ExportWorkerRecordsOptions,
+  visit: (record: WorkerRecord) => void,
+) {
   const sections = options.sections ?? RECORD_SECTIONS;
   const sinceRevision = options.sinceRevision ?? 0;
-  const records = new Map<string, WorkerRecord>();
+  const revisions = new Map<string, number>();
   let cursor: number | null = 0;
   let revision = sinceRevision;
   let exportStartRevision: number | undefined;
@@ -244,13 +274,18 @@ export async function exportWorkerRecords(options: {
     for (const record of page.records) {
       validateWorkerRecord(record);
       const key = `${record.section}/${record.id}`;
-      const prior = records.get(key);
-      if (!prior || prior.storeRevision < record.storeRevision) records.set(key, record);
-    }
-    // Abort mid-pagination: the bound exists so an unsnapshotted large repo
-    // never triggers an unbounded full-journal download.
-    if (options.maxRecords !== undefined && records.size > options.maxRecords) {
-      throw new WorkerRecordExportBoundError(options.repoSlug, records.size, options.maxRecords);
+      const prior = revisions.get(key);
+      if (prior !== undefined && prior >= record.storeRevision) continue;
+      revisions.set(key, record.storeRevision);
+      // Count identities, including tombstones, not writes or journal pages.
+      if (options.maxRecords !== undefined && revisions.size > options.maxRecords) {
+        throw new WorkerRecordExportBoundError(
+          options.repoSlug,
+          revisions.size,
+          options.maxRecords,
+        );
+      }
+      visit(record);
     }
     if (
       page.nextCursor !== null &&
@@ -262,26 +297,59 @@ export async function exportWorkerRecords(options: {
       throw new Error("Worker record export cursor did not advance");
     }
     cursor = page.nextCursor;
+    // The export returns one row per identity ordered by its unique, monotonic
+    // store revision, and `nextCursor` is the last row returned. Every identity
+    // whose current revision is at or below it has therefore been applied at
+    // that revision, so stopping here leaves a consistent tree that a later
+    // replay can resume from `cursor`. At least one page is always applied.
+    if (
+      cursor !== null &&
+      options.replayDeadline !== undefined &&
+      (options.now ?? Date.now)() >= options.replayDeadline
+    ) {
+      break;
+    }
   } while (cursor !== null);
   return {
     repoSlug: options.repoSlug,
     revision,
     exportStartRevision: exportStartRevision!,
-    records: [...records.values()].sort((left, right) =>
-      recordRelativePath(left).localeCompare(recordRelativePath(right)),
-    ),
+    recordCount: revisions.size,
+    // null when the export was replayed to the end.
+    resumeRevision: cursor,
   };
 }
 
-export async function materializeWorkerRecords(options: {
+type MaterializeWorkerRecordsOptions = {
   worktreeRoot: string;
   baseUrl: string;
   webhookSecret: string;
   repoSlugs: readonly string[];
   cacheRoot?: string;
+  // Readers that need only some sections (the dashboard corpus reads items and
+  // closed) drop the rest from the snapshot copy and never replay them.
+  sections?: readonly RecordSection[];
+  // Coverage manifests list canonical items; readers without one skip the listing.
+  trackCoverage?: boolean;
   fetch?: typeof globalThis.fetch;
   log?: (line: string) => void;
-}) {
+};
+
+export async function materializeWorkerRecords(options: MaterializeWorkerRecordsOptions) {
+  return materializeRecords(options, "hydration");
+}
+
+async function materializeRecords(
+  options: MaterializeWorkerRecordsOptions,
+  purpose: "hydration" | "snapshot",
+  producer: { replayDeadline?: number; now?: () => number } = {},
+) {
+  if (purpose === "hydration" && producer.replayDeadline !== undefined)
+    throw new Error("Only snapshot producers may stop a record replay early");
+  // The snapshot producer must bootstrap repositories that readers refuse.
+  // Both paths retain the same staging, watermark and snapshot/delta lifecycle.
+  const coldRecordLimit =
+    purpose === "snapshot" ? SNAPSHOT_MAX_IDENTITIES : COLD_HYDRATION_MAX_RECORDS;
   const log = options.log ?? ((line: string) => console.error(line));
   mkdirSync(options.worktreeRoot, { recursive: true });
   const recordsRoot = path.join(options.worktreeRoot, "records");
@@ -305,6 +373,8 @@ export async function materializeWorkerRecords(options: {
       coverageTrackedItemIds: number[];
     }
   > = {};
+  // Producer-only: where a replay stopped early. Kept out of the reader manifest.
+  const resumeRevisions: Record<string, number | null> = {};
   try {
     for (const repoSlug of options.repoSlugs) {
       try {
@@ -339,22 +409,35 @@ export async function materializeWorkerRecords(options: {
             fetch: options.fetch,
           });
           cpSync(cached.treeRoot, stagedRepoRoot, { recursive: true });
+          for (const section of RECORD_SECTIONS) {
+            if (options.sections && !options.sections.includes(section)) {
+              rmSync(path.join(stagedRepoRoot, section), { force: true, recursive: true });
+            }
+          }
           snapshotBytes = storedSnapshot.bytes;
           snapshotCache = cached.cache;
         } else {
           mkdirSync(stagedRepoRoot, { recursive: true });
         }
-        const journal = await exportWorkerRecords({
-          baseUrl: options.baseUrl,
-          webhookSecret: options.webhookSecret,
-          repoSlug,
-          sinceRevision: storedSnapshot?.revisionWatermark ?? 0,
-          ...(storedSnapshot ? {} : { maxRecords: COLD_HYDRATION_MAX_RECORDS }),
-          fetch: options.fetch,
-        }).catch((error: unknown) => {
+        const journal = await visitWorkerRecords(
+          {
+            baseUrl: options.baseUrl,
+            webhookSecret: options.webhookSecret,
+            repoSlug,
+            sinceRevision: storedSnapshot?.revisionWatermark ?? 0,
+            ...(options.sections ? { sections: options.sections } : {}),
+            ...(storedSnapshot ? {} : { maxRecords: coldRecordLimit }),
+            ...(producer.replayDeadline === undefined
+              ? {}
+              : { replayDeadline: producer.replayDeadline }),
+            ...(producer.now ? { now: producer.now } : {}),
+            fetch: options.fetch,
+          },
+          (record) => applyWorkerRecord(stagedRepoRoot, record),
+        ).catch((error: unknown) => {
           // Over the bound, the named refusal returns: the operator must run a
           // snapshot sweep for this slug before worker hydration accepts it.
-          if (error instanceof WorkerRecordExportBoundError) {
+          if (purpose === "hydration" && error instanceof WorkerRecordExportBoundError) {
             throw new WorkerSnapshotUnavailableError(
               "snapshot_not_found",
               {
@@ -367,28 +450,35 @@ export async function materializeWorkerRecords(options: {
           }
           throw error;
         });
-        applyWorkerRecords(stagedRepoRoot, journal.records);
-        const coverageTrackedItemIds = await fetchWorkerCanonicalItemIds({
-          baseUrl: options.baseUrl,
-          webhookSecret: options.webhookSecret,
-          repoSlug,
-          fetch: options.fetch,
-        });
+        const coverageTrackedItemIds =
+          options.trackCoverage === false
+            ? []
+            : await fetchWorkerCanonicalItemIds({
+                baseUrl: options.baseUrl,
+                webhookSecret: options.webhookSecret,
+                repoSlug,
+                fetch: options.fetch,
+              });
         repositories[repoSlug] = {
           revision: journal.revision,
           exportStartRevision: journal.exportStartRevision,
           snapshotRevision: storedSnapshot?.revisionWatermark ?? 0,
           snapshotBytes,
           snapshotCache,
-          deltaRecords: journal.records.length,
+          deltaRecords: journal.recordCount,
           recordCount: countMaterializedRecords(stagingRoot, repoSlug),
           coverageTrackedItemIds,
         };
+        resumeRevisions[repoSlug] = journal.resumeRevision;
         const entry = repositories[repoSlug];
+        if (journal.resumeRevision !== null)
+          log(
+            `[worker-records] snapshot replay reached its time budget repo=${repoSlug} resumeRevision=${journal.resumeRevision} replayedRecords=${entry.deltaRecords} revision=${entry.revision}; the next snapshot run resumes from resumeRevision`,
+          );
         log(
           storedSnapshot
             ? `[worker-records] snapshot hydrated repo=${repoSlug} revision=${entry.revision} snapshotRevision=${entry.snapshotRevision} snapshotBytes=${entry.snapshotBytes} cache=${entry.snapshotCache} deltaRecords=${entry.deltaRecords} records=${entry.recordCount} coverageTrackedItems=${entry.coverageTrackedItemIds.length}`
-            : `[worker-records] COLD HYDRATION repo=${repoSlug}: no stored snapshot, replayed the full journal from revision 0 (revision=${entry.revision} journalRecords=${entry.deltaRecords} records=${entry.recordCount} coverageTrackedItems=${entry.coverageTrackedItemIds.length} bound=${COLD_HYDRATION_MAX_RECORDS}); trigger a snapshot sweep to make future hydrations incremental`,
+            : `[worker-records] ${purpose === "snapshot" ? "SNAPSHOT BOOTSTRAP" : "COLD HYDRATION"} repo=${repoSlug}: no stored snapshot, replayed the full journal from revision 0 (revision=${entry.revision} journalRecords=${entry.deltaRecords} records=${entry.recordCount} coverageTrackedItems=${entry.coverageTrackedItemIds.length} bound=${coldRecordLimit})${purpose === "hydration" ? "; trigger a snapshot sweep to make future hydrations incremental" : ""}`,
         );
       } catch (error) {
         // Re-wrap so the refusal that aborts a multi-slug hydration names the
@@ -409,7 +499,7 @@ export async function materializeWorkerRecords(options: {
     rmSync(stagingRoot, { force: true, recursive: true });
   }
   const manifestPath = writeWorkerRecordsManifest(options.worktreeRoot, repositories);
-  return { recordsRoot, manifestPath, repositories };
+  return { recordsRoot, manifestPath, repositories, resumeRevisions };
 }
 
 export async function materializeWorkerItems(options: {
@@ -1077,18 +1167,15 @@ function validateSnapshotTree(treeRoot: string) {
   return fileCount;
 }
 
-function applyWorkerRecords(repoRoot: string, records: readonly WorkerRecord[]) {
-  for (const record of records) {
-    const destination = path.join(repoRoot, recordRelativePath(record));
-    if (record.deleted) {
-      rmSync(destination, { force: true });
-      continue;
-    }
-    if (record.content === null)
-      throw new Error(`Worker record is missing content: ${destination}`);
-    mkdirSync(path.dirname(destination), { recursive: true });
-    writeFileSync(destination, record.content, "utf8");
+function applyWorkerRecord(repoRoot: string, record: WorkerRecord) {
+  const destination = path.join(repoRoot, recordRelativePath(record));
+  if (record.deleted) {
+    rmSync(destination, { force: true });
+    return;
   }
+  if (record.content === null) throw new Error(`Worker record is missing content: ${destination}`);
+  mkdirSync(path.dirname(destination), { recursive: true });
+  writeFileSync(destination, record.content, "utf8");
 }
 
 function signedWorkerRecordReadPost<T>(options: SignedPostOptions): Promise<T> {
@@ -1449,14 +1536,35 @@ function sha256(content: string) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+export type WorkerSnapshotReplay = {
+  // false when the replay stopped at its time budget; the uploaded snapshot then
+  // covers changes through `resumeRevision` and the next run continues there.
+  complete: boolean;
+  previousRevision: number;
+  resumeRevision: number | null;
+  replayedRecords: number;
+  durationsMs: { hydrate: number; pack: number; upload: number };
+};
+
 export async function uploadWorkerRecordSnapshot(options: {
   baseUrl: string;
   webhookSecret: string;
   repoSlug: string;
+  // Bounds download plus replay, measured from the call. Packing and upload run
+  // afterwards, so callers leave room for them inside any job timeout.
+  replayBudgetMs?: number;
+  now?: () => number;
   fetch?: typeof globalThis.fetch;
   log?: (line: string) => void;
-}) {
+}): Promise<WorkerStoredSnapshot & { replay: WorkerSnapshotReplay }> {
   validateRepoSlug(options.repoSlug);
+  const now = options.now ?? Date.now;
+  const startedAt = now();
+  if (
+    options.replayBudgetMs !== undefined &&
+    (!Number.isSafeInteger(options.replayBudgetMs) || options.replayBudgetMs < 1)
+  )
+    throw new Error("Snapshot replay budget must be a positive integer of milliseconds");
   const root = mkdtempSync(path.join(tmpdir(), "clawsweeper-snapshot-upload-"));
   let uploadId: string | undefined;
   const operationId =
@@ -1470,11 +1578,28 @@ export async function uploadWorkerRecordSnapshot(options: {
       body: { ...body, operation, issuedAt: new Date().toISOString() },
     });
   try {
-    const hydrated = await materializeWorkerRecords({
-      ...options,
-      worktreeRoot: root,
-      repoSlugs: [options.repoSlug],
-    });
+    const hydrated = await materializeRecords(
+      // The producer only packs the tree; the coverage listing is a reader concern.
+      { ...options, worktreeRoot: root, repoSlugs: [options.repoSlug], trackCoverage: false },
+      "snapshot",
+      {
+        ...(options.replayBudgetMs === undefined
+          ? {}
+          : { replayDeadline: startedAt + options.replayBudgetMs }),
+        now,
+      },
+    );
+    const repository = hydrated.repositories[options.repoSlug]!;
+    const resumeRevision = hydrated.resumeRevisions[options.repoSlug] ?? null;
+    // A complete replay keeps the conservative first-page watermark. A stopped
+    // replay has applied every identity at or below its cursor, which is always
+    // past the previous snapshot because at least one page was applied.
+    const revisionWatermark = resumeRevision ?? repository.exportStartRevision;
+    if (resumeRevision !== null && resumeRevision <= repository.snapshotRevision)
+      throw new Error(
+        `Snapshot replay for ${options.repoSlug} stopped without passing the stored watermark ${repository.snapshotRevision}`,
+      );
+    const hydratedAt = now();
     const packed = await packWorkerRecordSnapshot({
       repoRoot: path.join(hydrated.recordsRoot, options.repoSlug),
       archivePath: path.join(root, "snapshot.tar.gz"),
@@ -1483,9 +1608,10 @@ export async function uploadWorkerRecordSnapshot(options: {
       throw new Error("Snapshot exceeds the 1 GiB upload limit");
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(packed.archivePath)) hash.update(chunk);
+    const packedAt = now();
     const descriptor = {
       repoSlug: options.repoSlug,
-      revisionWatermark: hydrated.repositories[options.repoSlug]!.exportStartRevision,
+      revisionWatermark,
       bytes: packed.bytes,
       uncompressedBytes: packed.uncompressedBytes,
       fileCount: packed.fileCount,
@@ -1580,7 +1706,21 @@ export async function uploadWorkerRecordSnapshot(options: {
       result.snapshot.bytes !== packed.bytes
     )
       throw new Error("Worker returned an invalid registered snapshot");
-    return result.snapshot;
+    const finishedAt = now();
+    return {
+      ...result.snapshot,
+      replay: {
+        complete: resumeRevision === null,
+        previousRevision: repository.snapshotRevision,
+        resumeRevision,
+        replayedRecords: repository.deltaRecords,
+        durationsMs: {
+          hydrate: hydratedAt - startedAt,
+          pack: packedAt - hydratedAt,
+          upload: finishedAt - packedAt,
+        },
+      },
+    };
   } catch (error) {
     if (uploadId) await post("abort", { uploadId }).catch(() => undefined);
     throw error;
@@ -1589,25 +1729,90 @@ export async function uploadWorkerRecordSnapshot(options: {
   }
 }
 
+// Uploads a first snapshot for every repository the canonical store lists
+// without one. Cold hydration refuses a snapshot-less slug past
+// COLD_HYDRATION_MAX_RECORDS, and every fleet-wide reader hydrates every slug,
+// so one unsnapshotted growing repository fails all of them. One slug's lookup
+// or upload failure must not strand the rest; failures are reported after the
+// sweep.
+export async function bootstrapColdWorkerRecordSnapshots(options: {
+  baseUrl: string;
+  webhookSecret: string;
+  fetch?: typeof globalThis.fetch;
+  log?: (line: string) => void;
+}) {
+  const log = options.log ?? ((line: string) => console.error(line));
+  const repositories = await discoverWorkerRecordRepoSlugs(options);
+  const coldSlugs: string[] = [];
+  const snapshots: WorkerStoredSnapshot[] = [];
+  const failures: Array<{ repoSlug: string; error: string }> = [];
+  for (const { repoSlug } of repositories) {
+    try {
+      const cold = await fetchWorkerStoredSnapshot({ ...options, repoSlug }).then(
+        () => false,
+        (error: unknown) => {
+          if (
+            error instanceof WorkerSnapshotUnavailableError &&
+            error.reason === "snapshot_not_found"
+          )
+            return true;
+          throw error;
+        },
+      );
+      if (!cold) continue;
+      coldSlugs.push(repoSlug);
+      snapshots.push(await uploadWorkerRecordSnapshot({ ...options, repoSlug }));
+      log(`[worker-records] SNAPSHOT BOOTSTRAP repo=${repoSlug}: uploaded the first snapshot`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push({ repoSlug, error: message });
+      log(`[worker-records] SNAPSHOT BOOTSTRAP repo=${repoSlug}: failed: ${message}`);
+    }
+  }
+  return { coldSlugs, snapshots, failures };
+}
+
 export async function workerRecordsMain(argv: string[], env: NodeJS.ProcessEnv = process.env) {
   const [command, ...args] = argv;
-  if (command !== "snapshot-upload")
+  if (command !== "snapshot-upload" && command !== "snapshot-bootstrap-cold")
     throw new Error(
-      "Usage: worker-records.ts snapshot-upload --repo-slug <slug> [--records-url <url>]",
+      "Usage: worker-records.ts snapshot-upload --repo-slug <slug> [--records-url <url>] [--replay-budget-seconds <n>]\n" +
+        "       worker-records.ts snapshot-bootstrap-cold [--records-url <url>]",
     );
   const { values } = parseArgs({
     args,
-    options: { "repo-slug": { type: "string" }, "records-url": { type: "string" } },
+    options: {
+      "repo-slug": { type: "string" },
+      "records-url": { type: "string" },
+      "replay-budget-seconds": { type: "string" },
+    },
     strict: true,
   });
-  if (!values["repo-slug"]) throw new Error("--repo-slug is required");
+  const replayBudget = values["replay-budget-seconds"];
+  if (replayBudget !== undefined && !/^[1-9]\d{0,5}$/.test(replayBudget))
+    throw new Error("--replay-budget-seconds must be a positive whole number of seconds");
   const webhookSecret = env.CLAWSWEEPER_RECORDS_SECRET ?? env.CLAWSWEEPER_WEBHOOK_SECRET ?? "";
   if (!webhookSecret) throw new Error("CLAWSWEEPER_WEBHOOK_SECRET is required");
+  const baseUrl =
+    values["records-url"] ?? env.CLAWSWEEPER_RECORDS_URL ?? "https://clawsweeper.openclaw.ai";
+  if (command === "snapshot-bootstrap-cold") {
+    if (values["repo-slug"]) throw new Error("snapshot-bootstrap-cold takes no --repo-slug");
+    if (replayBudget !== undefined)
+      throw new Error("snapshot-bootstrap-cold takes no --replay-budget-seconds");
+    const result = await bootstrapColdWorkerRecordSnapshots({ baseUrl, webhookSecret });
+    console.log(JSON.stringify(result));
+    if (result.failures.length > 0)
+      throw new Error(
+        `Snapshot bootstrap failed for ${result.failures.map(({ repoSlug }) => repoSlug).join(", ")}`,
+      );
+    return result;
+  }
+  if (!values["repo-slug"]) throw new Error("--repo-slug is required");
   const snapshot = await uploadWorkerRecordSnapshot({
     repoSlug: values["repo-slug"],
-    baseUrl:
-      values["records-url"] ?? env.CLAWSWEEPER_RECORDS_URL ?? "https://clawsweeper.openclaw.ai",
+    baseUrl,
     webhookSecret,
+    ...(replayBudget === undefined ? {} : { replayBudgetMs: Number(replayBudget) * 1000 }),
   });
   console.log(JSON.stringify(snapshot));
   return snapshot;

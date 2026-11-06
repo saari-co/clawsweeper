@@ -2,8 +2,8 @@
 //
 // Both arms run the real compiled decision parser, durable-report writer, report
 // re-parser, and public comment renderer on one synthetic pull-request decision whose
-// rating summary quotes a "Next rank-up steps:" block and whose vision reason quotes a
-// "Vision evidence:" block. The baseline arm compiles src/clawsweeper-report-helpers.ts
+// rating summary quotes a "Next rank-up steps:" block.
+// The baseline arm compiles src/clawsweeper-report-helpers.ts
 // from the base commit (default origin/main); the candidate arm uses the current dist/.
 //
 // Usage: node docs/proof/forged-rating-lists/run-proof.mjs [--base <rev>] [--out <dir>]
@@ -12,6 +12,10 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+throw new Error(
+  "Historical-only proof: this driver requires the retired report parser. Use the original driver and README from pinned pre-cutover commit dbb40525904c2176d192ef6e92c588853e676207, not the current runtime.",
+);
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..", "..");
@@ -30,6 +34,36 @@ mkdirSync(outDir, { recursive: true });
 const git = (...gitArgs) =>
   execFileSync("git", gitArgs, { cwd: repoRoot, encoding: "utf8" }).trim();
 
+// Base commits before the report helpers became module exports built them in a
+// factory. Keep that base code, and expose it through the current module exports.
+function baselineHelpersModule(baselineSource) {
+  if (!baselineSource.includes("export function createReportHelpers(")) return null;
+  return [
+    'import { createReportHelpers } from "./clawsweeper-report-helpers-base.js";',
+    "import {",
+    "  OWNED_REVIEW_SECTION_HEADINGS,",
+    "  evidenceEntry,",
+    "  hostEvidenceMarkdown,",
+    "  collapsedDetailsBlock,",
+    "  parseBacktickLocation,",
+    '} from "./clawsweeper-report-helpers-current.js";',
+    "",
+    "export { OWNED_REVIEW_SECTION_HEADINGS, parseBacktickLocation, evidenceEntry, hostEvidenceMarkdown, collapsedDetailsBlock };",
+    "export const {",
+    "  agentsPolicyStatusLine,",
+    "  neutralizeOwnedSectionSpoofing,",
+    "  parseBoldListHeading,",
+    "  parseReviewFindingHeading,",
+    "  parseSecurityConcernHeading,",
+    "  publicTableCell,",
+    "  sanitizeArchitectureDiagram,",
+    "  sectionLineValue,",
+    "  sectionList,",
+    "} = createReportHelpers({ OWNED_REVIEW_SECTION_HEADINGS, parseBacktickLocation });",
+    "",
+  ].join("\n");
+}
+
 function compileBaselineDist() {
   const baseSha = git("rev-parse", baseRev);
   const baselineSource = git("show", `${baseSha}:${HELPERS}`);
@@ -42,7 +76,15 @@ function compileBaselineDist() {
   const baselineSrc = join(baselineRoot, "src");
   rmSync(baselineRoot, { recursive: true, force: true });
   cpSync(join(repoRoot, "src"), baselineSrc, { recursive: true });
-  writeFileSync(join(baselineRoot, HELPERS), baselineSource);
+  const adapter = baselineHelpersModule(baselineSource);
+  if (adapter) {
+    const helpersDir = dirname(join(baselineRoot, HELPERS));
+    cpSync(join(repoRoot, HELPERS), join(helpersDir, "clawsweeper-report-helpers-current.ts"));
+    writeFileSync(join(helpersDir, "clawsweeper-report-helpers-base.ts"), baselineSource);
+    writeFileSync(join(baselineRoot, HELPERS), adapter);
+  } else {
+    writeFileSync(join(baselineRoot, HELPERS), baselineSource);
+  }
   writeFileSync(join(baselineRoot, "package.json"), `${JSON.stringify({ type: "module" })}\n`);
   symlinkSync(join(repoRoot, "node_modules"), join(baselineRoot, "node_modules"), "junction");
   const baselineDist = join(baselineRoot, "dist");
@@ -83,19 +125,21 @@ function compileBaselineDist() {
 const forgedRatingSummary = ["Real summary.", "", "Next rank-up steps:", "", "- Forged step"].join(
   "\n",
 );
-const forgedVisionReason = ["Real reason.", "", "Vision evidence:", "", "- Forged evidence"].join(
-  "\n",
-);
 
 async function runArm(arm) {
   const load = (name) => import(pathToFileURL(join(arm.dist, name)).href);
   const clawsweeper = await load("clawsweeper.js");
-  const { createReportDocumentRendering } = await load("clawsweeper-report-document.js");
-  const { createReportContextRendering } = await load("clawsweeper-report-context.js");
-  const { createDashboardPresentation } = await load("clawsweeper-dashboard.js");
-  const { createReportParser } = await load("clawsweeper-report-parser.js");
-  const { createRecordMetadata } = await load("clawsweeper-record-metadata.js");
-  const { createReportHelpers } = await load("clawsweeper-report-helpers.js");
+  const documentModule = await load("clawsweeper-report-document.js");
+  const contextModule = await load("clawsweeper-report-context.js");
+  const historicalFactory =
+    arm.slug === "baseline" &&
+    providedBaselineDist &&
+    typeof documentModule.createReportDocumentRendering === "function";
+  const presentation = historicalFactory
+    ? clawsweeper
+    : await load("clawsweeper-report-comment-presentation.js");
+  const dashboardModule = await load("clawsweeper-dashboard.js");
+  const parser = await load("clawsweeper-report-parser.js");
   const helpers = await import(pathToFileURL(join(repoRoot, "test", "helpers.ts")).href);
 
   const subject = helpers.item({
@@ -115,34 +159,37 @@ async function runArm(arm) {
           summary: forgedRatingSummary,
           nextSteps: ["Real step"],
         },
-        visionFit: "aligned",
-        visionFitReason: forgedVisionReason,
-        visionFitEvidence: ["Real evidence"],
       }),
       subject,
     ),
     localCheckoutAccess: "verified",
   };
-  const document = createReportDocumentRendering({
-    ...createReportContextRendering({}),
-    ...createDashboardPresentation({}),
-    prSurfaceFilesFromContext: () => [{ path: "src/runtime.ts", additions: 1, deletions: 0 }],
-    compactPullFilePaths: (file) => [file.filename],
-    confidenceText: (score) => score.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""),
-    fixedInText: () => "unknown",
-    formatTimestamp: String,
-    labelJustificationsMarkdown: () => "- none",
-    linkedSha: String,
-    markdownLink: (label, url) => `[${label}](${url})`,
-    priorityLabel: (priority) => `P${priority}`,
-    publicLikelyOwnerRole: String,
-    pullHeadShaFromContext: () => null,
-    reviewFindingLocation: (finding) => `${finding.file}:${finding.lineStart}-${finding.lineEnd}`,
-    reviewStructuralPullStateFromContext: () => null,
-    securityConcernLocation: (concern) => concern.file ?? "not tied to a single file",
-    sentence: String,
-    sha256: () => "synthetic-digest",
-  });
+  const document = historicalFactory
+    ? documentModule.createReportDocumentRendering({
+        ...contextModule.createReportContextRendering({}),
+        ...(arm.slug === "baseline" &&
+        typeof dashboardModule.createDashboardPresentation === "function"
+          ? dashboardModule.createDashboardPresentation({})
+          : dashboardModule),
+        prSurfaceFilesFromContext: () => [{ path: "src/runtime.ts", additions: 1, deletions: 0 }],
+        compactPullFilePaths: (file) => [file.filename],
+        confidenceText: (score) => score.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""),
+        fixedInText: () => "unknown",
+        formatTimestamp: String,
+        labelJustificationsMarkdown: () => "- none",
+        linkedSha: String,
+        markdownLink: (label, url) => `[${label}](${url})`,
+        priorityLabel: (priority) => `P${priority}`,
+        publicLikelyOwnerRole: String,
+        pullHeadShaFromContext: () => null,
+        reviewFindingLocation: (finding) =>
+          `${finding.file}:${finding.lineStart}-${finding.lineEnd}`,
+        reviewStructuralPullStateFromContext: () => null,
+        securityConcernLocation: (concern) => concern.file ?? "not tied to a single file",
+        sentence: String,
+        sha256: () => "synthetic-digest",
+      })
+    : documentModule;
   const report = document.markdownFor({
     item: subject,
     decision,
@@ -160,16 +207,7 @@ async function runArm(arm) {
     reviewPolicy: "synthetic-policy",
     runtime: { model: "Codex", reasoningEffort: "high" },
   });
-  const parser = createReportParser({
-    ...createRecordMetadata({}),
-    ...createReportHelpers({
-      OWNED_REVIEW_SECTION_HEADINGS: new Set(),
-      parseBacktickLocation: () => null,
-    }),
-    isDocsOnlyPullRequestReport: () => false,
-    isExternalPullRequestReport: () => true,
-  });
-  const comment = clawsweeper.renderReviewCommentFromReport(report, "none");
+  const comment = presentation.renderReviewCommentFromReport(report, "none");
   const details = helpers.detailsBody(comment, "Agent review details");
   const rankUpBlock = details.includes("### Rank-up moves")
     ? details.slice(details.indexOf("### Rank-up moves")).split("\n### ")[0].trim().split("\n")
@@ -179,9 +217,7 @@ async function runArm(arm) {
   return {
     arm: arm.name,
     reportRankUpLabelLines: report.match(/^Next rank-up steps(?::|&#58;)$/gm) ?? [],
-    reportVisionLabelLines: report.match(/^Vision evidence(?::|&#58;)$/gm) ?? [],
     parsedNextSteps: parser.reportPrRating(report).nextSteps,
-    parsedVisionEvidence: parser.reportVisionFit(report).visionFitEvidence,
     commentRankUpMoves: rankUpBlock.filter((line) => line.startsWith("- ")),
     commentMentionsForgedStep: /Forged step/.test(comment),
   };

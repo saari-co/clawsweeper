@@ -4,59 +4,58 @@ import {
   OBSOLETE_FIX_PR_MAX_CHANGED_FILES,
   OBSOLETE_FIX_PR_MIN_INACTIVE_DAYS,
 } from "./clawsweeper-policy.js";
-import type { AuthorPrBudgetApplyGate, Item } from "./clawsweeper-types.js";
-import type { ApplyGuardDependencies } from "./clawsweeper-apply-guard-dependencies.js";
-import type { createApplyGuardActivity } from "./clawsweeper-apply-guard-activity.js";
-import type { createApplyGuardPolicy } from "./clawsweeper-apply-guard-policy.js";
-import type { createApplyGuardProof } from "./clawsweeper-apply-guard-proof.js";
+import type { ApplyCloseGuardBlock, AuthorPrBudgetApplyGate, Item } from "./clawsweeper-types.js";
+import {
+  authorPrBudgetSignalBlockReason,
+  isWorkflowOrCiPath,
+  prAutoCloseExemptLabel,
+  type ApplyGuardActivity,
+  type GuardReads,
+} from "./clawsweeper-apply-guard-activity.js";
+import {
+  authorPrBudgetAgeSkipReason,
+  isMaintainerAuthored,
+  labelNames,
+  obsoleteFixPrAgeSkipReason,
+  protectedLabels,
+} from "./clawsweeper-item-policy.js";
+import {
+  authorPrBudget,
+  authorPrBudgetCloseEnabled,
+  obsoleteFixPrCloseEnabled,
+} from "./policy-flags.js";
+import { asRecord, nonBlankStringOrUndefined } from "./value-coerce.js";
 
 export function createApplyGuardCapacity(
-  dependencies: ApplyGuardDependencies &
-    ReturnType<typeof createApplyGuardActivity> &
-    ReturnType<typeof createApplyGuardPolicy> &
-    ReturnType<typeof createApplyGuardProof>,
-) {
-  const {
-    asRecord,
-    authorPrBudget,
-    authorPrBudgetAgeSkipReason,
-    authorPrBudgetCloseEnabled,
-    ghJson,
-    isMaintainerAuthored,
-    labelNames,
-    obsoleteFixPrAgeSkipReason,
-    obsoleteFixPrCloseEnabled,
-    protectedLabels,
-    stringOrUndefined,
-    targetRepo,
+  { ghJson, targetRepo }: GuardReads,
+  {
+    authorOpenPullRequestCount,
+    defaultBranchPathMissing,
     pullRequestHumanEngagementBlockReason,
     pullRequestLiveActivity,
-    prAutoCloseExemptLabel,
-    isWorkflowOrCiPath,
-    defaultBranchPathMissing,
-    authorPrBudgetSignalBlockReason,
-    authorOpenPullRequestCount,
-  } = dependencies;
-
-  function obsoleteFixPrApplyBlockReason(
+  }: ApplyGuardActivity,
+) {
+  function obsoleteFixPrApplyBlock(
     number: number,
     item: Pick<Item, "createdAt">,
-  ): string | null {
-    if (!obsoleteFixPrCloseEnabled()) return "obsolete-fix PR apply policy is disabled";
+  ): ApplyCloseGuardBlock | null {
+    if (!obsoleteFixPrCloseEnabled()) return { reason: "obsolete-fix PR apply policy is disabled" };
     const storedAgeBlock = obsoleteFixPrAgeSkipReason(item);
-    if (storedAgeBlock) return storedAgeBlock;
+    if (storedAgeBlock) return { reason: storedAgeBlock };
 
     const activity = pullRequestLiveActivity(number);
-    if (activity.state !== "open") return "live PR is not open";
+    if (activity.state !== "open") return { reason: "live PR is not open" };
     const liveAgeBlock = obsoleteFixPrAgeSkipReason({ createdAt: activity.createdAt });
-    if (liveAgeBlock) return liveAgeBlock;
-    if (!activity.headSha) return "obsolete_fix_pr requires a live PR head SHA";
+    if (liveAgeBlock) return { reason: liveAgeBlock };
+    if (!activity.headSha) return { reason: "obsolete_fix_pr requires a live PR head SHA" };
     if (
       activity.changedFiles === null ||
       activity.changedFiles < 1 ||
       activity.changedFiles > OBSOLETE_FIX_PR_MAX_CHANGED_FILES
     ) {
-      return `obsolete_fix_pr requires between 1 and ${OBSOLETE_FIX_PR_MAX_CHANGED_FILES} live changed files`;
+      return {
+        reason: `obsolete_fix_pr requires between 1 and ${OBSOLETE_FIX_PR_MAX_CHANGED_FILES} live changed files`,
+      };
     }
 
     const commit = ghJson<{ commit?: { committer?: { date?: string } } }>([
@@ -66,7 +65,7 @@ export function createApplyGuardCapacity(
     const committedAt = commit.commit?.committer?.date ?? "";
     const committedAtMs = Date.parse(committedAt);
     if (!Number.isFinite(committedAtMs)) {
-      return "obsolete_fix_pr requires a dated current-head committer timestamp";
+      return { reason: "obsolete_fix_pr requires a dated current-head committer timestamp" };
     }
     const latestActivityAtMs = Math.max(
       committedAtMs,
@@ -74,7 +73,10 @@ export function createApplyGuardCapacity(
       activity.headStatusActivityAtMs ?? Number.NEGATIVE_INFINITY,
     );
     if (Date.now() - latestActivityAtMs <= OBSOLETE_FIX_PR_MIN_INACTIVE_DAYS * DAY_MS) {
-      return `obsolete_fix_pr requires ${OBSOLETE_FIX_PR_MIN_INACTIVE_DAYS} days without current-head commit, status, or check-run activity`;
+      return {
+        reason: `obsolete_fix_pr requires ${OBSOLETE_FIX_PR_MIN_INACTIVE_DAYS} days without current-head commit, status, or check-run activity`,
+        closePolicyHoldVerified: true,
+      };
     }
 
     const issue = ghJson<{ assignees?: unknown[]; labels?: unknown[] }>([
@@ -82,31 +84,35 @@ export function createApplyGuardCapacity(
       `repos/${targetRepo()}/issues/${number}`,
     ]);
     const protectedLabel = protectedLabels(labelNames(issue.labels))[0];
-    if (protectedLabel) return `protected label: ${protectedLabel}`;
-    const engagementBlock = pullRequestHumanEngagementBlockReason(number, {
-      assignees: issue.assignees ?? [],
-      requestedReviewers: activity.requestedReviewers,
-      requestedTeams: activity.requestedTeams,
-    });
-    if (engagementBlock) return engagementBlock;
+    if (protectedLabel) return { reason: `protected label: ${protectedLabel}` };
+    const engagementBlock = pullRequestHumanEngagementBlockReason(
+      number,
+      {
+        assignees: issue.assignees ?? [],
+        requestedReviewers: activity.requestedReviewers,
+        requestedTeams: activity.requestedTeams,
+      },
+      OBSOLETE_FIX_PR_MIN_INACTIVE_DAYS,
+    );
+    if (engagementBlock) return { reason: engagementBlock };
 
     const repository = ghJson<{ default_branch?: string }>(["api", `repos/${targetRepo()}`]);
     const defaultBranch = repository.default_branch?.trim() ?? "";
-    if (!defaultBranch) return "obsolete_fix_pr requires the repository default branch";
+    if (!defaultBranch) return { reason: "obsolete_fix_pr requires the repository default branch" };
     const files = ghJson<unknown[]>([
       "api",
       `repos/${targetRepo()}/pulls/${number}/files?per_page=${OBSOLETE_FIX_PR_MAX_CHANGED_FILES}`,
     ]);
     if (files.length !== activity.changedFiles) {
-      return "obsolete_fix_pr live changed-file list is incomplete";
+      return { reason: "obsolete_fix_pr live changed-file list is incomplete" };
     }
     const changedEntries = files.map((file) => ({
-      path: stringOrUndefined(asRecord(file).filename)?.trim() ?? "",
-      status: stringOrUndefined(asRecord(file).status)?.trim() ?? "",
+      path: nonBlankStringOrUndefined(asRecord(file).filename)?.trim() ?? "",
+      status: nonBlankStringOrUndefined(asRecord(file).status)?.trim() ?? "",
     }));
     const paths = changedEntries.map((entry) => entry.path);
     if (paths.some((path) => !path) || new Set(paths).size !== paths.length) {
-      return "obsolete_fix_pr live changed-file paths are incomplete";
+      return { reason: "obsolete_fix_pr live changed-file paths are incomplete" };
     }
 
     const since = new Date(committedAtMs + 1).toISOString();
@@ -126,26 +132,28 @@ export function createApplyGuardCapacity(
         ) {
           continue;
         }
-        return `touched path unchanged on main; fix may still be relevant: ${path}`;
+        return { reason: `touched path unchanged on main; fix may still be relevant: ${path}` };
       }
       const changedAt = asRecord(asRecord(commits[0]).commit).committer;
-      const changedDate = stringOrUndefined(asRecord(changedAt).date) ?? "";
+      const changedDate = nonBlankStringOrUndefined(asRecord(changedAt).date) ?? "";
       if (!Number.isFinite(Date.parse(changedDate)) || Date.parse(changedDate) <= committedAtMs) {
-        return `post-PR main-side change date is unavailable for touched path: ${path}`;
+        return { reason: `post-PR main-side change date is unavailable for touched path: ${path}` };
       }
     }
     return null;
   }
-  function obsoleteFixPrApplyBlockReasonSafe(
+  function obsoleteFixPrApplyBlockSafe(
     number: number,
     item: Pick<Item, "createdAt">,
-  ): string | null {
+  ): ApplyCloseGuardBlock | null {
     try {
-      return obsoleteFixPrApplyBlockReason(number, item);
+      return obsoleteFixPrApplyBlock(number, item);
     } catch (error) {
-      return `obsolete-fix PR live check failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
+      return {
+        reason: `obsolete-fix PR live check failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
     }
   }
   function authorPrBudgetApplyGate(
@@ -210,7 +218,11 @@ export function createApplyGuardCapacity(
       };
     }
 
-    const engagementBlock = pullRequestHumanEngagementBlockReason(number);
+    const engagementBlock = pullRequestHumanEngagementBlockReason(
+      number,
+      undefined,
+      AUTHOR_PR_BUDGET_MIN_INACTIVE_DAYS,
+    );
     if (engagementBlock) return { allowed: false, reason: engagementBlock };
 
     const budget = authorPrBudget();
@@ -241,8 +253,8 @@ export function createApplyGuardCapacity(
   }
 
   return {
-    obsoleteFixPrApplyBlockReason,
-    obsoleteFixPrApplyBlockReasonSafe,
+    obsoleteFixPrApplyBlock,
+    obsoleteFixPrApplyBlockSafe,
     authorPrBudgetApplyGate,
     authorPrBudgetApplyGateSafe,
   };

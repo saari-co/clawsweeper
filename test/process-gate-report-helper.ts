@@ -1,40 +1,12 @@
 import { parseDecision } from "../dist/clawsweeper.js";
 import { closeDecision, item } from "./helpers.ts";
-import { createRepositoryLinks } from "../dist/clawsweeper-links.js";
-import { createReportDocumentRendering } from "../dist/clawsweeper-report-document.js";
-import { createReportContextRendering } from "../dist/clawsweeper-report-context.js";
-import { createDashboardPresentation } from "../dist/clawsweeper-dashboard.js";
-import { normalizeRepo, repositoryProfileFor } from "../dist/repository-profiles.js";
-const evidenceLinks = createRepositoryLinks({
-  reportRepo: "openclaw/clawsweeper-state",
-  normalizeRepo,
-  targetRepo: () => "example-org/example-private-suite",
-  targetProfile: () => repositoryProfileFor("openclaw/openclaw"),
-});
+import { markdownFor } from "../dist/clawsweeper-report-document.js";
 
 export function processGateReport(
   overrides: Record<string, unknown> = {},
   body: string | null = null,
 ) {
-  const document = createReportDocumentRendering({
-    ...evidenceLinks,
-    ...createReportContextRendering({} as never),
-    ...createDashboardPresentation({} as never),
-    prSurfaceFilesFromContext: () => [],
-    compactPullFilePaths: () => [],
-    confidenceText: String,
-    priorityLabel: (value: unknown) => `P${value}`,
-    reviewFindingLocation: () => "src/example.ts:1",
-    fixedInText: () => "unknown",
-    formatTimestamp: String,
-    labelJustificationsMarkdown: () => "- none",
-    publicLikelyOwnerRole: String,
-    pullHeadShaFromContext: () => "c".repeat(40),
-    reviewStructuralPullStateFromContext: () => null,
-    sentence: String,
-    sha256: () => "synthetic-digest",
-  } as Parameters<typeof createReportDocumentRendering>[0]);
-  return document.markdownFor({
+  return markdownFor({
     item: item({
       kind: "pull_request",
       repo: "example-org/example-private-suite",
@@ -51,7 +23,12 @@ export function processGateReport(
       // The host stamps checkout access after parsing model output.
       localCheckoutAccess: "verified",
     },
-    context: { issue: { body }, comments: [], timeline: [] },
+    context: {
+      issue: { body },
+      pullRequest: { head: { sha: "c".repeat(40) } },
+      comments: [],
+      timeline: [],
+    },
     git: { mainSha: "a".repeat(40), latestRelease: null, releaseStateComplete: true },
     action: { actionTaken: "kept_open" },
     exactTupleIdentity: {
@@ -70,5 +47,5 @@ export function processGateReport(
     contentDigest: "synthetic-content",
     reviewPolicy: "synthetic-policy",
     runtime: { model: "Codex", reasoningEffort: "high" },
-  } as Parameters<typeof document.markdownFor>[0]);
+  } as Parameters<typeof markdownFor>[0]);
 }

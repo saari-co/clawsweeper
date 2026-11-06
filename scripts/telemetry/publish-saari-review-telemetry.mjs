@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { renderReviewCommentFromReport } from "../../dist/clawsweeper.js";
+import { renderReviewCommentFromReport } from "../../dist/clawsweeper-report-comment-presentation.js";
 
 export const SCHEMA_VERSION = "clawsweeper.telemetry.v1";
 export const TENANT = "saari";

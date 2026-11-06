@@ -1,8 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { VIDEO_PROOF_EXTENSIONS } from "../../dist/clawsweeper-media-proof.js";
+import { MAX_MEDIA_PROOF_URLS, MEDIA_PROOF_TIMEOUT_MS } from "../../dist/media-proof-budget.js";
 import { adaptiveReviewBudgetForPullRequest } from "../../dist/repair/adaptive-review-budget.js";
 import { mediaFixtureUrls } from "../primary-body-fixture.ts";
+import { serializeReviewPreflightPayload } from "../../dist/review-preflight-contract.js";
+
+test("adaptive review budget excludes advisory metadata URLs but keeps outer proof URLs", () => {
+  const block = serializeReviewPreflightPayload({
+    v: 1,
+    repo: "openclaw/openclaw",
+    base: "a".repeat(40),
+    head: "b".repeat(40),
+    tool: { name: "autoreview", version: "1" },
+    completion: "partial",
+    summary: mediaFixtureUrls.attachment,
+  });
+  assert.equal(adaptiveReviewBudgetForPullRequest({ body: block }).mediaProofTimeoutMs, 0);
+  assert.equal(
+    adaptiveReviewBudgetForPullRequest({ body: `${mediaFixtureUrls.attachment}\n\n${block}` })
+      .mediaProofTimeoutMs,
+    MEDIA_PROOF_TIMEOUT_MS,
+  );
+});
 
 test("adaptive review budget includes unknown GitHub attachments once and excludes known images", () => {
   const { attachment, legacyAttachment, prefix } = mediaFixtureUrls;
@@ -16,15 +37,18 @@ test("adaptive review budget includes unknown GitHub attachments once and exclud
       attachment.replace("github.com", "example.invalid"),
     ].join("\n"),
   });
-  assert.equal(budget.mediaProofTimeoutMs, 240_000);
+  assert.equal(budget.mediaProofTimeoutMs, 2 * MEDIA_PROOF_TIMEOUT_MS);
   assert.equal(budget.codexTimeoutMs, 600_000);
 });
 
-test("adaptive review budget caps GitHub attachment preprocessing at four URLs", () => {
-  const body = [1, 2, 3, 4, 5]
-    .map((n) => mediaFixtureUrls.attachment.replace(/.$/, String(n)))
-    .join("\n");
-  assert.equal(adaptiveReviewBudgetForPullRequest({ body }).mediaProofTimeoutMs, 480_000);
+test("adaptive review budget caps GitHub attachment preprocessing at the media proof URL cap", () => {
+  const body = Array.from({ length: MAX_MEDIA_PROOF_URLS + 1 }, (_, n) =>
+    mediaFixtureUrls.attachment.replace(/.$/, String(n)),
+  ).join("\n");
+  assert.equal(
+    adaptiveReviewBudgetForPullRequest({ body }).mediaProofTimeoutMs,
+    MAX_MEDIA_PROOF_URLS * MEDIA_PROOF_TIMEOUT_MS,
+  );
 });
 
 test("adaptive review budget normalizes REST aggregate and gh file shapes", () => {
@@ -53,22 +77,20 @@ test("adaptive review budget normalizes REST aggregate and gh file shapes", () =
 
   assert.deepEqual(aggregate, {
     codexTimeoutMs: 1_268_800,
-    mediaProofTimeoutMs: 240_000,
+    mediaProofTimeoutMs: 2 * MEDIA_PROOF_TIMEOUT_MS,
   });
   assert.deepEqual(files, aggregate);
 });
 
 test("adaptive review budget caps video preprocessing allowance", () => {
+  const extensions = [...VIDEO_PROOF_EXTENSIONS];
   const budget = adaptiveReviewBudgetForPullRequest({
-    body: [
-      "https://uploads.example.invalid/one.mov",
-      "https://uploads.example.invalid/two.mp4",
-      "https://uploads.example.invalid/three.webm",
-      "https://uploads.example.invalid/four.mkv",
-      "https://uploads.example.invalid/five.avi",
-    ].join("\n"),
+    body: Array.from(
+      { length: MAX_MEDIA_PROOF_URLS + 1 },
+      (_, n) => `https://uploads.example.invalid/${n}${extensions[n % extensions.length]}`,
+    ).join("\n"),
   });
 
-  assert.equal(budget.mediaProofTimeoutMs, 480_000);
+  assert.equal(budget.mediaProofTimeoutMs, MAX_MEDIA_PROOF_URLS * MEDIA_PROOF_TIMEOUT_MS);
   assert.equal(budget.codexTimeoutMs, 600_000);
 });

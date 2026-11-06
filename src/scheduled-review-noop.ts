@@ -1,12 +1,11 @@
+import { reviewBodyWithoutPreflight } from "./review-preflight-body.ts";
 import { createHash } from "node:crypto";
+import { CLAWSWEEPER_BOT_LOGINS } from "./clawsweeper-bot-identity.ts";
 
 const TRUSTED_AUTHORS = new Set(
-  [
-    "clawsweeper",
-    "clawsweeper[bot]",
-    "openclaw-clawsweeper[bot]",
-    process.env.CLAWSWEEPER_COMMENT_AUTHOR_LOGIN?.toLowerCase(),
-  ].filter((value): value is string => Boolean(value)),
+  [...CLAWSWEEPER_BOT_LOGINS, process.env.CLAWSWEEPER_COMMENT_AUTHOR_LOGIN?.toLowerCase()].filter(
+    (value): value is string => Boolean(value),
+  ),
 );
 const SOURCE_REVISION_PATTERN =
   /<!--\s+clawsweeper-review-version\b[^>]*\bsource_revision=([0-9a-f]{64})\b[^>]*-->/g;
@@ -69,7 +68,9 @@ export function scheduledReviewSemanticSourceRevision(
   const source = object(issue);
   const snapshot = {
     title: scalar(source.title),
-    body: scalar(source.body),
+    body: source.pull_request
+      ? reviewBodyWithoutPreflight(scalar(source.body))
+      : scalar(source.body),
     labels: (Array.isArray(source.labels) ? source.labels : [])
       .map(labelName)
       .filter(Boolean)
@@ -122,6 +123,24 @@ export function classifyScheduledReviewNoop(options: {
   if (!Number.isFinite(queuedUpdatedAt) || queuedUpdatedAt !== liveUpdatedAt) {
     return { noop: false, reason: "queued_source_drift" };
   }
+  return trustedOwnedActivityOnly({ ...options, issue })
+    ? { noop: true, reason: "trusted_owned_activity_only" }
+    : { noop: false, reason: "missing_or_changed_durable_source" };
+}
+
+/**
+ * True when the item's latest activity is ClawSweeper's own review write: its
+ * durable review comment records the current semantic source and settled
+ * within moments of the item's updated_at. Scheduling and admission share it.
+ */
+export function trustedOwnedActivityOnly(options: {
+  issue: unknown;
+  comments: readonly unknown[];
+  liveHeadSha?: string;
+}): boolean {
+  const issue = object(options.issue);
+  const liveUpdatedAt = Date.parse(scalar(issue.updated_at));
+  if (!Number.isFinite(liveUpdatedAt)) return false;
   const liveRevision = scheduledReviewSemanticSourceRevision(issue, options.comments);
   for (const comment of [...options.comments].map(object).reverse()) {
     if (!trustedClawSweeperComment(comment)) continue;
@@ -136,8 +155,8 @@ export function classifyScheduledReviewNoop(options: {
       liveUpdatedAt >= commentUpdatedAt &&
       liveUpdatedAt - commentUpdatedAt <= SETTLING_WINDOW_MS
     ) {
-      return { noop: true, reason: "trusted_owned_activity_only" };
+      return true;
     }
   }
-  return { noop: false, reason: "missing_or_changed_durable_source" };
+  return false;
 }

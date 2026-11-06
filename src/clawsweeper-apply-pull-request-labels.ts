@@ -5,25 +5,18 @@ import type {
   PrStatusLabelKind,
   StalePullRequestReviewHead,
 } from "./clawsweeper-types.js";
+import { frontMatterValue, replaceFrontMatterValue } from "./report-front-matter.js";
+import { reportReviewDecision } from "./report-review-decision.js";
+import { prStatusLabelKindFromReport } from "./clawsweeper-label-policy.js";
 
 type ApplyPullRequestLabelDependencies = Pick<
   CreateApplyDecisionWorkflowDependencies,
-  | "frontMatterValue"
-  | "prStatusLabelKindFromReport"
-  | "reportFeatureShowcase"
-  | "reportOverallCorrectness"
-  | "reportPrRating"
-  | "reportRealBehaviorProof"
-  | "reportSecurityReview"
-  | "reportTelegramVisibleProof"
-  | "replaceFrontMatterValue"
   | "syncFeatureShowcaseLabel"
   | "syncPrRatingLabel"
   | "syncPrStatusLabel"
   | "syncRealBehaviorProofMediaLabels"
   | "syncRealBehaviorProofSufficientLabel"
   | "syncStalePullRequestReviewLabels"
-  | "syncTelegramVisibleProofLabel"
 >;
 
 interface ApplyPullRequestLabelOptions {
@@ -47,22 +40,12 @@ export function syncApplyPullRequestLabels(
   markdown: string;
 } {
   const {
-    frontMatterValue,
-    prStatusLabelKindFromReport,
-    reportFeatureShowcase,
-    reportOverallCorrectness,
-    reportPrRating,
-    reportRealBehaviorProof,
-    reportSecurityReview,
-    reportTelegramVisibleProof,
-    replaceFrontMatterValue,
     syncFeatureShowcaseLabel,
     syncPrRatingLabel,
     syncPrStatusLabel,
     syncRealBehaviorProofMediaLabels,
     syncRealBehaviorProofSufficientLabel,
     syncStalePullRequestReviewLabels,
-    syncTelegramVisibleProofLabel,
   } = dependencies;
   const {
     currentItemContext,
@@ -96,7 +79,8 @@ export function syncApplyPullRequestLabels(
     return { changed, currentPrStatusKind, labels, markdown };
   }
 
-  const proof = reportRealBehaviorProof(markdown);
+  const decision = reportReviewDecision(markdown);
+  const proof = decision.realBehaviorProof;
   applyLabels(syncRealBehaviorProofSufficientLabel({ number, labels, proof, dryRun, onMutation }));
 
   applyLabels(syncRealBehaviorProofMediaLabels({ number, labels, proof, dryRun, onMutation }));
@@ -105,7 +89,7 @@ export function syncApplyPullRequestLabels(
     syncPrRatingLabel({
       number,
       labels,
-      rating: reportPrRating(markdown),
+      rating: decision.prRating,
       reviewFailed: frontMatterValue(markdown, "review_status") === "failed",
       dryRun,
       onMutation,
@@ -117,11 +101,11 @@ export function syncApplyPullRequestLabels(
       number,
       labels,
       isPullRequest: true,
-      itemCategory: frontMatterValue(markdown, "item_category"),
-      requiresNewFeature: frontMatterValue(markdown, "requires_new_feature") === "true",
-      showcase: reportFeatureShowcase(markdown),
-      securityReview: reportSecurityReview(markdown),
-      overallCorrectness: reportOverallCorrectness(markdown),
+      itemCategory: decision.itemCategory,
+      requiresNewFeature: decision.requiresNewFeature,
+      showcase: decision.featureShowcase,
+      securityReview: decision.securityReview,
+      overallCorrectness: decision.overallCorrectness,
       dryRun,
       onMutation,
     }),
@@ -130,16 +114,6 @@ export function syncApplyPullRequestLabels(
   currentPrStatusKind = prStatusLabelKindFromReport(markdown, currentItemContext(), labels);
   applyLabels(
     syncPrStatusLabel({ number, labels, statusKind: currentPrStatusKind, dryRun, onMutation }),
-  );
-
-  applyLabels(
-    syncTelegramVisibleProofLabel({
-      number,
-      labels,
-      proof: reportTelegramVisibleProof(markdown),
-      dryRun,
-      onMutation,
-    }),
   );
 
   return { changed, currentPrStatusKind, labels, markdown };

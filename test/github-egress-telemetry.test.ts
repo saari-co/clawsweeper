@@ -2,18 +2,19 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { githubTest as test, installGhFixture } from "./github-runtime-fixture.ts";
 import YAML from "yaml";
 
 import { ExactReviewQueue } from "../dashboard/exact-review-queue.ts";
 import { GithubEgressTelemetryStore } from "../dashboard/github-egress-telemetry.ts";
-import { createGitHubRuntime } from "../dist/clawsweeper-github-runtime.js";
+import * as runtime from "../dist/clawsweeper-github-runtime.js";
 import {
   githubEgressCommandDescriptor,
   githubEgressRouteTemplate,
 } from "../dist/github-egress-descriptor.js";
 import {
   observeGitHubDebugStderr,
+  recordGitHubHttpRead,
   recordGithubEgressBrokerEvent,
   recordGithubEgressMember,
   recordUnobservedGitHubInvocation,
@@ -25,6 +26,37 @@ import {
 import { MemoryDurableStorage } from "./dashboard-worker-harness.ts";
 
 const NOW = Date.parse("2026-08-12T12:00:00.000Z");
+
+test("lossless receipt reads preserve bounded wire and rate-limit accounting", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-egress-receipt-"));
+  try {
+    const metricsPath = join(root, "metrics.jsonl");
+    const rateLimitPath = join(root, "rate-limits.jsonl");
+    recordGitHubHttpRead(
+      ["api", "repos/private-owner/private-repo/issues/991/comments?per_page=100&page=2"],
+      429,
+      new Map([
+        ["retry-after", "5"],
+        ["etag", "private-etag"],
+        ["x-github-request-id", "private-request"],
+      ]),
+      20,
+      observerEnv(metricsPath, rateLimitPath),
+    );
+    const metrics = jsonLines(metricsPath);
+    assert.equal(metrics.length, 2);
+    assert.ok(metrics.every((entry) => entry.telemetryComplete === true));
+    assert.equal(metrics[0]!.unit, "wire_attempt");
+    assert.equal(metrics[0]!.pageBucket, "2");
+    assert.equal(metrics[0]!.operation, "comments");
+    assert.equal(metrics[1]!.unit, "invocation");
+    assert.equal(jsonLines(rateLimitPath)[0]!.status, 429);
+    const persisted = readFileSync(metricsPath, "utf8") + readFileSync(rateLimitPath, "utf8");
+    assert.doesNotMatch(persisted, /private-owner|private-repo|private-etag|private-request/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("GH_DEBUG observation counts paginated wire attempts and strips unsafe diagnostics", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-egress-observer-"));
@@ -307,7 +339,8 @@ test("wire evidence completes high-level gh invocations without leaking their ar
   }
 });
 
-test("runtime attribution follows the selected credential instead of throttle text", () => {
+test("runtime attribution follows the selected credential instead of throttle text", (t) => {
+  const fixture = installGhFixture(t, 'process.stdout.write("{}");');
   const keys = [
     "CLAWSWEEPER_GITHUB_EGRESS_METRICS_PATH",
     "CLAWSWEEPER_GITHUB_STAGE",
@@ -321,7 +354,7 @@ test("runtime attribution follows the selected credential instead of throttle te
   ];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   Object.assign(process.env, {
-    CLAWSWEEPER_GITHUB_EGRESS_METRICS_PATH: "metrics.jsonl",
+    CLAWSWEEPER_GITHUB_EGRESS_METRICS_PATH: join(fixture.root, "metrics.jsonl"),
     CLAWSWEEPER_GITHUB_STAGE: "publication_apply",
     CLAWSWEEPER_GITHUB_SOURCE_ACTION: "scheduled_hot_intake",
     CLAWSWEEPER_GITHUB_CLAIM_GENERATION: "2",
@@ -330,18 +363,6 @@ test("runtime attribution follows the selected credential instead of throttle te
     GH_TOKEN: "target-app-token",
     REPO_TOKEN: "repository-actions-token",
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
-  });
-  const requests: Array<{ token: string; pool: string }> = [];
-  const runtime = createGitHubRuntime({
-    ROOT: process.cwd(),
-    targetRepo: () => "openclaw/openclaw",
-    run: (_command, _args, options) => {
-      requests.push({
-        token: String(options?.env?.GH_TOKEN || process.env.GH_TOKEN || ""),
-        pool: String(options?.env?.CLAWSWEEPER_GITHUB_POOL_CLASS || ""),
-      });
-      return "{}";
-    },
   });
   try {
     runtime.ghWithPreparedTimeout(["api", "repos/openclaw/openclaw/issues/1"], 1_000);
@@ -352,11 +373,14 @@ test("runtime attribution follows the selected credential instead of throttle te
     runtime.ghWithPreparedTimeout(["api", "repos/openclaw/openclaw/issues/1"], 1_000, {
       GH_TOKEN: "repository-actions-token",
     });
-    assert.deepEqual(requests, [
-      { token: "public-actions-token", pool: "public_read_fallback" },
-      { token: "target-app-token", pool: "target_app" },
-      { token: "repository-actions-token", pool: "repository_actions" },
-    ]);
+    assert.deepEqual(
+      fixture.requests().map(({ token, pool }) => ({ token, pool })),
+      [
+        { token: "public-actions-token", pool: "public_read_fallback" },
+        { token: "target-app-token", pool: "target_app" },
+        { token: "repository-actions-token", pool: "repository_actions" },
+      ],
+    );
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
@@ -366,12 +390,12 @@ test("runtime attribution follows the selected credential instead of throttle te
 });
 
 test("publication workflows retain v1 metrics while wiring bounded v2 observation and upload", () => {
-  const batchSource = readFileSync(".github/workflows/exact-review-batch-publish.yml", "utf8");
-  const sweepSource = readFileSync(".github/workflows/sweep.yml", "utf8");
-  const batch = YAML.parse(batchSource) as {
+  const batch = YAML.parse(
+    readFileSync(".github/workflows/exact-review-batch-publish.yml", "utf8"),
+  ) as {
     jobs: { publish: { env: Record<string, string>; steps: Array<Record<string, unknown>> } };
   };
-  const sweep = YAML.parse(sweepSource) as {
+  const sweep = YAML.parse(readFileSync(".github/workflows/sweep.yml", "utf8")) as {
     jobs: Record<string, { steps: Array<Record<string, unknown>> }>;
   };
   assert.ok(batch.jobs.publish.env.CLAWSWEEPER_GITHUB_REQUEST_METRICS_PATH);
@@ -384,8 +408,11 @@ test("publication workflows retain v1 metrics while wiring bounded v2 observatio
     "Submit batch GitHub egress telemetry",
     "Release unfinished batch members",
   ]);
-  assert.match(batchSource, /CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions/);
-  assert.match(batchSource, /CLAWSWEEPER_GITHUB_STAGE=publication_router/);
+  const finalize = batchSteps.find(
+    (step) => step.name === "Finalize healthy members under a fenced heartbeat",
+  );
+  assert.match(String(finalize?.run), /export CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions/);
+  assert.match(String(finalize?.run), /export CLAWSWEEPER_GITHUB_STAGE=publication_router/);
   assert.equal(
     batchSteps.find((step) => step.id === "github-egress-observer")?.["continue-on-error"],
     true,
@@ -431,12 +458,13 @@ test("publication workflows retain v1 metrics while wiring bounded v2 observatio
     artifact.find((step) => step.name === "Record artifact-publication member")?.env?.TARGET_REPO,
     "${{ steps.publication-context.outputs.target_repo }}",
   );
-  assert.match(sweepSource, /CLAWSWEEPER_GITHUB_POOL_CLASS: repository_actions/);
-  assert.match(sweepSource, /CLAWSWEEPER_GITHUB_STAGE: publication_router/);
-  assert.match(
-    sweepSource,
-    /repeat_revision=\$\{responseProtocol === 2 \? repeatRevision : false\}/,
-  );
+  for (const step of [
+    direct.find((candidate) => candidate.id === "finalize-direct-exact-review-lifecycle"),
+    artifact.find((candidate) => candidate.id === "queue-deferred-verdict-router"),
+  ] as Array<{ env?: Record<string, string> } | undefined>) {
+    assert.equal(step?.env?.CLAWSWEEPER_GITHUB_POOL_CLASS, "repository_actions");
+    assert.equal(step?.env?.CLAWSWEEPER_GITHUB_STAGE, "publication_router");
+  }
 });
 
 test("signed upload, SQLite restart, retention, cardinality, and public privacy are bounded", async () => {
@@ -832,6 +860,67 @@ test("signed upload, SQLite restart, retention, cardinality, and public privacy 
   }
 });
 
+test("egress retention cadence is shared by uploads and public reads", () => {
+  const storage = new MemoryDurableStorage();
+  const store = new GithubEgressTelemetryStore(storage);
+  store.ensureSchemaSync();
+  store.ingest(telemetryBody("1".repeat(64), NOW), NOW);
+  storage.sql.exec(
+    "INSERT INTO exact_review_github_egress_receipts_v2 (receipt_id, observed_at) VALUES (?, ?)",
+    "expired",
+    NOW - 7 * 24 * 60 * 60_000 - 1,
+  );
+  store.ingest(telemetryBody("2".repeat(64), NOW), NOW + 1);
+  store.publicSummary(NOW + 2);
+  store.publicObservability(1, NOW + 3);
+  const expiredReceipt = () =>
+    Array.from(
+      storage.sql.exec(
+        "SELECT receipt_id FROM exact_review_github_egress_receipts_v2 WHERE receipt_id = 'expired'",
+      ),
+    );
+  assert.equal(expiredReceipt().length, 1);
+  store.publicSummary(NOW + 5 * 60_000);
+  assert.equal(expiredReceipt().length, 0);
+  assert.equal(store.publicSummary(NOW + 5 * 60_000).units.wire_attempt, 2);
+});
+
+test("egress cap counts recover after rollback and count repeated metrics once", () => {
+  const storage = new MemoryDurableStorage();
+  const store = new GithubEgressTelemetryStore(storage, { maxRollupRows: 2 });
+  store.ensureSchemaSync();
+  const oldBody = telemetryBody("1".repeat(64), NOW - 2 * 60 * 60_000);
+  assert.equal(store.ingest(oldBody, NOW).ok, true);
+  const repeated = telemetryBody("2".repeat(64), NOW - 5 * 60_000);
+  repeated.metrics.push({ ...repeated.metrics[0]! });
+  const exec = storage.sql.exec.bind(storage.sql);
+  let fail = true;
+  storage.sql.exec = (query, ...bindings) => {
+    if (fail && query.includes("SET accepted_submissions = accepted_submissions + 1")) {
+      fail = false;
+      throw new Error("rollback after cap eviction");
+    }
+    return exec(query, ...bindings);
+  };
+  assert.throws(() => store.ingest(repeated, NOW), /rollback after cap eviction/);
+  assert.equal(store.ingest(repeated, NOW).ok, true);
+  assert.equal(store.ingest(repeated, NOW).deduped, true);
+  const expectedStorage = new MemoryDurableStorage();
+  const expected = new GithubEgressTelemetryStore(expectedStorage, { maxRollupRows: 2 });
+  expected.ensureSchemaSync();
+  expected.ingest(oldBody, NOW);
+  expected.ingest(repeated, NOW);
+  expected.ingest(repeated, NOW);
+  assert.deepEqual(store.publicSummary(NOW), expected.publicSummary(NOW));
+  for (const hours of [0.25, 1, 6, 24, 168]) {
+    assert.deepEqual(
+      store.publicObservability(hours, NOW),
+      expected.publicObservability(hours, NOW),
+    );
+  }
+  assert.equal(store.publicObservability(1, NOW)?.units.wire_attempt, 2);
+});
+
 test("cap eviction watermarks preserve intact short windows without synthesizing missing buckets", () => {
   const storage = new MemoryDurableStorage();
   const store = new GithubEgressTelemetryStore(storage, {
@@ -931,6 +1020,15 @@ test("legacy eviction diagnostics migrate conservatively across restart", () => 
     maskedOneHour.retention.last_rollup_evicted_bucket_start,
     new Date(recentFiveMinuteBoundary).toISOString(),
     "an older retained hourly row cannot mask a five-minute legacy boundary",
+  );
+  const changes = () =>
+    Number([...storage.sql.exec("SELECT total_changes() AS n")][0]?.n ?? Number.NaN);
+  const beforeSettledStart = changes();
+  new GithubEgressTelemetryStore(storage).ensureSchemaSync();
+  assert.equal(
+    changes() - beforeSettledStart,
+    0,
+    "a migrated row is not rewritten on later starts",
   );
 
   storage.sql.exec("DELETE FROM exact_review_github_egress_rollups_v2");

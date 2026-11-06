@@ -1,24 +1,14 @@
-import { recordOrEmpty, requireRecord as record } from "./value-coerce.js";
+import { normalizeRepo, slugForRepo } from "./repository-identity.js";
+export { normalizeRepo, slugForRepo } from "./repository-identity.js";
+import { asRecord, requireRecord as record } from "./value-coerce.js";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { stringArg, type Args } from "./clawsweeper-args.js";
 import { readTargetRepositoryConfigSource } from "./target-repository-config.js";
-
 export type RepositoryItemKind = "issue" | "pull_request";
-export type RepositoryLiveTestSurface = "browser" | "terminal";
 export type RepositoryPackageManager = "bun" | "pnpm" | "npm";
-
-export interface RepositoryLiveTestConfig {
-  enabled: boolean;
-  surfaceDefault: RepositoryLiveTestSurface;
-  setup: readonly string[];
-  allowInstallScripts: boolean;
-  start?: string;
-  url?: string;
-  readyTimeoutSeconds: number;
-  maxRecordingSeconds: number;
-}
 
 export type RepositoryCloseReason =
   | "implemented_on_main"
@@ -45,12 +35,16 @@ export interface RepositoryProfile {
   slug: string;
   displayName: string;
   checkoutDir: string;
-  packageManager: RepositoryPackageManager;
+  /** Unlisted local targets do not declare or install a package manager. */
+  packageManager?: RepositoryPackageManager;
   docsUrl?: string;
   communityUrl?: string;
   promptNote: string;
+  /** Repository policy that applies to one item kind only. */
+  kindPromptNotes?: Partial<Record<RepositoryItemKind, string>>;
+  /** Opt in only after accepting this repository's issue-rating stability. */
+  bulkFilerExcludeHighRatedIssues?: boolean;
   applyCloseRules: Partial<Record<RepositoryItemKind, readonly RepositoryCloseReason[]>>;
-  liveTest?: RepositoryLiveTestConfig;
 }
 
 interface TargetRepositoryConfig {
@@ -68,7 +62,6 @@ interface ConfiguredRepositoryProfile {
   communityUrl?: string;
   promptNote: string;
   applyCloseRules: Partial<Record<RepositoryItemKind, readonly RepositoryCloseReason[]>>;
-  liveTest?: RepositoryLiveTestConfig;
 }
 
 interface GenericFallbackConfig {
@@ -78,7 +71,6 @@ interface GenericFallbackConfig {
   packageManager: RepositoryPackageManager;
   promptNote: string;
   applyCloseRules: Partial<Record<RepositoryItemKind, readonly RepositoryCloseReason[]>>;
-  liveTest?: RepositoryLiveTestConfig;
 }
 
 const OPENCLAW_CLOSE_REASONS: readonly RepositoryCloseReason[] = [
@@ -109,6 +101,7 @@ export const DEFAULT_TARGET_REPO = "openclaw/openclaw";
 
 const CORE_OPENCLAW_PROFILE: RepositoryProfile = {
   targetRepo: DEFAULT_TARGET_REPO,
+  bulkFilerExcludeHighRatedIssues: true,
   slug: "openclaw-openclaw",
   displayName: "OpenClaw",
   checkoutDir: "openclaw",
@@ -116,9 +109,16 @@ const CORE_OPENCLAW_PROFILE: RepositoryProfile = {
   docsUrl: "https://docs.openclaw.ai",
   communityUrl: "https://clawhub.ai/",
   promptNote:
-    "Use the OpenClaw source tree, docs, changelog, and current main branch. Close proposals may use the normal OpenClaw stale/duplicate/not-in-repo/implemented-on-main policy when evidence is strong. For OpenClaw PR reviews, ClawSweeper renders deterministic PR surface stats separately; do not repeat changed-file counts, additions/deletions, or area totals in Review metrics unless adding a new interpretation not present in the deterministic surface block. Use Review metrics for new review-relevant facts, especially user-facing configuration additions, new flags/options/env vars, new protocol/API params, default changes, migrations, persisted settings, or compatibility paths.\n\n" +
-    "Keep repository-managed locale PRs open: the canonical same-repository `automation/native-app-locale-refresh` and `automation/control-ui-locale-refresh` branches targeting main, authored by `openclaw-mantis[bot]` (`app/openclaw-mantis` in GraphQL), belong to their generated-PR publisher. That publisher owns freshness and auto-merge; continue normal review and CI requirements.\n\n" +
-    "For `openclaw/openclaw` PR release-note review, `CHANGELOG.md` is release-owned. Normal PRs, repair workers, and automerge/autofix lanes should not edit it. Do not make missing `CHANGELOG.md` a review finding, merge blocker, work item, or next-step blocker. If release-note context is needed, ask for PR-body or commit message context: user-visible behavior, affected surface, issue/PR refs, and credited human author/reporter when known. Never request `Thanks @steipete`, `Thanks @openclaw`, `Thanks @clawsweeper`, or other forbidden bot/maintainer changelog attributions.",
+    "Use the OpenClaw source tree, docs, changelog, and current main branch. Close proposals may use the normal OpenClaw stale/duplicate/not-in-repo/implemented-on-main policy when evidence is strong.\n\n" +
+    "`CHANGELOG.md` is release-owned. Normal PRs should not edit it. Do not request contributor changelog entries, and do not make missing `CHANGELOG.md` a review finding, merge blocker, work item, or next-step blocker. If release-note context is needed, ask for PR-body or commit message context: user-visible behavior, affected surface, issue/PR refs, and credited human author/reporter when known. Never request `Thanks @steipete`, `Thanks @openclaw`, `Thanks @clawsweeper`, or other forbidden bot/maintainer changelog attributions.",
+  kindPromptNotes: {
+    issue:
+      "For `maturity:stable`, read the checked-out `qa/maturity-scores.yaml` and relevant `taxonomy.yaml` entries, and `docs/maturity/` when the owner or category is ambiguous; without a scorecard that establishes current maturity, use `[]`. Identify exactly one primary owner surface from the broken behavior and the source owner boundary. Shared Gateway/CLI transit, APIs, hosting, diagnostics, or plumbing do not qualify an issue whose primary owner is below M4. Select the label only when current docs, tests, an API or CLI contract, or established shipped behavior define the expected behavior and current-source evidence supports both that contract and the owner. Use `[]` for a feature proposal, new capability, UX preference, new configuration or policy choice, docs/support request, cleanup, or unclear report; `requiresNewFeature: true` or `requiresNewConfigOption: true` strongly means `[]`. If the existing-behavior contract or primary owner remains ambiguous, use `[]`. When selected, cite the contract and surface in `evidence` and `labelJustifications`; stable maturity does not raise priority automatically.",
+    pull_request:
+      "ClawSweeper renders deterministic PR surface stats separately. In Review metrics, do not repeat changed-file counts, total additions/deletions, or area totals: the production-vs-test LOC metric that the `reviewMetrics` description defines is the only size metric to add, and only when its conditions apply. Use Review metrics for new review-relevant facts, especially user-facing configuration additions, new flags/options/env vars, new protocol/API params, default changes, migrations, persisted settings, or compatibility paths.\n\n" +
+      "Keep repository-managed locale PRs open: the canonical same-repository `automation/native-app-locale-refresh` and `automation/control-ui-locale-refresh` branches targeting main, authored by `openclaw-mantis[bot]` (`app/openclaw-mantis` in GraphQL), belong to their generated-PR publisher. That publisher owns freshness and auto-merge; continue normal review and CI requirements.\n\n" +
+      "In implementer-owned decisions, OpenClaw tool-owned metadata includes Doctor bookkeeping tables and config provenance in an upgrade snapshot, and a Doctor repair that removes rows whose referenced parent is missing is a recovery repair.",
+  },
   applyCloseRules: {
     issue: OPENCLAW_CLOSE_REASONS.filter(
       (reason) => reason !== "author_pr_budget_exceeded" && reason !== "obsolete_fix_pr",
@@ -130,24 +130,12 @@ const CORE_OPENCLAW_PROFILE: RepositoryProfile = {
         reason !== "stale_version_bug",
     ),
   },
-  // Browser live proofs run against the repository's self-contained mock
-  // control-UI dev server, which needs no gateway, accounts, or credentials.
-  liveTest: {
-    enabled: true,
-    surfaceDefault: "browser",
-    setup: ["pnpm install --frozen-lockfile", "pnpm ui:install"],
-    allowInstallScripts: false,
-    start: "pnpm dev:ui:mock",
-    url: "http://127.0.0.1:5187",
-    readyTimeoutSeconds: 300,
-    maxRecordingSeconds: 90,
-  },
 };
 
 const TARGET_REPOSITORY_CONFIG = readTargetRepositoryConfig();
 
 export const REPOSITORY_PROFILES: RepositoryProfile[] = [
-  repositoryProfileWithFallbackLiveTest(CORE_OPENCLAW_PROFILE),
+  CORE_OPENCLAW_PROFILE,
   ...TARGET_REPOSITORY_CONFIG.repositories.map(configuredRepositoryProfile),
 ];
 
@@ -171,12 +159,26 @@ export function configuredRepositoryProfileFor(targetRepo: string): RepositoryPr
   );
 }
 
-export function repositoryProfileForSlug(slug: string): RepositoryProfile | undefined {
-  return REPOSITORY_PROFILES.find((candidate) => candidate.slug === slug);
+export function localRepositoryProfileFor(targetRepo: string): RepositoryProfile {
+  const normalized = repoValue(targetRepo, "Local target repo");
+  const profile =
+    configuredRepositoryProfileFor(normalized) ?? fallbackRepositoryProfile(normalized);
+  // Local review may reuse repository guidance, but never hosted close authority.
+  if (profile) return { ...profile, applyCloseRules: {} };
+  const repoName = normalized.split("/")[1]!;
+  return {
+    targetRepo: normalized,
+    slug: slugForRepo(normalized),
+    displayName: repoName,
+    checkoutDir: repoName,
+    promptNote:
+      "Review the local checkout using its own AGENTS.md, documentation, tests, and Git history. No hosted repository policy or close authority is configured for this local target.",
+    applyCloseRules: {},
+  };
 }
 
-export function normalizeRepo(targetRepo: string): string {
-  return targetRepo.trim().toLowerCase();
+export function repositoryProfileForSlug(slug: string): RepositoryProfile | undefined {
+  return REPOSITORY_PROFILES.find((candidate) => candidate.slug === slug);
 }
 
 export function isAutoCloseAllowed(
@@ -197,13 +199,13 @@ export function repositoryManagedPullRequestCloseReason(
     !["openclaw-mantis[bot]", "app/openclaw-mantis"].includes(item.author.toLowerCase())
   )
     return null;
-  const pull = recordOrEmpty(readPullRequest());
-  const head = recordOrEmpty(pull.head);
-  const base = recordOrEmpty(pull.base);
+  const pull = asRecord(readPullRequest());
+  const head = asRecord(pull.head);
+  const base = asRecord(pull.base);
   if (
-    recordOrEmpty(pull.user).login !== "openclaw-mantis[bot]" ||
-    recordOrEmpty(head.repo).full_name !== DEFAULT_TARGET_REPO ||
-    recordOrEmpty(base.repo).full_name !== DEFAULT_TARGET_REPO ||
+    asRecord(pull.user).login !== "openclaw-mantis[bot]" ||
+    asRecord(head.repo).full_name !== DEFAULT_TARGET_REPO ||
+    asRecord(base.repo).full_name !== DEFAULT_TARGET_REPO ||
     base.ref !== "main" ||
     typeof head.ref !== "string" ||
     !["automation/native-app-locale-refresh", "automation/control-ui-locale-refresh"].includes(
@@ -228,15 +230,7 @@ function configuredRepositoryProfile(profile: ConfiguredRepositoryProfile): Repo
   };
   if (profile.docsUrl) result.docsUrl = profile.docsUrl;
   if (profile.communityUrl) result.communityUrl = profile.communityUrl;
-  const liveTest = profile.liveTest ?? genericFallbackConfigFor(targetRepo)?.liveTest;
-  if (liveTest) result.liveTest = liveTest;
   return result;
-}
-
-function repositoryProfileWithFallbackLiveTest(profile: RepositoryProfile): RepositoryProfile {
-  if (profile.liveTest) return profile;
-  const liveTest = genericFallbackConfigFor(profile.targetRepo)?.liveTest;
-  return liveTest ? { ...profile, liveTest } : profile;
 }
 
 function fallbackRepositoryProfile(normalizedTargetRepo: string): RepositoryProfile | undefined {
@@ -257,7 +251,6 @@ function fallbackRepositoryProfile(normalizedTargetRepo: string): RepositoryProf
       .replaceAll("{repo_name}", repoName),
     applyCloseRules: fallback.applyCloseRules,
   };
-  if (fallback.liveTest) result.liveTest = fallback.liveTest;
   return result;
 }
 
@@ -286,10 +279,6 @@ function fallbackDescription(): string {
     .join(", ");
 }
 
-export function slugForRepo(targetRepo: string): string {
-  return targetRepo.replace(/[^A-Za-z0-9_.-]+/g, "-");
-}
-
 function readTargetRepositoryConfig(
   filePath = join(repoRoot(), "config", "target-repositories.json"),
 ): TargetRepositoryConfig {
@@ -304,16 +293,12 @@ function validateTargetRepositoryConfig(value: unknown): TargetRepositoryConfig 
   if (schemaVersion !== 1 && schemaVersion !== 2)
     throw new Error(`Unsupported target repository config schema: ${schemaVersion}`);
   const repositories = arrayValue(config.repositories, "repositories").map((entry, index) =>
-    validateConfiguredRepositoryProfile(entry, `repositories[${index}]`, schemaVersion as 1 | 2),
+    validateConfiguredRepositoryProfile(entry, `repositories[${index}]`),
   );
   const genericFallbacks =
     config.generic_fallbacks !== undefined
       ? arrayValue(config.generic_fallbacks, "generic_fallbacks").map((entry, index) =>
-          validateGenericFallbackConfig(
-            entry,
-            `generic_fallbacks[${index}]`,
-            schemaVersion as 1 | 2,
-          ),
+          validateGenericFallbackConfig(entry, `generic_fallbacks[${index}]`),
         )
       : [];
   const result: TargetRepositoryConfig = {
@@ -324,11 +309,7 @@ function validateTargetRepositoryConfig(value: unknown): TargetRepositoryConfig 
   if (config.openclaw_fallback !== undefined) {
     result.genericFallbacks = [
       ...result.genericFallbacks,
-      validateGenericFallbackConfig(
-        config.openclaw_fallback,
-        "openclaw_fallback",
-        schemaVersion as 1 | 2,
-      ),
+      validateGenericFallbackConfig(config.openclaw_fallback, "openclaw_fallback"),
     ];
   }
   return result;
@@ -337,7 +318,6 @@ function validateTargetRepositoryConfig(value: unknown): TargetRepositoryConfig 
 function validateConfiguredRepositoryProfile(
   value: unknown,
   label: string,
-  schemaVersion: 1 | 2,
 ): ConfiguredRepositoryProfile {
   const profile = record(value, label);
   const result: ConfiguredRepositoryProfile = {
@@ -354,77 +334,10 @@ function validateConfiguredRepositoryProfile(
   if (profile.community_url !== undefined) {
     result.communityUrl = stringValue(profile.community_url, `${label}.community_url`);
   }
-  if (profile.live_test !== undefined) {
-    if (schemaVersion !== 2) throw new Error(`${label}.live_test requires schema_version 2`);
-    result.liveTest = liveTestValue(profile.live_test, `${label}.live_test`);
-  }
   return result;
 }
 
-function liveTestValue(value: unknown, label: string): RepositoryLiveTestConfig {
-  // Local so the eager module-init config read cannot hit a temporal dead zone
-  // when a checked-in profile carries a live_test block.
-  const liveTestKeys = new Set([
-    "enabled",
-    "surface_default",
-    "setup",
-    "allow_install_scripts",
-    "start",
-    "url",
-    "ready_timeout_seconds",
-    "max_recording_seconds",
-  ]);
-  const config = record(value, label);
-  const unexpected = Object.keys(config).filter((key) => !liveTestKeys.has(key));
-  if (unexpected.length) throw new Error(`${label} has unexpected keys: ${unexpected.join(", ")}`);
-  const surfaceDefault = stringValue(
-    config.surface_default,
-    `${label}.surface_default`,
-  ) as RepositoryLiveTestSurface;
-  if (surfaceDefault !== "browser" && surfaceDefault !== "terminal") {
-    throw new Error(`${label}.surface_default must be browser or terminal`);
-  }
-  const setup = arrayValue(config.setup, `${label}.setup`).map((entry, index) =>
-    commandValue(entry, `${label}.setup[${index}]`),
-  );
-  const result: RepositoryLiveTestConfig = {
-    enabled: booleanValue(config.enabled, `${label}.enabled`),
-    surfaceDefault,
-    setup,
-    allowInstallScripts:
-      config.allow_install_scripts === undefined
-        ? false
-        : booleanValue(config.allow_install_scripts, `${label}.allow_install_scripts`),
-    readyTimeoutSeconds: positiveIntegerValue(
-      config.ready_timeout_seconds,
-      `${label}.ready_timeout_seconds`,
-    ),
-    maxRecordingSeconds: positiveIntegerValue(
-      config.max_recording_seconds,
-      `${label}.max_recording_seconds`,
-    ),
-  };
-  if (result.maxRecordingSeconds > 90) {
-    throw new Error(`${label}.max_recording_seconds must be at most 90`);
-  }
-  if (config.start !== undefined) result.start = commandValue(config.start, `${label}.start`);
-  if (config.url !== undefined) result.url = urlOriginValue(config.url, `${label}.url`);
-  if (surfaceDefault === "browser") {
-    if (!result.start) throw new Error(`${label}.start is required for browser live tests`);
-    if (!result.url) throw new Error(`${label}.url is required for browser live tests`);
-  }
-  return result;
-}
-
-export function validateTargetRepositoryConfigForTest(value: unknown): TargetRepositoryConfig {
-  return validateTargetRepositoryConfig(value);
-}
-
-function validateGenericFallbackConfig(
-  value: unknown,
-  label: string,
-  schemaVersion: 1 | 2,
-): GenericFallbackConfig {
+function validateGenericFallbackConfig(value: unknown, label: string): GenericFallbackConfig {
   const fallback = record(value, label);
   const pattern = stringValue(fallback.allow_repo_name_pattern, `${label}.allow_repo_name_pattern`);
   const result: GenericFallbackConfig = {
@@ -437,10 +350,6 @@ function validateGenericFallbackConfig(
     promptNote: stringValue(fallback.prompt_note, `${label}.prompt_note`),
     applyCloseRules: closeRulesValue(fallback.apply_close_rules, `${label}.apply_close_rules`),
   };
-  if (fallback.live_test !== undefined) {
-    if (schemaVersion !== 2) throw new Error(`${label}.live_test requires schema_version 2`);
-    result.liveTest = liveTestValue(fallback.live_test, `${label}.live_test`);
-  }
   return result;
 }
 
@@ -495,45 +404,6 @@ function stringValue(value: unknown, label: string): string {
   return value;
 }
 
-function commandValue(value: unknown, label: string): string {
-  const command = stringValue(value, label);
-  if (/[\r\n\u2028\u2029]/.test(command)) throw new Error(`${label} must be a single line`);
-  return command;
-}
-
-function urlOriginValue(value: unknown, label: string): string {
-  const text = stringValue(value, label);
-  let url: URL;
-  try {
-    url = new URL(text);
-  } catch {
-    throw new Error(`${label} must be an HTTP URL origin`);
-  }
-  if (
-    !["http:", "https:"].includes(url.protocol) ||
-    url.username ||
-    url.password ||
-    url.pathname !== "/" ||
-    url.search ||
-    url.hash
-  ) {
-    throw new Error(`${label} must be an HTTP URL origin`);
-  }
-  return url.origin;
-}
-
-function booleanValue(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
-  return value;
-}
-
-function positiveIntegerValue(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    throw new Error(`${label} must be a positive integer`);
-  }
-  return value;
-}
-
 function numberValue(value: unknown, label: string): number {
   if (typeof value !== "number") throw new Error(`${label} must be a number`);
   return value;
@@ -546,4 +416,39 @@ function arrayValue(value: unknown, label: string): unknown[] {
 
 function repoRoot(): string {
   return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+let activeRepositoryProfile: RepositoryProfile | undefined;
+
+export function targetProfile(): RepositoryProfile {
+  return (activeRepositoryProfile ??= repositoryProfileFor(
+    process.env.CLAWSWEEPER_TARGET_REPO ?? DEFAULT_TARGET_REPO,
+  ));
+}
+
+export function targetRepo(): string {
+  return targetProfile().targetRepo;
+}
+
+export function setTargetRepo(repo: string): RepositoryProfile {
+  activeRepositoryProfile = repositoryProfileFor(repo);
+  return activeRepositoryProfile;
+}
+
+export function repoFromArgs(args: Args): RepositoryProfile {
+  return setTargetRepo(
+    stringArg(
+      args.target_repo,
+      process.env.CLAWSWEEPER_TARGET_REPO ?? process.env.TARGET_REPO ?? DEFAULT_TARGET_REPO,
+    ),
+  );
+}
+
+export function withTargetProfile<T>(profile: RepositoryProfile, fn: () => T): T {
+  const previousProfile = activeRepositoryProfile;
+  activeRepositoryProfile = profile;
+  try {
+    return fn();
+  } finally {
+    activeRepositoryProfile = previousProfile;
+  }
 }

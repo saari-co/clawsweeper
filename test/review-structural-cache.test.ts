@@ -3,11 +3,11 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { compactPrimaryBody } from "../dist/clawsweeper-primary-body.js";
 import { longProofBody } from "./primary-body-fixture.ts";
+import { serializeReviewPreflightPayload } from "../dist/review-preflight-contract.js";
 
 import {
   REVIEW_STRUCTURAL_CACHE_VERSION,
   createReviewStructuralRecord,
-  reviewStructuralActivitiesForTest,
   reviewStructuralCacheDecision,
   reviewStructuralCacheProbeDecision,
   reviewStructuralQuery,
@@ -28,6 +28,39 @@ const TARGET_SHA = "a".repeat(40);
 const HEAD_SHA = "b".repeat(40);
 const BASE_SHA = "c".repeat(40);
 const CHECKS_DIGEST = "d".repeat(64);
+
+test("GraphQL semantic snapshot normalizes only PR metadata before relation detection", () => {
+  const annotation = (summary: string) =>
+    serializeReviewPreflightPayload({
+      v: 1,
+      repo: "openclaw/openclaw",
+      base: BASE_SHA,
+      head: HEAD_SHA,
+      tool: { name: "autoreview", version: "1.0" },
+      completion: "partial",
+      summary,
+    });
+  const firstBody = `Human proof\n\n${annotation("Fixes #777")}`;
+  const secondBody = `Human proof\n\n${annotation("No linkage claim")}`;
+  const first = graphqlRecord("pull_request", { ...graphqlNode("pull_request"), body: firstBody });
+  const second = graphqlRecord("pull_request", {
+    ...graphqlNode("pull_request"),
+    body: secondBody,
+  });
+  assert.ok(first);
+  assert.deepEqual(first, second);
+  assert.notDeepEqual(
+    first,
+    graphqlRecord("pull_request", {
+      ...graphqlNode("pull_request"),
+      body: secondBody.replace("Human proof", "Changed proof"),
+    }),
+  );
+  assert.notDeepEqual(
+    graphqlRecord("issue", { ...graphqlNode("issue"), body: firstBody }),
+    graphqlRecord("issue", { ...graphqlNode("issue"), body: secondBody }),
+  );
+});
 
 test("structural cache version rejects locale-sensitive legacy records", () => {
   assert.equal(REVIEW_STRUCTURAL_CACHE_VERSION, 6);
@@ -668,6 +701,73 @@ test("a validated reservation covers its own activity but nothing after it", () 
   );
 });
 
+test("an unchanged scheduled pass reuses its verdict once the prior record is present", () => {
+  // Timestamps from two consecutive scheduled passes on one unchanged issue
+  // (2026-10-07, UTC). Pass 1 reserved at 08:43:57, synced labels at 08:46:32
+  // and its durable comment at 08:46:43, then released the reservation, which
+  // moved item activity to 08:46:46. Pass 2 reserved at 09:50:52.
+  const now = Date.parse("2026-10-07T09:50:58Z");
+  const priorReview = review({
+    lastFullReviewAt: "2026-10-07T08:46:03Z",
+    labelsSyncedAt: "2026-10-07T08:46:32Z",
+    reviewCommentSyncedAt: "2026-10-07T08:46:43Z",
+  });
+  const priorRecord = record(issueSnapshot({ activityUpdatedAt: "2026-10-07T08:43:57Z" }));
+  const base = {
+    review: priorReview,
+    priorRecord,
+    currentRecord: record(issueSnapshot({ activityUpdatedAt: "2026-10-07T09:50:52Z" })),
+    reviewPolicy: "policy-1",
+    reviewModel: "gpt-5.6",
+    explicitDispatch: false,
+    maintainerRequest: false,
+    coordinationEnabled: true,
+    now,
+  };
+
+  // Without the hydrated prior record the pass can only hydrate and rerun the model.
+  assert.equal(
+    reviewStructuralCacheProbeDecision({ ...base, review: null }).reason,
+    "missing_review",
+  );
+  // The release is newer than both recorded syncs, so it alone is not covered.
+  assert.equal(
+    reviewStructuralCacheDecision({
+      ...base,
+      currentRecord: record(issueSnapshot({ activityUpdatedAt: "2026-10-07T08:46:46Z" })),
+    }).reason,
+    "activity_changed",
+  );
+  // The next pass's own reservation covers the release and its own comment.
+  assert.deepEqual(
+    reviewStructuralCacheDecision({ ...base, ownedReservationUpdatedAt: "2026-10-07T09:50:52Z" }),
+    { hit: true, reason: "hit" },
+  );
+  // A human comment after pass 1 still forces a fresh review.
+  const humanComment = {
+    id: "IC_human_after_review",
+    updatedAt: "2026-10-07T09:00:00Z",
+    author: "reporter",
+    authorAssociation: "NONE",
+    state: null,
+    commitSha: null,
+    bodyDigest: digest("still broken"),
+  };
+  assert.equal(
+    reviewStructuralCacheDecision({
+      ...base,
+      currentRecord: record(
+        issueSnapshot({
+          activityUpdatedAt: "2026-10-07T09:50:52Z",
+          comments: [...issueSnapshot().comments, humanComment],
+        }),
+      ),
+      ownedReservationUpdatedAt: "2026-10-07T09:50:52Z",
+    }).reason,
+    "source_changed",
+  );
+});
+
 test("disabled coordination and missing lease revisions force hydration", () => {
   assert.equal(decision({ coordinationEnabled: false }).reason, "coordination_disabled");
   assert.equal(
@@ -1049,45 +1149,25 @@ test("PR structural records require a complete check-state digest", () => {
 });
 
 test("metadata probes ignore ClawSweeper comments but fail closed on malformed entries", () => {
-  const result = reviewStructuralActivitiesForTest(
-    {
-      pageInfo: { hasPreviousPage: false },
-      nodes: [
-        {
-          id: "bot-comment",
-          updatedAt: "2026-07-10T10:00:00Z",
-          body: "Automated status",
-          author: { login: "ClawSweeper[bot]" },
-          authorAssociation: "NONE",
-        },
-        {
-          id: "human-comment",
-          updatedAt: "2026-07-10T10:01:00Z",
-          body: "No related item",
-          author: { login: "maintainer" },
-          authorAssociation: "MEMBER",
-        },
-      ],
-    },
-    ["clawsweeper[bot]"],
-  );
-  assert.equal(result.truncated, false);
-  assert.deepEqual(result.activities, [
-    {
-      id: "human-comment",
-      updatedAt: "2026-07-10T10:01:00Z",
-      author: "maintainer",
-      authorAssociation: "MEMBER",
-      state: null,
-      commitSha: null,
-      bodyDigest: digest("No related item"),
-    },
-  ]);
+  const node = graphqlNode("issue");
+  const withBot = graphqlRecord("issue", node);
+  assert.ok(withBot);
+  const withoutBot = graphqlRecord("issue", {
+    ...node,
+    comments: graphqlConnection(
+      node.comments.nodes.filter(
+        (entry) => entry.author.login.toLowerCase() !== "clawsweeper[bot]",
+      ),
+    ),
+  });
+  assert.deepEqual(withBot, withoutBot);
   assert.equal(
-    reviewStructuralActivitiesForTest({
-      pageInfo: { hasPreviousPage: false },
-      nodes: [{ id: "missing-timestamp", author: { login: "maintainer" } }],
-    }).truncated,
-    true,
+    graphqlRecord("issue", {
+      ...node,
+      comments: graphqlConnection([
+        { id: "missing-timestamp", body: "Malformed", author: { login: "maintainer" } },
+      ]),
+    }),
+    null,
   );
 });

@@ -114,7 +114,7 @@ function fixture(
           level: "info-0",
           logger: "trufflehog",
           msg: "finished scanning",
-          trufflehog_version: "3.97.4",
+          trufflehog_version: "3.99.4",
           chunks: 1,
           bytes: 1,
           verified_secrets: rows.filter((r) => r.Verified === true).length,
@@ -160,7 +160,6 @@ test("reviewed event UUID permits only enumerated complete source blobs", (t) =>
       "refused",
     );
 });
-
 for (const [name, override] of Object.entries({
   verified: { Verified: true },
   decoder: { DecoderName: "HTML" },

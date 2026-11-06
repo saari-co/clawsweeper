@@ -11,27 +11,26 @@ import {
   UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS,
   UNSPONSORED_FEATURE_MIN_AGE_DAYS,
 } from "./clawsweeper-policy.js";
-import type { ApplyKind, CloseReason, Item } from "./clawsweeper-types.js";
-
-const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+import type { ApplyCloseGuardBlock, ApplyKind, CloseReason, Item } from "./clawsweeper-types.js";
+import { asRecord } from "./value-coerce.js";
+import { isOlderThanDays, isOlderThanMs } from "./iso-time.js";
+import { isSecurityLabel } from "./repair/security-signals.js";
+import {
+  isMaintainerAuthorAssociation,
+  isMaintainerRepositoryPermission,
+  normalizeAuthorAssociation,
+  requiresMaintainerReviewRequest,
+} from "./maintainer-review-policy.js";
+export {
+  isMaintainerAuthorAssociation,
+  normalizeAuthorAssociation,
+} from "./maintainer-review-policy.js";
 
 // Owners and members can legitimately file coordinated issue batches; outside
 // collaborators still remain subject to bulk-filer policy.
 const BULK_FILER_EXEMPT_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER"]);
 
-// Installation tokens can redact membership to CONTRIBUTOR, so independently
-// readable admin/maintain permissions provide the narrow fallback.
-const BULK_FILER_EXEMPT_REPOSITORY_PERMISSIONS = new Set(["admin", "maintain"]);
-
-export function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-}
-
-export function login(value: unknown): string | undefined {
-  const user = asRecord(value);
-  const name = user.login;
-  return typeof name === "string" ? name : undefined;
-}
+const WRITE_ACCESS_REPOSITORY_PERMISSIONS = new Set(["admin", "maintain", "write"]);
 
 export function labelNames(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -44,12 +43,27 @@ export function labelNames(value: unknown): string[] {
     .filter((name): name is string => Boolean(name));
 }
 
-export function normalizeAuthorAssociation(value: unknown): string {
-  return typeof value === "string" && value.trim() ? value.trim().toUpperCase() : "NONE";
+export function isAutomationReportAuthor(author: string | undefined): boolean {
+  return Boolean(author && (/\[bot\]$/i.test(author) || author.startsWith("app/")));
 }
 
-export function isMaintainerAuthorAssociation(value: unknown): boolean {
-  return MAINTAINER_AUTHOR_ASSOCIATIONS.has(normalizeAuthorAssociation(value));
+export function usesContributorProofPolicy(
+  author: string | undefined,
+  authorAssociation: unknown,
+  localRange = false,
+): boolean {
+  // Local Git display names are not GitHub identities and cannot grant bot exemptions.
+  return (
+    localRange ||
+    (!isMaintainerAuthorAssociation(authorAssociation) && !isAutomationReportAuthor(author))
+  );
+}
+
+export function lockedConversationApplyReason(
+  item: Pick<Item, "activeLockReason" | "locked">,
+): string | null {
+  if (!item.locked) return null;
+  return `conversation is locked${item.activeLockReason ? ` (${item.activeLockReason})` : ""}`;
 }
 
 export function isBulkFilerExemptAuthorAssociation(value: unknown): boolean {
@@ -57,24 +71,13 @@ export function isBulkFilerExemptAuthorAssociation(value: unknown): boolean {
 }
 
 export function isBulkFilerExemptRepositoryPermission(value: unknown): boolean {
-  return (
-    typeof value === "string" &&
-    BULK_FILER_EXEMPT_REPOSITORY_PERMISSIONS.has(value.trim().toLowerCase())
-  );
+  return isMaintainerRepositoryPermission(value);
 }
 
-export function verifiedMaintainerAuthorAssociation(options: {
-  authorAssociation: unknown;
-  repositoryPermission: unknown;
-}): string {
-  const association = normalizeAuthorAssociation(options.authorAssociation);
-  if (
-    !isMaintainerAuthorAssociation(association) &&
-    isBulkFilerExemptRepositoryPermission(options.repositoryPermission)
-  ) {
-    return "MEMBER";
-  }
-  return association;
+export function isWriteAccessRepositoryPermission(value: unknown): boolean {
+  return (
+    typeof value === "string" && WRITE_ACCESS_REPOSITORY_PERMISSIONS.has(value.trim().toLowerCase())
+  );
 }
 
 export function isMaintainerAuthored(item: Pick<Item, "authorAssociation">): boolean {
@@ -89,12 +92,20 @@ export function normalizeLabelName(label: string): string {
   return label.trim().toLowerCase();
 }
 
+export function normalizedLabelSet(labels: readonly string[]): Set<string> {
+  return new Set(labels.map(normalizeLabelName));
+}
+
+export function hasNormalizedLabel(labels: readonly string[], label: string): boolean {
+  return normalizedLabelSet(labels).has(normalizeLabelName(label));
+}
+
 export function protectedLabels(labels: readonly string[]): string[] {
   return labels
     .map((label) => normalizeLabelName(label))
     .filter(
       (label, index, normalized) =>
-        (PROTECTED_LABELS.has(label) || label.includes("security")) &&
+        (PROTECTED_LABELS.has(label) || isSecurityLabel(label)) &&
         normalized.indexOf(label) === index,
     );
 }
@@ -111,7 +122,7 @@ export function applyBlockingProtectedLabels(
     .map((label) => normalizeLabelName(label))
     .filter(
       (label, index, normalized) =>
-        (APPLY_PROTECTED_LABELS.has(label) || label.includes("security")) &&
+        (APPLY_PROTECTED_LABELS.has(label) || isSecurityLabel(label)) &&
         normalized.indexOf(label) === index,
     );
   if (!isVerifiedFixedCloseReason(closeReason) && closeReason !== "oversized_pull_request")
@@ -123,19 +134,13 @@ export function applyProtectedLabelReason(labels: readonly string[], closeReason
   return `protected label: ${applyBlockingProtectedLabels(labels, closeReason).join(", ")}`;
 }
 
-export function shouldPlanItem(item: Pick<Item, "authorAssociation" | "labels">): boolean {
-  return protectedLabels(item.labels).every((label) => label === "maintainer");
-}
-
-export function isOlderThanDays(isoTimestamp: string, days: number, now = Date.now()): boolean {
-  return isOlderThanMs(isoTimestamp, days * DAY_MS, now);
-}
-
-function isOlderThanMs(isoTimestamp: string, milliseconds: number, now = Date.now()): boolean {
-  if (milliseconds <= 0) return true;
-  const timestamp = Date.parse(isoTimestamp);
-  if (!Number.isFinite(timestamp)) return false;
-  return now - timestamp > milliseconds;
+export function shouldPlanItem(
+  item: Pick<Item, "authorAssociation" | "createdAt" | "labels">,
+): boolean {
+  return (
+    !requiresMaintainerReviewRequest(item) &&
+    protectedLabels(item.labels).every((label) => label === "maintainer")
+  );
 }
 
 export function applyKindArg(value: string | boolean | string[] | undefined): ApplyKind {
@@ -195,14 +200,20 @@ export function closeReasonApplyAgeSkipReason(
   return null;
 }
 
-export function unconfirmedProductDirectionAgeSkipReason(
+export function unconfirmedProductDirectionAgeBlock(
   item: Pick<Item, "createdAt">,
   reviewedUpdatedAt: string | undefined,
   reviewedAt: string | undefined,
   now = Date.now(),
-): string | null {
+): ApplyCloseGuardBlock | null {
+  const createdAtMs = Date.parse(item.createdAt);
   if (!isOlderThanDays(item.createdAt, UNCONFIRMED_PRODUCT_DIRECTION_MIN_AGE_DAYS, now)) {
-    return `unconfirmed_product_direction requires PR older than ${UNCONFIRMED_PRODUCT_DIRECTION_MIN_AGE_DAYS} days`;
+    return {
+      reason: `unconfirmed_product_direction requires PR older than ${UNCONFIRMED_PRODUCT_DIRECTION_MIN_AGE_DAYS} days`,
+      ...(Number.isFinite(createdAtMs) && createdAtMs <= now
+        ? { closePolicyHoldVerified: true as const }
+        : {}),
+    };
   }
   const sourceUpdatedAtMs = Date.parse(reviewedUpdatedAt ?? "");
   const reviewedAtMs = Date.parse(reviewedAt ?? "");
@@ -211,7 +222,17 @@ export function unconfirmedProductDirectionAgeSkipReason(
     !Number.isFinite(reviewedAtMs) ||
     reviewedAtMs - sourceUpdatedAtMs <= UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS * DAY_MS
   ) {
-    return `unconfirmed_product_direction requires ${UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS} days without source activity before review`;
+    return {
+      reason: `unconfirmed_product_direction requires ${UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS} days without source activity before review`,
+      // Missing or contradictory dates are evidence gaps, not confirmed activity.
+      ...(Number.isFinite(sourceUpdatedAtMs) &&
+      Number.isFinite(reviewedAtMs) &&
+      createdAtMs <= sourceUpdatedAtMs &&
+      sourceUpdatedAtMs <= reviewedAtMs &&
+      reviewedAtMs <= now
+        ? { closePolicyHoldVerified: true as const }
+        : {}),
+    };
   }
   return null;
 }

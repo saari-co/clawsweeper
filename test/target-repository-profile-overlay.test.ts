@@ -10,10 +10,6 @@ import {
   TARGET_REPOSITORY_PROFILE_OVERLAY_ENV,
   targetRepositoryProfileOverlayPath,
 } from "../dist/target-repository-config.js";
-import {
-  __resetTargetRepoToolchainCache,
-  resolveTargetRepoToolchain,
-} from "../dist/repair/target-toolchain-config.js";
 
 const bundledPath = join(process.cwd(), "config", "target-repositories.json");
 
@@ -60,7 +56,6 @@ test("profile overlay extends runtime profiles and toolchains without changing b
         "--eval",
         `
           const { repositoryProfileFor } = await import("./dist/repository-profiles.js");
-          const { resolveTargetRepoToolchain } = await import("./dist/repair/target-toolchain-config.js");
           const { readInventoryConfig } = await import("./dist/repair/target-fanout.js");
           const fallback = repositoryProfileFor("Saari-Co/example");
           const explicit = repositoryProfileFor("saari-co/special");
@@ -70,12 +65,10 @@ test("profile overlay extends runtime profiles and toolchains without changing b
               targetRepo: fallback.targetRepo,
               promptNote: fallback.promptNote,
               applyCloseRules: fallback.applyCloseRules,
-              toolchain: resolveTargetRepoToolchain(fallback.targetRepo),
             },
             explicit: {
               targetRepo: explicit.targetRepo,
               packageManager: explicit.packageManager,
-              toolchain: resolveTargetRepoToolchain(explicit.targetRepo),
             },
             bundled: {
               targetRepo: bundled.targetRepo,
@@ -102,16 +95,10 @@ test("profile overlay extends runtime profiles and toolchains without changing b
       targetRepo: "saari-co/example",
       promptNote: "Review saari-co/example conservatively.",
       applyCloseRules: { issue: [], pull_request: [] },
-      toolchain: { packageManager: "pnpm", baseValidationCommands: [], changedGate: null },
     });
     assert.deepEqual(output.explicit, {
       targetRepo: "saari-co/special",
       packageManager: "npm",
-      toolchain: {
-        packageManager: "npm",
-        baseValidationCommands: ["npm test"],
-        changedGate: null,
-      },
     });
     assert.deepEqual(output.bundled, {
       targetRepo: "openclaw/openclaw",
@@ -185,23 +172,6 @@ test("profile overlay path must be absolute and its schema surface stays narrow"
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("repair toolchain lookup keeps its total-function fallback for an invalid overlay path", () => {
-  const previous = process.env[TARGET_REPOSITORY_PROFILE_OVERLAY_ENV];
-  process.env[TARGET_REPOSITORY_PROFILE_OVERLAY_ENV] = "relative/profiles.json";
-  __resetTargetRepoToolchainCache();
-  try {
-    assert.deepEqual(resolveTargetRepoToolchain("saari-co/example"), {
-      packageManager: "pnpm",
-      baseValidationCommands: [],
-      changedGate: null,
-    });
-  } finally {
-    if (previous === undefined) delete process.env[TARGET_REPOSITORY_PROFILE_OVERLAY_ENV];
-    else process.env[TARGET_REPOSITORY_PROFILE_OVERLAY_ENV] = previous;
-    __resetTargetRepoToolchainCache();
   }
 });
 

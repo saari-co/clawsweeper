@@ -10,8 +10,8 @@
       "pages": [
         "agent-owned-review.md",
         "commit-sweeper.md",
-        "live-proof.md",
         "review-cache.md",
+        "intake-triage.md",
         "pr-review-comments.md",
         "pr-proof-triage-dashboard.md",
         "author-pr-budget-close-policy.md",
@@ -31,9 +31,11 @@
         "github-egress-telemetry.md",
         "github-webhook-read-model.md",
         "operator-configuration.md",
+        "input-scan-diagnostics.md",
+        "coverage-credential-probe.md",
         "private-inference.md",
         "live-dashboard.md",
-        "openclaw-bay-demo.md",
+        "agent-performance-metrics.md",
         "openclaw-event-hooks.md",
         "state-storage.md",
         "action-ledger.md",
@@ -43,25 +45,27 @@
         "saari-exact-tuple-export.md",
         "triage-dashboard.md",
         "related-issue-discovery.md",
-        "spam-scanner.md",
-        "local-clawsweeper-skill.md"
-      ]
-    },
-    {
-      "name": "Repair",
-      "pages": [
-        "steerable-repair-automation.md",
-        "repair/README.md",
-        "repair/operations.md",
-        "repair/automatic-issue-prs.md",
-        "repair/auto-update-prs.md",
-        "repair/automerge-flow.md",
-        "repair/automerge-e2e.md",
-        "repair/internal-features.md"
+        "local-clawsweeper-skill.md",
+        "local-package.md"
       ]
     }
   ],
   "noncanonical": [
+    {
+      "path": "canonical-body-tiering.md",
+      "lifecycle": "proposed",
+      "banner": "This is an unapproved storage design. It grants no schema, deployment, migration, or deletion authority."
+    },
+    {
+      "path": "review-authority.md",
+      "lifecycle": "proposed",
+      "banner": "The role classifier is inert. This integration contract does not change current admission or command authority."
+    },
+    {
+      "path": "portable-review-receipt.md",
+      "lifecycle": "proposed",
+      "banner": "This candidate exports a local advisory summary; general attachment and hosted enforcement are not enabled."
+    },
     {
       "path": "queue-service-split-runbook.md",
       "lifecycle": "proposed",
@@ -71,11 +75,6 @@
       "path": "sqlite-change-policy-proposal.md",
       "lifecycle": "proposed",
       "banner": "This is an unapproved policy proposal; it grants no review, label, or merge authority."
-    },
-    {
-      "path": "repair/containment-validation-todo.md",
-      "lifecycle": "historical",
-      "banner": "This is historical decision evidence, not current operator guidance."
     },
     {
       "prefix": "proof/",

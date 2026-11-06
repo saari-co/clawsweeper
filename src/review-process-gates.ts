@@ -18,6 +18,15 @@ export function parseProcessGates(value: unknown): ProcessGate[] | undefined {
   return [...value] as ProcessGate[];
 }
 
+export function reportProcessGates(markdown: string): ProcessGate[] | undefined {
+  const front = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
+  if (front === undefined) return undefined;
+  const fields = front.split(/\r?\n/).filter((line) => line.startsWith("process_gates:"));
+  if (fields.length === 0) return undefined;
+  if (fields.length !== 1) throw new Error("duplicate process_gates frontmatter");
+  return parseProcessGates(JSON.parse(fields[0]!.slice("process_gates:".length).trim()));
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)

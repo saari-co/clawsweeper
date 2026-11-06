@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { processGateReport } from "./process-gate-report-helper.ts";
 import { reviewFinding } from "./helpers.ts";
-import { renderReviewCommentFromReport } from "../dist/clawsweeper.js";
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import { normalizeTenantFeed } from "../dashboard/unified-review-dashboard.ts";
 import {
   buildSaariReviewTelemetry,
@@ -83,29 +83,18 @@ function writeItemArtifact(
 
 - none
 `;
-  writeFileSync(
-    join(itemsDir, "44.md"),
-    `---
-number: 44
-repository: saari-co/x-api
-type: pull_request
-url: https://github.com/saari-co/x-api/pull/44
-reviewed_at: 2026-09-13T17:55:00Z
-main_sha: ${BASE}
-pull_head_sha: ${sha}
-review_status: complete
-decision: keep_open
-pr_rating_overall: ${rating}
-proof_path: proof/dgx-clawsweeper-sweep-saari-co-x-api-20260913T175500Z/PROOF.md
----
-
-# #44: sample
-
-<!-- clawsweeper-verdict:${verdict} item=44 sha=${sha} confidence=high -->
-
-${findings}
-`,
-  );
+  const report = processGateReport()
+    .replaceAll("example-org/example-private-suite", "saari-co/x-api")
+    .replaceAll("123", "44")
+    .replaceAll("c".repeat(40), sha)
+    .replace(/^pr_rating_overall: .*$/m, `pr_rating_overall: ${rating}`)
+    .replace(
+      /^reviewed_at: .*$/m,
+      "reviewed_at: 2026-09-13T17:55:00Z\nproof_path: proof/dgx-clawsweeper-sweep-saari-co-x-api-20260913T175500Z/PROOF.md",
+    )
+    .replace(/## Review Findings[\s\S]*?(?=\n## |\n*$)/, `${findings.trim()}\n`)
+    .concat(`\n<!-- clawsweeper-verdict:${verdict} item=44 sha=${sha} confidence=high -->\n`);
+  writeFileSync(join(itemsDir, "44.md"), report);
 }
 
 function publish(options: {

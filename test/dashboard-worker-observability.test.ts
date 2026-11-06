@@ -1,5 +1,3 @@
-import type { TestContext } from "node:test";
-
 import {
   assert,
   createHmac,
@@ -20,6 +18,27 @@ import {
   jsonResponse,
 } from "./dashboard-worker-harness.ts";
 import { publicHealthHistoryContract } from "../dashboard/worker.ts";
+
+test("StatusStore startup removes only retired Bay history keys", async () => {
+  const storage = new MemoryDurableStorage();
+  await storage.put("openclaw-bay:terminal-state:v1", { retired: true });
+  await storage.put("openclaw-bay:journey-state:v1", { retired: true });
+  await storage.put("snapshot", { current: true });
+  for (let restart = 0; restart < 2; restart++) {
+    let ready = Promise.resolve();
+    new StatusStore({
+      storage,
+      blockConcurrencyWhile: (callback: () => Promise<unknown>) => {
+        ready = callback().then(() => {});
+        return ready;
+      },
+    });
+    await ready;
+    assert.equal(await storage.get("openclaw-bay:terminal-state:v1"), undefined);
+    assert.equal(await storage.get("openclaw-bay:journey-state:v1"), undefined);
+    assert.deepEqual(await storage.get("snapshot"), { current: true });
+  }
+});
 
 test("public durable publication event endpoint returns bounded aggregate-only window data", async () => {
   const storage = new MemoryDurableStorage();
@@ -54,7 +73,7 @@ test("public durable publication event endpoint returns bounded aggregate-only w
     true,
   );
   assert.equal(JSON.stringify(body).includes("openclaw/openclaw#898"), false);
-  assert.equal(JSON.stringify(body).includes("workflow"), false);
+  assert.doesNotMatch(JSON.stringify(body), /"workflow(?:_run)?"\s*:/);
   const cached = await worker.fetch(
     new Request("https://clawsweeper.openclaw.ai/api/recent-durable-publication-events?window=6h"),
     { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue) },
@@ -112,10 +131,7 @@ test("public telemetry routes contain malformed and rejecting durable reads", as
     ["/api/review-coverage", 503, "review_coverage_unavailable"],
     ["/api/recent-durable-publication-events", 200, null],
   ] as const;
-  const storeRoutes = [
-    ["/api/apply-observability", "apply_observability_unavailable"],
-    ["/api/automerge-metrics", "automerge_metrics_unavailable"],
-  ] as const;
+  const storeRoutes = [["/api/apply-observability", "apply_observability_unavailable"]] as const;
   for (const behavior of ["malformed", "reject"] as const) {
     const rejecting = {
       async fetch() {
@@ -156,214 +172,6 @@ test("public telemetry routes contain malformed and rejecting durable reads", as
       assert.deepEqual(await response.json(), { error });
     }
   }
-});
-
-test("durable lifecycle Bay is a pure, bounded public-reference reducer snapshot", async () => {
-  const now = Date.now();
-  const storage = new MemoryDurableStorage();
-  const bootstrapLifecycle = new ExactReviewLifecycleProjectionStore(storage);
-  bootstrapLifecycle.ensureSchemaSync();
-  storage.sql.exec("DROP INDEX exact_review_lifecycle_projection_bay_repository_v2");
-  storage.sql.exec(
-    `CREATE INDEX exact_review_lifecycle_projection_bay_repository
-        ON exact_review_lifecycle_projection_v1 (
-          LOWER(SUBSTR(canonical_target_key, 1, INSTR(canonical_target_key, '#') - 1)),
-          updated_at DESC,
-          canonical_target_key,
-          fence_key,
-          revision
-        )`,
-  );
-  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
-  lifecycle.ensureSchemaSync();
-  const record = ({
-    number,
-    revision = 1,
-    terminal,
-    command = false,
-    repository = "openclaw/openclaw",
-  }: {
-    number: number;
-    revision?: number;
-    terminal?: "review_completed_routed" | "superseded" | "requeue" | "dead_letter";
-    command?: boolean;
-    repository?: string;
-  }) => {
-    const identity = {
-      canonicalTargetKey: `${repository}#${number}`,
-      fenceKey: `fence-secret-${number}`,
-      revision,
-    };
-    lifecycle.recordAdmission({
-      ...identity,
-      deliveryId: `delivery-secret-${number}-${revision}`,
-      sourceAction: "re_review",
-      commandOriginated: command,
-      statusMarker: command ? `status-secret-${number}-${revision}` : null,
-      statusCommentId: command ? number : null,
-      observedAt: now - 500 + revision,
-    });
-    if (terminal === "review_completed_routed") {
-      lifecycle.recordCanonicalReceipt({
-        ...identity,
-        outcome: "accepted",
-        receiptId: `receipt-secret-${number}-${revision}`,
-        observedAt: now - 400 + revision,
-      });
-      lifecycle.recordRouterReceipt({
-        ...identity,
-        outcome: "durable",
-        receiptId: `router-secret-${number}-${revision}`,
-        observedAt: now - 300 + revision,
-      });
-    }
-    if (terminal) {
-      lifecycle.recordTerminalDisposition({
-        ...identity,
-        kind: terminal,
-        observedAt: now - 200 + revision,
-      });
-    }
-  };
-
-  // A re-review produces a new revision in its own lane; the first revision
-  // remains visible as superseded rather than moving backwards.
-  record({ number: 910, revision: 1, terminal: "superseded" });
-  record({ number: 910, revision: 2 });
-  record({ number: 911, terminal: "review_completed_routed", command: true });
-  record({ number: 912, terminal: "review_completed_routed" });
-  record({ number: 913, terminal: "requeue" });
-  record({ number: 914, terminal: "dead_letter" });
-  record({ number: 915, repository: "private-owner/private-repo" });
-  record({ number: 916, repository: "openclaw/clawsweeper" });
-
-  let initialized = 0;
-  const queue = new ExactReviewQueue(
-    {
-      storage,
-      blockConcurrencyWhile: async (callback: () => Promise<void>) => {
-        initialized += 1;
-        return callback();
-      },
-    },
-    {},
-  );
-  const exec = storage.sql.exec.bind(storage.sql);
-  const queries: string[] = [];
-  const queryBindings: unknown[][] = [];
-  storage.sql.exec = (query: string, ...bindings: unknown[]) => {
-    assert.match(query, /^\s*SELECT\b/i, "Bay route must be read-only");
-    if (query === "SELECT total_changes() AS changes") return exec(query, ...bindings);
-    queries.push(query);
-    queryBindings.push(bindings);
-    assert.match(query, /FROM exact_review_lifecycle_projection_v1/);
-    assert.match(query, /WHERE LOWER\(SUBSTR\(canonical_target_key/);
-    return exec(query, ...bindings);
-  };
-
-  const response = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
-      PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
-    },
-  );
-  const body = (await response.json()) as {
-    durable_lifecycle_bay: {
-      collection: { state: string };
-      inventory: { lifecycle_records: number } | null;
-      lanes: Record<string, number> | null;
-      sample: {
-        limit: number;
-        returned: number;
-        omitted: number;
-        cards: Array<Record<string, unknown>>;
-      } | null;
-    };
-  };
-  const snapshot = body.durable_lifecycle_bay;
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.equal(initialized, 1, "constructor must provision only the Bay read schema");
-  assert.equal(storage.sql.hasNormalizedQueue(), false);
-  assert.equal(queries.length, 4, "one count and one projection scan per public repository");
-  for (const [index, query] of queries.entries()) {
-    if (!/^\s*SELECT projection_json/.test(query)) continue;
-    const plan = Array.from(exec(`EXPLAIN QUERY PLAN ${query}`, ...queryBindings[index]!));
-    assert.ok(
-      plan.some((row) =>
-        String(row.detail || "").includes(
-          "exact_review_lifecycle_projection_bay_repository_journey",
-        ),
-      ),
-      "the actual reader must seek through its repository-leading journey index",
-    );
-    assert.equal(
-      plan.some((row) =>
-        /SCAN exact_review_lifecycle_projection_v1|USE TEMP B-TREE/i.test(String(row.detail || "")),
-      ),
-      false,
-      "the actual projection scan must avoid unrelated rows and unbounded sorting",
-    );
-  }
-  assert.deepEqual(queryBindings.slice(0, 4), [
-    ["openclaw/clawsweeper"],
-    ["openclaw/clawsweeper"],
-    ["openclaw/openclaw"],
-    ["openclaw/openclaw"],
-  ]);
-  assert.equal(snapshot.collection.state, "complete");
-  assert.equal(snapshot.inventory?.lifecycle_records, 7);
-  assert.deepEqual(snapshot.lanes, {
-    pending: 2,
-    acknowledgement_pending: 1,
-    completed: 1,
-    superseded: 1,
-    requeued: 1,
-    terminal_attention: 1,
-  });
-  assert.equal(snapshot.sample?.limit, 24);
-  assert.equal(snapshot.sample?.returned, 7);
-  assert.equal(snapshot.sample?.omitted, 0);
-  assert.equal(snapshot.sample?.cards.length, 7);
-  assert.deepEqual(
-    snapshot
-      .sample!.cards.filter((card) => card.item_number === 910)
-      .map((card) => [card.state, card.current_revision])
-      .sort(),
-    [
-      ["pending", true],
-      ["superseded", false],
-    ],
-  );
-  for (const card of snapshot.sample?.cards || []) {
-    assert.deepEqual(Object.keys(card).sort(), [
-      "current_revision",
-      "inline_proof",
-      "item_number",
-      "lane",
-      "repository",
-      "state",
-      "updated_at",
-    ]);
-    assert.ok(
-      card.repository === "openclaw/openclaw" || card.repository === "openclaw/clawsweeper",
-    );
-  }
-  const publicText = JSON.stringify(body);
-  for (const secret of [
-    "fence-secret",
-    "delivery-secret",
-    "status-secret",
-    "receipt-secret",
-    "router-secret",
-    "private-owner",
-  ]) {
-    assert.doesNotMatch(publicText, new RegExp(secret));
-  }
-  assert.match(publicText, /openclaw\/openclaw/i);
-  assert.doesNotMatch(publicText, /\/issues\/|https?:\/\//i);
-  assert.doesNotMatch(publicText, /claimGeneration|commentId|digest|cursor/i);
 });
 
 test("operator lifecycle audit inventory is signed, redacted, paginated, snapshot-stable, and short-lived", async () => {
@@ -545,828 +353,6 @@ test("operator lifecycle audit inventory is signed, redacted, paginated, snapsho
     state: "unknown",
     reason: "stale",
   });
-});
-
-test("operator telemetry reconciliation is signed and returns aggregate-only scope results", async () => {
-  const storage = new MemoryDurableStorage();
-  const queue = new ExactReviewQueue(
-    {
-      storage,
-      blockConcurrencyWhile: async (callback: () => Promise<void>) => callback(),
-    },
-    { PUBLIC_BAY_REPOS: "openclaw/openclaw" },
-  );
-  const env = {
-    EXACT_REVIEW_OPERATOR_SECRET: "operator-secret",
-    PUBLIC_BAY_REPOS: "openclaw/openclaw",
-    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
-  };
-  const endpoint = "https://clawsweeper.openclaw.ai/internal/exact-review/telemetry-reconciliation";
-  const unsigned = await worker.fetch(new Request(endpoint, { method: "POST", body: "{}" }), env);
-  assert.equal(unsigned.status, 401);
-  const body = "{}";
-  const response = await worker.fetch(
-    new Request(endpoint, {
-      method: "POST",
-      headers: {
-        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", "operator-secret")
-          .update(body)
-          .digest("hex")}`,
-      },
-      body,
-    }),
-    env,
-  );
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  const reconciliation = payload.exact_review_telemetry_reconciliation;
-  assert.deepEqual(reconciliation.collection, { state: "complete" });
-  assert.deepEqual(reconciliation.scope, { repository_count: 1 });
-  assert.equal(reconciliation.comparison.event_sets_match, true);
-  assert.equal(reconciliation.comparison.canonical_events, 0);
-  assert.equal(JSON.stringify(payload).includes("openclaw/openclaw"), false);
-  assert.equal(JSON.stringify(payload).includes("records"), false);
-});
-
-test("durable lifecycle Bay provisions only its indexed reader before ordinary queue initialization", async () => {
-  const storage = new MemoryDurableStorage();
-  let initialized = 0;
-  const queue = new ExactReviewQueue(
-    {
-      storage,
-      blockConcurrencyWhile: async (callback: () => Promise<void>) => {
-        initialized += 1;
-        return callback();
-      },
-    },
-    {},
-  );
-
-  const pure = await queue.fetch(
-    new Request("https://clawsweeper-exact-review-queue/lifecycle-bay"),
-  );
-  const pureBody = (await pure.json()) as {
-    durable_lifecycle_bay: {
-      collection: { state: string };
-      inventory: { lifecycle_records: number };
-      lanes: Record<string, number>;
-      sample: { returned: number; cards: unknown[] };
-    };
-  };
-  assert.equal(pure.status, 200);
-  assert.deepEqual(pureBody.durable_lifecycle_bay.collection, { state: "complete" });
-  assert.equal(pureBody.durable_lifecycle_bay.inventory.lifecycle_records, 0);
-  assert.deepEqual(Object.values(pureBody.durable_lifecycle_bay.lanes), [0, 0, 0, 0, 0, 0]);
-  assert.equal(pureBody.durable_lifecycle_bay.sample.returned, 0);
-  assert.deepEqual(pureBody.durable_lifecycle_bay.sample.cards, []);
-  assert.equal(initialized, 1, "the constructor must provision the Bay read schema and indexes");
-  assert.equal(storage.sql.hasNormalizedQueue(), false);
-
-  const ordinary = await queue.fetch(
-    new Request(
-      "https://clawsweeper-exact-review-queue/recent-durable-publication-events?window=24h",
-    ),
-  );
-  const ordinaryBody = (await ordinary.json()) as {
-    recent_durable_publication_events: { collection: { state: string; complete: boolean } };
-  };
-  assert.equal(ordinary.status, 200);
-  assert.equal(initialized, 2, "ordinary queue GET must still run full initialization normally");
-  assert.equal(storage.sql.hasNormalizedQueue(), true);
-  assert.equal(ordinaryBody.recent_durable_publication_events.collection.state, "complete");
-  assert.equal(ordinaryBody.recent_durable_publication_events.collection.complete, true);
-});
-
-test("durable lifecycle Bay caches public responses by origin and repository scope for 30 seconds", async (t) => {
-  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-02T12:00:00Z") });
-  const originalCaches = globalThis.caches;
-  const values = new MemoryCache();
-  const expires = new Map<string, number>();
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        async match(request: Request) {
-          if ((expires.get(request.url) || 0) <= Date.now()) return undefined;
-          return values.match(request);
-        },
-        async put(request: Request, response: Response) {
-          const ttl = request.url.endsWith("/stale") ? 60_000 : 30_000;
-          expires.set(request.url, Date.now() + ttl);
-          await values.put(request, response);
-        },
-      },
-    },
-  });
-  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
-  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
-  let reads = 0;
-  let unavailable = false;
-  const namespace = new MemoryDurableNamespace({
-    async fetch(request: Request) {
-      reads += 1;
-      if (unavailable) return new Response(null, { status: 503 });
-      return queue.fetch(request);
-    },
-  });
-  const env = { EXACT_REVIEW_QUEUE: namespace, PUBLIC_BAY_REPOS: "openclaw/openclaw" };
-  const url = "https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay";
-  const first = await worker.fetch(new Request(url), env);
-  const initialBody = await first.json();
-  assert.equal(first.headers.get("cache-control"), "no-store");
-  assert.equal(initialBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.equal(reads, 1);
-  t.mock.timers.tick(29_000);
-  const second = await worker.fetch(new Request(`${url}?ignored=cache-bypass`), env);
-  assert.deepEqual(
-    await second.json(),
-    initialBody,
-    "cache hits keep the original observation time",
-  );
-  assert.equal(second.headers.get("cache-control"), "no-store");
-  assert.equal(reads, 1);
-
-  await worker.fetch(new Request(url), {
-    ...env,
-    PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
-  });
-  assert.equal(reads, 2, "a different public scope needs its own snapshot");
-  await worker.fetch(new Request(url), {
-    ...env,
-    PUBLIC_BAY_REPOS: "openclaw/clawsweeper,openclaw/openclaw",
-  });
-  assert.equal(reads, 2, "repository order does not split the cache");
-  await worker.fetch(new Request("https://other.example/api/durable-lifecycle-bay"), env);
-  assert.equal(reads, 3, "origins do not share cache entries");
-
-  t.mock.timers.tick(1_001);
-  unavailable = true;
-  const expired = await worker.fetch(new Request(url), env);
-  const unknown = await expired.json();
-  assert.deepEqual(unknown.durable_lifecycle_bay.collection, {
-    state: "unknown",
-    reason: "unavailable",
-  });
-  assert.equal(reads, 4, "expiry must read the current owner, not serve old success");
-  const cachedUnknown = await worker.fetch(new Request(url), env);
-  assert.deepEqual(await cachedUnknown.json(), unknown);
-  assert.equal(reads, 4, "unknown responses also suppress repeated reads briefly");
-});
-
-test("durable lifecycle Bay rejects malformed or stale cached timestamps and caps remaining freshness", async (t) => {
-  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-02T12:00:00Z") });
-  const originalCaches = globalThis.caches;
-  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
-  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
-  const live = await queue.fetch(new Request("https://queue/lifecycle-bay"));
-  const source = await live.json();
-  source.durable_lifecycle_bay.generated_at = new Date(Date.now() - 55_000).toISOString();
-  let reads = 0;
-  let writes = 0;
-  const namespace = new MemoryDurableNamespace({
-    async fetch() {
-      reads += 1;
-      return jsonResponse(source);
-    },
-  });
-  for (const body of [
-    "{not-json",
-    JSON.stringify({ durable_lifecycle_bay: {} }),
-    JSON.stringify({
-      durable_lifecycle_bay: { ...source.durable_lifecycle_bay, generated_at: "invalid" },
-    }),
-    JSON.stringify({
-      durable_lifecycle_bay: {
-        ...source.durable_lifecycle_bay,
-        generated_at: new Date(Date.now() - 60_001).toISOString(),
-      },
-    }),
-  ]) {
-    Object.defineProperty(globalThis, "caches", {
-      configurable: true,
-      value: {
-        default: {
-          match: async () => new Response(body),
-          put: async (_request: Request, response: Response) => {
-            writes += 1;
-            assert.equal(response.headers.get("cache-control"), "public, max-age=5");
-          },
-        },
-      },
-    });
-    const response = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-      {
-        EXACT_REVIEW_QUEUE: namespace,
-        PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      },
-    );
-    const result = await response.json();
-    assert.equal(result.durable_lifecycle_bay.collection.state, "complete");
-    assert.equal(
-      result.durable_lifecycle_bay.generated_at,
-      source.durable_lifecycle_bay.generated_at,
-    );
-    assert.equal(response.headers.get("cache-control"), "no-store");
-  }
-  assert.equal(reads, 4);
-  assert.equal(writes, 8);
-});
-
-test("durable lifecycle Bay serves fresh snapshots when native cache reads or writes fail", async (t) => {
-  const originalCaches = globalThis.caches;
-  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
-  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
-  let reads = 0;
-  let writes = 0;
-  const namespace = new MemoryDurableNamespace({
-    async fetch(request: Request) {
-      reads += 1;
-      return queue.fetch(request);
-    },
-  });
-  for (const failMatch of [false, true]) {
-    Object.defineProperty(globalThis, "caches", {
-      configurable: true,
-      value: {
-        default: {
-          async match() {
-            if (failMatch) throw new Error("synthetic cache read failure");
-            return undefined;
-          },
-          async put() {
-            writes += 1;
-            throw new Error("synthetic cache write failure");
-          },
-        },
-      },
-    });
-    const response = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-      {
-        EXACT_REVIEW_QUEUE: namespace,
-        PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      },
-    );
-    assert.equal((await response.json()).durable_lifecycle_bay.collection.state, "complete");
-    assert.equal(response.headers.get("cache-control"), "no-store");
-  }
-  assert.equal(reads, 2);
-  assert.equal(writes, 4);
-});
-
-test("durable lifecycle Bay fail-closes unknown snapshots without partial cards or counts", async () => {
-  const assertUnknown = (snapshot: Record<string, unknown>, reason: string) => {
-    assert.deepEqual(snapshot.collection, { state: "unknown", reason });
-    assert.equal(snapshot.inventory, null);
-    assert.equal(snapshot.lanes, null);
-    assert.equal(snapshot.sample, null);
-  };
-  const unavailable = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {},
-  );
-  const unavailableBody = (await unavailable.json()) as {
-    durable_lifecycle_bay: Record<string, unknown>;
-  };
-  assert.equal(unavailable.status, 200);
-  assertUnknown(unavailableBody.durable_lifecycle_bay, "unavailable");
-
-  const staleQueue = {
-    fetch: async () =>
-      new Response(
-        JSON.stringify({
-          durable_lifecycle_bay: {
-            version: 1,
-            source: "exact-review-lifecycle-projection-v1",
-            generated_at: new Date(Date.now() - 60_001).toISOString(),
-            freshness: { maximum_age_ms: 60_000 },
-            collection: { state: "complete" },
-            inventory: { lifecycle_records: 0, target_revisions: 0, unique_targets: 0 },
-            lanes: {
-              pending: 0,
-              acknowledgement_pending: 0,
-              completed: 0,
-              superseded: 0,
-              requeued: 0,
-              terminal_attention: 0,
-            },
-            sample: { limit: 24, returned: 0, omitted: 0, cards: [] },
-          },
-        }),
-      ),
-  };
-  const stale = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(staleQueue) },
-  );
-  const staleBody = (await stale.json()) as { durable_lifecycle_bay: Record<string, unknown> };
-  assertUnknown(staleBody.durable_lifecycle_bay, "stale");
-
-  for (const generatedAt of [
-    1_723_700_000_000,
-    "Sat, 15 Aug 2026 12:00:00 GMT",
-    "https://invalid.example/private?timestamp=1",
-  ]) {
-    const invalidTimestampQueue = {
-      fetch: async () =>
-        jsonResponse({
-          durable_lifecycle_bay: {
-            version: 1,
-            source: "exact-review-lifecycle-projection-v1",
-            generated_at: generatedAt,
-            freshness: { maximum_age_ms: 60_000 },
-            collection: { state: "complete" },
-            inventory: { lifecycle_records: 0, target_revisions: 0, unique_targets: 0 },
-            lanes: {
-              pending: 0,
-              acknowledgement_pending: 0,
-              completed: 0,
-              superseded: 0,
-              requeued: 0,
-              terminal_attention: 0,
-            },
-            sample: { limit: 24, returned: 0, omitted: 0, cards: [] },
-          },
-        }),
-    };
-    const invalidTimestamp = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-      { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(invalidTimestampQueue) },
-    );
-    const invalidTimestampBody = (await invalidTimestamp.json()) as {
-      durable_lifecycle_bay: Record<string, unknown>;
-    };
-    assertUnknown(invalidTimestampBody.durable_lifecycle_bay, "malformed");
-  }
-
-  const formerlyCappedQueue = {
-    fetch: async () =>
-      jsonResponse({
-        durable_lifecycle_bay: {
-          version: 1,
-          source: "exact-review-lifecycle-projection-v1",
-          generated_at: new Date().toISOString(),
-          freshness: { maximum_age_ms: 60_000 },
-          collection: { state: "complete" },
-          inventory: {
-            lifecycle_records: 1_000_001,
-            target_revisions: 1_000_001,
-            unique_targets: 1_000_001,
-          },
-          lanes: {
-            pending: 1_000_001,
-            acknowledgement_pending: 0,
-            completed: 0,
-            superseded: 0,
-            requeued: 0,
-            terminal_attention: 0,
-          },
-          sample: { limit: 24, returned: 0, omitted: 1_000_001, cards: [] },
-        },
-      }),
-  };
-  const formerlyCapped = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(formerlyCappedQueue) },
-  );
-  const formerlyCappedBody = (await formerlyCapped.json()) as {
-    durable_lifecycle_bay: {
-      collection: { state: string };
-      inventory: { lifecycle_records: number };
-      lanes: { pending: number };
-    };
-  };
-  assert.equal(formerlyCappedBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.equal(formerlyCappedBody.durable_lifecycle_bay.inventory.lifecycle_records, 1_000_001);
-  assert.equal(formerlyCappedBody.durable_lifecycle_bay.lanes.pending, 1_000_001);
-
-  for (const inventory of [
-    {
-      lifecycle_records: Number.MAX_SAFE_INTEGER + 1,
-      target_revisions: Number.MAX_SAFE_INTEGER + 1,
-      unique_targets: Number.MAX_SAFE_INTEGER + 1,
-    },
-    { lifecycle_records: 1, target_revisions: 2, unique_targets: 3 },
-  ]) {
-    const lifecycleRecords = Number(inventory.lifecycle_records);
-    const invalidQueue = {
-      fetch: async () =>
-        jsonResponse({
-          durable_lifecycle_bay: {
-            version: 1,
-            source: "exact-review-lifecycle-projection-v1",
-            generated_at: new Date().toISOString(),
-            freshness: { maximum_age_ms: 60_000 },
-            collection: { state: "complete" },
-            inventory,
-            lanes: {
-              pending: lifecycleRecords,
-              acknowledgement_pending: 0,
-              completed: 0,
-              superseded: 0,
-              requeued: 0,
-              terminal_attention: 0,
-            },
-            sample: { limit: 24, returned: 0, omitted: lifecycleRecords, cards: [] },
-          },
-        }),
-    };
-    const invalid = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-      { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(invalidQueue) },
-    );
-    const invalidBody = (await invalid.json()) as {
-      durable_lifecycle_bay: Record<string, unknown>;
-    };
-    assertUnknown(invalidBody.durable_lifecycle_bay, "malformed");
-  }
-
-  const storage = new MemoryDurableStorage();
-  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
-  lifecycle.ensureSchemaSync();
-  storage.sql.exec(
-    "INSERT INTO exact_review_lifecycle_projection_v1 (canonical_target_key, revision, fence_key, projection_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-    "openclaw/openclaw#950",
-    1,
-    "malformed-fence",
-    "{not-json",
-    Date.now(),
-  );
-  const malformed = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(new ExactReviewQueue({ storage }, {})),
-    },
-  );
-  const malformedBody = (await malformed.json()) as {
-    durable_lifecycle_bay: Record<string, unknown>;
-  };
-  assertUnknown(malformedBody.durable_lifecycle_bay, "malformed");
-
-  const nestedMalformedStorage = new MemoryDurableStorage();
-  const nestedMalformedLifecycle = new ExactReviewLifecycleProjectionStore(nestedMalformedStorage);
-  nestedMalformedLifecycle.ensureSchemaSync();
-  nestedMalformedStorage.sql.exec(
-    "INSERT INTO exact_review_lifecycle_projection_v1 (canonical_target_key, revision, fence_key, projection_json, updated_at) VALUES (?, ?, ?, ?, ?)",
-    "openclaw/openclaw#951",
-    1,
-    "nested-malformed-fence",
-    JSON.stringify({
-      version: 1,
-      canonicalTargetKey: "openclaw/openclaw#951",
-      fenceKey: "nested-malformed-fence",
-      revision: 1,
-      updatedAt: Date.now(),
-      admission: null,
-    }),
-    Date.now(),
-  );
-  const nestedMalformed = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: nestedMalformedStorage }, {}),
-      ),
-    },
-  );
-  const nestedMalformedBody = (await nestedMalformed.json()) as {
-    durable_lifecycle_bay: Record<string, unknown>;
-  };
-  assertUnknown(nestedMalformedBody.durable_lifecycle_bay, "mixed");
-
-  const missingGithubEffectStorage = new MemoryDurableStorage();
-  const missingGithubEffectLifecycle = new ExactReviewLifecycleProjectionStore(
-    missingGithubEffectStorage,
-  );
-  missingGithubEffectLifecycle.ensureSchemaSync();
-  missingGithubEffectLifecycle.recordAdmission({
-    canonicalTargetKey: "openclaw/openclaw#952",
-    fenceKey: "missing-github-effect-fence",
-    revision: 1,
-    deliveryId: "missing-github-effect-delivery",
-    sourceAction: "re_review",
-    commandOriginated: false,
-    statusMarker: null,
-    statusCommentId: null,
-    observedAt: Date.now(),
-  });
-  const missingGithubEffect = missingGithubEffectLifecycle.read(
-    "openclaw/openclaw#952",
-    "missing-github-effect-fence",
-    1,
-  );
-  assert.ok(missingGithubEffect);
-  const missingGithubEffectJson = { ...missingGithubEffect } as Record<string, unknown>;
-  delete missingGithubEffectJson.githubEffect;
-  missingGithubEffectStorage.sql.exec(
-    "UPDATE exact_review_lifecycle_projection_v1 SET projection_json = ? WHERE canonical_target_key = ? AND revision = ? AND fence_key = ?",
-    JSON.stringify(missingGithubEffectJson),
-    "openclaw/openclaw#952",
-    1,
-    "missing-github-effect-fence",
-  );
-  const missingGithubEffectResponse = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: missingGithubEffectStorage }, {}),
-      ),
-    },
-  );
-  const missingGithubEffectBody = (await missingGithubEffectResponse.json()) as {
-    durable_lifecycle_bay: Record<string, unknown>;
-  };
-  assertUnknown(missingGithubEffectBody.durable_lifecycle_bay, "mixed");
-
-  const scopedStorage = new MemoryDurableStorage();
-  const scopedLifecycle = new ExactReviewLifecycleProjectionStore(scopedStorage);
-  scopedLifecycle.ensureSchemaSync();
-  for (let index = 1; index <= 33; index += 1) {
-    scopedLifecycle.recordAdmission({
-      canonicalTargetKey: `openclaw/openclaw#${10_000 + index}`,
-      fenceKey: `cap-fence-${index}`,
-      revision: 1,
-      deliveryId: `cap-delivery-${index}`,
-      sourceAction: "re_review",
-      commandOriginated: false,
-      statusMarker: null,
-      statusCommentId: null,
-      observedAt: Date.now() - index,
-    });
-  }
-  scopedLifecycle.recordAdmission({
-    canonicalTargetKey: "openclaw/clawsweeper#990",
-    fenceKey: "allowlisted-fence",
-    revision: 1,
-    deliveryId: "allowlisted-delivery",
-    sourceAction: "re_review",
-    commandOriginated: false,
-    statusMarker: null,
-    statusCommentId: null,
-    observedAt: Date.now(),
-  });
-  const allowlisted = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      PUBLIC_BAY_REPOS: "openclaw/clawsweeper",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: scopedStorage }, {}),
-      ),
-    },
-  );
-  const allowlistedBody = (await allowlisted.json()) as {
-    durable_lifecycle_bay: {
-      collection: { state: string };
-      inventory: { lifecycle_records: number; target_revisions: number; unique_targets: number };
-      sample: { returned: number; omitted: number; cards: Array<Record<string, unknown>> };
-    };
-  };
-  assert.deepEqual(allowlistedBody.durable_lifecycle_bay.collection, { state: "complete" });
-  assert.deepEqual(allowlistedBody.durable_lifecycle_bay.inventory, {
-    lifecycle_records: 1,
-    target_revisions: 1,
-    unique_targets: 1,
-  });
-  assert.equal(allowlistedBody.durable_lifecycle_bay.sample.returned, 1);
-  assert.equal(allowlistedBody.durable_lifecycle_bay.sample.omitted, 0);
-  assert.deepEqual(allowlistedBody.durable_lifecycle_bay.sample.cards[0], {
-    repository: "openclaw/clawsweeper",
-    item_number: 990,
-    lane: "pending",
-    state: "pending",
-    current_revision: true,
-    inline_proof: "unknown",
-    updated_at: allowlistedBody.durable_lifecycle_bay.sample.cards[0]?.updated_at,
-  });
-  const sampled = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
-    {
-      PUBLIC_BAY_REPOS: "openclaw/openclaw",
-      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: scopedStorage }, {}),
-      ),
-    },
-  );
-  const sampledBody = (await sampled.json()) as {
-    durable_lifecycle_bay: {
-      collection: { state: string };
-      inventory: { lifecycle_records: number };
-      sample: { returned: number; omitted: number };
-    };
-  };
-  assert.equal(sampledBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.equal(sampledBody.durable_lifecycle_bay.inventory.lifecycle_records, 33);
-  assert.equal(sampledBody.durable_lifecycle_bay.sample.returned, 24);
-  assert.equal(sampledBody.durable_lifecycle_bay.sample.omitted, 9);
-});
-
-test("automerge metric ingestion validates before writes and requires durable storage", async () => {
-  const statusStore = new MemoryKv();
-  const token = ["test", "token"].join("-");
-  const env = { INGEST_TOKEN: token, STATUS_STORE: statusStore };
-  const request = (body: Record<string, unknown>) =>
-    worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/events", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          event_type: "clawsweeper.automerge_metric",
-          repository: "openclaw/openclaw",
-          item_number: 42,
-          phase: "activated",
-          occurred_at: "2026-07-17T10:00:00Z",
-          ...body,
-        }),
-      }),
-      env,
-    );
-
-  assert.equal((await request({})).status, 400);
-  assert.equal(await statusStore.get("events"), null);
-  assert.equal(await statusStore.get("latest-event"), null);
-
-  assert.equal(
-    (
-      await request({
-        event_id: "activation-42",
-        session_id: "openclaw/openclaw#42:100:2026-07-17T10:00:00Z",
-      })
-    ).status,
-    503,
-  );
-  assert.equal(await statusStore.get("events"), null);
-  assert.equal(await statusStore.get("latest-event"), null);
-});
-
-test("automerge metric events use isolated durable keys and aggregate through the API", async () => {
-  const storage = new MemoryDurableStorage();
-  const store = new StatusStore({ storage });
-  const namespace = new MemoryDurableNamespace({
-    fetch: (request: Request, init?: RequestInit) =>
-      store.fetch(init ? new Request(request, init) : request),
-  });
-  const token = ["test", "token"].join("-");
-  const env = { INGEST_TOKEN: token, STATUS_STORE: namespace };
-  const occurredAt = new Date().toISOString();
-  for (const eventId of ["terminal-1", "terminal-2"]) {
-    const response = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/events", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          event_type: "clawsweeper.automerge_metric",
-          event_id: eventId,
-          session_id: `openclaw/openclaw#42:${eventId}:${occurredAt}`,
-          repository: "openclaw/openclaw",
-          item_number: 42,
-          phase: "terminal",
-          outcome: "merged",
-          occurred_at: occurredAt,
-        }),
-      }),
-      env,
-    );
-    assert.equal(response.status, 200);
-  }
-  const duplicate = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/api/events", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        event_type: "clawsweeper.automerge_metric",
-        event_id: "terminal-1",
-        session_id: `openclaw/openclaw#42:terminal-1:${occurredAt}`,
-        repository: "openclaw/openclaw",
-        item_number: 42,
-        phase: "terminal",
-        outcome: "maintainer_stopped",
-        occurred_at: new Date(Date.now() + 60_000).toISOString(),
-      }),
-    }),
-    env,
-  );
-  assert.equal(duplicate.status, 200);
-
-  assert.equal(storage.rawHas("automerge-product-metrics:v1"), false);
-  assert.equal(storage.rawHas("automerge-product-metrics:v1:id:terminal-1"), true);
-  assert.equal(storage.rawHas("automerge-product-metrics:v1:id:terminal-2"), true);
-  const metrics = await (
-    await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/automerge-metrics?range=6h"),
-      env,
-    )
-  ).json();
-  assert.equal(metrics.summary.terminal_sessions, 2);
-  assert.equal(metrics.summary.merged_sessions, 2);
-});
-
-test("automerge metrics retain bounded pre-window context for spanning sessions", async () => {
-  const storage = new MemoryDurableStorage();
-  const store = new StatusStore({ storage });
-  const namespace = new MemoryDurableNamespace(store);
-  const now = Date.now();
-  const prefix = "automerge-product-metrics:v1:time:";
-  const spanningActivationAt = new Date(now - 7 * 60 * 60_000).toISOString();
-  const spanningRepairAt = new Date(now - 5 * 60 * 60_000).toISOString();
-  const spanningTerminalAt = new Date(now - 60 * 60_000).toISOString();
-  const preWindowActivationAt = new Date(now - 9 * 60 * 60_000).toISOString();
-  const preWindowTerminalAt = new Date(now - 7 * 60 * 60_000).toISOString();
-  const outsideContextAt = new Date(now - 9 * 24 * 60 * 60_000).toISOString();
-  const outsideContextKey = `${prefix}${outsideContextAt}:outside-context`;
-  storage.rawPut(outsideContextKey, {
-    value: "{not-json",
-    expires_at: now + 60_000,
-  });
-  const rows = [
-    {
-      event_id: "spanning-activation",
-      session_id: "openclaw/openclaw#42:spanning",
-      repository: "openclaw/openclaw",
-      item_number: 42,
-      policy_version: "immediate-v1",
-      phase: "activated",
-      occurred_at: spanningActivationAt,
-    },
-    {
-      event_id: "spanning-repair",
-      session_id: "openclaw/openclaw#42:spanning",
-      repository: "openclaw/openclaw",
-      item_number: 42,
-      policy_version: "immediate-v1",
-      phase: "repair_completed",
-      base_sync: true,
-      occurred_at: spanningRepairAt,
-    },
-    {
-      event_id: "spanning-terminal",
-      session_id: "openclaw/openclaw#42:spanning",
-      repository: "openclaw/openclaw",
-      item_number: 42,
-      policy_version: "immediate-v1",
-      phase: "terminal",
-      outcome: "merged",
-      occurred_at: spanningTerminalAt,
-    },
-    {
-      event_id: "pre-window-activation",
-      session_id: "openclaw/openclaw#43:pre-window",
-      repository: "openclaw/openclaw",
-      item_number: 43,
-      policy_version: "immediate-v1",
-      phase: "activated",
-      occurred_at: preWindowActivationAt,
-    },
-    {
-      event_id: "pre-window-terminal",
-      session_id: "openclaw/openclaw#43:pre-window",
-      repository: "openclaw/openclaw",
-      item_number: 43,
-      policy_version: "immediate-v1",
-      phase: "terminal",
-      outcome: "merged",
-      occurred_at: preWindowTerminalAt,
-    },
-  ];
-  const rowKeys = rows.map((event) => `${prefix}${event.occurred_at}:${event.event_id}`);
-  for (const [index, event] of rows.entries()) {
-    storage.rawPut(rowKeys[index]!, {
-      value: JSON.stringify(event),
-      expires_at: now + 60_000,
-    });
-  }
-
-  const publicQueryMarker = ["synthetic", "automerge", "filter"].join("_");
-  const response = await worker.fetch(
-    new Request(
-      `https://clawsweeper.openclaw.ai/api/automerge-metrics?range=6h&repo=${publicQueryMarker}&policy_version=${publicQueryMarker}&session_id=${publicQueryMarker}&active_only=true&session_limit=1`,
-    ),
-    { STATUS_STORE: namespace },
-  );
-  const metrics = await response.json();
-  assert.equal(response.status, 200);
-  assert.equal(metrics.summary.terminal_sessions, 1);
-  assert.equal(metrics.summary.merged_sessions, 1);
-  assert.equal(metrics.summary.command_to_merge_p50_ms, 6 * 60 * 60_000);
-  assert.equal(metrics.summary.base_sync_p50, 1);
-  assert.equal(metrics.repair_efficiency.one_base_sync, 1);
-  assert.equal(Object.hasOwn(metrics, "sessions"), false);
-  assert.equal(Object.hasOwn(metrics, "filters"), false);
-  assert.equal(JSON.stringify(metrics).includes(publicQueryMarker), false);
-  assert.deepEqual(storage.listedKeys(prefix), [...rowKeys].sort());
-  assert.equal(storage.listedKeys(prefix).includes(outsideContextKey), false);
 });
 
 test("apply observability accepts signed durable events and exposes the API summary", async () => {
@@ -1648,64 +634,6 @@ test("dashboard durable status store persists, expires, and prepends events", as
     [{ id: "second" }, { id: "first" }],
   );
 
-  const bayStoreUrl = `https://clawsweeper-status-store/${encodeURIComponent(
-    "openclaw-bay:terminal-state:v1",
-  )}`;
-  for (const number of [501, 502]) {
-    const response = await store.fetch(
-      new Request(bayStoreUrl, {
-        method: "POST",
-        body: JSON.stringify({
-          attempts: [
-            {
-              run_id: number,
-              job_id: number,
-              repository: "openclaw/openclaw",
-              item_numbers: [number],
-              outcome: "success",
-              terminal_outcome: "success",
-              completed_at: `2026-07-11T12:00:${String(number - 500).padStart(2, "0")}Z`,
-            },
-          ],
-          closed_items: [],
-          generated_at: `2026-07-11T12:00:${String(number - 500).padStart(2, "0")}Z`,
-          ttl_seconds: 60,
-        }),
-      }),
-    );
-    assert.equal(response.status, 200);
-  }
-  const persistedBay = JSON.parse(await (await store.fetch(new Request(bayStoreUrl))).text());
-  const bayPutsBeforeReplay = storage.putCount("openclaw-bay:terminal-state:v1");
-  const replay = await store.fetch(
-    new Request(bayStoreUrl, {
-      method: "POST",
-      body: JSON.stringify({
-        attempts: [
-          {
-            run_id: 502,
-            job_id: 502,
-            repository: "openclaw/openclaw",
-            item_numbers: [502],
-            outcome: "success",
-            terminal_outcome: "success",
-            completed_at: "2026-07-11T12:00:02Z",
-          },
-        ],
-        closed_items: [],
-        generated_at: "2026-07-11T12:00:03Z",
-        ttl_seconds: 60,
-      }),
-    }),
-  );
-  assert.equal(replay.status, 200);
-  assert.equal(storage.putCount("openclaw-bay:terminal-state:v1"), bayPutsBeforeReplay);
-  assert.equal(JSON.parse(await replay.text()).updated_at, persistedBay.updated_at);
-  assert.deepEqual(
-    persistedBay.terminal_buffer.map((item: { number: number }) => item.number),
-    [501, 502],
-  );
-
   await store.fetch(
     new Request("https://clawsweeper-status-store/events", {
       method: "PUT",
@@ -1739,7 +667,7 @@ test("dashboard durable status store persists, expires, and prepends events", as
   assert.equal(storage.has("cold-expired"), false);
 });
 
-test("dashboard reuses a current Bay snapshot from the matching shared status scope", async () => {
+test("dashboard reuses a current snapshot from the matching shared status scope", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -1748,7 +676,7 @@ test("dashboard reuses a current Bay snapshot from the matching shared status sc
   });
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+    "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -1799,10 +727,9 @@ test("dashboard reuses a current Bay snapshot from the matching shared status sc
     assert.equal(status.pipeline[0].arbitrary_boolean, undefined);
     assert.deepEqual(status.fleet, { active_codex_jobs: 1 });
     assert.equal(status.arbitrary_namespace, undefined);
-    assert.equal(status.bay.timings.sample_kind, "completed_review_journeys");
-    assert.equal(status.bay.timings.source, "durable_exact_review_lifecycles");
+    assert.equal(status.bay.timings, undefined);
     assert.equal(networkRequests, 0);
-    const persisted = String(await statusStore.get("snapshot:bay-scope:v1:openclaw%2Fopenclaw"));
+    const persisted = String(await statusStore.get("snapshot:bay-scope:v2:openclaw%2Fopenclaw"));
     assert.equal(persisted.includes("arbitrary_count"), false);
     assert.equal(persisted.includes("arbitrary_boolean"), false);
     assert.equal(persisted.includes("arbitrary_namespace"), false);
@@ -1812,7 +739,7 @@ test("dashboard reuses a current Bay snapshot from the matching shared status sc
   }
 });
 
-test("dashboard rejects a current Bay snapshot from a different public scope", async () => {
+test("dashboard rejects a current snapshot from a different public scope", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -1821,7 +748,7 @@ test("dashboard rejects a current Bay snapshot from a different public scope", a
   });
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+    "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -1879,7 +806,7 @@ test("dashboard isolates fresh edge caches by public Bay scope", async () => {
     value: { default: cache },
   });
   await cache.put(
-    new Request("https://clawsweeper.openclaw.ai/api/status-cache/v7/openclaw%2Fopenclaw/fresh"),
+    new Request("https://clawsweeper.openclaw.ai/api/status-cache/v8/openclaw%2Fopenclaw/fresh"),
     jsonResponse({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -1922,7 +849,7 @@ test("dashboard isolates fresh edge caches by public Bay scope", async () => {
   }
 });
 
-test("dashboard refreshes a durable snapshot that predates the legacy timing aggregate", async () => {
+test("dashboard refreshes a durable snapshot from an obsolete cache generation", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -1931,7 +858,7 @@ test("dashboard refreshes a durable snapshot that predates the legacy timing agg
   });
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot",
+    "snapshot:bay-scope:v1:_",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -1965,8 +892,7 @@ test("dashboard refreshes a durable snapshot that predates the legacy timing agg
     const status = await response.json();
     assert.equal(response.status, 200);
     assert.ok(networkRequests > 0);
-    assert.equal(status.bay.timings.sample_kind, "completed_review_journeys");
-    assert.equal(status.bay.timings.source, "durable_exact_review_lifecycles");
+    assert.equal(status.bay.timings, undefined);
     assert.deepEqual(status.pipeline, []);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2015,13 +941,13 @@ test("dashboard does not publish a malformed durable root as the current snapsho
     assert.equal(body.diagnostics.error_count, 1);
     assert.equal(JSON.stringify(body).includes(marker), false);
     assert.equal(body.freshness.state, "unavailable");
-    assert.equal(await statusStore.get("snapshot:bay-scope:v1:_"), null);
+    assert.equal(await statusStore.get("snapshot:bay-scope:v2:_"), null);
     assert.equal(
-      await cache.match(new Request("https://clawsweeper.openclaw.ai/api/status-cache/v7/_/stale")),
+      await cache.match(new Request("https://clawsweeper.openclaw.ai/api/status-cache/v8/_/stale")),
       undefined,
     );
     assert.equal(
-      await cache.match(new Request("https://clawsweeper.openclaw.ai/api/status-cache/v7/_/fresh")),
+      await cache.match(new Request("https://clawsweeper.openclaw.ai/api/status-cache/v8/_/fresh")),
       undefined,
     );
   } finally {
@@ -2406,7 +1332,7 @@ test("optional exact-review telemetry failures do not freeze an idle status snap
   });
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:_",
+    "snapshot:bay-scope:v2:_",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -2494,7 +1420,7 @@ test("optional queue status failures remain bounded in public and persisted snap
   });
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:_",
+    "snapshot:bay-scope:v2:_",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -2555,7 +1481,7 @@ test("optional queue status failures remain bounded in public and persisted snap
     assert.equal(status.diagnostics.exact_review_queue_error, undefined);
     assert.equal(JSON.stringify(status).includes(rejectionMarker), false);
 
-    const persisted = await statusStore.get("snapshot:bay-scope:v1:_");
+    const persisted = await statusStore.get("snapshot:bay-scope:v2:_");
     assert.ok(persisted);
     const persistedSnapshot = JSON.parse(persisted);
     assert.equal(persistedSnapshot.exact_review_queue, null);
@@ -2651,7 +1577,7 @@ test("optional queue status failure retains the last complete public Bay queue s
 
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+    "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -2722,7 +1648,7 @@ test("optional queue status failure retains the last complete public Bay queue s
     assert.equal(status.dashboard_health.severity, "amber");
     assert.equal(JSON.stringify(status).includes(rejectionMarker), false);
 
-    const persisted = await statusStore.get("snapshot:bay-scope:v1:openclaw%2Fopenclaw");
+    const persisted = await statusStore.get("snapshot:bay-scope:v2:openclaw%2Fopenclaw");
     assert.ok(persisted);
     const persistedSnapshot = JSON.parse(persisted);
     assert.deepEqual(
@@ -2757,7 +1683,7 @@ test("optional queue status failure retains the last complete public Bay queue s
       value: { default: new MemoryCache() },
     });
     await statusStore.put(
-      "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+      "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
       JSON.stringify({
         ...JSON.parse(persisted),
         generated_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2791,7 +1717,7 @@ test("optional queue status failure retains the last complete public Bay queue s
     stalePriorExactReviewQueue.generated_at = staleQueueGeneratedAt;
     stalePriorExactReviewQueue.handoff_health.observed_at = staleQueueGeneratedAt;
     await statusStore.put(
-      "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+      "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
       JSON.stringify({
         ...JSON.parse(persisted),
         generated_at: new Date().toISOString(),
@@ -2880,7 +1806,7 @@ test("dashboard health grades fresh queue telemetry while retaining prior public
 
   const statusStore = new MemoryKv();
   await statusStore.put(
-    "snapshot:bay-scope:v1:openclaw%2Fopenclaw",
+    "snapshot:bay-scope:v2:openclaw%2Fopenclaw",
     JSON.stringify({
       schema_version: 1,
       generated_at: new Date().toISOString(),
@@ -2966,194 +1892,3 @@ test("dashboard health grades fresh queue telemetry while retaining prior public
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
   }
 });
-
-test("durable lifecycle Bay stale polls share one background refresh and respect maximum age", async (t) => {
-  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-04T00:00:00Z") });
-  const originalCaches = globalThis.caches;
-  const values = new MemoryCache();
-  const expires = new Map<string, number>();
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        async match(request: Request) {
-          if ((expires.get(request.url) || 0) <= Date.now()) return undefined;
-          return values.match(request);
-        },
-        async put(request: Request, response: Response) {
-          const ttl = Number(
-            /max-age=(\d+)/.exec(response.headers.get("cache-control") || "")?.[1],
-          );
-          expires.set(request.url, Date.now() + ttl * 1000);
-          await values.put(request, response);
-        },
-      },
-    },
-  });
-  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
-  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
-  let reads = 0;
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const env = {
-    PUBLIC_BAY_REPOS: "openclaw/openclaw",
-    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace({
-      async fetch(request: Request) {
-        if (++reads === 2) await gate;
-        return queue.fetch(request);
-      },
-    }),
-  };
-  const background: Promise<unknown>[] = [];
-  const ctx = {
-    waitUntil(promise: Promise<unknown>) {
-      background.push(promise);
-    },
-  };
-  const read = () =>
-    worker.fetch(new Request("https://swr.example/api/durable-lifecycle-bay"), env, ctx);
-  const first = await (await read()).text();
-  t.mock.timers.tick(29_999);
-  assert.equal(await (await read()).text(), first);
-  assert.equal(reads, 1);
-  t.mock.timers.tick(1);
-  const stale = await Promise.all(Array.from({ length: 8 }, async () => (await read()).text()));
-  assert.ok(stale.every((body) => body === first));
-  assert.equal(reads, 2);
-  assert.equal(background.length, 8);
-  release();
-  await Promise.all(background);
-  const fresh = await (await read()).text();
-  assert.notEqual(fresh, first);
-  assert.equal(reads, 2);
-  t.mock.timers.tick(60_001);
-  assert.notEqual(await (await read()).text(), fresh);
-  assert.equal(reads, 3, "expired source data cannot be served as stale success");
-});
-
-async function assertFailedBayRefreshPreservesStaleSuccess(
-  t: TestContext,
-  failure: "unavailable" | "malformed",
-) {
-  const startedAt = Date.parse("2026-09-04T00:00:00Z");
-  t.mock.timers.enable({ apis: ["Date"], now: new Date(startedAt) });
-  const originalCaches = globalThis.caches;
-  const values = new MemoryCache();
-  const expires = new Map<string, number>();
-  let writes = 0;
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        async match(request: Request) {
-          if ((expires.get(request.url) || 0) <= Date.now()) return undefined;
-          return values.match(request);
-        },
-        async put(request: Request, response: Response) {
-          const ttl = Number(
-            /max-age=(\d+)/.exec(response.headers.get("cache-control") || "")?.[1],
-          );
-          expires.set(request.url, Date.now() + ttl * 1000);
-          writes += 1;
-          await values.put(request, response);
-        },
-      },
-    },
-  });
-  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
-
-  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
-  let reads = 0;
-  let mode: "success" | "unavailable" | "malformed" = "success";
-  let releaseFailedRefresh!: () => void;
-  const failedRefreshGate = new Promise<void>((resolve) => {
-    releaseFailedRefresh = resolve;
-  });
-  const namespace = new MemoryDurableNamespace({
-    async fetch(request: Request) {
-      reads += 1;
-      if (reads === 2) await failedRefreshGate;
-      if (mode === "unavailable") return new Response(null, { status: 503 });
-      if (mode === "malformed") return jsonResponse({ durable_lifecycle_bay: {} });
-      return queue.fetch(request);
-    },
-  });
-  const env = {
-    PUBLIC_BAY_REPOS: "openclaw/openclaw",
-    EXACT_REVIEW_QUEUE: namespace,
-  };
-  const url = "https://failed-refresh.example/api/durable-lifecycle-bay";
-  const background: Promise<unknown>[] = [];
-  const ctx = {
-    waitUntil(promise: Promise<unknown>) {
-      background.push(promise);
-    },
-  };
-  const read = async (context?: typeof ctx) => {
-    const response = await worker.fetch(new Request(url), env, context);
-    return { text: await response.text(), response };
-  };
-
-  const initial = await read();
-  const initialBody = JSON.parse(initial.text);
-  const initialGeneratedAt = initialBody.durable_lifecycle_bay.generated_at;
-  assert.equal(initialBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.equal(reads, 1);
-  assert.equal(writes, 2);
-  const freshKey = [...expires.keys()].find((key) => key.endsWith("/fresh"))!;
-  const staleKey = [...expires.keys()].find((key) => key.endsWith("/stale"))!;
-  const originalFreshExpiry = expires.get(freshKey);
-  const originalStaleExpiry = expires.get(staleKey);
-  assert.equal(originalFreshExpiry, startedAt + 30_000);
-  assert.equal(originalStaleExpiry, startedAt + 60_000);
-
-  t.mock.timers.tick(30_000);
-  mode = failure;
-  const staleBatch = await Promise.all(Array.from({ length: 8 }, () => read(ctx)));
-  assert.ok(staleBatch.every((entry) => entry.text === initial.text));
-  assert.equal(reads, 2, "concurrent stale polls share one failed owner refresh");
-  releaseFailedRefresh();
-  await Promise.all(background.splice(0));
-  assert.equal(writes, 2, "a failed refresh must not replace either cache bucket");
-  assert.equal(expires.get(freshKey), originalFreshExpiry);
-  assert.equal(expires.get(staleKey), originalStaleExpiry);
-
-  t.mock.timers.tick(29_999);
-  const beforeExpiry = await read(ctx);
-  assert.equal(beforeExpiry.text, initial.text);
-  await Promise.all(background.splice(0));
-  assert.equal(expires.get(staleKey), originalStaleExpiry);
-
-  t.mock.timers.tick(2);
-  const afterExpiry = await read();
-  const failedBody = JSON.parse(afterExpiry.text);
-  assert.deepEqual(failedBody.durable_lifecycle_bay.collection, {
-    state: "unknown",
-    reason: failure,
-  });
-  assert.notEqual(failedBody.durable_lifecycle_bay.generated_at, initialGeneratedAt);
-
-  t.mock.timers.tick(30_001);
-  mode = "success";
-  const recovered = await read();
-  const recoveredBody = JSON.parse(recovered.text);
-  const recoveredGeneratedAt = recoveredBody.durable_lifecycle_bay.generated_at;
-  assert.equal(recoveredBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.notEqual(recoveredGeneratedAt, initialGeneratedAt);
-  assert.equal(writes, 6, "failed-close and later success each replace both buckets");
-  for (const key of [freshKey, staleKey]) {
-    const cached = await values.match(new Request(key));
-    assert.ok(cached);
-    assert.equal((await cached.json()).durable_lifecycle_bay.generated_at, recoveredGeneratedAt);
-  }
-  assert.equal(expires.get(freshKey), Date.now() + 30_000);
-  assert.equal(expires.get(staleKey), Date.now() + 60_000);
-}
-
-test("durable lifecycle Bay preserves stale success across unavailable background refresh", (t) =>
-  assertFailedBayRefreshPreservesStaleSuccess(t, "unavailable"));
-
-test("durable lifecycle Bay preserves stale success across malformed background refresh", (t) =>
-  assertFailedBayRefreshPreservesStaleSuccess(t, "malformed"));

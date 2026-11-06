@@ -1,11 +1,11 @@
+import { decodeStoredJson } from "../dashboard/stored-json.ts";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
   GITHUB_WEBHOOK_READ_MODEL_COMMENT_TTL_MS,
-  GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS,
+  GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS,
   GithubWebhookReadModelStore,
   githubWebhookReadModelDeliveryFromWebhook,
 } from "../dashboard/github-webhook-read-model.ts";
@@ -17,6 +17,12 @@ import {
   signedGithubWebhookRequest,
 } from "./dashboard-worker-harness.ts";
 import { githubReadModelLeaseItemRequest } from "../dist/github-webhook-read-model-client.js";
+import { createReviewPlanningInventory } from "../dist/clawsweeper-review-planning-inventory.js";
+import { currentReviewRevision } from "../dist/clawsweeper-report-actions.js";
+import { githubTest, installGhFixture } from "./github-runtime-fixture.ts";
+import { readFileSync, writeFileSync } from "node:fs";
+import { createCommandOperations } from "../dist/clawsweeper-command-operations.js";
+import { withQuietReviewStartStatusLease } from "../dist/clawsweeper-review-comment-state.js";
 
 const secret = "github-read-model-test-secret";
 const repository = {
@@ -27,6 +33,248 @@ const repository = {
   fork: false,
   has_issues: true,
 };
+
+test("read model discovers and retires an in-place review lease through comment edits", async () => {
+  const now = "2026-08-14T10:00:00Z";
+  const original = "Codex review: keep open.\n\n<!-- clawsweeper-review item=77 -->";
+  const body = withQuietReviewStartStatusLease(original, {
+    number: 77,
+    kind: "issue",
+    title: "fixture",
+    headSha: "a".repeat(64),
+    startedAt: now,
+    leaseExpiresAt: "2026-08-14T11:00:00Z",
+    leaseOwner: "fixture",
+  });
+  const store = new GithubWebhookReadModelStore(new MemoryDurableStorage());
+  store.ensureSchemaSync();
+  for (const [index, text] of [body, original].entries()) {
+    const at = `2026-08-14T10:0${index}:00Z`;
+    store.ingest(
+      requiredDelivery("issue_comment", `quiet-${index}`, at, {
+        action: "edited",
+        repository,
+        issue: issue(77, "fixture", at),
+        comment: {
+          id: 123,
+          body: text,
+          updated_at: at,
+          user: { login: "clawsweeper[bot]", type: "Bot" },
+        },
+      }),
+      Date.parse(at),
+    );
+    store.repair(
+      { repository: repository.full_name, repair_kind: "placeholders", objects: [] },
+      Date.parse(at),
+    );
+    const result = await store.readPlaceholders(
+      { repository: repository.full_name, state: "open" },
+      Date.parse(at),
+    );
+    assert.equal(result.usable, true);
+    assert.equal((result.candidates as unknown[]).length, index === 0 ? 1 : 0);
+  }
+});
+
+test("raw PR webhooks preserve the Issues API discriminator and earlier marker metadata", async () => {
+  const now = "2026-08-14T10:06:00.000Z";
+  for (const event of ["pull_request", "pull_request_review", "pull_request_review_comment"]) {
+    const raw = pull(77, now);
+    assert.equal(Object.hasOwn(raw, "pull_request"), false);
+    const delivery = requiredDelivery(event, event, now, {
+      action: "created",
+      repository,
+      pull_request: raw,
+      review: { id: 1, submitted_at: now },
+      comment: { id: 2, updated_at: now },
+    });
+    const item = delivery.objects.find((object) => object.kind === "item");
+    assert.ok(item);
+    assert.equal(item.itemKind, "pull_request");
+    assert.deepEqual(item.snapshot.head, raw.head);
+    const storage = new MemoryDurableStorage();
+    const store = new GithubWebhookReadModelStore(storage);
+    store.ensureSchemaSync();
+    store.ingest(delivery, Date.parse(now));
+    const snapshot = await store.readItem(
+      { repository: repository.full_name, number: 77 },
+      Date.parse(now),
+    );
+    assert.deepEqual((snapshot.item as Record<string, unknown>).pull_request, {});
+  }
+  const marker = { url: "https://api.github.com/repos/openclaw/openclaw/pulls/77" };
+  const delivery = requiredDelivery("issue_comment", "issue-comment", now, {
+    action: "created",
+    repository,
+    issue: { ...issue(77, "PR comment", now), pull_request: marker },
+    comment: { id: 3, updated_at: now, body: "ClawSweeper status: review started." },
+  });
+  assert.deepEqual(delivery.objects[0].snapshot.pull_request, marker);
+  const storage = new MemoryDurableStorage();
+  const store = new GithubWebhookReadModelStore(storage);
+  store.ensureSchemaSync();
+  store.ingest(delivery, Date.parse(now));
+  const later = "2026-08-14T10:07:00.000Z";
+  store.ingest(
+    requiredDelivery("pull_request", "later-raw-pr", later, {
+      action: "synchronize",
+      repository,
+      pull_request: pull(77, later),
+    }),
+    Date.parse(later),
+  );
+  const snapshot = await store.readItem(
+    { repository: repository.full_name, number: 77 },
+    Date.parse(later),
+  );
+  assert.equal(snapshot.usable, true);
+  assert.deepEqual((snapshot.item as Record<string, unknown>).pull_request, marker);
+  store.repair(
+    { repository: repository.full_name, repair_kind: "placeholders", objects: [] },
+    Date.parse(later),
+  );
+  const placeholders = await store.readPlaceholders(
+    { repository: repository.full_name, state: "open" },
+    Date.parse(later),
+  );
+  assert.equal(placeholders.usable, true);
+  const candidates = placeholders.candidates as { item: Record<string, unknown> }[];
+  assert.deepEqual(candidates[0].item.pull_request, marker);
+});
+
+for (const kind of ["pull_request", "stored_pull_request", "issue"] as const) {
+  githubTest(
+    `read-model ${kind} preserves revision identity through lease reservation`,
+    async (t) => {
+      const now = "2026-08-14T10:06:00.000Z";
+      const nowMs = Date.parse(now);
+      const isPull = kind !== "issue";
+      const storage = new MemoryDurableStorage();
+      const store = new GithubWebhookReadModelStore(storage);
+      store.ensureSchemaSync();
+      store.ingest(
+        requiredDelivery(isPull ? "pull_request" : "issues", kind, now, {
+          action: "opened",
+          repository,
+          ...(isPull ? { pull_request: pull(77, now) } : { issue: issue(77, "issue", now) }),
+        }),
+        nowMs,
+      );
+      if (kind === "stored_pull_request") {
+        // Existing rows have the authoritative kind but lack the JSON marker.
+        const row = [
+          ...storage.sql.exec("SELECT snapshot_json FROM github_webhook_read_model_items_v1"),
+        ][0]!;
+        const legacy = JSON.parse(decodeStoredJson(String(row.snapshot_json)));
+        delete legacy.pull_request;
+        storage.sql.exec(
+          "UPDATE github_webhook_read_model_items_v1 SET snapshot_json = ?",
+          JSON.stringify(legacy),
+        );
+      }
+      const before = [...storage.sql.exec(`SELECT * FROM github_webhook_read_model_items_v1`)];
+      const snapshot = await store.readItem(
+        { repository: repository.full_name, number: 77 },
+        nowMs,
+      );
+      assert.equal(snapshot.usable, true);
+      assert.deepEqual(
+        [...storage.sql.exec(`SELECT * FROM github_webhook_read_model_items_v1`)],
+        before,
+      );
+      const inventory = createReviewPlanningInventory({
+        targetRepo: () => repository.full_name,
+        ghJson: () => assert.fail("fresh item projection must not poll GitHub"),
+        normalizeAuthorAssociation: () => "CONTRIBUTOR",
+        githubReadModelRequestSync: () => snapshot,
+      } as Parameters<typeof createReviewPlanningInventory>[0]);
+      const item = inventory.fetchItem(77).item;
+      assert.equal(item.kind, isPull ? "pull_request" : "issue");
+      let headSha = "a".repeat(40);
+      const issueRevision = "b".repeat(64);
+      const revisionReads: string[] = [];
+      const fixture = installGhFixture(
+        t,
+        `
+const path = args[1];
+if (path === "repos/openclaw/openclaw/pulls/77") {
+  console.log(JSON.stringify({ head: { sha: state.headSha || ${JSON.stringify(headSha)} } }));
+} else throw new Error("unexpected read " + args.join(" "));
+`,
+      );
+      const output: string[] = [];
+      t.mock.method(console, "log", (value: string) => output.push(value));
+      t.mock.method(console, "error", () => {});
+      const posted: { headSha?: string }[] = [];
+      const { reserveReviewLeaseCommand } = createCommandOperations({
+        targetRepo: () => repository.full_name,
+        repoFromArgs: () => {},
+        fetchItem: inventory.fetchItem,
+        currentReviewRevision: (candidate) =>
+          currentReviewRevision(candidate, (collectedItem, options) => {
+            assert.equal(collectedItem.number, 77);
+            assert.deepEqual(options, { fullTimelineForRelations: true });
+            revisionReads.push("issue");
+            return { sourceRevision: issueRevision };
+          }),
+        exactReviewQueueAuthorityFromEnv: () => ({
+          itemKey: "openclaw/openclaw#77",
+          ...(isPull ? { sourceHeadSha: "a".repeat(40) } : {}),
+        }),
+        postReviewStartStatusComment: (options) => {
+          posted.push(options);
+          return {
+            status: "posted",
+            lease: { owner: "fixture", commentId: 123, headSha: options.headSha },
+          };
+        },
+        reviewActionLedger: {},
+      } as Parameters<typeof createCommandOperations>[0]);
+      reserveReviewLeaseCommand({ item_number: "77", review_timeout_ms: "600000" });
+      assert.equal(posted.length, 1);
+      assert.equal(posted[0].headSha, isPull ? headSha : issueRevision);
+      assert.equal(JSON.parse(output[0]).headSha, posted[0].headSha);
+      assert.deepEqual(revisionReads, isPull ? [] : ["issue"]);
+      assert.deepEqual(
+        fixture.requests().map(({ args }) => args),
+        isPull ? [["api", "repos/openclaw/openclaw/pulls/77"]] : [],
+      );
+      if (isPull) {
+        headSha = "c".repeat(40);
+        writeFileSync(
+          fixture.statePath,
+          JSON.stringify({ ...JSON.parse(readFileSync(fixture.statePath, "utf8")), headSha }),
+        );
+        reserveReviewLeaseCommand({ item_number: "77", review_timeout_ms: "600000" });
+        assert.equal(posted.length, 1, "head drift cannot publish a lease");
+        assert.equal(JSON.parse(output[1]).reason, "source_head_drift");
+      }
+
+      store.ingest(
+        requiredDelivery("issue_comment", `${kind}-comment`, now, {
+          action: "created",
+          repository,
+          issue: { ...issue(77, "comment", now), ...(isPull ? { pull_request: {} } : {}) },
+          comment: { id: 123, body: "ClawSweeper status: review started.", updated_at: now },
+        }),
+        nowMs,
+      );
+      store.repair(
+        { repository: repository.full_name, repair_kind: "placeholders", objects: [] },
+        nowMs,
+      );
+      const placeholders = await store.readPlaceholders(
+        { repository: repository.full_name, state: "open" },
+        nowMs,
+      );
+      assert.equal(placeholders.usable, true);
+      const candidates = placeholders.candidates as { item: Record<string, unknown> }[];
+      assert.equal(candidates.length, 1);
+      assert.equal(Boolean(candidates[0].item.pull_request), isPull);
+    },
+  );
+}
 
 test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, and TTL", async () => {
   const now = Date.parse("2026-08-14T10:06:00.000Z");
@@ -56,8 +304,9 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
 
   for (const [deliveryId, action, body, updatedAt] of [
     ["comment-create", "created", "placeholder", "2026-08-14T10:01:00.000Z"],
-    ["comment-delete", "deleted", "placeholder", "2026-08-14T10:03:00.000Z"],
-    ["comment-late-edit", "edited", "resurrected", "2026-08-14T10:02:00.000Z"],
+    ["comment-delete", "deleted", "placeholder", "2026-08-14T10:01:00.000Z"],
+    ["comment-equal-edit", "edited", "resurrected", "2026-08-14T10:01:00.000Z"],
+    ["comment-late-edit", "edited", "resurrected", "2026-08-14T10:00:00.000Z"],
   ] as const) {
     store.ingest(
       requiredDelivery("issue_comment", deliveryId, updatedAt, {
@@ -89,6 +338,49 @@ test("read model dedupes GUIDs, keeps object watermarks monotonic, tombstones, a
   assert.equal(stale.usable, false);
   assert.equal((stale.freshness as Record<string, unknown>).stale, true);
 });
+
+for (const event of ["issue_comment", "pull_request_review_comment"] as const) {
+  test(`${event} deletion wins equal timestamps and releases retained payloads`, () => {
+    const storage = new MemoryDurableStorage();
+    const store = new GithubWebhookReadModelStore(storage);
+    store.ensureSchemaSync();
+    const now = Date.parse("2026-08-26T12:00:00Z");
+    const at = now - GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS - 1;
+    const updatedAt = new Date(at).toISOString();
+    const table =
+      event === "issue_comment"
+        ? "github_webhook_read_model_comments_v1"
+        : "github_webhook_read_model_activity_v1";
+    const deliver = (id: string, action: string, receivedAt: number) =>
+      store.ingest(
+        requiredDelivery(event, id, new Date(receivedAt).toISOString(), {
+          action,
+          repository,
+          ...(event === "issue_comment"
+            ? { issue: issue(42, "parent", updatedAt) }
+            : { pull_request: pull(42, updatedAt) }),
+          comment: { id: 4201, body: "ClawSweeper status: review started.", updated_at: updatedAt },
+        }),
+        receivedAt,
+      );
+    deliver("created", "created", at);
+    storage.transactionSync(() => store.prunePayloadsSync(now));
+    deliver("deleted", "deleted", now);
+    const deleted = [...storage.sql.exec(`SELECT * FROM ${table}`)];
+    assert.equal(deleted[0].tombstone, 1);
+    assert.equal(JSON.parse(decodeStoredJson(String(deleted[0].snapshot_json))).body, null);
+    deliver("late-edit", "edited", now + 1);
+    assert.deepEqual([...storage.sql.exec(`SELECT * FROM ${table}`)], deleted);
+    storage.transactionSync(() =>
+      store.prunePayloadsSync(now + GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS + 1),
+    );
+    assert.equal(
+      [...storage.sql.exec("SELECT payload_pruned FROM github_webhook_read_model_items_v1")][0]
+        .payload_pruned,
+      1,
+    );
+  });
+}
 
 test("receipt expiry upgrades existing databases idempotently and uses a SQLite range search", (t) => {
   const { storage, store, now } = receiptExpiryFixture();
@@ -201,7 +493,7 @@ test("receipt expiry and watermark writes roll back together after a later prune
     if (query.startsWith(`DELETE FROM ${receiptTable} `)) pruned = result.rowsWritten;
     return result;
   });
-  storage.failNextSql(/DELETE FROM github_webhook_read_model_workflows_v1/);
+  storage.failNextSql(/SELECT rowid FROM github_webhook_read_model_workflows_v1/);
   assert.throws(() => store.ingest(receiptDelivery("retry", now), now), /injected SQL failure/);
   assert.equal(pruned, 256, "failure occurs after receipt pruning");
   assert.deepEqual(readModelState(storage), before);
@@ -278,6 +570,254 @@ function readModelState(storage: MemoryDurableStorage) {
   );
 }
 
+for (const repairKind of ["items", "comments", "placeholders"] as const) {
+  for (const itemKind of ["issue", "pull_request"] as const) {
+    test(`${repairKind} repair waits for its consumer's webhook class (${itemKind})`, async () => {
+      const storage = new MemoryDurableStorage();
+      const store = new GithubWebhookReadModelStore(storage);
+      store.ensureSchemaSync();
+      const now = Date.parse("2026-08-26T12:00:00Z");
+      const updatedAt = new Date(now).toISOString();
+      const item = {
+        kind: "item",
+        repository: repository.full_name,
+        number: 77,
+        itemKind,
+        sourceUpdatedAt: updatedAt,
+        snapshot: { ...issue(77, "polled item", updatedAt), comments: 1 },
+      };
+      const comment = commentObject(77, 7701, "ClawSweeper status: review started.", updatedAt);
+      const repair = {
+        repository: repository.full_name,
+        repair_kind: repairKind,
+        complete_comment_items: [77],
+        objects: repairKind === "items" ? [item] : [item, comment],
+      };
+      const requiredClass =
+        repairKind === "items"
+          ? itemKind === "issue"
+            ? "issues"
+            : "pull_requests"
+          : "issue_comments";
+      store.ingest(
+        {
+          version: 1,
+          deliveryId: "unrelated-class",
+          event: "workflow_run",
+          action: "completed",
+          receivedAt: updatedAt,
+          eventClasses: ["workflow_runs"],
+          objects: [],
+        },
+        now,
+      );
+      const before = readModelState(storage);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        assert.deepEqual(store.repair(repair, now + attempt), {
+          accepted: false,
+          reason: "event_class_unavailable",
+          watermark: 1,
+          evicted_workflow_runs: 0,
+        });
+        assert.deepEqual(readModelState(storage), before);
+      }
+      store.ingest(
+        {
+          version: 1,
+          deliveryId: "required-class",
+          event: requiredClass,
+          action: "created",
+          receivedAt: updatedAt,
+          eventClasses: [requiredClass],
+          objects: [],
+        },
+        now + 2,
+      );
+      assert.equal(store.repair(repair, now + 3).accepted, true);
+      assert.equal(store.classState(requiredClass, now + 3).available, true);
+      const response =
+        repairKind === "items"
+          ? await store.readItem({ repository: repository.full_name, number: 77 }, now + 4)
+          : repairKind === "comments"
+            ? await store.readComments({ repository: repository.full_name, number: 77 }, now + 4)
+            : await store.readPlaceholders(
+                { repository: repository.full_name, state: "open" },
+                now + 4,
+              );
+      assert.equal(response.usable, true);
+    });
+  }
+}
+
+test("mixed item repairs wait for every required class without partial writes", () => {
+  const storage = new MemoryDurableStorage();
+  const store = new GithubWebhookReadModelStore(storage);
+  store.ensureSchemaSync();
+  const now = Date.parse("2026-08-26T12:00:00Z");
+  const updatedAt = new Date(now).toISOString();
+  store.ingest(
+    requiredDelivery("issues", "issue-class", updatedAt, {
+      action: "opened",
+      repository,
+      issue: issue(77, "known issue", updatedAt),
+    }),
+    now,
+  );
+  const before = readModelState(storage);
+  assert.equal(
+    store.repair(
+      {
+        repository: repository.full_name,
+        repair_kind: "items",
+        objects: ["issue", "pull_request"].map((itemKind, index) => ({
+          kind: "item",
+          repository: repository.full_name,
+          number: 78 + index,
+          itemKind,
+          sourceUpdatedAt: updatedAt,
+          snapshot: issue(78 + index, "polled", updatedAt),
+        })),
+      },
+      now,
+    ).accepted,
+    false,
+  );
+  assert.deepEqual(readModelState(storage), before);
+});
+
+for (const kind of ["comment", "review"] as const) {
+  for (const count of [499, 500, 501, 620]) {
+    test(`${kind} pruning preserves retained IDs across the limit (${count})`, () => {
+      const storage = new MemoryDurableStorage();
+      const store = new GithubWebhookReadModelStore(storage);
+      store.ensureSchemaSync();
+      const table = `github_webhook_read_model_${kind === "comment" ? "comments" : "activity"}_v1`;
+      const idColumn = kind === "comment" ? "comment_id" : "activity_id";
+      const columns = `repository, number, ${kind === "review" ? "activity_kind," : ""}
+        ${idColumn}, source_updated_at, tombstone, snapshot_json, delivery_id, watermark, received_at, payload_retire_at`;
+      const now = Date.parse("2026-08-26T12:00:00Z");
+      store.ingest(
+        {
+          version: 1,
+          deliveryId: "comment-coverage",
+          event: "issue_comment",
+          action: "created",
+          receivedAt: new Date(now).toISOString(),
+          eventClasses: ["issue_comments"],
+          objects: [],
+        },
+        now,
+      );
+      storage.transactionSync(() => {
+        for (let id = 1; id <= count; id += 1) {
+          storage.sql.exec(
+            `INSERT INTO ${table} (${columns}) VALUES (?, 77, ${kind === "review" ? "'review'," : ""} ?, ?, ?, '{}', 'seed', 1, ?, ?)`,
+            repository.full_name,
+            id,
+            now - Math.floor((count - id) / 3),
+            id % 2,
+            now,
+            now + GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS,
+          );
+        }
+        if (kind === "review") {
+          // A retained ID also protects an older row of the other activity kind.
+          storage.sql.exec(
+            `INSERT INTO ${table} (${columns}) VALUES (?, 77, 'review_comment', ?, ?, 1, '{}', 'seed', 1, ?, ?)`,
+            repository.full_name,
+            count,
+            now - 10_000,
+            now,
+            now + GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS,
+          );
+        }
+        storage.sql.exec(
+          `INSERT INTO ${table} (${columns}) VALUES ('other/repo', 77, ${kind === "review" ? "'review'," : ""} 1, ?, 0, '{}', 'seed', 1, ?, ?)`,
+          now - 20_000,
+          now,
+          now + GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS,
+        );
+        storage.sql.exec(
+          `INSERT INTO ${table} (${columns}) VALUES (?, 78, ${kind === "review" ? "'review'," : ""} 1, ?, 0, '{}', 'seed', 1, ?, ?)`,
+          repository.full_name,
+          now - 20_000,
+          now,
+          now + GITHUB_WEBHOOK_READ_MODEL_PAYLOAD_RETENTION_MS,
+        );
+      });
+      const expected = [
+        ...storage.sql.exec(
+          `SELECT * FROM ${table}
+            WHERE repository <> ? OR number <> 77 OR ${idColumn} IN (
+              SELECT ${idColumn} FROM ${table} WHERE repository = ? AND number = 77
+               ORDER BY source_updated_at DESC, ${idColumn} DESC LIMIT 500
+            ) ORDER BY rowid`,
+          repository.full_name,
+          repository.full_name,
+        ),
+      ];
+      store.repair(
+        {
+          repository: repository.full_name,
+          repair_kind: "comments",
+          objects: [
+            {
+              kind,
+              repository: repository.full_name,
+              number: 77,
+              id: count,
+              sourceUpdatedAt: new Date(now - 30_000).toISOString(),
+              tombstone: false,
+              snapshot: {},
+            },
+          ],
+        },
+        now,
+      );
+      assert.deepEqual([...storage.sql.exec(`SELECT * FROM ${table} ORDER BY rowid`)], expected);
+    });
+  }
+}
+
+for (const count of [0, 1000, 1001, 1200]) {
+  for (const tied of [false, true]) {
+    test(`global workflow pruning preserves original order (${count}, tied=${tied})`, () => {
+      const storage = new MemoryDurableStorage();
+      const store = new GithubWebhookReadModelStore(storage);
+      store.ensureSchemaSync();
+      const table = "github_webhook_read_model_workflows_v1";
+      const now = Date.parse("2026-08-26T12:00:00Z");
+      storage.transactionSync(() => {
+        for (let id = 1; id <= count; id += 1) {
+          storage.sql.exec(
+            `INSERT INTO ${table} VALUES (?, ?, ?, NULL, ?, '{}', 'seed', 1, ?)`,
+            id % 2 ? repository.full_name : "other/repo",
+            id % 3 ? "workflow_run" : "check_run",
+            id,
+            tied ? now : now - (id % 17),
+            now,
+          );
+        }
+      });
+      const removed = new Set(
+        [
+          ...storage.sql.exec(
+            `SELECT rowid FROM ${table} ORDER BY source_updated_at DESC LIMIT -1 OFFSET 1000`,
+          ),
+        ].map((row) => row.rowid),
+      );
+      const expected = [...storage.sql.exec(`SELECT rowid, * FROM ${table} ORDER BY rowid`)].filter(
+        (row) => !removed.has(row.rowid),
+      );
+      store.ingest(receiptDelivery(`workflow-prune-${count}-${tied}`, now), now);
+      assert.deepEqual(
+        [...storage.sql.exec(`SELECT rowid, * FROM ${table} ORDER BY rowid`)],
+        expected,
+      );
+    });
+  }
+}
+
 test("comment-count gaps force a repair poll and a complete repair heals the collection", async () => {
   const storage = new MemoryDurableStorage();
   const store = new GithubWebhookReadModelStore(storage);
@@ -289,6 +829,7 @@ test("comment-count gaps force a repair poll and a complete repair heals the col
       repository,
       issue: { ...issue(55, "gap", updatedAt), comments: 2 },
     }),
+    Date.parse(updatedAt),
   );
   store.ingest(
     requiredDelivery("issue_comment", "gap-comment-one", updatedAt, {
@@ -297,6 +838,7 @@ test("comment-count gaps force a repair poll and a complete repair heals the col
       issue: { ...issue(55, "gap", updatedAt), comments: 2 },
       comment: { id: 5501, body: "one", created_at: updatedAt, updated_at: updatedAt },
     }),
+    Date.parse(updatedAt),
   );
   const gap = await store.readComments(
     { repository: "openclaw/openclaw", number: 55 },
@@ -529,7 +1071,7 @@ test("read-model failures expose only endpoint-owned error codes", async () => {
   }
 });
 
-test("dashboard workflow snapshot preserves health decisions while removing run and job polls", async () => {
+test("workflow read-model snapshots preserve the health projection", async () => {
   const storage = new MemoryDurableStorage();
   const store = new GithubWebhookReadModelStore(storage);
   store.ensureSchemaSync();
@@ -610,268 +1152,6 @@ test("dashboard workflow snapshot preserves health decisions while removing run 
   );
   assert.deepEqual(snapshotDecision, pollDecision);
   assert.equal(githubRequests, 8, "the snapshot decision adds no GitHub requests");
-});
-
-test("dashboard health revalidates and evicts stale phantom queued runs", async () => {
-  for (const liveVerdict of ["completed", "absent", "queued", "error", "zombie"] as const) {
-    const storage = new MemoryDurableStorage();
-    const store = new GithubWebhookReadModelStore(storage);
-    store.ensureSchemaSync();
-    const queue = new ExactReviewQueue({ storage }, {});
-    const observedAtMs = Date.now() - GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS - 60_000;
-    const observedAt = new Date(observedAtMs).toISOString();
-    const createdAt = new Date(
-      Date.now() - (liveVerdict === "zombie" ? 25 * 60 * 60_000 : 60 * 60_000),
-    ).toISOString();
-    const staleRun = {
-      id: 9911,
-      name: "Review",
-      display_title: "Review event item openclaw/openclaw#9911",
-      status: "queued",
-      conclusion: null,
-      created_at: createdAt,
-      updated_at: observedAt,
-    };
-    store.ingest(
-      requiredDelivery("workflow_run", `phantom-${liveVerdict}`, observedAt, {
-        action: "requested",
-        repository,
-        workflow_run: staleRun,
-      }),
-      observedAtMs,
-    );
-    store.repair(
-      {
-        repository: "openclaw/openclaw",
-        repair_kind: "workflows",
-        workflow_run_census_complete: true,
-        // Model the census race: this row arrived after the census began, so
-        // reconciliation preserved it even though the completed census omitted it.
-        workflow_run_census_started_at: new Date(observedAtMs - 1).toISOString(),
-        objects: [],
-      },
-      Date.now() - 30_000,
-    );
-    const seeded = await store.readWorkflows({ repository: "openclaw/openclaw" });
-    assert.equal(seeded.usable, true);
-    assert.equal((seeded.runs as unknown[]).length, 1);
-
-    const originalFetch = globalThis.fetch;
-    const originalCaches = globalThis.caches;
-    const originalWarn = console.warn;
-    const warnings: string[] = [];
-    Object.defineProperty(globalThis, "caches", {
-      configurable: true,
-      value: { default: { match: async () => undefined, put: async () => undefined } },
-    });
-    console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
-    let exactRunRequests = 0;
-    globalThis.fetch = async (input) => {
-      const url = new URL(input instanceof Request ? input.url : String(input));
-      if (url.pathname === "/repos/openclaw/openclaw/actions/runs/9911") {
-        exactRunRequests += 1;
-        if (liveVerdict === "zombie") throw new Error("zombie must not be reverified");
-        if (liveVerdict === "absent") return jsonResponse({ message: "Not Found" }, 404);
-        if (liveVerdict === "error") return jsonResponse({ message: "Unavailable" }, 503);
-        return jsonResponse(
-          liveVerdict === "completed"
-            ? { ...staleRun, status: "completed", conclusion: "success", updated_at: new Date() }
-            : staleRun,
-        );
-      }
-      if (url.pathname.includes("/actions/workflows/") || url.pathname.endsWith("/actions/runs")) {
-        return jsonResponse({ workflow_runs: [] });
-      }
-      if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
-      if (url.pathname.includes("/issues")) return jsonResponse([]);
-      throw new Error(`unexpected fetch ${url}`);
-    };
-    try {
-      const response = await worker.fetch(
-        new Request("https://clawsweeper.openclaw.ai/api/status"),
-        {
-          CLAWSWEEPER_REPO: "openclaw/openclaw",
-          TARGET_REPOS: "openclaw/openclaw",
-          CACHE_TTL_SECONDS: "0",
-          CLAWSWEEPER_WEBHOOK_SECRET: secret,
-          EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
-        },
-        { waitUntil: () => undefined },
-      );
-      const status = (await response.json()) as {
-        operational_health: {
-          status: string;
-          queued_over_threshold: number;
-          zombie_queued_runs: number;
-        };
-      };
-      if (liveVerdict === "zombie") {
-        assert.equal(status.operational_health.status, "healthy");
-        assert.equal(status.operational_health.queued_over_threshold, 0);
-        assert.equal(status.operational_health.zombie_queued_runs, 1);
-        assert.equal(exactRunRequests, 0);
-      } else if (liveVerdict === "error") {
-        assert.equal(status.operational_health.status, "unknown");
-        assert.equal(status.operational_health.queued_over_threshold, 0);
-        assert.equal(
-          warnings.some((line) => line.includes("github_read_model_workflow_run_evicted")),
-          false,
-        );
-      } else if (liveVerdict === "queued") {
-        assert.equal(status.operational_health.status, "degraded");
-        assert.equal(status.operational_health.queued_over_threshold, 1);
-        assert.equal(
-          warnings.some((line) => line.includes("github_read_model_workflow_run_evicted")),
-          false,
-        );
-        const confirmed = await store.readWorkflows({ repository: "openclaw/openclaw" });
-        const observation = (confirmed.run_observations as Array<Record<string, unknown>>)[0];
-        assert.ok(Date.parse(String(observation.confirmed_at)) > observedAtMs);
-      } else {
-        assert.equal(status.operational_health.status, "healthy");
-        assert.equal(status.operational_health.queued_over_threshold, 0);
-        assert.equal(
-          warnings.some(
-            (line) =>
-              line.includes("github_read_model_workflow_run_evicted") &&
-              line.includes(`"verdict":"${liveVerdict}"`),
-          ),
-          true,
-        );
-        const healed = await store.readWorkflows({ repository: "openclaw/openclaw" });
-        assert.deepEqual(healed.runs, []);
-      }
-    } finally {
-      globalThis.fetch = originalFetch;
-      console.warn = originalWarn;
-      Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-    }
-  }
-});
-
-test("dashboard health caps stale queued-run revalidation and drains oldest rows first", async () => {
-  const storage = new MemoryDurableStorage();
-  const store = new GithubWebhookReadModelStore(storage);
-  store.ensureSchemaSync();
-  const queue = new ExactReviewQueue({ storage }, {});
-  const observedAtMs = Date.now() - GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS - 60_000;
-  const observedAt = new Date(observedAtMs).toISOString();
-  const staleRunCount = 205;
-  const expectedBatchSize = 10;
-  const runIds = Array.from({ length: staleRunCount }, (_, index) => 10_000 + index);
-
-  for (const [index, runId] of runIds.entries()) {
-    store.ingest(
-      requiredDelivery("workflow_run", `stale-batch-${runId}`, observedAt, {
-        action: "requested",
-        repository,
-        workflow_run: {
-          id: runId,
-          name: "Review",
-          display_title: `Review event item openclaw/openclaw#${runId}`,
-          status: "queued",
-          conclusion: null,
-          created_at: new Date(Date.now() - (60 + index) * 60_000).toISOString(),
-          updated_at: observedAt,
-        },
-      }),
-      observedAtMs,
-    );
-  }
-  store.repair(
-    {
-      repository: "openclaw/openclaw",
-      repair_kind: "workflows",
-      workflow_run_census_complete: true,
-      workflow_run_census_started_at: new Date(observedAtMs - 1).toISOString(),
-      objects: [],
-    },
-    Date.now() - 30_000,
-  );
-
-  const originalFetch = globalThis.fetch;
-  const originalCaches = globalThis.caches;
-  const originalWarn = console.warn;
-  const warnings: string[] = [];
-  const exactRunRequests: number[] = [];
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: { default: { match: async () => undefined, put: async () => undefined } },
-  });
-  console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
-  globalThis.fetch = async (input) => {
-    const url = new URL(input instanceof Request ? input.url : String(input));
-    const exactRun = url.pathname.match(/^\/repos\/openclaw\/openclaw\/actions\/runs\/(\d+)$/);
-    if (exactRun) {
-      exactRunRequests.push(Number(exactRun[1]));
-      await new Promise((resolve) => setTimeout(resolve, 40));
-      return jsonResponse({ message: "Not Found" }, 404);
-    }
-    if (url.pathname.includes("/actions/workflows/") || url.pathname.endsWith("/actions/runs")) {
-      return jsonResponse({ workflow_runs: [] });
-    }
-    if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
-    if (url.pathname.includes("/issues")) return jsonResponse([]);
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  try {
-    let remaining = staleRunCount;
-    let refreshes = 0;
-    while (remaining > 0) {
-      const requestsBefore = exactRunRequests.length;
-      const startedAt = Date.now();
-      const response = await worker.fetch(
-        new Request("https://clawsweeper.openclaw.ai/api/status"),
-        {
-          CLAWSWEEPER_REPO: "openclaw/openclaw",
-          TARGET_REPOS: "openclaw/openclaw",
-          CACHE_TTL_SECONDS: "0",
-          CLAWSWEEPER_WEBHOOK_SECRET: secret,
-          EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
-        },
-        { waitUntil: () => undefined },
-      );
-      const elapsedMs = Date.now() - startedAt;
-      const status = (await response.json()) as {
-        operational_health: { status: string; queued_over_threshold: number };
-      };
-      const batchSize = Math.min(expectedBatchSize, remaining);
-      assert.equal(exactRunRequests.length - requestsBefore, batchSize);
-      assert.ok(elapsedMs < 500, `bounded refresh took ${elapsedMs}ms`);
-      remaining -= batchSize;
-      refreshes += 1;
-      assert.equal(status.operational_health.queued_over_threshold, 0);
-      assert.equal(status.operational_health.status, remaining > 0 ? "unknown" : "healthy");
-
-      const snapshot = await store.readWorkflows({ repository: "openclaw/openclaw" });
-      assert.equal((snapshot.runs as unknown[]).length, remaining);
-    }
-
-    assert.equal(refreshes, Math.ceil(staleRunCount / expectedBatchSize));
-    assert.deepEqual(
-      exactRunRequests.slice(0, expectedBatchSize).toSorted((left, right) => left - right),
-      runIds.slice(-expectedBatchSize),
-    );
-    assert.deepEqual(
-      exactRunRequests.toSorted((left, right) => left - right),
-      runIds,
-      "successive refreshes select every stale row exactly once",
-    );
-    assert.ok(
-      warnings.some(
-        (line) =>
-          line.includes('"event":"github_read_model_workflow_run_revalidation_batch"') &&
-          line.includes(`"batch_size":${expectedBatchSize}`) &&
-          line.includes(`"omitted_count":${staleRunCount - expectedBatchSize}`),
-      ),
-      "batch telemetry records the cap and omitted count",
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-    console.warn = originalWarn;
-    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-  }
 });
 
 test("dashboard health ignores repair-fed workflow rows without subscription coverage", async () => {
@@ -991,19 +1271,6 @@ test("exact-review lease capability reads only its own item without the webhook 
     env,
   );
   assert.equal(rejected.status, 409);
-});
-
-test("exact-review workflow exposes the scoped lease tuple but not the shared webhook secret", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  const start = workflow.indexOf("- name: Review exact event item");
-  const end = workflow.indexOf("\n      - name:", start + 1);
-  const step = workflow.slice(start, end);
-  assert.match(step, /EXACT_REVIEW_ITEM_KEY:/);
-  assert.match(step, /EXACT_REVIEW_LEASE_ID:/);
-  assert.match(step, /EXACT_REVIEW_LEASE_REVISION:/);
-  assert.match(step, /EXACT_REVIEW_CLAIM_GENERATION:/);
-  assert.match(step, /QUEUE_URL:/);
-  assert.doesNotMatch(step, /CLAWSWEEPER_WEBHOOK_SECRET:/);
 });
 
 function issue(number: number, title: string, updatedAt: string) {

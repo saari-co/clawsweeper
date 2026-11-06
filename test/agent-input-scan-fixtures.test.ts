@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   classifyReviewedFixtureScan,
   serializeReviewContext,
+  validateReviewedAttributionPolicy,
   type ReviewedAttribution,
   type StagedScanInput,
 } from "../dist/agent-input-scan-fixtures.js";
@@ -27,7 +28,7 @@ test("native refusal inventory preserves first refusal and bounds unadjudicated 
         level: "info-0",
         logger: "trufflehog",
         msg: "finished scanning",
-        trufflehog_version: "3.97.4",
+        trufflehog_version: "3.99.4",
         chunks: 1,
         bytes: 3,
         verified_secrets: 1,
@@ -73,7 +74,7 @@ test("native refusal inventory has deterministic count and byte bounds", () => {
         level: "info-0",
         logger: "trufflehog",
         msg: "finished scanning",
-        trufflehog_version: "3.97.4",
+        trufflehog_version: "3.99.4",
         chunks: 1,
         bytes: 40,
         verified_secrets: 0,
@@ -132,7 +133,7 @@ test("native inventory exposes only uniquely proven PLAIN source coordinates", (
         level: "info-0",
         logger: "trufflehog",
         msg: "finished scanning",
-        trufflehog_version: "3.97.4",
+        trufflehog_version: "3.99.4",
         chunks: 1,
         bytes: 28,
         verified_secrets: 0,
@@ -147,9 +148,11 @@ test("native inventory exposes only uniquely proven PLAIN source coordinates", (
   assert.ok(inventory);
   assert.equal(inventory.findings[0]?.sourceLine, 2);
   assert.equal(inventory.findings[0]?.sourceLineStatus, "proven");
+  assert.equal(inventory.findings[0]?.sourceLineReason, "unique_plain_literal");
   assert.equal(inventory.findings[0]?.scannerInputLine, 99);
   assert.equal(inventory.findings[1]?.sourceLine, null);
   assert.equal(inventory.findings[1]?.sourceLineStatus, "unavailable");
+  assert.equal(inventory.findings[1]?.sourceLineReason, "unsupported_decoder");
   assert.equal(inventory.findings[1]?.scannerInputLine, 100);
   assert.deepEqual(inventory.findings[0]?.material?.references, [
     {
@@ -161,13 +164,17 @@ test("native inventory exposes only uniquely proven PLAIN source coordinates", (
   ]);
 });
 
-test("native coordinate witnesses reject ambiguous, decoded and oversized inputs", () => {
-  for (const [bytes, raw, decoder] of [
-    [Buffer.from("neutral neutral"), "neutral", "PLAIN"],
-    [Buffer.from("aaaa"), "aaa", "PLAIN"],
-    [Buffer.from("neutral"), "neutral", "HTML"],
-    [Buffer.from("absent"), "neutral", "PLAIN"],
-    [Buffer.alloc(1024 * 1024 + 1, 120), "x", "PLAIN"],
+test("native coordinate witnesses explain unavailable attribution without exposing input", () => {
+  for (const [bytes, raw, decoder, reason] of [
+    [Buffer.from("neutral neutral"), "neutral", "PLAIN", "ambiguous_literal"],
+    [Buffer.from("aaaa"), "aaa", "PLAIN", "ambiguous_literal"],
+    [Buffer.from("neutral"), "neutral", "HTML", "unsupported_decoder"],
+    [Buffer.from("absent"), "neutral", "PLAIN", "literal_absent"],
+    [Buffer.alloc(1024 * 1024 + 1, 120), "x", "PLAIN", "source_size_limit"],
+    [Buffer.from("neutral"), "x".repeat(64 * 1024 + 1), "PLAIN", "literal_size_limit"],
+    [Buffer.from([0xff]), "neutral", "PLAIN", "invalid_source_utf8"],
+    [Buffer.from("neutral"), "", "PLAIN", "missing_literal"],
+    [undefined, "neutral", "PLAIN", "missing_source_bytes"],
   ] as const) {
     const finding = {
       DetectorType: 999999,
@@ -184,19 +191,26 @@ test("native coordinate witnesses reject ambiguous, decoded and oversized inputs
           level: "info-0",
           logger: "trufflehog",
           msg: "finished scanning",
-          trufflehog_version: "3.97.4",
+          trufflehog_version: "3.99.4",
           chunks: 1,
-          bytes: bytes.length,
+          bytes: (bytes?.length ?? 0) || 1,
           verified_secrets: 0,
           unverified_secrets: 1,
         }) + "\n",
       ),
-      new Map([["input", { kind: "blob", id: "a".repeat(40), bytes, references: [] }]]),
+      new Map([
+        [
+          "input",
+          { kind: "blob", id: "a".repeat(40), ...(bytes ? { bytes } : {}), references: [] },
+        ],
+      ]),
     );
     assert.equal(result.kind, "refused");
     if (result.kind !== "refused" || result.diagnostic.kind !== "unclassified_finding") continue;
     assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLine, null);
     assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLineStatus, "unavailable");
+    assert.equal(result.diagnostic.nativeFindings?.findings[0]?.sourceLineReason, reason);
+    assert.equal(JSON.stringify(result.diagnostic).includes("neutral"), false);
   }
 });
 
@@ -243,7 +257,7 @@ test("native inventory retains a late first refusal before truncating reviewed f
         level: "info-0",
         logger: "trufflehog",
         msg: "finished scanning",
-        trufflehog_version: "3.97.4",
+        trufflehog_version: "3.99.4",
         chunks: 1,
         bytes: 1,
         verified_secrets: 0,
@@ -279,6 +293,38 @@ test("native inventory retains a late first refusal before truncating reviewed f
     new Set(inventory.findings.map((finding) => finding.index)).size,
     inventory.retained,
   );
+});
+
+test("custom endpoint URI qualification stays native-identity and source-line bound", () => {
+  const source = readFileSync(
+    new URL("../src/agent-input-scan-fixtures.ts", import.meta.url),
+    "utf8",
+  );
+  const declaration = source.match(/const REVIEWED_ATTRIBUTIONS:[^\n]* = \[([\s\S]*?)\n\];/);
+  assert.ok(declaration);
+  const matching = declaration[1]!
+    .split("\n")
+    .filter((line) =>
+      line.includes("7efab902442b7a5718ca6037293710b1651a072ea24f11da9c6a9a5cadfb5fc3"),
+    )
+    .map((line) => JSON.parse(line.trim().replace(/,$/, "")) as ReviewedAttribution);
+  assert.deepEqual(
+    matching,
+    ["PLAIN", "HTML"].map((decoder) => [
+      17,
+      "URI",
+      decoder,
+      "597eab0f9f33f6ee623768b183c5e349f6b5e94f4760d5e846c2e77fd193f977",
+      "7efab902442b7a5718ca6037293710b1651a072ea24f11da9c6a9a5cadfb5fc3",
+      "6532ea82ef6d753e323297804484e534857b597d5d82d161a1f14ab6ed606672",
+      "src/gateway/server-methods/config-custom-endpoint.test.ts",
+      "100644",
+    ]),
+  );
+});
+
+test("host-owned reviewed attribution policy is valid and has no duplicate rows", () => {
+  assert.doesNotThrow(validateReviewedAttributionPolicy);
 });
 
 test("WebVNC fixture policy retains both exact native identities and source witnesses", () => {
@@ -524,7 +570,7 @@ function fixturePatch(
               level: "info-0",
               logger: "trufflehog",
               msg: "finished scanning",
-              trufflehog_version: "3.97.4",
+              trufflehog_version: "3.99.4",
               chunks: 1,
               bytes: content.length,
               verified_secrets: findings.filter((finding) => finding.Verified === true).length,
@@ -665,64 +711,81 @@ function questionPromptFixture(): ReturnType<typeof autoreviewFixtures>[number] 
   return { raw, rawV2, line: `    "${rawV2}-in",`, decoders: ["PLAIN", "HTML"] };
 }
 
-const questionPromptSource = "ui/src/app/question-prompt.test.ts";
-
-for (const change of ["add", "remove", "context"] as const) {
-  test(`question URL rejection fixture admits exact Git-generated ${change} attribution`, (t) => {
-    const patch = fixturePatch(t, questionPromptSource, [questionPromptFixture()], change);
-    for (const decoder of ["PLAIN", "HTML"] as const) {
-      const result = patch.classify(decoder);
-      assert.equal(result.kind, "classified", JSON.stringify(result));
-      if (result.kind !== "classified") continue;
-      assert.ok(result.notices.every((notice) => notice.source === questionPromptSource));
-      const findings = result.notices.flatMap((notice) => notice.findings);
-      assert.ok(findings.some((finding) => finding.patch));
-      assert.ok(findings.every((finding) => finding.decoder === decoder));
-      if (change === "context") {
-        assert.ok(findings.some((finding) => finding.role === "base"));
-        assert.ok(findings.some((finding) => finding.role === "head"));
-      } else {
-        assert.ok(findings.every((finding) => finding.role === patch.role));
-      }
-    }
-  });
+function websiteFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://:", "example-password", "@", "status.example"].join("");
+  return {
+    raw,
+    rawV2: raw,
+    line: `    { name: "password-only", url: "${raw}/" },`,
+    decoders: ["PLAIN"],
+  };
 }
 
-for (const variant of ["literal", "line", "path", "mode", "verified", "decoder"] as const) {
-  test(`question URL rejection fixture still refuses changed ${variant}`, (t) => {
-    const entry = questionPromptFixture();
-    if (variant === "literal") {
-      entry.raw = entry.raw.replace("password", "passwore");
-      entry.rawV2 = entry.rawV2!.replace("password", "passwore");
-      entry.line = entry.line.replace("password", "passwore");
-    } else if (variant === "line") {
-      entry.line += " ";
-    }
-    const patch = fixturePatch(
-      t,
-      variant === "path" ? "ui/src/app/another-question.test.ts" : questionPromptSource,
-      [entry],
-    );
-    if (variant === "mode") {
-      for (const [file, input] of patch.inputs) {
-        if (input.kind === "blob") {
-          patch.inputs.set(file, {
-            ...input,
-            references: input.references.map((reference) => ({ ...reference, mode: "100755" })),
-          });
+for (const { name, source, makeFixture } of [
+  {
+    name: "question",
+    source: "ui/src/app/question-prompt.test.ts",
+    makeFixture: questionPromptFixture,
+  },
+  {
+    name: "website",
+    source: "ui/src/lib/board/widgets/website.test.ts",
+    makeFixture: websiteFixture,
+  },
+]) {
+  for (const change of ["add", "remove", "context"] as const) {
+    test(`${name} URL rejection fixture admits exact Git-generated ${change} attribution`, (t) => {
+      const patch = fixturePatch(t, source, [makeFixture()], change);
+      for (const decoder of makeFixture().decoders) {
+        const result = patch.classify(decoder);
+        assert.equal(result.kind, "classified", JSON.stringify(result));
+        if (result.kind !== "classified") continue;
+        assert.ok(result.notices.every((notice) => notice.source === source));
+        const findings = result.notices.flatMap((notice) => notice.findings);
+        assert.ok(findings.some((finding) => finding.patch));
+        assert.ok(findings.every((finding) => finding.decoder === decoder));
+        if (change === "context") {
+          assert.ok(findings.some((finding) => finding.role === "base"));
+          assert.ok(findings.some((finding) => finding.role === "head"));
+        } else {
+          assert.ok(findings.every((finding) => finding.role === patch.role));
         }
       }
-    }
-    const result = patch.classify(
-      "HTML",
-      variant === "verified"
-        ? { Verified: true }
-        : variant === "decoder"
-          ? { DecoderName: "BASE64" }
-          : {},
-    );
-    assert.equal(result.kind, "refused", JSON.stringify(result));
-  });
+    });
+  }
+
+  for (const variant of ["literal", "line", "path", "mode", "verified", "decoder"] as const) {
+    test(`${name} URL rejection fixture still refuses changed ${variant}`, (t) => {
+      const entry = makeFixture();
+      if (variant === "literal") {
+        entry.raw = entry.raw.replace("password", "passwore");
+        entry.rawV2 = entry.rawV2!.replace("password", "passwore");
+        entry.line = entry.line.replace("password", "passwore");
+      } else if (variant === "line") {
+        entry.line += " ";
+      }
+      const patch = fixturePatch(t, variant === "path" ? `${source}.other` : source, [entry]);
+      if (variant === "mode") {
+        for (const [file, input] of patch.inputs) {
+          if (input.kind === "blob") {
+            patch.inputs.set(file, {
+              ...input,
+              references: input.references.map((reference) => ({ ...reference, mode: "100755" })),
+            });
+          }
+        }
+      }
+      const result = patch.classify(
+        entry.decoders.at(-1)!,
+        variant === "verified"
+          ? { Verified: true }
+          : variant === "decoder"
+            ? { DecoderName: name === "website" ? "HTML" : "BASE64" }
+            : {},
+      );
+      assert.equal(result.kind, "refused", JSON.stringify(result));
+    });
+  }
 }
 
 function readinessPrivacyFixture(): ReturnType<typeof autoreviewFixtures>[number] {
@@ -970,7 +1033,7 @@ function githubCheckLinkFixture(): ReturnType<typeof autoreviewFixtures>[number]
   return { raw, rawV2, line: '    "' + rawV2 + '",', decoders: ["PLAIN", "HTML"] };
 }
 
-function browserSessionFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+function browserSessionFixture(variable = "cdpUrl"): ReturnType<typeof autoreviewFixtures>[number] {
   const raw = [
     "https://",
     "browser-user",
@@ -980,33 +1043,59 @@ function browserSessionFixture(): ReturnType<typeof autoreviewFixtures>[number] 
     "browserless.example",
   ].join("");
   const rawV2 = raw + "/cdp";
-  return { raw, rawV2, line: '    const cdpUrl = "' + rawV2 + '";', decoders: ["PLAIN", "HTML"] };
+  return {
+    raw,
+    rawV2,
+    line: "    const " + variable + ' = "' + rawV2 + '";',
+    decoders: ["PLAIN", "HTML"],
+  };
+}
+
+function updateFailureReportFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://", "user", ":", "password", "@", "private.example"].join("");
+  const rawV2 = raw + "/config";
+  return { raw, rawV2, line: '  "' + rawV2 + '",', decoders: ["PLAIN", "HTML"] };
 }
 
 function exactUriFixtureTests(
   name: string,
   source: string,
   makeFixture: () => ReturnType<typeof autoreviewFixtures>[number],
+  options: {
+    admittedChanges?: readonly ("add" | "remove" | "context")[];
+    mutationChange?: "add" | "remove" | "context";
+  } = {},
 ) {
   for (const change of ["add", "remove", "context"] as const) {
-    test(name + " fixture admits exact Git-generated " + change + " attribution", (t) => {
-      const patch = fixturePatch(t, source, [makeFixture()], change);
-      for (const decoder of makeFixture().decoders) {
-        const result = patch.classify(decoder);
-        assert.equal(result.kind, "classified", JSON.stringify(result));
-        if (result.kind !== "classified") continue;
-        assert.ok(result.notices.every((notice) => notice.source === source));
-        const findings = result.notices.flatMap((notice) => notice.findings);
-        assert.ok(findings.some((finding) => finding.patch));
-        assert.ok(findings.every((finding) => finding.decoder === decoder));
-        if (change === "context") {
-          assert.ok(findings.some((finding) => finding.role === "base"));
-          assert.ok(findings.some((finding) => finding.role === "head"));
-        } else {
-          assert.ok(findings.every((finding) => finding.role === patch.role));
+    const admitted = options.admittedChanges?.includes(change) ?? true;
+    test(
+      name +
+        ` fixture ${admitted ? "admits" : "refuses"} exact Git-generated ` +
+        change +
+        " attribution",
+      (t) => {
+        const patch = fixturePatch(t, source, [makeFixture()], change);
+        for (const decoder of makeFixture().decoders) {
+          const result = patch.classify(decoder);
+          if (!admitted) {
+            assert.equal(result.kind, "refused", JSON.stringify(result));
+            continue;
+          }
+          assert.equal(result.kind, "classified", JSON.stringify(result));
+          if (result.kind !== "classified") continue;
+          assert.ok(result.notices.every((notice) => notice.source === source));
+          const findings = result.notices.flatMap((notice) => notice.findings);
+          assert.ok(findings.some((finding) => finding.patch));
+          assert.ok(findings.every((finding) => finding.decoder === decoder));
+          if (change === "context") {
+            assert.ok(findings.some((finding) => finding.role === "base"));
+            assert.ok(findings.some((finding) => finding.role === "head"));
+          } else {
+            assert.ok(findings.every((finding) => finding.role === patch.role));
+          }
         }
-      }
-    });
+      },
+    );
   }
   for (const variant of [
     "literal",
@@ -1033,7 +1122,12 @@ function exactUriFixtureTests(
         variant === "extra-occurrence"
           ? [entry, { ...entry, line: entry.line + " // extra" }]
           : [entry];
-      const patch = fixturePatch(t, variant === "path" ? source + ".other" : source, entries);
+      const patch = fixturePatch(
+        t,
+        variant === "path" ? source + ".other" : source,
+        entries,
+        options.mutationChange,
+      );
       if (variant === "mode" || variant === "role" || variant === "revision") {
         for (const [file, input] of patch.inputs) {
           if (input.kind !== "blob") continue;
@@ -1064,6 +1158,112 @@ function exactUriFixtureTests(
     });
   }
 }
+
+exactUriFixtureTests(
+  "Historical OCE proxy URL rejection",
+  "tests/conformance/kubernetes-compute.test.mjs",
+  () => {
+    const raw = ["https://", "operator", ":", "secret", "@", "10.42.0.15:3128"].join("");
+    return {
+      raw,
+      rawV2: raw,
+      line: '    "' + raw + '",',
+      decoders: ["PLAIN"],
+    };
+  },
+  { admittedChanges: [], mutationChange: "remove" },
+);
+
+exactUriFixtureTests(
+  "Historical OCE API URL rejection",
+  "tests/conformance/kubernetes-compute.test.mjs",
+  () => {
+    const raw = ["https://", "user", ":", "password", "@", "127.0.0.1"].join("");
+    return {
+      raw,
+      rawV2: raw,
+      line: '    { name: "embedded-api-credentials", server: "' + raw + ':1" },',
+      decoders: ["PLAIN"],
+    };
+  },
+  { admittedChanges: [], mutationChange: "remove" },
+);
+
+test("Historical OCE URI fixture admits only an exact reviewed source blob", (t) => {
+  const source = "tests/conformance/kubernetes-compute.test.mjs";
+  const raw = ["https://", "operator", ":", "secret", "@", "10.42.0.15:3128"].join("");
+  const entry = {
+    raw,
+    rawV2: raw,
+    line: '    "' + raw + '",',
+    decoders: ["PLAIN"] as const,
+  };
+  const fixture = fixturePatch(t, source, [entry], "remove");
+  const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const reviewedInput = [...fixture.inputs.values()].find(
+    (input) => input.kind === "blob" && input.bytes?.includes(raw),
+  );
+  assert.equal(reviewedInput?.kind, "blob");
+  assert.ok(reviewedInput.bytes);
+  const reviewedAttributions: ReviewedAttribution[] = [
+    [
+      17,
+      "URI",
+      "PLAIN",
+      hash(raw),
+      hash(raw),
+      hash(entry.line),
+      source,
+      "100644",
+      [hash(reviewedInput.bytes)],
+    ],
+  ];
+  const classified = fixture.classify("PLAIN", {}, { blobOnly: true, reviewedAttributions });
+  assert.equal(classified.kind, "classified", JSON.stringify(classified));
+
+  reviewedInput.bytes = Buffer.concat([reviewedInput.bytes, Buffer.from("# unrelated change\n")]);
+  const refused = fixture.classify("PLAIN", {}, { blobOnly: true, reviewedAttributions });
+  assert.equal(refused.kind, "refused", JSON.stringify(refused));
+  if (refused.kind === "refused") assert.equal(refused.diagnostic.reason, "source_not_reviewed");
+});
+
+function catalogIconUriFixture(): ReturnType<typeof autoreviewFixtures>[number] {
+  const raw = ["https://", "user", ":", "password", "@", "cdn.example.com"].join("");
+  const rawV2 = raw + "/icon";
+  return {
+    raw,
+    rawV2,
+    line: '      "' + rawV2 + '.svg",',
+    decoders: ["PLAIN", "HTML"],
+  };
+}
+
+const catalogIconFixtureSource = "src/plugins/catalog-icon-registry.test.ts";
+
+exactUriFixtureTests("Catalog icon URL rejection", catalogIconFixtureSource, catalogIconUriFixture);
+
+test("Catalog icon URL rejection refuses a shared blob under an unqualified path", (t) => {
+  const entry = catalogIconUriFixture();
+  const patch = fixturePatch(t, catalogIconFixtureSource, [entry], "add", [
+    { source: "src/plugins/other-catalog-icon.test.ts", entries: [entry] },
+  ]);
+  for (const decoder of entry.decoders) {
+    const result = patch.classify(decoder);
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    if (result.kind === "refused") assert.equal(result.diagnostic.reason, "source_not_reviewed");
+  }
+});
+
+test("Catalog icon URL rejection binds the suffix beyond the native URI match", (t) => {
+  const entry = catalogIconUriFixture();
+  entry.line = entry.line.replace(".svg", ".png");
+  const patch = fixturePatch(t, catalogIconFixtureSource, [entry]);
+  for (const decoder of entry.decoders) {
+    const result = patch.classify(decoder);
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    if (result.kind === "refused") assert.equal(result.diagnostic.reason, "literal_mismatch");
+  }
+});
 
 test("SDK browser CDP fixtures bind native identities and complete source lines", (t) => {
   const entries = [9222, 80].map((port) => {
@@ -1634,9 +1834,61 @@ exactUriFixtureTests(
   githubCheckLinkFixture,
 );
 exactUriFixtureTests(
+  "GitHub check-link reformatted",
+  "extensions/github/src/detail-checks.test.ts",
+  () => {
+    const raw = ["https://", "user", ":", "password", "@", "ci.example.com"].join("");
+    const rawV2 = raw + "/log";
+    return {
+      raw,
+      rawV2,
+      line: '  it.each(["http://ci.example.com/log", "' + rawV2 + '"])(',
+      decoders: ["PLAIN", "HTML"],
+    };
+  },
+);
+exactUriFixtureTests(
+  "GitHub detail truncated upstream URL",
+  "extensions/github/src/detail.test.ts",
+  () => {
+    const raw = ["https://", "user", ":", "password", "@", "api.github.com"].join("");
+    return {
+      raw,
+      // The native PLAIN match stops at 45 bytes while the line holds the full URL.
+      rawV2: raw + "/repos/oc",
+      line: '    "' + raw + '/repos/octocat/repo",',
+      decoders: ["PLAIN", "HTML"],
+    };
+  },
+);
+exactUriFixtureTests(
+  "GitHub detail full upstream URL",
+  "extensions/github/src/detail.test.ts",
+  () => {
+    const raw = ["https://", "user", ":", "password", "@", "api.github.com"].join("");
+    const rawV2 = raw + "/repos/octocat/repo";
+    return { raw, rawV2, line: '    "' + rawV2 + '",', decoders: ["PLAIN", "HTML"] };
+  },
+);
+exactUriFixtureTests("GitHub detail steal-link", "extensions/github/src/detail.test.ts", () => {
+  const raw = ["https://", "user", ":", "secret", "@", "github.com"].join("");
+  const rawV2 = raw + "/owner/repo";
+  return {
+    raw,
+    rawV2,
+    line: '  it.each(["https://example.com/steal", "' + rawV2 + '"])(',
+    decoders: ["PLAIN", "HTML"],
+  };
+});
+exactUriFixtureTests(
   "browser session",
   "extensions/browser/src/browser/pw-session.connections.test.ts",
-  browserSessionFixture,
+  () => browserSessionFixture(),
+);
+exactUriFixtureTests(
+  "renamed browser session",
+  "extensions/browser/src/browser/pw-session.connections.test.ts",
+  () => browserSessionFixture("endpoint"),
 );
 
 exactUriFixtureTests(
@@ -1852,7 +2104,7 @@ for (const [index, entry] of crabboxConfigFixtures.entries()) {
                 level: "info-0",
                 logger: "trufflehog",
                 msg: "finished scanning",
-                trufflehog_version: "3.97.4",
+                trufflehog_version: "3.99.4",
                 chunks: 1,
                 bytes: bytes.length,
                 verified_secrets: findings.filter((value) => value.Verified).length,
@@ -1897,6 +2149,267 @@ for (const [index, entry] of crabboxConfigFixtures.entries()) {
     }
   });
 }
+
+test("logging redaction fixtures bind native decoders to exact source bytes across revisions", () => {
+  // Reassemble qualified synthetic literals so this policy test adds no contiguous URI credentials.
+  const browser = ["https", "browser-user:browser-password-1234567890@api.example.test"].join(
+    "://",
+  );
+  const emptyUser = ["https", ":empty-username-password-1234567890@api.example.test"].join("://");
+  const postgres = ["postgres", "secret:secret@db.example.test:5432"].join("://");
+  const mongo = ["mongodb+srv", "mongo:mongodb-password-1234567890@cluster.example.test/app"].join(
+    "://",
+  );
+  const redacted = ["postgres", "secret:***@db.example.test:5432"].join("://");
+  const postgresExtra = {
+    database: "openclaw",
+    host: "db.example.test:5432",
+    sslmode: "<unset>",
+    username: "secret",
+  };
+  const fixtures = [
+    {
+      DetectorType: 17,
+      DetectorName: "URI",
+      Raw: browser,
+      RawV2: browser + "/v1",
+      line: '      "' + browser + '/v1",',
+      SecretParts: {
+        host: "api.example.test",
+        username: "browser-user",
+        password: "browser-password-1234567890",
+      },
+      ExtraData: null,
+      digests: ["de7dcbd8", "198d323e", "8ff8c788"],
+    },
+    {
+      DetectorType: 17,
+      DetectorName: "URI",
+      Raw: emptyUser,
+      RawV2: emptyUser + "/v1",
+      line: '      "' + emptyUser + '/v1",',
+      SecretParts: {
+        host: "api.example.test",
+        username: "",
+        password: "empty-username-password-1234567890",
+      },
+      ExtraData: null,
+      digests: ["a460200b", "839b16fa", "232cce5b"],
+    },
+    {
+      DetectorType: 968,
+      DetectorName: "Postgres",
+      Raw: postgres,
+      RawV2: postgres,
+      line: ['      "postgres', 'secret:secret@db.example.test/openclaw",'].join("://"),
+      SecretParts: { connection_string: postgres },
+      ExtraData: postgresExtra,
+      digests: ["39a03151", "39a03151", "4b03f485"],
+    },
+    {
+      DetectorType: 895,
+      DetectorName: "MongoDB",
+      Raw: mongo,
+      RawV2: "",
+      line: '      "' + mongo + '",',
+      SecretParts: { key: mongo },
+      ExtraData: {
+        database: "app",
+        host: "cluster.example.test",
+        rotation_guide: ["https", "howtorotate.com/docs/tutorials/mongo/"].join("://"),
+        username: "mongo",
+      },
+      digests: ["087c10ed", "e3b0c442", "0aeba0d1"],
+    },
+    {
+      DetectorType: 968,
+      DetectorName: "Postgres",
+      Raw: redacted,
+      RawV2: redacted,
+      line: ['        "postgres', 'secret:***@db.example.test/openclaw",'].join("://"),
+      SecretParts: { connection_string: redacted },
+      ExtraData: postgresExtra,
+      digests: ["050c1ddf", "050c1ddf", "cc1376c8"],
+    },
+  ];
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  for (const [index, fixture] of fixtures.entries()) {
+    assert.deepEqual(
+      [fixture.Raw, fixture.RawV2, fixture.line].map((value) => digest(value).slice(0, 8)),
+      fixture.digests,
+      `native identity ${index + 1} digests`,
+    );
+  }
+  const oldLine = [
+    '    expect(output).toContain("postgres',
+    'secret:***@db.example.test/openclaw");',
+  ].join("://");
+  assert.equal(digest(oldLine).slice(0, 8), "6dc3c292", "pre-rewrite line digest");
+
+  const file = "/scanner/logging-redaction-fixture";
+  const source = "src/logging/redact.test.ts";
+  const reference = { source, mode: "100644", revision: "a".repeat(40), role: "base" as const };
+  const lines = fixtures.map((fixture) => fixture.line);
+  const findings = fixtures.map(({ line: _line, digests: _digests, ...fixture }, index) => ({
+    ...fixture,
+    SourceType: 15,
+    DecoderName: "PLAIN",
+    Verified: false,
+    VerificationError: "synthetic verification error",
+    StructuredData: null,
+    SourceMetadata: { Data: { Filesystem: { file, line: index + 1 } } },
+  }));
+  const scan = (
+    options: {
+      lines?: string[];
+      findings?: typeof findings;
+      references?: Extract<StagedScanInput, { kind: "blob" | "worktree" }>["references"];
+      complete?: boolean;
+    } = {},
+  ) => {
+    const observed = options.findings ?? findings;
+    const bytes = Buffer.from((options.lines ?? lines).join("\n") + "\n");
+    return {
+      stdout: Buffer.from(observed.map((finding) => JSON.stringify(finding)).join("\n") + "\n"),
+      stderr: Buffer.from(
+        options.complete === false
+          ? ""
+          : JSON.stringify({
+              level: "info-0",
+              logger: "trufflehog",
+              msg: "finished scanning",
+              trufflehog_version: "3.99.4",
+              chunks: 1,
+              bytes: bytes.length,
+              verified_secrets: observed.filter((finding) => finding.Verified).length,
+              unverified_secrets: observed.filter((finding) => !finding.Verified).length,
+            }) + "\n",
+      ),
+      inputs: new Map<string, StagedScanInput>([
+        [
+          file,
+          {
+            kind: "blob",
+            id: "a".repeat(40),
+            bytes,
+            references: options.references ?? [
+              reference,
+              { ...reference, revision: "b".repeat(40), role: "head" },
+            ],
+          },
+        ],
+      ]),
+    };
+  };
+  const classify = (options: Parameters<typeof scan>[0] = {}) => {
+    const { stdout, stderr, inputs } = scan(options);
+    return classifyReviewedFixtureScan(183, stdout, stderr, inputs);
+  };
+  const classified = (observed: typeof findings, label: string, stagedLines = lines) => {
+    const result = classify({ findings: observed, lines: stagedLines });
+    assert.equal(result.kind, "classified", `${label}: ${JSON.stringify(result)}`);
+    if (result.kind !== "classified") return;
+    assert.equal(result.notices.length, observed.length, label);
+    assert.deepEqual(
+      result.notices.map((notice) => notice.detector).sort(),
+      observed.map((finding) => finding.DetectorName).sort(),
+      label,
+    );
+    for (const notice of result.notices) {
+      assert.equal(notice.source, source, label);
+      assert.deepEqual(
+        notice.findings.map((finding) => finding.role).sort(),
+        ["base", "head"],
+        label,
+      );
+    }
+  };
+  const decoders = ["PLAIN", "ESCAPED_UNICODE", "HTML"];
+  for (const decoder of decoders) {
+    classified(
+      findings.map((finding) => ({ ...finding, DecoderName: decoder })),
+      decoder,
+    );
+  }
+  for (let k = 0; k < decoders.length; k++) {
+    const mixed = findings.map((finding, i) => ({
+      ...finding,
+      DecoderName: decoders[(i + k) % 3]!,
+    }));
+    classified(mixed, `mixed decoders ${k}`);
+    classified([...mixed].reverse(), `reversed findings ${k}`);
+    classified([mixed[4]!, mixed[0]!], `reversed subset ${k}`);
+    for (const finding of mixed) classified([finding], `single finding ${k}`);
+  }
+  const refused = (label: string, result: ReturnType<typeof classify>, reason: string) => {
+    assert.equal(result.kind, "refused", label);
+    if (result.kind === "refused") assert.equal(result.diagnostic.reason, reason, label);
+  };
+  refused(
+    "changed line bytes",
+    classify({ lines: lines.map((line, i) => line + (i === 0 ? " " : "")) }),
+    "literal_mismatch",
+  );
+  for (const [label, overrides] of [
+    ["decoder BASE64", { DecoderName: "BASE64" }],
+    ["verified finding", { Verified: true }],
+  ] as const) {
+    refused(
+      label,
+      classify({ findings: findings.map((finding) => ({ ...finding, ...overrides })) }),
+      "finding_not_reviewed",
+    );
+  }
+  for (const [label, overrides] of [
+    ["source path", { source: "src/logging/other.test.ts" }],
+    ["executable mode", { mode: "100755" }],
+    ["worktree role", { role: "worktree" }],
+  ] as const) {
+    refused(
+      label,
+      classify({ references: [{ ...reference, ...overrides }] }),
+      "source_not_reviewed",
+    );
+  }
+  refused(
+    "duplicate native record",
+    classify({ findings: [...findings, findings[0]!] }),
+    "duplicate_finding",
+  );
+  refused("extra URI occurrence", classify({ lines: [...lines, lines[0]!] }), "literal_mismatch");
+  refused("incomplete scan", classify({ complete: false }), "incomplete_scan");
+
+  const oldLines = lines.map((line, i) => (i === 4 ? oldLine : line));
+  for (const decoder of decoders) {
+    const observed = [{ ...findings[4]!, DecoderName: decoder }];
+    if (decoder === "HTML") {
+      refused(
+        "pre-rewrite HTML",
+        classify({ lines: oldLines, findings: observed }),
+        "literal_mismatch",
+      );
+    } else {
+      classified(observed, `pre-rewrite ${decoder}`, oldLines);
+    }
+  }
+  const { stdout, stderr, inputs } = scan();
+  assert.throws(
+    () =>
+      classifyReviewedFixtureScan(183, stdout, stderr, inputs, [
+        [
+          17,
+          "URI",
+          "BASE64",
+          digest(browser),
+          digest(browser + "/v1"),
+          digest(lines[0]!),
+          source,
+          "100644",
+        ],
+      ]),
+    /invalid reviewed attribution policy/,
+  );
+});
 
 function nativeRuntimeEndpointFixture(config: boolean) {
   // Reconstruct the intentionally rejected synthetic input without adding a scan literal.
@@ -2143,3 +2656,9 @@ for (const decoder of ["PLAIN", "HTML"] as const) {
     }
   });
 }
+
+exactUriFixtureTests(
+  "update failure report",
+  "src/infra/update-failure-report-config.test.ts",
+  updateFailureReportFixture,
+);

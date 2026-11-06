@@ -1,16 +1,6 @@
-export type DirectReReviewOrigin = "hosted_webhook" | "comment_router";
-export type InlineProofScenario = "web-ui-chat-proof" | "telegram-bot-e2e-proof";
+import { commandStatusMarker } from "./markers.ts";
 
-export function validProofAllowedScenarios(value: unknown): value is InlineProofScenario[] {
-  return (
-    Array.isArray(value) &&
-    value.length <= 2 &&
-    new Set(value).size === value.length &&
-    value.every(
-      (scenario) => scenario === "web-ui-chat-proof" || scenario === "telegram-bot-e2e-proof",
-    )
-  );
-}
+export type DirectReReviewOrigin = "hosted_webhook" | "comment_router";
 
 export type DirectReReviewDecision = {
   targetRepo: string;
@@ -21,14 +11,12 @@ export type DirectReReviewDecision = {
   sourceAction: "re_review";
   supersedesInProgress: false;
   sourceDeliveryId: string;
-  bayJourneyDeliveryId?: string;
   sourceCommentId: number;
   sourceCommentUpdatedAt: string;
   commandBodyDigest: string;
   commandOrigin: DirectReReviewOrigin;
   commandStatusMarker: string;
   additionalPrompt: string;
-  proofAllowedScenarios?: InlineProofScenario[];
   statusCommentId?: number;
   sourceHeadSha?: string;
   sourceBaseSha?: string;
@@ -89,10 +77,8 @@ export function directReReviewIntake(options: {
   commandBodyDigest: string;
   commandOrigin: DirectReReviewOrigin;
   additionalPrompt: string;
-  proofAllowedScenarios?: InlineProofScenario[];
   statusCommentId?: number;
   candidateHeadSha?: string;
-  bayJourneyDeliveryId?: string;
 }): DirectReReviewIntake {
   const commandVersionId = reReviewCommandVersionIdentity({
     commentId: options.sourceCommentId,
@@ -101,12 +87,6 @@ export function directReReviewIntake(options: {
   });
   if (!Number.isSafeInteger(options.installationId) || options.installationId < 1) {
     throw new Error("exact re-review installation is invalid");
-  }
-  if (
-    Object.hasOwn(options, "proofAllowedScenarios") &&
-    !validProofAllowedScenarios(options.proofAllowedScenarios)
-  ) {
-    throw new Error("exact re-review proof selection is invalid");
   }
   const decision: DirectReReviewIntake["decision"] = {
     targetRepo: options.targetRepo,
@@ -117,17 +97,12 @@ export function directReReviewIntake(options: {
     sourceAction: "re_review",
     supersedesInProgress: false,
     sourceDeliveryId: commandVersionId,
-    ...(options.bayJourneyDeliveryId ? { bayJourneyDeliveryId: options.bayJourneyDeliveryId } : {}),
     sourceCommentId: options.sourceCommentId,
     sourceCommentUpdatedAt: options.sourceCommentUpdatedAt,
     commandBodyDigest: options.commandBodyDigest,
     commandOrigin: options.commandOrigin,
     commandStatusMarker: directReReviewStatusMarker(options.itemNumber, commandVersionId),
     additionalPrompt: options.additionalPrompt.slice(0, 5_000),
-    // An explicit empty selection denies every proof tool; never omit it.
-    ...(options.proofAllowedScenarios !== undefined
-      ? { proofAllowedScenarios: [...options.proofAllowedScenarios] }
-      : {}),
     ...(options.statusCommentId ? { statusCommentId: options.statusCommentId } : {}),
     ...(options.candidateHeadSha ? { sourceHeadSha: options.candidateHeadSha } : {}),
   };
@@ -165,9 +140,6 @@ export function validateDirectReReviewIntake(value: unknown): DirectReReviewInta
         bodySha256: String(intake.commandBodyDigest),
       }) ||
     decision.sourceDeliveryId !== intake.commandVersionId ||
-    (decision.bayJourneyDeliveryId !== undefined &&
-      (typeof decision.bayJourneyDeliveryId !== "string" ||
-        !/^[A-Za-z0-9_.:-]{1,200}$/.test(decision.bayJourneyDeliveryId))) ||
     decision.sourceCommentId !== intake.sourceCommentId ||
     decision.sourceCommentUpdatedAt !== intake.sourceCommentUpdatedAt ||
     decision.commandBodyDigest !== intake.commandBodyDigest ||
@@ -186,8 +158,6 @@ export function validateDirectReReviewIntake(value: unknown): DirectReReviewInta
       directReReviewStatusMarker(Number(decision.itemNumber), intake.commandVersionId) ||
     typeof decision.additionalPrompt !== "string" ||
     decision.additionalPrompt.length > 5_000 ||
-    (Object.hasOwn(decision, "proofAllowedScenarios") &&
-      !validProofAllowedScenarios(decision.proofAllowedScenarios)) ||
     Object.hasOwn(decision, "sourceHeadVerified") ||
     Object.hasOwn(decision, "sourceCommentVerified") ||
     Object.hasOwn(decision, "sourceAuthoritySeq") ||
@@ -210,7 +180,13 @@ export function validateDirectReReviewIntake(value: unknown): DirectReReviewInta
   ) {
     return null;
   }
-  return intake as DirectReReviewIntake;
+  if (!Object.hasOwn(decision, "bayJourneyDeliveryId")) return intake as DirectReReviewIntake;
+  const normalized = {
+    ...intake,
+    decision: { ...decision },
+  } as DirectReReviewIntake;
+  Reflect.deleteProperty(normalized.decision, "bayJourneyDeliveryId");
+  return normalized;
 }
 
 function directReReviewStatusMarker(itemNumber: number, commandVersionId: string) {
@@ -221,5 +197,5 @@ function directReReviewStatusMarker(itemNumber: number, commandVersionId: string
   ) {
     throw new Error("exact re-review command status marker is invalid");
   }
-  return `<!-- clawsweeper-command-status:${itemNumber}:re_review:${commandVersionId} -->`;
+  return commandStatusMarker(itemNumber, "re_review", commandVersionId);
 }

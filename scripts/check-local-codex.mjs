@@ -1,7 +1,33 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { parseArgs } from "node:util";
 
-const model = argValue("--model") ?? process.env.CLAWSWEEPER_LOCAL_CODEX_MODEL ?? "gpt-5.6-sol";
+const usage = "Usage: pnpm run codex:local:check -- [--diagnostics] [--model <name>]";
+let values;
+try {
+  const args = process.argv.slice(2);
+  if (args[0] === "--") args.shift();
+  ({ values } = parseArgs({
+    args,
+    options: {
+      diagnostics: { type: "boolean" },
+      model: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
+  }));
+} catch (error) {
+  console.error(error.message);
+  console.error(usage);
+  process.exit(1);
+}
+if (values.help) {
+  console.log(usage);
+  console.log("--diagnostics checks Codex login status without a model request.");
+  console.log("Without --diagnostics, the check also runs a model smoke test.");
+  process.exit(0);
+}
+const model =
+  (values.model || undefined) ?? process.env.CLAWSWEEPER_LOCAL_CODEX_MODEL ?? "gpt-6.1-sol";
 const { codexSpawnInvocation } = await loadCodexLauncher();
 const codexEnv = { ...process.env };
 const codex = codexInvocation([]);
@@ -21,6 +47,11 @@ if (status.status !== 0) {
   process.exit(1);
 }
 
+if (values.diagnostics) {
+  console.log("Codex login status passed. Model access not tested.");
+  process.exit(0);
+}
+
 const smoke = runCodex(
   `Running Codex smoke test with ${model}`,
   [
@@ -30,7 +61,7 @@ const smoke = runCodex(
     "-c",
     'service_tier="fast"',
     "-c",
-    'model_reasoning_effort="high"',
+    'model_reasoning_effort="medium"',
     "-c",
     'approval_policy="never"',
     "--sandbox",
@@ -47,12 +78,6 @@ if (smoke.status !== 0) {
 }
 
 console.log("Codex local preflight passed.");
-
-function argValue(name) {
-  const index = process.argv.indexOf(name);
-  const value = index >= 0 ? process.argv[index + 1] : undefined;
-  return value && !value.startsWith("--") ? value : undefined;
-}
 
 async function loadCodexLauncher() {
   try {
